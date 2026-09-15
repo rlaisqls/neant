@@ -1,0 +1,135 @@
+// neant compiler, in neant: AST from nparse -> bytecode data the VM loads with `exec`.
+// unit = (opcodes; args; consts); lambda code = (opcodes; args; consts; params; nlocals)
+// const entries: (`k;v) literal  (`g;`name) global  (`p;"+") verb  (`a;"/";f) adverbed verb  (`f;code) lambda
+// Same output as src/compile.rs, exposed as `compile` (the oracle). State lives in globals updated with ::.
+// A lambda reading an enclosing lambda's local captures it by value (mkclosure); captured slots follow its own locals.
+OPS: `push`loadg`storeg`loadl`storel`monad`dyad`call`mkadv`jmp`jmpf`pop`list`takel`takeg`amend`ret`mkclosure`loop ! til 19
+
+emit: {[op;a] cops:: cops, OPS op; cargs:: cargs, a; (count cops)-1}
+kc: {[entry] cconsts:: cconsts, ,entry; (count cconsts)-1}
+patch: {[pos] cargs[pos]: count cops}
+pushNull: {[] emit[`push; kc (`k; null)]}
+// is nm a local or capture of any enclosing lambda? cparents: list of (slots dict; captures) from outermost in
+visible: {[nm] $[0=count cparents; 0; |/ {[nm;p] (not null~p[0] nm) | nm in p[1]}[nm] each cparents]}
+// local slot for nm: own local, already captured, or newly captured from an enclosing lambda; null -> global
+slot: {[nm]
+  if[ctop; :null]
+  s: cscope nm; if[not null~s; :s]
+  i: ccaps?nm; if[i<count ccaps; :cbase+i]
+  if[visible nm; ccaps:: ccaps, nm; :cbase+(count ccaps)-1]
+  null}
+
+// x: x, rhs  (what x,: rhs parses to) -> rhs, else ()
+appendRhs: {[nm;e] $[not e[0]=`dy; (); (e[1]~(`verb; ",")) & e[2]~(`name; nm); e[3]; ()]}
+
+// verbs and verb+adverb are compile-time constants
+fnconst: {[n]
+  if[n[0]=`verb; :(`p; n[1])]
+  if[n[0]=`advb; inner: fnconst n[2]; :$[null~inner; null; (`a; n[1]; inner)]]
+  null}
+callee: {[f;arity]
+  c: fnconst f
+  if[not null~c; :emit[$[arity=1; `monad; `dyad]; kc c]]
+  gen f; emit[`call; arity]}
+
+gen: {[n]
+  kind: n[0]
+  if[kind=`const; :emit[`push; kc (`k; n[1])]]
+  if[kind=`name; s: slot n[1]; :$[null~s; emit[`loadg; kc (`g; n[1])]; emit[`loadl; s]]]
+  if[kind in `assign`gassign
+    rhs: appendRhs[n[1]; n[2]]
+    if[count rhs                          // x,: y  ->  take x so join can extend in place
+      gen rhs; kj: kc (`p; ",")
+      s: $[kind=`assign; slot n[1]; null]
+      if[null~s; g: kc (`g; n[1]); emit[`takeg; g]; emit[`dyad; kj]; :emit[`storeg; g]]
+      emit[`takel; s]; emit[`dyad; kj]; :emit[`storel; s]]]
+  if[kind=`assign; gen n[2]; s: slot n[1]; :$[null~s; emit[`storeg; kc (`g; n[1])]; emit[`storel; s]]]
+  if[kind=`gassign; gen n[2]; :emit[`storeg; kc (`g; n[1])]]
+  if[kind=`iassign
+    gen n[3]; gen each reverse n[2]; nn: count n[2]; s: slot n[1]
+    if[null~s; g: kc (`g; n[1]); emit[`takeg; g]; emit[`amend; nn]; :emit[`storeg; g]]
+    emit[`takel; s]; emit[`amend; nn]; :emit[`storel; s]]
+  if[kind in `verb`advb
+    f: fnconst n
+    if[not null~f; :emit[`push; kc f]]
+    gen n[2]; :emit[`mkadv; `code$n[1]]]
+  if[kind=`mo; gen n[2]; :callee[n[1]; 1]]
+  if[kind=`dy; gen n[3]; gen n[2]; :callee[n[1]; 2]]
+  if[kind=`app; gen n[2]; gen n[1]; :emit[`call; 1]]
+  if[kind=`call; gen each reverse n[2]; gen n[1]; :emit[`call; count n[2]]]
+  if[kind=`list; gen each reverse n[1]; :emit[`list; count n[1]]]
+  if[kind=`noun; :gen n[1]]
+  if[kind=`return; gen n[1]; :emit[`ret; 0]]
+  if[kind=`fn
+    r: compileFn[n[1]; n[2]]; caps: r[1]
+    gen each {(`name; x)} each caps
+    emit[`push; kc (`f; r[0])]
+    if[count caps; emit[`mkclosure; count caps]]
+    :0]
+  if[kind=`cond
+    a: n[1]; ends: (); i: 0
+    while[(i+1)<count a; gen a[i]; j: emit[`jmpf; 0]; gen a[i+1]; ends,: emit[`jmp; 0]; patch j; i+: 2]
+    $[i<count a; gen a[i]; pushNull[]]
+    patch each ends; :0]
+  if[kind=`if; gen n[1]; j: emit[`jmpf; 0]; block n[2]; patch j; :pushNull[]]
+  if[kind=`while
+    top: count cops; gen n[1]; j: emit[`jmpf; 0]
+    cloops:: cloops, ,(0; ()); block n[2]; emit[`jmp; top]; patch j; endLoop[]; :pushNull[]]
+  if[kind=`do
+    gen n[1]; top: count cops; j: emit[`loop; 0]
+    cloops:: cloops, ,(1; ()); block n[2]; emit[`jmp; top]; patch j; endLoop[]; :pushNull[]]
+  if[kind=`break
+    if[0=count cloops; signal "compile: break outside a loop"]
+    fr: last cloops
+    if[fr[0]; emit[`pop; 0]]                                   // drop the do-loop counter
+    j: emit[`jmp; 0]
+    cloops[(count cloops)-1]: (fr[0]; fr[1], j)
+    :0]
+  signal "compile: unknown node ",string kind}
+block: {[stmts] {gen x; emit[`pop; 0]} each stmts}
+// close the innermost loop frame: its breaks jump here. cloops: list of (is do-loop; break jmp positions)
+endLoop: {[] fr: last cloops; cloops:: -1_cloops; patch each fr[1]}
+genBody: {[stmts]
+  if[0=count stmts; :pushNull[]]
+  n: count stmts; i: 0
+  while[i<n; gen stmts[i]; if[(i+1)<n; emit[`pop; 0]]; i+: 1]}
+
+// names assigned anywhere in a lambda body are its locals; slot order is first-seen, params first
+collectLocals: {[a]
+  k: a[0]
+  if[k=`assign; if[null~cscope a[1]; cscope[a[1]]: count cscope]; :collectLocals a[2]]
+  if[k in `const`verb`name`fn; :0]
+  if[k in `advb`gassign; :collectLocals a[2]]
+  if[k in `noun`return; :collectLocals a[1]]
+  if[k in `mo`app`dy; collectLocals each 1_a; :0]
+  if[k=`iassign; collectLocals each a[2]; :collectLocals a[3]]
+  if[k in `list`cond; collectLocals each a[1]; :0]
+  if[k in `call`if`while`do; collectLocals a[1]; collectLocals each a[2]; :0]
+  0}
+
+// -> (code; captured names)
+compileFn: {[params;body]
+  saved: (cops; cargs; cconsts; cscope; ctop; cbase; ccaps; cparents; cloops)
+  cparents:: $[ctop; (); cparents, ,(cscope; ccaps)]
+  cops:: (); cargs:: (); cconsts:: (); ctop:: 0; ccaps:: (); cloops:: ()
+  cscope:: params ! til count params
+  collectLocals each body
+  cbase:: count cscope
+  genBody body
+  code: (cops; cargs; cconsts; params; cbase)
+  caps: ccaps
+  cops:: saved[0]; cargs:: saved[1]; cconsts:: saved[2]; cscope:: saved[3]; ctop:: saved[4]; cbase:: saved[5]; ccaps:: saved[6]; cparents:: saved[7]; cloops:: saved[8]
+  (code; caps)}
+
+compileStmt: {[ast] cops:: (); cargs:: (); cconsts:: (); ctop:: 1; cscope:: null; cbase:: 0; ccaps:: (); cparents:: (); cloops:: (); gen ast; (cops; cargs; cconsts)}
+ncompile: {[s] compileStmt each nparse s}
+// the whole pipeline without the Rust front end: source -> tokens -> AST -> bytecode -> result
+nrun: {[s]
+  a: nparse s; multi: $[count plines; 1<last plines; 0]   // one-liners (the REPL) get no "at line 1" noise
+  r: null; i: 0
+  while[i<count a
+    u: compileStmt a[i]
+    r: $[multi; @[exec; u; {[ln;e] signal e," at line ",string ln}[slines[i]]]; exec u]
+    i+:1]
+  $[0=count a; r; (last a)[0] in `assign`gassign`iassign; null; r]}   // a trailing assignment is silent, like the REPL
+load: {nrun "\n" sv read0 x}

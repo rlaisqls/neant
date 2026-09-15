@@ -1,0 +1,132 @@
+// neant lexer, in neant. Same token stream as src/lex.rs, which is exposed as `lex` and used as the oracle.
+// Token: (`kind; value). kinds: num str sym name verb adv punct. Newline and ; both lex as punct ";".
+// Literals: 1 2 3 vectors, 101b bools, 0N 0W 0n 0w null/infinity, 2026.09.15 dates, 12:30:00 times.
+// Adverbs \: and /: are one token each, spelled "L" and "R". nlex also sets plines: the line each token starts on.
+digits: "0123456789"
+hexd: "0123456789abcdefABCDEF"
+alpha: "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ"
+alnum: alpha,digits
+verbs: "+-*%!&|<>=~,^#_$?@"
+puncts: "()[]{}:"
+
+// index of the first char at or after i that fails pred
+run: {[s;i;pred] n: count s; while[$[i<n; pred s[i]; 0]; i+:1]; i}
+// true when position i does not continue a number: not alphanumeric and not "."
+endsNum: {[s;i] $[i<count s; not s[i] in alnum,"."; 1]}
+// exactly n digits at i -> end index, else -1
+ndigits: {[s;i;n] j: run[s;i;{x in digits}]; $[(j-i)<n; -1; i+n]}
+
+// end of the number literal starting at i (optional -, 0N 0W 0n 0w, digits, ., exponent); i itself if there is none
+numAt: {[s;i]
+  n: count s; j: i
+  if[$[j<n; s[j]="-"; 0]; j+:1]
+  if[$[(j+1)<n; (s[j]="0") & s[j+1] in "NWnw"; 0]; if[endsNum[s;j+2]; :j+2]]
+  d: j; j: run[s;j;{x in digits}]; hasd: j>d
+  if[$[j<n; s[j]="."; 0]; j+:1; f: j; j: run[s;j;{x in digits}]; hasd: hasd | j>f]
+  if[hasd & $[j<n; s[j] in "eE"; 0]; k: j+1; if[$[k<n; s[k] in "+-"; 0]; k+:1]; e: k; k: run[s;k;{x in digits}]; if[k>e; j: k]]
+  $[hasd; j; i]}
+pint: {$[x~"0N"; 0N; x~"0W"; 0W; x~"-0W"; -0W; `int$x]}
+pflt: {$[(x~"0n") | x~"0N"; 0n; (x~"0w") | x~"0W"; 0w; (x~"-0w") | x~"-0W"; -0w; `float$x]}
+
+// yyyy.mm.dd -> (date; end) or ()
+dateAt: {[s;i]
+  a: ndigits[s;i;4]; if[a<0; :()]; if[not $[a<count s; s[a]="."; 0]; :()]
+  b: ndigits[s;a+1;2]; if[b<0; :()]; if[not $[b<count s; s[b]="."; 0]; :()]
+  c: ndigits[s;b+1;2]; if[c<0; :()]; if[not endsNum[s;c]; :()]
+  d: @[{`date$x}; s[i+til c-i]; {()}]
+  $[0=count d; (); (d; c)]}
+// hh:mm[:ss[.mmm]] -> (time; end) or ()
+timeAt: {[s;i]
+  a: ndigits[s;i;2]; if[a<0; a: ndigits[s;i;1]]; if[a<0; :()]
+  if[not $[a<count s; s[a]=":"; 0]; :()]
+  e: ndigits[s;a+1;2]; if[e<0; :()]
+  if[$[e<count s; s[e]=":"; 0]
+    f: ndigits[s;e+1;2]
+    if[not f<0
+      e: f
+      if[$[e<count s; s[e]="."; 0]
+        g: run[s;e+1;{x in digits}]
+        if[g>e+4; :()]
+        if[g>e+1; e: g]]]]
+  if[not endsNum[s;e]; :()]
+  t: @[{`time$x}; s[i+til e-i]; {()}]
+  $[0=count t; (); (t; e)]}
+// 1b 010b -> (bool; end) or ()
+boolAt: {[s;i]
+  j: run[s;i;{x in "01"}]
+  if[(j=i) | not $[j<count s; s[j]="b"; 0]; :()]
+  if[not endsNum[s;j+1]; :()]
+  bits: "1"=s[i+til j-i]
+  ($[1=count bits; first bits; bits]; j+1)}
+
+// a noun just before a glued - makes it subtraction, not a negative literal:  1 -2 is a vector, x -2 is x minus 2
+prevNoun: {[toks]
+  if[0=count toks; :0]
+  t: last toks
+  (t[0] in `num`str`sym`name) | (t[0]=`punct) & t[1] in ")]}"}
+
+// each lexX returns (next index; token)
+lexNum: {[s;i]
+  if[(s[i]="0") & $[(i+1)<count s; s[i+1]="x"; 0]           // 0x0aff bytes; one pair is a byte atom
+    j: run[s;i+2;{x in hexd}]; h: s[(i+2)+til (j-i)-2]
+    if[(count h) mod 2; signal "lex: odd hex digits in 0x",h]
+    :(j; (`num; $[2=count h; first unhex h; unhex h]))]
+  d: dateAt[s;i]
+  if[count d                                    // 2026.01.01 2026.01.02 is one date vector
+    ds: ,d[0]; e: d[1]
+    k: run[s;e;{x in " \t"}]; d2: $[k>e; dateAt[s;k]; ()]
+    while[count d2; ds,: d2[0]; e: d2[1]; k: run[s;e;{x in " \t"}]; d2: $[k>e; dateAt[s;k]; ()]]
+    :(e; (`num; $[1=count ds; first ds; ds]))]
+  t: timeAt[s;i]; if[count t; :(t[1]; (`num; t[0]))]
+  b: boolAt[s;i]; if[count b; :(b[1]; (`num; b[0]))]
+  j: numAt[s;i]; parts: ,s[i+til j-i]
+  k: run[s;j;{x in " \t"}]
+  while[(k>j) & numAt[s;k]>k; j2: numAt[s;k]; parts,: ,s[k+til j2-k]; j: j2; k: run[s;j;{x in " \t"}]]
+  isf: |/ {(|/x in ".eE") | (last x) in "nw"} each parts
+  v: $[isf; pflt; pint] each parts
+  (j; (`num; $[1=count parts; first v; v]))}
+
+lexName: {[s;i] j: run[s;i+1;{x in alnum,"_."}]; (j; (`name; s[i+til j-i]))}
+
+lexSym: {[s;i]
+  n: count s; names: ()
+  while[$[i<n; s[i]="`"; 0]
+    j: run[s;i+1;{x in alnum,"_."}]
+    nm: $[j>i+1; s[(i+1)+til j-(i+1)]; ""]
+    names,: ,`$nm
+    i: j]
+  (i; (`sym; $[1=count names; first names; names]))}
+
+unesc: {$[x in "ntr0"; ("ntr0"!"\n\t\r\0") x; x]}
+// returns (next index; token; newlines inside the string)
+lexStr: {[s;i;line]
+  n: count s; j: i+1; buf: ""; nl: 0
+  while[$[j<n; not s[j]="\""; 0]
+    esc: (s[j]="\\") & (j+1)<n
+    if[esc; buf,: unesc s[j+1]; j+:2]
+    if[not esc; if[s[j]="\n"; nl+:1]; buf,: s[j]; j+:1]]
+  if[not j<n; signal "lex: unterminated string at line ",string line]
+  (j+1; (`str; buf); nl)}
+
+nlex: {[s]
+  n: count s; i: 0; toks: (); lines: (); line: 1
+  while[i<n
+    c: s[i]
+    r: $[c in " \t\r"; (i+1; ());
+         (c="/") & $[(i+1)<n; s[i+1]="/"; 0]; (run[s;i;{not x="\n"}]; ());
+         c in "\n;"; (i+1; (`punct; ";"));
+         c="`"; lexSym[s;i];
+         c="\""; lexStr[s;i;line];
+         (c in digits) | ((c=".") & $[(i+1)<n; s[i+1] in digits; 0]) | (c="-") & (not prevNoun toks) & $[(i+1)<n; s[i+1] in digits,"."; 0]; lexNum[s;i];
+         (c in alpha) | (c=".") & $[(i+1)<n; s[i+1] in alpha; 0]; lexName[s;i];
+         c in puncts; (i+1; (`punct; c));
+         c in verbs; (i+1; (`verb; c));
+         (c in "\\/") & $[(i+1)<n; s[i+1]=":"; 0]; (i+2; (`adv; $[c="\\"; "L"; "R"]));
+         c in "/\\'"; (i+1; (`adv; c));
+         signal "lex: unexpected ",c," at line ",string line]
+    i: r[0]
+    if[count r[1]; toks,: ,r[1]; lines,: line]
+    if[c="\n"; line+:1]
+    if[2<count r; line+: r[2]]]
+  plines:: lines
+  toks}

@@ -1,0 +1,116 @@
+// neant standard library, in neant. Loaded first, before the boot compiler (and by --rust).
+// A name bound to a verb gets both valences, like q's first = *:  — count[1;2] is 1 2 take.
+null: $[0;0]
+count: #
+first: *
+til: !
+reverse: |
+where: &
+distinct: ?
+floor: _
+not: ~
+string: $
+type: @
+sqrt: ^
+sum: +/
+prd: */
+min: &/
+max: |/
+avg: {(+/x)%#x}
+abs: {x|-x}
+last: {x[(#x)-1]}
+sort: {x[<x]}
+raze: {,/x}
+sym: {`$x}
+xexp: {x^y}
+mod: {x-y*_x%y}
+div: {_x%y}
+in: {(#y)>y?x}
+within: {(not x<y[0]) & not x>y[1]}
+
+// strings
+lowerc: "abcdefghijklmnopqrstuvwxyz"
+upperc: "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
+upper: {`char$(`code$x)-32*x in lowerc}
+lower: {`char$(`code$x)+32*x in upperc}
+trim: {i: &not x in " \t\r\n"; $[#i; x[(first i)+til 1+(last i)-first i]; ""]}
+// positions where p occurs in s
+ss: {[s;p] p: $[`char=@p; ,p; p]; n: #p; if[n>#s; :()]; c: & {[s;p;i] s[i+til count p]~p}[s;p] each til 1+(#s)-n
+  $[1<#c; {[n;a;i] $[i<n+last a; a; a,i]}[n]/[,first c; 1_c]; c]}
+// split s on sep -> list of strings;  join strings with sep
+vs: {[sep;s] p: s ss sep; st: 0, p+#sep; en: p, #s; {[s;a;b] s[a+til b-a]}[s]'[st;en]}
+sv: {[sep;xs] $[0=#xs; ""; (,/) {[sep;x;i] $[i; sep,x; x]}[sep]'[xs;til count xs]]}
+
+// nulls
+nullof: {t: @x; $[t in `int`ints; 0N; t in `float`floats; 0n; t in `sym`syms; `; t in `char`chars; " "; t in `date`dates; `date$-2147483648; t in `time`times; `time$0N; null]}
+fill: {[a;x] i: &isnull x; if[count i; x[i]: a]; x}
+fills: {{$[isnull y; x; y]}\x}
+
+// vector utilities
+enlist: ,
+flip: +
+prev: {(nullof x), -1_x}
+next: {(1_x), nullof x}
+deltas: {(first x), (1_x) - -1_x}
+ratios: {(first x), (1_x) % -1_x}
+sums: +\
+prds: *\
+maxs: |\
+mins: &\
+asc: {x[<x]}
+desc: {x[>x]}
+except: {x[&not x in y]}
+inter: {x[&x in y]}
+union: {distinct x,y}
+cross: {[x;y] raze {[y;a] {(x;y)}[a] each y}[y] each x}
+today: {now`date}
+// "% and %" fmt (1;2)  ->  "1 and 2"
+fmt: {[s;a] ps: "%" vs s; (,/) raze flip (ps; (string each a), enlist "")}
+
+// timing and string helpers
+timeit: {t0: now`time; r: x[]; print fmt["%ms"; ,`int$now[`time]-t0]; r}          // timeit {sum til 1000000}
+
+// math
+neg: -
+iasc: <
+idesc: >
+any: |/
+all: &/
+pi: 3.141592653589793
+ceiling: {-_-x}
+round: {_x+0.5}                        // half up: round -1.5 is -1
+signum: {(x>0)-x<0}
+med: {s: asc x; n: #s; $[n mod 2; s[n div 2]; avg s[(n div 2)-1 0]]}
+var: {avg (x-avg x)^2}
+dev: {sqrt var x}
+rank: {<<x}
+xbar: {[n;x] t: @x; r: n*_x%n; $[t in `date`dates; `date$r; t in `time`times; `time$r; r]}
+// x bin y: index of the last element of sorted x not greater than y, -1 if none
+bin: {[x;y] $[(@y) in `int`float`date`time; (+/ not x>y)-1; {[x;b] (+/ not x>b)-1}[x] each y]}
+
+// windows (partial windows at the start, like q)
+msum: {[n;x] s: sums x; s - (n#0),(-n)_s}
+mavg: {[n;x] msum[n;x] % n & 1+til count x}
+mwin: {[f;n;x] {[f;n;x;i] f x[(0|1+i-n)+til n&1+i]}[f;n;x] each til count x}   // ponytail: O(n*w), a monotone deque if windows get wide
+mmax: mwin[max]
+mmin: mwin[min]
+ema: {[a;x] {[a;p;c] (a*c)+p*1-a}[a] scan x}
+
+// lists
+rotate: {[n;x] c: count x; x[(n+til c) mod c]}
+cut: {[i;x] if[`int=@i; i: i*til ceiling (count x)%i]; en: (1_i),count x; {[x;a;b] x[a+til b-a]}[x]'[i;en]}
+sublist: {[r;x] $[`int=@r; (r&count x)#x; x[r[0]+til r[1]&(count x)-r[0]]]}
+differ: {(,1b), not {x~y}'[1_x;-1_x]}
+
+// more strings
+ws: " \t\r\n"
+ltrim: {i: &not x in ws; $[#i; (first i)_x; ""]}
+rtrim: {i: &not x in ws; $[#i; (1+last i)#x; ""]}
+ssr: {[s;p;r] r sv p vs s}
+// glob match: * any run, ? any one char.  ponytail: backtracking, exponential on many *
+like: {[s;p] p: $[`char=@p; ,p; p]; s: $[`char=@s; ,s; s]
+  $[0=#p; 0=#s; p[0]="*"; $[like[s;1_p]; 1b; 0=#s; 0b; like[1_s;p]]; 0=#s; 0b; (p[0]="?") | s[0]=p[0]; like[1_s;1_p]; 0b]}
+
+// bytes <-> hex text:  hex 0x0aff -> "0aff",  unhex "0aff" -> 0x0aff  (the lexer uses unhex for 0x literals)
+hex: {2_string x}
+unhex: {d: "0123456789abcdef"?lower x; n: (count x) div 2; `byte$(16*d[2*til n])+d[1+2*til n]}

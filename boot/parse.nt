@@ -1,0 +1,184 @@
+// neant parser, in neant. Consumes nlex tokens (boot/lex.nt); produces the same AST as src/parse.rs,
+// which is exposed as `parse` and used as the oracle. Nodes are (`kind; ...) lists, identifiers are symbols:
+//   (`const;v) (`name;`x) (`verb;"+") (`advb;"/";f) (`mo;f;x) (`dy;f;x;y) (`app;f;x) (`call;f;args) (`list;items)
+//   (`assign;`x;e) (`gassign;`x;e) (`iassign;`x;idxs;e) (`return;e) (`fn;params;body) (`if;c;body) (`while;c;body)
+//   (`do;n;body) (`cond;args) (`noun;e)
+// Parser state is two globals: pt (tokens) and pi (position), updated with ::.
+INFIX: `mod`div`xexp`in`within`vs`sv`ss`write0`each`over`scan`except`inter`union`cross`fill`like`rand`msum`mavg`mmax`mmin`ema`xbar`bin`cut`rotate`sublist`band`bor`bxor`shl`shr
+SELKW: ("by";"from";"where")
+
+peek: {[k] $[(pi+k)<count pt; pt[pi+k]; (`eof;" ")]}
+isPt: {[t;c] $[t[0]=`punct; t[1]=c; 0]}
+isP: {[k;c] isPt[peek k;c]}
+isV: {[t;c] $[t[0]=`verb; t[1]=c; 0]}
+kw: {[k;w] t: peek k; $[t[0]=`name; t[1]~w; 0]}
+fnlike: {[a] $[a[0] in `verb`advb; 1; a[0]=`name; a[1] in INFIX; 0]}
+need: {if[0=count x; signal "parse: incomplete expression"]; x}
+advf: {$[x="L"; "\\:"; x="R"; "/:"; x]}
+
+// statements up to the closing punct ("\0" = end of input). Empty statements are skipped.
+stmts: {[close]
+  out: ()
+  while[1
+    t: peek 0
+    if[t[0]=`eof; $[close="\0"; :out; signal "parse: missing ",close]]
+    if[isPt[t;close]; pi::pi+1; :out]
+    if[isPt[t;";"]; pi::pi+1]
+    if[not isPt[t;";"]
+      if[close="\0"; slines:: slines, plines[pi]]   // line of each top-level statement, for runtime errors
+      out,: ,expr[]]]}
+
+// the whole rest of the line, or () when empty
+expr: {[]
+  if[isP[0;":"]; pi::pi+1; :(`return; rhs[])]
+  t: peek 0
+  if[t[0]=`name
+    nm: `$t[1]
+    if[isP[1;":"] & isP[2;":"]; pi::pi+3; :(`gassign; nm; rhs[])]
+    if[isP[1;":"]; pi::pi+2; :(`assign; nm; rhs[])]
+    if[((peek 1)[0]=`verb) & isP[2;":"]; v: (peek 1)[1]; pi::pi+3; :(`assign; nm; (`dy; (`verb; v); (`name; nm); rhs[]))]
+    if[isP[1;"["]
+      save: pi; pi::pi+2; idx: pargs[]
+      if[count idx
+        if[isP[0;":"]; pi::pi+1; :(`iassign; nm; idx; rhs[])]
+        if[((peek 0)[0]=`verb) & isP[1;":"]
+          v: (peek 0)[1]; pi::pi+2
+          :(`iassign; nm; idx; (`dy; (`verb; v); (`call; (`name; nm); idx); rhs[]))]]
+      pi::save]]
+  items: ()
+  while[not stop[]; items,: ,primary[]]
+  resolve items}
+rhs: {[] e: expr[]; if[0=count e; signal "parse: empty assignment"]; e}
+stop: {[] t: peek 0; $[t[0]=`eof; 1; t[0]=`punct; t[1] in ";)]}"; 0]}
+
+// [noun verb rest] -> dy, [verb rest] -> mo, [noun rest] -> app; the right operand is the rest of the line
+resolve: {[items]
+  if[2>count items; :$[count items; items[0]; ()]]
+  h: items[0]; rest: 1_items
+  if[fnlike h; :(`mo; h; need resolve rest)]
+  if[fnlike rest[0]; :(`dy; rest[0]; h; need resolve 1_rest)]
+  (`app; h; need resolve rest)}
+
+primary: {[]
+  t: peek 0; pi::pi+1; k: t[0]; v: t[1]
+  if[k=`eof; signal "parse: unexpected end"]
+  if[k=`adv; signal "parse: dangling adverb ",advf v]
+  if[k in `num`sym; node: (`const; v)]
+  if[k=`str; node: (`const; $[1=count v; first v; v])]
+  if[k=`name
+    if[((v~"if") | (v~"while") | v~"do") & isP[0;"["]
+      pi::pi+1; a: stmts["]"]
+      if[0=count a; signal "parse: ",v," needs a condition"]
+      :(`$v; a[0]; 1_a)]
+    if[v~"select"; :selectForm[]]
+    if[v~"break"; :,`break]
+    node: (`name; `$v)]
+  if[k=`verb
+    if[(v="$") & isP[0;"["]; pi::pi+1; :(`cond; stmts["]"])]
+    node: (`verb; v)]
+  if[k=`punct
+    if[not v in "({"; signal "parse: unexpected ",v]
+    if[v="("; body: stmts[")"]; node: $[1=count body; $[fnlike body[0]; (`noun; body[0]); body[0]]; (`list; body)]]
+    if[v="{"
+      hasP: isP[0;"["]
+      if[hasP; pi::pi+1; params: paramList[]]
+      body: stmts["}"]
+      if[not hasP; params: `x`y`z[til max 1,implicitMax body]]
+      node: (`fn; params; body)]]
+  while[1; $[(peek 0)[0]=`adv; node: advb node; isP[0;"["]; node: callp node; :node]]}
+advb: {[node] t: peek 0; pi::pi+1; (`advb; t[1]; node)}
+callp: {[node] pi::pi+1; a: pargs[]; (`call; node; a)}
+
+paramList: {[]
+  ps: ()
+  while[1
+    t: peek 0; pi::pi+1
+    if[isPt[t;"]"]; :ps]
+    if[t[0]=`name; ps,: `$t[1]]
+    if[not (t[0]=`name) | isPt[t;";"]; signal "parse: bad parameter list"]]}
+
+// call arguments after [ ; an empty slot is a null constant (projection)
+pargs: {[]
+  out: ()
+  while[1
+    e: expr[]
+    t: peek 0; pi::pi+1
+    if[isPt[t;";"]; out,: ,$[count e; e; (`const; null)]]
+    if[isPt[t;"]"]
+      if[count e; out,: ,e]
+      if[(0=count e) & 0<count out; out,: ,(`const; null)]
+      :out]
+    if[not isPt[t;";"] | isPt[t;"]"]; signal "parse: missing ]"]]}
+
+// ---- select cols by keys from t where conds  ->  qsel[t; where-fn; by-dict; col-dict]  (boot/table.nt)
+selectForm: {[]
+  cols: $[kw[0;"by"] | kw[0;"from"]; (); selList[]]
+  by: (); if[kw[0;"by"]; pi::pi+1; by: selList[]]
+  if[not kw[0;"from"]; signal "parse: select needs from"]
+  pi::pi+1
+  from: selExpr[]; if[0=count from; signal "parse: select needs a table"]
+  wh: (); if[kw[0;"where"]; pi::pi+1; wh: {x[1]} each selList[]]
+  desugarSelect[cols; by; from; wh]}
+// comma-separated [name:] expr items, up to by/from/where or a terminator; each item is (name-or-(); expr)
+selList: {[]
+  out: ()
+  while[1
+    nm: ()
+    if[((peek 0)[0]=`name) & isP[1;":"]; nm: (peek 0)[1]; pi::pi+2]
+    e: selExpr[]; if[0=count e; signal "parse: empty select item"]
+    out,: ,(nm; e)
+    $[isV[peek 0;","]; pi::pi+1; :out]]}
+stopSel: {[] t: peek 0; $[stop[]; 1; isV[t;","]; 1; t[0]=`name; |/ t[1] ~/: SELKW; 0]}   // ~/: because `in` on a string is per char
+selExpr: {[] items: (); while[not stopSel[]; items,: ,primary[]]; resolve items}
+
+autoName: {[e] $[e[0]=`name; e[1]; e[0] in `app`mo; autoName e[2]; ()]}
+selLam: {[e] (`fn; ,`.t; ,colref e)}
+selDict: {[items]
+  if[0=count items; :(`const; ())]
+  names: (); n: 0; i: 0
+  while[i<count items
+    it: items[i]; nm: it[0]; auto: autoName it[1]
+    an: `$"x",$[n>0; string n; ""]
+    if[(0=count nm) & 0=count auto; n+:1]
+    names,: $[count nm; `$nm; count auto; auto; an]
+    i+:1]
+  (`dy; (`verb; "!"); (`const; names); (`list; selLam each {x[1]} each items))}
+desugarSelect: {[cols;by;from;wh]
+  wl: (`const; ())
+  if[count wh; acc: wh[0]; i: 1; while[i<count wh; acc: (`dy; (`verb; "&"); acc; wh[i]); i+:1]; wl: selLam acc]
+  (`call; (`name; `qsel); (from; wl; selDict by; selDict cols))}
+// every name in a column expression resolves to a column when the table has one, else to the global
+colref: {[a]
+  k: a[0]
+  if[k=`name; if[a[1]=`.t; :a]; :(`cond; ((`dy; (`name; `in); (`const; a[1]); (`app; (`name; `key); (`name; `.t))); (`app; (`name; `.t); (`const; a[1])); a))]
+  if[k in `const`verb; :a]
+  if[k=`advb; :(`advb; a[1]; colref a[2])]
+  if[k in `mo`app; :(k; colref a[1]; colref a[2])]
+  if[k=`dy; :(k; colref a[1]; colref a[2]; colref a[3])]
+  if[k=`call; :(k; colref a[1]; colref each a[2])]
+  if[k in `list`cond; :(k; colref each a[1])]
+  if[k in `noun`return; :(k; colref a[1])]
+  if[k=`fn; :(k; a[1]; colref each a[2])]
+  if[k in `if`while`do; :(k; colref a[1]; colref each a[2])]
+  if[k in `assign`gassign; :(k; a[1]; colref a[2])]
+  if[k=`iassign; :(k; a[1]; colref each a[2]; colref a[3])]
+  a}
+
+// highest implicit parameter (x=1 y=2 z=3) referenced in a body, not descending into nested lambdas
+implicitMax: {[body] max 0, usesXYZ each body}
+usesXYZ: {[a]
+  k: a[0]
+  if[k=`name; :$[a[1]=`x; 1; a[1]=`y; 2; a[1]=`z; 3; 0]]
+  if[k in `const`verb`fn; :0]
+  if[k in `advb`assign`gassign; :usesXYZ a[2]]
+  if[k in `noun`return; :usesXYZ a[1]]
+  if[k in `mo`app`dy; :max usesXYZ each 1_a]
+  if[k=`iassign; :max (usesXYZ each a[2]), usesXYZ a[3]]
+  if[k in `list`cond; :max 0, usesXYZ each a[1]]
+  if[k in `call`if`while`do; :max (usesXYZ a[1]), usesXYZ each a[2]]
+  0}
+
+// errors carry the line of the token being looked at, like the Rust parser
+nparse: {[s]
+  pt:: nlex s; pi:: 0; slines:: ()
+  @[{stmts["\0"]}; 0; {$[count plines; signal x," at line ",string plines[pi & -1+count plines]; signal x]}]}
