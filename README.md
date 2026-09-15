@@ -158,8 +158,8 @@ key bxor data                // the bit verbs on two byte operands give bytes
 ```
 
 `boot/crypto.nt` is pure neant on those: `sha256 hmac hkdfExtract hkdfExpand chacha20 poly1305
-aeadEncrypt aeadDecrypt x25519`, all checked against the RFC vectors (SHA-256 ~0.3ms/block,
-ChaCha20-Poly1305 ~25ms per 10KB, X25519 ~75ms). 32-bit words live in ints masked after each sum;
+aeadEncrypt aeadDecrypt x25519`, all checked against the RFC vectors (SHA-256 ~0.12ms/block,
+ChaCha20-Poly1305 ~16ms per 10KB, X25519 ~42ms). 32-bit words live in ints masked after each sum;
 the 2^255-19 and 2^130-5 fields use 22- and 26-bit limbs so products stay exact in an int, and
 carries run as vector passes.
 
@@ -243,10 +243,22 @@ consistently is no longer caught by construction — it is caught only if a lang
   Nested keys fall back to a scan.
 - Atom lookup in a typed vector scans the raw elements instead of boxing the vector. (`x in y` is a
   `?` over `Syms`, and the boot compiler's ``k in `const`verb...`` dispatch chains run it per AST node.)
-- Two int atoms through `+ - * & | < > =` skip the shape/broadcast machinery.
+- Two int atoms through `+ - * & | < > =` skip the shape/broadcast machinery, and through
+  `band bor bxor shl shr` as well — those are named builtins, so they carry the fast function on
+  `PrimDef` rather than being matched by name.
+- **A call to anything that is not a user function — a primitive, an adverb, `x[i]` on a vector or a
+  dict — reads its arguments straight off the stack.** The general path builds an argument vector that
+  becomes the callee's locals and returns to the pool, but `call` consumed and dropped that vector for
+  a primitive, so every `a bxor b` and every `w[i]` allocated. This was the single largest win.
+- `x[i]` and `x[i]: v` for a typed vector indexed by an int vector gather and scatter in place.
+  The general path boxes every index and element into a `Value`, indexes one at a time, then re-detects
+  the type in `pack` — the shape `acc[i+til 12] +: a[i]*b` that the field arithmetic is built out of.
 
-Together: the 7.7KB parser lexes+parses+compiles itself in ~34ms (was ~200ms), the self-hosted
-rebuild of `boot/*.nt` takes ~138ms, and a `while` iteration costs 26ns.
+Together: the self-hosted rebuild of `boot/*.nt` takes ~185ms (was ~324ms), and a `while` iteration
+costs 26ns. On the crypto in `boot/crypto.nt`, per 64KB: SHA-256 284ms → 119ms, ChaCha20 115 → 68,
+Poly1305 61 → 34, the AEAD 198 → 103; X25519 76ms → 42, and a TLS 1.3 handshake against OpenSSL
+169ms → 97ms. Allocation went from ~34% of samples to under 1%; what is left is the dispatch loop
+itself and `Value` clone/drop.
 
 Runtime errors carry a line table, which costs ~10% of compile throughput. A frame is named by its
 caller's `LoadG`, so the bytecode carries positions but no names.
@@ -254,11 +266,16 @@ caller's `LoadG`, so the bytecode carries positions but no names.
 ### Next
 
 A register-style calling convention was tried and reverted — it measured slower, and the profile
-says frame setup is ~5% while `Value` clone/drop and small-list allocation are ~35%. So the next
-target is that allocation: AST nodes and const entries are `Rc<Vec<Value>>` built one `List` op at a
-time. After that, moving more of the VM dispatch into neant-generated specialised code.
+said frame setup is ~5% while `Value` clone/drop and small-list allocation are ~35%. The allocation
+half of that is now gone (see above). What the profile shows next is `execute` itself and `Value`
+clone/drop — Rc traffic through the operand stack — so the remaining levers are moving VM dispatch
+into neant-generated specialised code, and a user-function call, which still costs ~37ns of frame
+setup on top of its body.
 
-For TLS, what is missing is ASN.1 DER, RSA/ECDSA signature verification, and a root store.
+For TLS, what is missing is ASN.1 DER, RSA/ECDSA signature verification, and a root store. Before any
+of those: **`rand` is an xorshift64 seeded from the clock, and `tlsConnect` draws the x25519 private
+key and then the ClientHello random from it.** The random goes out in the clear, xorshift is linear and
+invertible, and 32 bytes of it are enough to solve for the state and roll back to the key. A CSPRNG
 builtin is the prerequisite for the rest meaning anything.
 
 Ed25519 needs one runtime change and no language change: the bit verbs already give exact 64-bit

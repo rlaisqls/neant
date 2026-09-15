@@ -42,6 +42,9 @@ pub struct PrimDef {
     pub name: &'static str,
     pub m: Option<fn(Value) -> R<Value>>,
     pub d: Option<fn(Value, Value) -> R<Value>>,
+    /// Two int atoms, straight through. The bit verbs work on the raw 64-bit pattern (nulls and all,
+    /// like `prims::bitop`), so the VM can answer them without the shape/broadcast machinery.
+    pub ib: Option<fn(u64, u64) -> u64>,
 }
 
 #[derive(Clone)]

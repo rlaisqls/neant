@@ -23,6 +23,9 @@ fn int_dyad(name: &str, a: i64, b: i64) -> Option<Value> {
     })
 }
 
+/// The value `n` down from the top of a stack, for peeking at a callee before popping it.
+fn f_at(st: &[Value], n: usize) -> &Value { &st[st.len() - 1 - n] }
+
 /// One call-stack frame of an error: the function's name (None when it is not a plain global call) and
 /// the source line it was on. A frame is named by its *caller*, which knows the global it loaded to call it.
 type Frame = (Option<Rc<str>>, u32);
@@ -135,6 +138,22 @@ impl Vm {
                     let x = st.pop().unwrap(); let y = st.pop().unwrap();
                     let r = self.dyad(&k[a as usize], x, y)?; st.push(r);
                 }
+                // Anything that is not a user function takes its arguments straight off the stack: no args vector,
+                // so no allocation. The general path's vector becomes the callee's locals and returns to the
+                // pool, but `call` consumes and drops it for a primitive or an index. Lambdas go below.
+                Op::Call(n @ (1 | 2)) if !matches!(f_at(&st, 0), Lambda(_) | Closure(..) | Proj(..)) => {
+                    let f = st.pop().unwrap();
+                    let x = st.pop().unwrap();
+                    let prim = matches!(f, Prim(_) | Adv(..));
+                    let r = if n == 1 {
+                        if prim { self.monad(&f, x)? } else { index_at(f, x)? }   // x[i] on a vector or dict
+                    } else {
+                        let y = st.pop().unwrap();
+                        if prim && (matches!(x, Null) || matches!(y, Null)) { Proj(Rc::new(f), Rc::new(vec![x, y])) }
+                        else { self.dyad(&f, x, y)? }   // a non-callable here still errors, in `call`
+                    };
+                    st.push(r);
+                }
                 Op::Call(n) => {
                     let f = st.pop().unwrap();
                     let mut args = self.pool.pop().unwrap_or_default();   // becomes the callee's locals; returned to the pool after
@@ -238,13 +257,14 @@ impl Vm {
                 _ => err(format!("rank: {} has no monadic form", p.name)),
             },
             Adv(c, g) => self.adv1(*c, g, x),
-            _ => self.call(f, vec![x]),
+            _ => { let mut a = self.pool.pop().unwrap_or_default(); a.push(x); self.call(f, a) }
         }
     }
     fn dyad(&mut self, f: &Value, x: Value, y: Value) -> R<Value> {
         match f {
             Prim(p) => {
                 if let (Int(a), Int(b)) = (&x, &y) {
+                    if let Some(f) = p.ib { return Ok(Int(f(*a as u64, *b as u64) as i64)); }
                     if let Some(v) = int_dyad(p.name, *a, *b) { return Ok(v); }
                 }
                 match (p.d, p.name) {
@@ -256,7 +276,7 @@ impl Vm {
                 }
             }
             Adv(c, g) => self.adv2(*c, g, x, y),
-            _ => self.call(f, vec![x, y]),
+            _ => { let mut a = self.pool.pop().unwrap_or_default(); a.push(x); a.push(y); self.call(f, a) }
         }
     }
 

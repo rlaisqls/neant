@@ -170,7 +170,28 @@ pub fn index_at(x: Value, i: Value) -> R<Value> {
     }
     if i.is_atom() { return x.item(usize::try_from(int_of(&i)?).map_err(|_| NError("index".into()))?); }
     if i.count() == 0 { return Ok(empty_like(&x)); }   // x[()] keeps x's type: "" for strings, not an empty int vector
+    if let (Ints(j), false) = (&i, x.is_atom()) { if let Some(r) = gather(&x, j) { return r; } }
     Ok(pack(i.seq().iter().map(|j| index_at(x.clone(), j.clone())).collect::<R<Vec<_>>>()?))
+}
+/// `x[i]` for a typed vector indexed by an int vector: gather straight into the same typed vector.
+/// The general path boxes every element into a `Value`, indexes it, then re-detects the type in `pack`;
+/// this is the same answer without any of that. `List` still goes through `pack`, which may retype it.
+fn gather(x: &Value, idx: &[i64]) -> Option<R<Value>> {
+    macro_rules! g { ($v:expr, $ctor:expr) => {{
+        let (src, n) = ($v, $v.len() as i64);
+        let mut out = Vec::with_capacity(idx.len());
+        for &j in idx {
+            if j < 0 || j >= n { return Some(err("index")); }
+            out.push(src[j as usize].clone());
+        }
+        Some(Ok($ctor(out)))
+    }}}
+    match x {
+        Ints(v) => g!(v, ints), Floats(v) => g!(v, floats), Bools(v) => g!(v, bools), Chars(v) => g!(v, chars),
+        Syms(v) => g!(v, syms), Dates(v) => g!(v, dates), Times(v) => g!(v, times), Bytes(v) => g!(v, bytes),
+        List(v) => g!(v, pack),
+        _ => None,
+    }
 }
 fn empty_like(x: &Value) -> Value {
     match x {
@@ -458,8 +479,39 @@ pub fn amend_path(x: &mut Value, idx: &[Value], v: Value) -> R<()> {
     amend(x, idx[0].clone(), sub)
 }
 /// `x[i]:v` in place. Vector index amends each; a missing dict key appends.
+/// `x[i]: v` for a typed vector written through an int vector with values of its own type — the shape
+/// `acc[i+til n] +: ...` that the field arithmetic in boot/crypto.nt is built out of. Writes in place
+/// instead of boxing every index and value and recursing once per element. Returns false (no writes yet)
+/// whenever anything does not line up, so the general path below still defines the semantics — including
+/// the partial mutation it performs when an index is out of range.
+fn scatter(x: &mut Value, idx: &[i64], v: &Value) -> bool {
+    macro_rules! s { ($r:expr, $one:pat => $get:expr, $many:pat => $src:expr) => {{
+        let n = $r.len() as i64;
+        if idx.iter().any(|&j| j < 0 || j >= n) { return false; }
+        match v {
+            $one => { let a = $get; let t = Rc::make_mut($r); for &j in idx { t[j as usize] = a.clone(); } true }
+            $many => {
+                let src = $src;
+                if src.len() != idx.len() { return false; }
+                let t = Rc::make_mut($r);
+                for (&j, a) in idx.iter().zip(src.iter()) { t[j as usize] = a.clone(); }
+                true
+            }
+            _ => false,
+        }
+    }}}
+    match x {
+        Ints(r) => s!(r, Int(a) => *a, Ints(w) => w),
+        Floats(r) => s!(r, Float(a) => *a, Floats(w) => w),
+        Bytes(r) => s!(r, Byte(a) => *a, Bytes(w) => w),
+        Bools(r) => s!(r, Bool(a) => *a, Bools(w) => w),
+        Chars(r) => s!(r, Char(a) => *a, Chars(w) => w),
+        _ => false,
+    }
+}
 pub fn amend(x: &mut Value, i: Value, v: Value) -> R<()> {
     if !i.is_atom() {
+        if let Ints(j) = &i { if scatter(x, j, &v) { return Ok(()); } }
         let idx = i.seq();
         let vs = if v.is_atom() { vec![v; idx.len()] } else { v.seq() };
         if vs.len() != idx.len() { return err("length: amend"); }
@@ -509,11 +561,17 @@ fn bitop(x: Value, y: Value, f: fn(u64, u64) -> u64) -> R<Value> {
     let r = match (sh_i(&x), sh_i(&y)) { (Some(a), Some(b)) => zip(a, b, |p, q| f(p as u64, q as u64) as i64)?, _ => return err("type: bit op on non-integer") };
     Ok(if by { match r { Out::A(v) => Byte(v as u8), Out::V(v) => bytes(v.iter().map(|&i| i as u8).collect()) } } else { oi(r) })
 }
-fn band(x: Value, y: Value) -> R<Value> { bitop(x, y, |a, b| a & b) }
-fn bor(x: Value, y: Value) -> R<Value> { bitop(x, y, |a, b| a | b) }
-fn bxor(x: Value, y: Value) -> R<Value> { bitop(x, y, |a, b| a ^ b) }
-fn shl(x: Value, y: Value) -> R<Value> { bitop(x, y, |a, n| a.checked_shl(n as u32).unwrap_or(0)) }
-fn shr(x: Value, y: Value) -> R<Value> { bitop(x, y, |a, n| a.checked_shr(n as u32).unwrap_or(0)) }
+// named so the VM can reach the same function for two int atoms (PrimDef::ib) as bitop does for vectors
+pub fn ib_and(a: u64, b: u64) -> u64 { a & b }
+pub fn ib_or(a: u64, b: u64) -> u64 { a | b }
+pub fn ib_xor(a: u64, b: u64) -> u64 { a ^ b }
+pub fn ib_shl(a: u64, n: u64) -> u64 { a.checked_shl(n as u32).unwrap_or(0) }
+pub fn ib_shr(a: u64, n: u64) -> u64 { a.checked_shr(n as u32).unwrap_or(0) }
+fn band(x: Value, y: Value) -> R<Value> { bitop(x, y, ib_and) }
+fn bor(x: Value, y: Value) -> R<Value> { bitop(x, y, ib_or) }
+fn bxor(x: Value, y: Value) -> R<Value> { bitop(x, y, ib_xor) }
+fn shl(x: Value, y: Value) -> R<Value> { bitop(x, y, ib_shl) }
+fn shr(x: Value, y: Value) -> R<Value> { bitop(x, y, ib_shr) }
 fn bnot(x: Value) -> R<Value> {
     match &x { Byte(b) => Ok(Byte(!b)), Bytes(v) => Ok(bytes(v.iter().map(|b| !b).collect())), _ => map_i(&x, |a| !a) }
 }
@@ -571,7 +629,10 @@ pub fn scan_fast(c: char, x: &Value) -> Option<Value> {
     }
 }
 
-macro_rules! p { ($n:literal, $m:expr, $d:expr) => { PrimDef { name: $n, m: $m, d: $d } } }
+macro_rules! p {
+    ($n:literal, $m:expr, $d:expr) => { PrimDef { name: $n, m: $m, d: $d, ib: None } };
+    ($n:literal, $m:expr, $d:expr, $b:expr) => { PrimDef { name: $n, m: $m, d: $d, ib: Some($b) } };
+}
 pub static PRIMS: &[PrimDef] = &[
     p!("+", Some(flip), Some(add)),
     p!("-", Some(neg), Some(sub)),
@@ -597,7 +658,8 @@ pub static PRIMS: &[PrimDef] = &[
 pub static BUILTINS: &[PrimDef] = &[
     p!("exp", Some(exp), None), p!("log", Some(log), None), p!("sin", Some(sin), None), p!("cos", Some(cos), None), p!("tan", Some(tan), None), p!("atan", Some(atan), None),
     p!("rand", Some(rand1), Some(rand2)), p!("rseed", Some(rseed), None),
-    p!("band", None, Some(band)), p!("bor", None, Some(bor)), p!("bxor", None, Some(bxor)), p!("shl", None, Some(shl)), p!("shr", None, Some(shr)), p!("bnot", Some(bnot), None),
+    p!("band", None, Some(band), ib_and), p!("bor", None, Some(bor), ib_or), p!("bxor", None, Some(bxor), ib_xor),
+    p!("shl", None, Some(shl), ib_shl), p!("shr", None, Some(shr), ib_shr), p!("bnot", Some(bnot), None),
     p!("key", Some(key), None), p!("value", Some(value), None), p!("group", Some(group), None),
     p!("isnull", Some(isnull), None), p!("now", Some(now), None),
     p!("show", Some(show), None), p!("print", Some(print), None), p!("signal", Some(signal), None), p!("exit", Some(exit), None),
