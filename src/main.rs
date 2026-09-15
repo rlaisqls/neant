@@ -308,6 +308,92 @@ mod tls {
     }
 }
 
+/// boot/ed25519.nt is a loadable module, not part of the image: SHA-512 on raw 64-bit words, and
+/// Ed25519 verification on boot/crypto.nt's 2^255-19 field. FIPS 180-4 and RFC 8032 vectors.
+#[cfg(test)]
+mod ed25519 {
+    use super::*;
+    fn ed_vm() -> vm::Vm {
+        let mut v = boot_vm();
+        v.eval(&std::fs::read_to_string("boot/ed25519.nt").unwrap()).unwrap();
+        v
+    }
+    /// `badd` is what makes this possible: a word may be any bit pattern, including the one `+` reads as 0N.
+    #[test]
+    fn sha512_matches_fips_vectors() {
+        let mut v = ed_vm();
+        for (src, want) in [
+            ("hex sha512 0x",
+             "\"cf83e1357eefb8bdf1542850d66d8007d620e4050b5715dc83f4a921d36ce9ce47d0d13c5d85f2b0ff8318d2877eec2f63b931bd47417a81a538327af927da3e\""),
+            ("hex sha512 `byte$\"abc\"",
+             "\"ddaf35a193617abacc417349ae20413112e6fa4e89a97ea20a9eeee64b55d39a2192992a274fc1a836ba3c23a3feebbd454d4423643ce80e2a9ac94fa54ca49f\""),
+            // two blocks, and a length that forces a padding block of its own
+            ("hex sha512 `byte$\"abcdefghbcdefghicdefghijdefghijkefghijklfghijklmghijklmnhijklmnoijklmnopjklmnopqklmnopqrlmnopqrsmnopqrstnopqrstu\"",
+             "\"8e959b75dae313da8cf4f72814fc143f8f7779c6eb9f7fa17299aeadb6889018501d289e4900f7e4331b99dec4b5433ac7d329eeb6dd26545e96e55b874be909\""),
+            ("hex sha512 `byte$ 200#\"a\"",
+             "\"4b11459c33f52a22ee8236782714c150a3b2c60994e9acee17fe68947a3e6789f31e7668394592da7bef827cddca88c4e6f86e4df7ed1ae6cba71f3e98faee9f\""),
+            ("mn: 1 shl 63; (mn badd 1; mn + 1)", "-0W 0N"),   // why `badd` has to exist
+        ] {
+            assert_eq!(tests::ev(&mut v, src), want, "source: {src}");
+        }
+    }
+    /// The group law, independent of any signature: the neutral element, negation, and doubling
+    /// two ways. The addition formula is the complete one, so `edAdd` must handle the identity.
+    #[test]
+    fn group_law_holds() {
+        let mut v = ed_vm();
+        for (src, want) in [
+            ("(edEncode EDB) ~ fencode EDBY", "1b"),
+            ("(edEncode edDecode edEncode EDB) ~ edEncode EDB", "1b"),
+            ("(edEncode edAdd[EDB;EDB]) ~ edEncode edDbl EDB", "1b"),
+            ("(edEncode edAdd[EDZERO;EDB]) ~ edEncode EDB", "1b"),
+            ("(edEncode edAdd[EDB;edNeg EDB]) ~ edEncode EDZERO", "1b"),
+            ("(edEncode edMul[253#scBits scFromBytes 0x02,31#0x00; EDB]) ~ edEncode edDbl EDB", "1b"),
+            ("scMod bitsBE unhex \"1000000000000000000000000000000014def9dea2f79cd65812631a5cf5d3ed\"", "0 0 0 0 0 0 0 0 0 0 0 0"),
+            ("scMod bitsBE (31#0x00),0x01", "1 0 0 0 0 0 0 0 0 0 0 0"),
+        ] {
+            assert_eq!(tests::ev(&mut v, src), want, "source: {src}");
+        }
+    }
+    const V: [(&str, &str, &str); 4] = [
+        ("d75a980182b10ab7d54bfed3c964073a0ee172f3daa62325af021a68f707511a", "",
+         "e5564300c360ac729086e2cc806e828a84877f1eb8e5d974d873e065224901555fb8821590a33bacc61e39701cf9b46bd25bf5f0595bbe24655141438e7a100b"),
+        ("3d4017c3e843895a92b70aa74d1b7ebc9c982ccf2ec4968cc0cd55f12af4660c", "72",
+         "92a009a9f0d4cab8720e820b5f642540a2b27b5416503f8fb3762223ebdb69da085ac1e43e15996e458f3613d0f11d8c387b2eaeb4302aeeb00d291612bb0c00"),
+        ("fc51cd8e6218a1a38da47ed00230f0580816ed13ba3303ac5deb911548908025", "af82",
+         "6291d657deec24024827e69c3abe01a30ce548a284743a445e3680d7db5ac3ac18ff9b538d16f290ae67f760984dc6594a7c15e9716ed28dc027beceea1ec40a"),
+        ("ec172b93ad5e563bf4932c70e1245034c35467ef2efd4d64ebf819683467e2bf",
+         "ddaf35a193617abacc417349ae20413112e6fa4e89a97ea20a9eeee64b55d39a2192992a274fc1a836ba3c23a3feebbd454d4423643ce80e2a9ac94fa54ca49f",
+         "dc2a4459e7369633a52b1bf277839a00201009a3efbf3ecb69bea2186c26b58909351fc9ac90b3ecfdfbc7c66431e0303dca179c138ac17ad9bef1177331a704"),
+    ];
+    #[test]
+    fn rfc8032_signatures_verify() {
+        let mut v = ed_vm();
+        for (pk, m, sg) in V {
+            let src = format!("ed25519Verify[unhex \"{pk}\"; unhex \"{m}\"; unhex \"{sg}\"]");
+            assert_eq!(tests::ev(&mut v, &src), "1b", "RFC 8032 vector {pk}");
+        }
+    }
+    /// Everything that must not verify. The last one is a signature with S = L: the point equation
+    /// still holds, so only the canonicality check rejects it.
+    #[test]
+    fn forgeries_are_rejected() {
+        let mut v = ed_vm();
+        let (pk, m, sg) = V[1];
+        let (other, _, _) = V[2];
+        for (what, src) in [
+            ("flipped signature bit", format!("s: unhex \"{sg}\"; ed25519Verify[unhex \"{pk}\"; unhex \"{m}\"; (63#s),bnot s[63]]")),
+            ("wrong message", format!("ed25519Verify[unhex \"{pk}\"; unhex \"73\"; unhex \"{sg}\"]")),
+            ("wrong public key", format!("ed25519Verify[unhex \"{other}\"; unhex \"{m}\"; unhex \"{sg}\"]")),
+            ("truncated signature", format!("ed25519Verify[unhex \"{pk}\"; unhex \"{m}\"; 63#unhex \"{sg}\"]")),
+            ("public key not on the curve", format!("ed25519Verify[32#0xff; unhex \"{m}\"; unhex \"{sg}\"]")),
+            ("S = L, not canonical", format!("ed25519Verify[unhex \"{pk}\"; unhex \"{m}\"; (32#unhex \"{sg}\"),unhex \"edd3f55c1a631258d69cf7a2def9de1400000000000000000000000000000010\"]")),
+        ] {
+            assert_eq!(tests::ev(&mut v, &src), "0b", "accepted a forgery: {what}");
+        }
+    }
+}
+
 #[cfg(test)]
 mod boot {
     use super::*;

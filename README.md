@@ -163,6 +163,22 @@ ChaCha20-Poly1305 ~16ms per 10KB, X25519 ~42ms). 32-bit words live in ints maske
 the 2^255-19 and 2^130-5 fields use 22- and 26-bit limbs so products stay exact in an int, and
 carries run as vector passes.
 
+`boot/ed25519.nt` (loadable, not in the boot image) adds **SHA-512 and Ed25519 verification** on top
+of that field — RFC 8032 vectors, ~68ms per signature:
+
+```
+load "boot/ed25519.nt"
+ed25519Verify[pub; msg; sig]       // 32-byte key, 64-byte signature -> 1b / 0b
+hex sha512 `byte$"abc"
+```
+
+64-bit words need no splitting: `band bor bxor shl shr` are exact on the raw `i64` pattern (`shr` is
+logical, `shl` discards), and `badd` is the wrapping add — plain `+` would read `1 shl 63` as an int
+null and poison the round. The curve reuses `fadd fsub fmul fsq finv fencode fdecode` unchanged, in
+extended coordinates with the complete addition law, and Shamir's trick does both scalars in one pass
+of 253 doublings. Scalars reduce mod L one bit at a time. Verification only: no signing, and nothing
+is constant-time, which is what a verifier's all-public inputs allow.
+
 ## Errors
 
 Lexer and parser errors carry the line. A runtime error points at the line that actually failed and
@@ -278,7 +294,7 @@ key and then the ClientHello random from it.** The random goes out in the clear,
 invertible, and 32 bytes of it are enough to solve for the state and roll back to the key. A CSPRNG
 builtin is the prerequisite for the rest meaning anything.
 
-Ed25519 needs one runtime change and no language change: the bit verbs already give exact 64-bit
-unsigned semantics on the `i64` pattern (`shr` is logical, `shl` discards, `+` wraps), so SHA-512 fits
-— except that `1 shl 63` is `0N`, and `+ - *` propagate that as null. A wrapping add alongside
-`band`/`bor`/`bxor`, which ignores null like they do, closes it.
+Ed25519 is in (`boot/ed25519.nt`), which took one runtime primitive — `badd` — and no language
+change. The remaining signature work is RSA-PSS and ECDSA P-256, which real certificates actually use;
+both need a general modular reduction (Montgomery or Barrett) rather than the special-prime folding
+the 2^255-19 field gets away with. RSA *verification* stays cheap because the exponent is 65537.
