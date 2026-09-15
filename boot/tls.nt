@@ -82,9 +82,9 @@ TLSCERT: ()!()
 
 // ---- the handshake. Returns a handle for tlsSend / tlsRecv / tlsClose.
 tlsConnect: {[host;port]
-  priv: `byte$ 32 rand 256
+  priv: urand 32                                           // `rand` is a reproducible PRNG, never a key
   pub: x25519[priv; X25519BASE]
-  ch: clientHello[host; pub; `byte$ 32 rand 256; `byte$ 32 rand 256]
+  ch: clientHello[host; pub; urand 32; urand 32]
   h: hopen host,":",string port
   sendPlain[h; 22; ch]
   tr: ch

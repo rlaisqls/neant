@@ -594,6 +594,19 @@ fn draw(m: &Value) -> R<Value> {
 /// `n rand m`: n draws from [0;m) (int or float m) or from the list m; `rand m` is one draw.
 fn rand2(n: Value, m: Value) -> R<Value> { Ok(pack((0..int_of(&n)?).map(|_| draw(&m)).collect::<R<Vec<_>>>()?)) }
 fn rand1(m: Value) -> R<Value> { draw(&m) }
+/// `urand n`: n bytes from the OS. `rand` is a reproducible PRNG seeded from the clock — fine for
+/// sampling, never for a key. /dev/urandom does not block once the pool is up, which on any system
+/// that can open a socket it is.
+fn urand(x: Value) -> R<Value> {
+    use std::io::Read;
+    let n = int_of(&x)?;
+    if n < 0 { return err("urand: negative count"); }
+    let mut buf = vec![0u8; n as usize];
+    std::fs::File::open("/dev/urandom")
+        .and_then(|mut f| f.read_exact(&mut buf))
+        .map_err(|e| NError(format!("urand: /dev/urandom: {e}")))?;
+    Ok(bytes(buf))
+}
 fn rseed(x: Value) -> R<Value> { let s = int_of(&x)? as u64 | 1; RNG.with(|c| c.set(s)); Ok(Null) }
 fn exit(x: Value) -> R<Value> { std::process::exit(int_of(&x)? as i32) }
 
@@ -661,7 +674,7 @@ pub static PRIMS: &[PrimDef] = &[
 /// Everything expressible with the verbs lives in boot/prelude.nt (sum avg count first in mod vs upper ...).
 pub static BUILTINS: &[PrimDef] = &[
     p!("exp", Some(exp), None), p!("log", Some(log), None), p!("sin", Some(sin), None), p!("cos", Some(cos), None), p!("tan", Some(tan), None), p!("atan", Some(atan), None),
-    p!("rand", Some(rand1), Some(rand2)), p!("rseed", Some(rseed), None),
+    p!("rand", Some(rand1), Some(rand2)), p!("rseed", Some(rseed), None), p!("urand", Some(urand), None),
     p!("badd", None, Some(badd), ib_add), p!("band", None, Some(band), ib_and), p!("bor", None, Some(bor), ib_or), p!("bxor", None, Some(bxor), ib_xor),
     p!("shl", None, Some(shl), ib_shl), p!("shr", None, Some(shr), ib_shr), p!("bnot", Some(bnot), None),
     p!("key", Some(key), None), p!("value", Some(value), None), p!("group", Some(group), None),

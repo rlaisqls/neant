@@ -211,6 +211,9 @@ mod tests {
             ("`int$\"42\"", "42"), ("`float$\"1.5\"", "1.5"), ("`int$3.7", "3"), ("`char$65 66", "\"AB\""), ("`code$\"A\"", "65"),
             ("`int$(\"1\";\"22\")", "1 22"), ("`int$\"x\"", "'parse: not an int: \"x\""),
             ("\"abc\"[1]", "\"b\""), ("\"abc\"~\"abc\"", "1b"), ("\"abc\"=\"abd\"", "110b"),
+            // urand is the OS pool, for keys; rand stays the reproducible PRNG it is documented as
+            ("count urand 32", "32"), ("type urand 8", "`bytes"), ("(urand 8)~urand 8", "0b"),
+            ("rseed 7; x: 8 rand 256; rseed 7; x ~ 8 rand 256", "1b"),
             ("undefined_name", "'undefined: undefined_name"), ("1 2+1 2 3", "'length"), ("{x}[1;2]", "'rank: expected 1 args, got 2"),
         ];
 

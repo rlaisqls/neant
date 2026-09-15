@@ -92,7 +92,7 @@ Only what needs the host; everything expressible with the verbs lives in the pre
 | Group | Builtins |
 |---|---|
 | Math | `exp log sin cos tan atan` |
-| Random | `rand rseed` — `n rand m` draws n from `[0;m)` or from the list m, `rseed 7` makes a run reproducible |
+| Random | `rand rseed` — `n rand m` draws n from `[0;m)` or from the list m, `rseed 7` makes a run reproducible. `urand n` is n bytes from the OS: `rand` is a PRNG seeded from the clock, so keys come from `urand` |
 | Bits | `badd band bor bxor shl shr bnot` — on the raw 64-bit pattern; `badd` is `+` without the int-null case, for u64 words |
 | Dicts | `key value group` |
 | Values | `isnull now` |
@@ -288,11 +288,12 @@ clone/drop — Rc traffic through the operand stack — so the remaining levers 
 into neant-generated specialised code, and a user-function call, which still costs ~37ns of frame
 setup on top of its body.
 
-For TLS, what is missing is ASN.1 DER, RSA/ECDSA signature verification, and a root store. Before any
-of those: **`rand` is an xorshift64 seeded from the clock, and `tlsConnect` draws the x25519 private
-key and then the ClientHello random from it.** The random goes out in the clear, xorshift is linear and
-invertible, and 32 bytes of it are enough to solve for the state and roll back to the key. A CSPRNG
-builtin is the prerequisite for the rest meaning anything.
+For TLS, what is missing is ASN.1 DER, RSA/ECDSA signature verification, and a root store.
+
+`tlsConnect` used to draw the x25519 private key from `rand`, and then the ClientHello random from it
+too. That random goes out in the clear, xorshift64 is linear and invertible, and 32 bytes of it are
+enough to solve for the state and roll back to the key — a passive break, no certificate needed. Key
+material now comes from `urand`, and `rand` keeps the reproducibility its tests want.
 
 Ed25519 is in (`boot/ed25519.nt`), which took one runtime primitive — `badd` — and no language
 change. The remaining signature work is RSA-PSS and ECDSA P-256, which real certificates actually use;
