@@ -211,6 +211,7 @@ mod tests {
             ("`int$\"42\"", "42"), ("`float$\"1.5\"", "1.5"), ("`int$3.7", "3"), ("`char$65 66", "\"AB\""), ("`code$\"A\"", "65"),
             ("`int$(\"1\";\"22\")", "1 22"), ("`int$\"x\"", "'parse: not an int: \"x\""),
             ("\"abc\"[1]", "\"b\""), ("\"abc\"~\"abc\"", "1b"), ("\"abc\"=\"abd\"", "110b"),
+            ("nrun \"1+1\"\n2", "2"),   // a nested nrun (what `load` is) must not clobber the caller's line table
             // `f ,x` reads as `f , x`, which used to build a two-element list and fail far from the cause
             ("f:{x};f,1", "'type: , has a function on its left — `f ,x` parses as `f , x`, so write `f (,x)`"),
             ("f:{x};f (,1)", ",1"), ("(1 2),3", "1 2 3"), ("x:();x,:{y};count x", "1"),

@@ -138,10 +138,11 @@ etext: {[ln]
 // the whole pipeline: source -> tokens -> AST -> bytecode -> result. The REPL and `load` are both this.
 nrun: {[s]
   a: nparse s; multi: $[count plines; 1<last plines; 0]   // one-liners (the REPL) get no "at line 1" noise
+  sl: slines                                             // a nested nrun (what `load` is) reparses and resets it
   r: null; i: 0
   while[i<count a
     u: compileStmt a[i]
-    r: $[multi; @[exec; u; {[ln;e] signal e,etext ln}[slines[i]]]; exec u]
+    r: $[multi; @[exec; u; {[ln;e] signal e,etext ln}[sl[i]]]; exec u]
     i+:1]
   $[0=count a; r; (last a)[2][0] in `assign`gassign`iassign; null; r]}   // (last a) is (`at;line;stmt); a trailing assignment is silent, like the REPL
 load: {nrun "\n" sv read0 x}
