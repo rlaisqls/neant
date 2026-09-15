@@ -202,7 +202,7 @@ came from.
 - `i+1<n` is `i+(1<n)`. Write `(i+1)<n`. Every comparison inside arithmetic needs parens.
 - `string +/v` is `+/` applied dyadically to `string` and `v`. Write `string sum v` or `string (+/)v`.
 - A glued `-` after a noun is subtraction: `f -1` is `f - 1`; write `f[-1]`.
-- A name followed by a verb is that verb's left argument: `til #p` is `til # p` (take), `value =x` is `value = x`. Write `til count p`, `value group x`.
+- A name followed by a verb is that verb's left argument: `til #p` is `til # p` (take), `value =x` is `value = x`. Write `til count p`, `value group x`. When the name holds a *function* this used to build a silent two-element list — `f ,x` is now an error that says so.
 - `in` against a plain string is per character: `"ab" in "abc"` is `11b`, not a substring test — use `ss` for that. Against a *list* of strings it does match whole strings, so `"from" in ("by";"from")` is `1b`.
 - Closures capture by value; assigning a captured name inside the inner lambda makes it a new local (like q). No mutable counters.
 - A variable assigned anywhere in a lambda is local to it. `x::v` assigns the global.

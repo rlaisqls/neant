@@ -72,6 +72,10 @@ fn try_append(x: &mut Value, y: &Value) -> bool {
     }
 }
 fn join(mut x: Value, y: Value) -> R<Value> {
+    // `f ,x` parses as `f , x` — a name in front of a verb is that verb's left argument, so the
+    // function gets joined into a two-element list and the mistake surfaces much later as a length
+    // or index error. Nothing legitimate joins onto a function, so it is an error here instead.
+    if x.is_fn() { return err("type: , has a function on its left — `f ,x` parses as `f , x`, so write `f (,x)`"); }
     if try_append(&mut x, &y) { return Ok(x); }
     let mut a = x.seq(); a.extend(y.seq()); Ok(pack(a))
 }

@@ -211,6 +211,9 @@ mod tests {
             ("`int$\"42\"", "42"), ("`float$\"1.5\"", "1.5"), ("`int$3.7", "3"), ("`char$65 66", "\"AB\""), ("`code$\"A\"", "65"),
             ("`int$(\"1\";\"22\")", "1 22"), ("`int$\"x\"", "'parse: not an int: \"x\""),
             ("\"abc\"[1]", "\"b\""), ("\"abc\"~\"abc\"", "1b"), ("\"abc\"=\"abd\"", "110b"),
+            // `f ,x` reads as `f , x`, which used to build a two-element list and fail far from the cause
+            ("f:{x};f,1", "'type: , has a function on its left — `f ,x` parses as `f , x`, so write `f (,x)`"),
+            ("f:{x};f (,1)", ",1"), ("(1 2),3", "1 2 3"), ("x:();x,:{y};count x", "1"),
             // urand is the OS pool, for keys; rand stays the reproducible PRNG it is documented as
             ("count urand 32", "32"), ("type urand 8", "`bytes"), ("(urand 8)~urand 8", "0b"),
             ("rseed 7; x: 8 rand 256; rseed 7; x ~ 8 rand 256", "1b"),
