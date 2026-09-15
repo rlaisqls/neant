@@ -211,6 +211,10 @@ mod tests {
             ("`int$\"42\"", "42"), ("`float$\"1.5\"", "1.5"), ("`int$3.7", "3"), ("`char$65 66", "\"AB\""), ("`code$\"A\"", "65"),
             ("`int$(\"1\";\"22\")", "1 22"), ("`int$\"x\"", "'parse: not an int: \"x\""),
             ("\"abc\"[1]", "\"b\""), ("\"abc\"~\"abc\"", "1b"), ("\"abc\"=\"abd\"", "110b"),
+            // a name the parser reads as a verb cannot be read back as a local, so it is rejected outright
+            ("{[sv] sv}", "'name: `sv is an infix verb, so it cannot be a local — rename it at line 1"),
+            ("{cut: 1; bin: 2; 0}", "'name: `cut, `bin are infix verbs, so they cannot be locals — rename them at line 1"),
+            ("\",\" sv (\"a\";\"b\")", "\"a,b\""),   // the global of that name is still the verb
             ("nrun \"1+1\"\n2", "2"),   // a nested nrun (what `load` is) must not clobber the caller's line table
             // `f ,x` reads as `f , x`, which used to build a two-element list and fail far from the cause
             ("f:{x};f,1", "'type: , has a function on its left — `f ,x` parses as `f , x`, so write `f (,x)`"),

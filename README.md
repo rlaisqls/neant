@@ -205,7 +205,7 @@ came from.
 - A name followed by a verb is that verb's left argument: `til #p` is `til # p` (take), `value =x` is `value = x`. Write `til count p`, `value group x`. When the name holds a *function* this used to build a silent two-element list — `f ,x` is now an error that says so.
 - `in` against a plain string is per character: `"ab" in "abc"` is `11b`, not a substring test — use `ss` for that. Against a *list* of strings it does match whole strings, so `"from" in ("by";"from")` is `1b`.
 - Closures capture by value; assigning a captured name inside the inner lambda makes it a new local (like q). No mutable counters.
-- A variable assigned anywhere in a lambda is local to it. `x::v` assigns the global.
+- A variable assigned anywhere in a lambda is local to it. `x::v` assigns the global. A local cannot be named after an infix verb (`in`, `sv`, `cut`, `bin`, …) — the parser would read it as the verb, so the compiler rejects it by name.
 - A newline ends a statement, so an expression cannot be split across lines. Build it up with `,:` instead.
 
 ## How it is built

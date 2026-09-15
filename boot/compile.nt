@@ -117,6 +117,10 @@ compileFn: {[params;body]
   cops:: (); cargs:: (); cconsts:: (); ctop:: 0; ccaps:: (); cloops:: (); clines:: (); cline:: 0
   cscope:: params ! til count params
   collectLocals each body
+  // a name the parser reads as an infix verb cannot be read back as a local: in `sv: 1; f sv`, the
+  // `f sv` is a join still waiting for its right argument. Caught here, where the scope is known.
+  bad: (key cscope) inter INFIX
+  if[count bad; signal "name: `",(", `" sv string each bad),$[1=count bad;" is an infix verb, so it cannot be a local — rename it";" are infix verbs, so they cannot be locals — rename them"]," at line ",string saved[10]]
   cbase:: count cscope
   genBody body
   code: (cops; cargs; cconsts; clines; params; cbase)
