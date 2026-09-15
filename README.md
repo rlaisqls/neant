@@ -21,68 +21,9 @@ x[1]: 9; d[`c]: 3   //             index assignment (in place), n+:1  x,:5
 f[;3] 10            //             projection: f[;3] fixes b, waits for a
 {x*2} each 1 2 3    // 2 4 6       also `over` `scan`; `(+) over x`
 @[{signal "boom"};0;{"caught: ",x}]   // protected call: @[f;x;handler]
-"," vs "a,b"        // ("a";"b")   strings: vs sv ss upper lower trim, `int$"42" `char$65
-read0 "f.txt"       //             IO: read0 write0 print args
-h: hopen "h:80"     //             TCP: hsend[h;bytes] hrecv[h;n] hclose h
 {if[x<0; :`neg]; `pos}              // :x returns early from a lambda
 counter::0; {counter::counter+1}[]  // :: assigns a global from inside a lambda
 1 -2                // vector 1 -2   (glued minus is a literal; `1 - 2` subtracts)
-```
-
-all checked against the RFC vectors (SHA-256 ~0.3ms/block, ChaCha20-Poly1305 ~25ms per 10KB, X25519 ~75ms). 32-bit words live in ints
-masked after each sum; the 2^255-19 and 2^130-5 fields use 22- and 26-bit limbs so products stay exact in an int, and carries run as
-vector passes.
-
-`boot/tls.nt` (loadable, not in the boot image) is a **TLS 1.3 client** on top of those and the socket
-builtins — x25519 key exchange, `TLS_CHACHA20_POLY1305_SHA256`, the RFC 8446 key schedule and record
-layer, all in neant. It completes a real handshake against OpenSSL and verifies the server's Finished.
-
-```
-load "boot/tls.nt"
-h: tlsConnect["localhost"; 44330]
-tlsSend[h; "GET / HTTP/1.0\r\n\r\n"]; `char$ tlsRecv h
-tlsClose h
-```
-
-> **It does not authenticate the server.** The certificate is read off the wire and kept (`tlsCert h`)
-> but never checked: no ASN.1/X.509 parsing, no signature verification, no hostname match, no root
-> store. That is confidentiality against someone recording the traffic and nothing at all against
-> someone sitting in the middle of it. Those three pieces are what stands between this and a usable
-> transport; until then it is a demonstration that the whole stack fits in the language.
-
-`cargo test` checks the key schedule against the RFC 8448 vectors and round-trips the record layer
-offline. For the handshake itself, point it at a local server:
-
-```
-openssl req -x509 -newkey rsa:2048 -keyout key.pem -out cert.pem -days 365 -nodes -subj /CN=localhost
-openssl s_server -accept 44330 -cert cert.pem -key key.pem -tls1_3 -www -quiet
-```
-
-```
-t: tbl[`name`dept`pay; (`ann`bob`cy; `eng`ops`eng; 120 80 100)]
-tsel[t; t[`pay]>90]          // rows where
-tby[t;`dept;`pay;sum]        // `eng`ops!220 80
-tshow tsort[t;`pay]          // aligned grid
-```
-
-## Gotchas (shared with q)
-
-- `i+1<n` is `i+(1<n)`. Write `(i+1)<n`. Every comparison inside arithmetic needs parens.
-- `string +/v` is `+/` applied dyadically to `string` and `v`. Write `string sum v` or `string (+/)v`.
-- A glued `-` after a noun is subtraction: `f -1` is `f - 1`; write `f[-1]`.
-- A name followed by a verb is that verb's left argument: `til #p` is `til # p` (take), `value =x` is `value = x`. Write `til count p`, `value group x`.
-- `in` on a string is per character: `"from" in ("by";"from")` is 0000b. Match whole strings with `~/:`: `|/ "from" ~/: kws`.
-- Closures capture by value; assigning a captured name inside the inner lambda makes it a new local (like q). No mutable counters.
-- A variable assigned anywhere in a lambda is local to it. `x::v` assigns the global.
-
-```
-f: {x+`a}                          // a runtime error points at the line that failed, then unwinds the stack
-g: {f x}
-g 1
-'type: arithmetic on non-numeric at line 1
-  in f at line 1
-  in g at line 2
-  at line 3
 ```
 
 ## Run
@@ -92,59 +33,213 @@ cargo run --release                     # REPL (self-hosted front end from the e
 cargo run --release -- file.nt          # run a file
 cargo run --release -- --rust file.nt   # same, through the Rust lexer/parser/compiler (debugging aid)
 cargo test --release
-
-After editing boot/*.nt or the compiler: `cargo run --release -- --build-boot`, then rebuild — `cargo test`
-fails until the embedded boot/boot.nb matches the sources again.
 ```
 
-## Plan
+After editing `boot/*.nt` or the compiler: `cargo run --release -- --build-boot`, then rebuild —
+`cargo test` fails until the embedded `boot/boot.nb` matches the sources again.
 
-Stage 0 (done): lexer, parser, compiler, VM in Rust — `src/{lex,parse,compile,vm,prims,value}.rs`.
-Stage 1 (in progress): rewrite lex/parse/compile in neant and run them on this VM, PyPy-style; the Rust
-VM and primitives stay as the runtime. `boot/lex.nt` is the lexer — `cargo test` checks it against the
-Rust lexer (exposed as the `lex` builtin) token-for-token. `boot/parse.nt` is the parser: nodes are
-`(`kind; ...)`lists with identifiers as symbols, checked against the Rust parser (`parse` builtin) on the
-same corpus. `boot/compile.nt` is the compiler: it emits bytecode as data — a unit is `(opcodes; args; consts; lines)`
-(`lines[i]` is the source line op `i` came from, 0 for synthetic ops),
-consts are tagged `(`k;v)` `(`g;`name)` `(`p;"+")` `(`a;"/";f)` `(`f;code)`— checked against the Rust compiler
-(`compile` builtin), and `exec` loads and runs it. `nrun src` is the whole pipeline with no Rust front end:
-`cargo test` runs every language case through it, then rebuilds the boot files with themselves (generation 2)
-and checks they still match the oracle. `--build-boot` serializes that bytecode into `boot/boot.nb`
-(`src/image.rs`), which is embedded in the binary: **the default front end is neant compiled by neant**; Rust
-is the VM plus primitives (and a stage-0 front end kept for building the image and as a test oracle).
-Boot compiler speed:`x,: y` compiles to Take+join so appends are in place (20k appends 444ms -> 1ms), globals are
-interned to slots at load, execution stacks are pooled: the 7.7KB parser lexes+parses+compiles itself in ~34ms
-(was ~200ms). `?` `distinct` `group`hash atoms (200k ints/1000 keys: distinct 159ms -> 6ms, group 198ms -> 10ms);
-nested keys fall back to a scan. Runtime errors carry a line table: the message points at the line that
-actually failed and unwinds a named call stack (`in f at line 1`), the same text from either front end —
-a frame is named by its caller's`LoadG`, so the bytecode carries positions but no names.
-Atom lookup in a typed vector scans the raw elements instead of boxing the vector (`x in y` is a
-`?` over `Syms`, and the boot compiler's`k in \`const\`verb...` dispatch chains run it per AST node), and two
-int atoms through `+ - * & | < > =` skip the shape/broadcast machinery (that pair took the self-rebuild
-from 162ms to 138ms and a `while` iteration from 39ns to 26ns).
-A register-style calling convention was tried and reverted — it measured slower, and the profile says frame setup is ~5% while `Value` clone/drop and small-list allocation are ~35%.
-Next, then, is that allocation: AST nodes and const entries are `Rc<Vec<Value>>` built one `List` op at a time.
-After that, moving more of the VM dispatch into neant-generated specialised code.
+## The language
 
-## More syntax and values
+### Verbs, adverbs, control
+
+- **Verbs** — `+ - * % & | < > = ~ , # _ ! ? @ ^ $`, each monadic and dyadic, q meanings.
+- **Adverbs** — `/` fold, `\` scan, `'` each, `\:` each-left, `/:` each-right.
+- **Control** — `if[c;...]` `while[c;...]` `do[n;...]` `$[c;a;b;...]`; `break` leaves the innermost
+  loop, `:x` returns from the lambda.
+
+### Literals and types
 
 ```
 101b  0N 0W  0n 0w                 // bool literals; int null/infinity (0N propagates through + - *); float null/inf
 2026.09.15 + 30                    // dates (days since 2000.01.01): 2026.10.15;  d1-d2 -> days;  `year$ `month$ `day$
 12:30:00.250 + 1000                // times (ms since midnight);  `hour$ `minute$ `second$;  today[]  now`time
-`date$"2026.02.28"  `int$d         // casts both ways; isnull x; fill[0;x]; fills x
-f: {n: 10; {x+n}}; (f 0) 5         // closures capture enclosing locals by value -> 15
-x[1;0]: 9   c[1]+: 10   do[5; ..]  // deep index assignment, compound index assignment, do loop; break leaves while/do
 2026.01.01 2026.01.03              // date vector literal
+`date$"2026.02.28"  `int$d         // casts both ways; isnull x; fill[0;x]; fills x
+0x0aff                             // bytes — see below
+```
+
+### Assignment, scope, control
+
+```
+x[1;0]: 9   c[1]+: 10   do[5; ..]  // deep index assignment, compound index assignment, do loop
+f: {n: 10; {x+n}}; (f 0) 5         // closures capture enclosing locals by value -> 15
 1 2 3 +\: 10 20   1 2 3 +/: 10 20  // each-left / each-right
 .ns.name: 7                        // dotted names as namespaces; load "file.nt" runs a file
-select total: sum pay, n: count pay by dept from t where pay>90
-                                   // q-style select, desugared by the parser into qsel[t;where;by;cols] (boot/table.nt)
-lj[t;`k;u]  ij[t;`k;u]  uj[t;u]    // joins on key columns; ungroup t; rcsv["SSI";",";"file.csv"]
-t[1]  t[0 2]  t[where t[`pay]>90]  // rows of a table by position
-kt: xkey[`id;t]; kt 3; unkey kt    // keyed table: key rows -> remaining columns; kt[(1;2)] for a multi-column key
-(1 2;3 4)?3 4                      // ? on a general list finds a whole row (1); so does `in`
-deltas prev next sums prds maxs mins ratios asc desc except inter union cross fmt
-'parse: missing ) at line 3        // lexer and parser errors carry the line
-@[f;x;{elast `line}]               // elast `line / `trace: where the error @ just caught came from
 ```
+
+### Standard library
+
+Written in neant, in `boot/prelude.nt`:
+
+| Group | Functions |
+|---|---|
+| Aggregate | `sum avg min max med var dev count any all` |
+| Math | `sqrt floor ceiling round signum neg mod div xexp` |
+| Lists | `til first last reverse raze sort asc desc distinct where rank rotate cut sublist except inter union cross` |
+| Running, windowed | `sums prds maxs mins deltas ratios prev next differ msum mavg mmax mmin ema xbar bin` |
+| Strings | `string sym vs sv ss upper lower trim ltrim rtrim ssr like fmt hex unhex` |
+| Tests | `type not in within` |
+
+### Rust builtins
+
+Only what needs the host; everything expressible with the verbs lives in the prelude instead:
+
+| Group | Builtins |
+|---|---|
+| Math | `exp log sin cos tan atan` |
+| Random | `rand rseed` — `n rand m` draws n from `[0;m)` or from the list m, `rseed 7` makes a run reproducible |
+| Bits | `band bor bxor shl shr bnot` |
+| Dicts | `key value group` |
+| Values | `isnull now` |
+| Output | `show print signal exit` |
+| Files | `read0 write0` |
+| Sockets | `hopen hclose hsend hrecv` |
+| Adverb keywords | `each over scan` |
+| Errors | `elast` |
+
+```
+read0 "f.txt"                      // list of lines; read0 0 reads stdin
+args                               // command-line arguments after the script (a global, not a builtin)
+h: hopen "example.com:80"          // TCP; hopen ("host:port"; timeoutMs) sets the timeout
+hsend[h; "GET / HTTP/1.0\r\n\r\n"]
+hrecv[h; 4096]                     // one read, up to n bytes; empty means the peer closed
+hclose h
+```
+
+## Tables
+
+`boot/table.nt`, in neant — a table is a dict of columns.
+
+```
+t: tbl[`name`dept`pay; (`ann`bob`cy; `eng`ops`eng; 120 80 100)]
+tsel[t; t[`pay]>90]          // rows where
+tby[t;`dept;`pay;sum]        // `eng`ops!220 80
+tshow tsort[t;`pay]          // aligned grid
+```
+
+| Group | Functions |
+|---|---|
+| Build, show | `tbl row rows tcount tappend tshow` |
+| Query | `tsel tsort tby xasc xdesc ungroup` |
+| Joins | `lj ij uj aj` |
+| Keyed | `xkey unkey` |
+| CSV | `rcsv["SSI";",";"file.csv"]` |
+
+```
+select total: sum pay, n: count pay by dept from t where pay>90
+                             // q-style select, desugared by the parser into qsel[t;where;by;cols]
+t[1]  t[0 2]                 // rows by position; t[where t[`pay]>90]
+kt: xkey[`id;t]; kt 3        // keyed table: key rows -> remaining columns; kt[(1;2)] for a multi-column key
+(1 2;3 4)?3 4                // ? on a general list finds a whole row (1); so does `in`
+```
+
+## JSON
+
+`boot/json.nt`: `jk` parses (objects are dicts, null is `::`), `jj` serializes.
+
+```
+jk "{\"a\": [1, 2]}"         // ,`a!(1 2)
+jj `a`b!(1 2;"x")            // "{"a": [1, 2], "b": "x"}"
+```
+
+## Bytes and crypto
+
+```
+0x0aff                       // byte literal
+`byte$"hé"                   // 0x68c3a9   UTF-8 encode
+`char$0x68c3a9               // "hé"       decode
+`int$0x0aff                  // 10 255     arithmetic on bytes gives ints
+key bxor data                // the bit verbs on two byte operands give bytes
+```
+
+`boot/crypto.nt` is pure neant on those: `sha256 hmac hkdfExtract hkdfExpand chacha20 poly1305
+aeadEncrypt aeadDecrypt x25519`, all checked against the RFC vectors (SHA-256 ~0.3ms/block,
+ChaCha20-Poly1305 ~25ms per 10KB, X25519 ~75ms). 32-bit words live in ints masked after each sum;
+the 2^255-19 and 2^130-5 fields use 22- and 26-bit limbs so products stay exact in an int, and
+carries run as vector passes.
+
+## Errors
+
+Lexer and parser errors carry the line. A runtime error points at the line that actually failed and
+unwinds a named call stack:
+
+```
+f: {x+`a}
+g: {f x}
+g 1
+'type: arithmetic on non-numeric at line 1
+  in f at line 1
+  in g at line 2
+  at line 3
+```
+
+`@[f;x;handler]` catches; inside the handler, ``elast `line`` and ``elast `trace`` say where the error
+came from.
+
+## Gotchas (shared with q)
+
+- `i+1<n` is `i+(1<n)`. Write `(i+1)<n`. Every comparison inside arithmetic needs parens.
+- `string +/v` is `+/` applied dyadically to `string` and `v`. Write `string sum v` or `string (+/)v`.
+- A glued `-` after a noun is subtraction: `f -1` is `f - 1`; write `f[-1]`.
+- A name followed by a verb is that verb's left argument: `til #p` is `til # p` (take), `value =x` is `value = x`. Write `til count p`, `value group x`.
+- `in` against a plain string is per character: `"ab" in "abc"` is `11b`, not a substring test — use `ss` for that. Against a *list* of strings it does match whole strings, so `"from" in ("by";"from")` is `1b`.
+- Closures capture by value; assigning a captured name inside the inner lambda makes it a new local (like q). No mutable counters.
+- A variable assigned anywhere in a lambda is local to it. `x::v` assigns the global.
+- A newline ends a statement, so an expression cannot be split across lines. Build it up with `,:` instead.
+
+## How it is built
+
+### Stage 0 (done)
+
+Lexer, parser, compiler and VM in Rust — `src/{lex,parse,compile,vm,prims,value}.rs`.
+
+### Stage 1 (in progress)
+
+Rewrite lex/parse/compile in neant and run them on this VM, PyPy-style; the Rust VM and primitives
+stay as the runtime.
+
+- `boot/lex.nt` — the lexer.
+- `boot/parse.nt` — the parser. Nodes are ``(`kind; ...)`` lists with identifiers as symbols.
+- `boot/compile.nt` — the compiler. It emits bytecode as data: a unit is
+  `(opcodes; args; consts; lines)`, where `lines[i]` is the source line op `i` came from (0 for
+  synthetic ops). Consts are tagged ``(`k;v)`` ``(`g;`name)`` ``(`p;"+")`` ``(`a;"/";f)`` ``(`f;code)``.
+  `exec` loads and runs it.
+
+`--build-boot` serializes that bytecode into `boot/boot.nb` (`src/image.rs`), which is embedded in
+the binary: **the default front end is neant compiled by neant.** Rust is the VM plus primitives,
+and a stage-0 front end kept for building the image and as a test oracle.
+
+### What the tests check
+
+- Each stage against its Rust oracle, exposed as the `lex`, `parse` and `compile` builtins: the
+  self-hosted lexer token-for-token, the parser AST-for-AST, the compiler bytecode-for-bytecode,
+  all on the same corpus.
+- `nrun src` is the whole pipeline with no Rust front end. Every language case runs through it.
+- Generation 2: rebuild the boot files with themselves, then check they still match the oracle and
+  still run every language case.
+- That the embedded `boot/boot.nb` is what the current sources compile to.
+
+### Performance
+
+- `x,: y` compiles to Take+join so appends are in place — 20k appends, 444ms → 1ms.
+- Globals are interned to slots at load, so `LoadG` is an index, not a hash. Execution stacks are pooled.
+- `?` `distinct` `group` hash atoms — 200k ints over 1000 keys: distinct 159ms → 6ms, group 198ms → 10ms.
+  Nested keys fall back to a scan.
+- Atom lookup in a typed vector scans the raw elements instead of boxing the vector. (`x in y` is a
+  `?` over `Syms`, and the boot compiler's ``k in `const`verb...`` dispatch chains run it per AST node.)
+- Two int atoms through `+ - * & | < > =` skip the shape/broadcast machinery.
+
+Together: the 7.7KB parser lexes+parses+compiles itself in ~34ms (was ~200ms), the self-hosted
+rebuild of `boot/*.nt` takes ~138ms, and a `while` iteration costs 26ns.
+
+Runtime errors carry a line table, which costs ~10% of compile throughput. A frame is named by its
+caller's `LoadG`, so the bytecode carries positions but no names.
+
+### Next
+
+A register-style calling convention was tried and reverted — it measured slower, and the profile
+says frame setup is ~5% while `Value` clone/drop and small-list allocation are ~35%. So the next
+target is that allocation: AST nodes and const entries are `Rc<Vec<Value>>` built one `List` op at a
+time. After that, moving more of the VM dispatch into neant-generated specialised code.
+
+For TLS, what is missing is ASN.1 DER, RSA/ECDSA signature verification, and a root store.
