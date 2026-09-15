@@ -44,7 +44,8 @@ impl Op {
     }
 }
 
-pub struct FnCode { pub ops: Vec<Op>, pub consts: Vec<Value>, pub params: Vec<String>, pub nlocals: usize }
+/// `lines[i]` is the source line op `i` came from (0 = synthetic), for runtime error positions.
+pub struct FnCode { pub ops: Vec<Op>, pub consts: Vec<Value>, pub lines: Vec<u32>, pub params: Vec<String>, pub nlocals: usize }
 
 pub struct PrimDef {
     pub name: &'static str,

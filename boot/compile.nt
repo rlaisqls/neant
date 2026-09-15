@@ -1,11 +1,12 @@
 // neant compiler, in neant: AST from nparse -> bytecode data the VM loads with `exec`.
-// unit = (opcodes; args; consts); lambda code = (opcodes; args; consts; params; nlocals)
+// unit = (opcodes; args; consts; lines); lambda code = (opcodes; args; consts; lines; params; nlocals)
+// lines[i] is the source line op i came from (0 = synthetic), for runtime error positions.
 // const entries: (`k;v) literal  (`g;`name) global  (`p;"+") verb  (`a;"/";f) adverbed verb  (`f;code) lambda
 // Same output as src/compile.rs, exposed as `compile` (the oracle). State lives in globals updated with ::.
 // A lambda reading an enclosing lambda's local captures it by value (mkclosure); captured slots follow its own locals.
 OPS: `push`loadg`storeg`loadl`storel`monad`dyad`call`mkadv`jmp`jmpf`pop`list`takel`takeg`amend`ret`mkclosure`loop ! til 19
 
-emit: {[op;a] cops:: cops, OPS op; cargs:: cargs, a; (count cops)-1}
+emit: {[op;a] cops:: cops, OPS op; cargs:: cargs, a; clines:: clines, cline; (count cops)-1}
 kc: {[entry] cconsts:: cconsts, ,entry; (count cconsts)-1}
 patch: {[pos] cargs[pos]: count cops}
 pushNull: {[] emit[`push; kc (`k; null)]}
@@ -34,6 +35,8 @@ callee: {[f;arity]
 
 gen: {[n]
   kind: n[0]
+  // a statement's line: every op emitted for it is tagged with it, then the enclosing line resumes
+  if[kind=`at; save: cline; cline:: n[1]; gen n[2]; cline:: save; :0]
   if[kind=`const; :emit[`push; kc (`k; n[1])]]
   if[kind=`name; s: slot n[1]; :$[null~s; emit[`loadg; kc (`g; n[1])]; emit[`loadl; s]]]
   if[kind in `assign`gassign
@@ -99,7 +102,7 @@ collectLocals: {[a]
   k: a[0]
   if[k=`assign; if[null~cscope a[1]; cscope[a[1]]: count cscope]; :collectLocals a[2]]
   if[k in `const`verb`name`fn; :0]
-  if[k in `advb`gassign; :collectLocals a[2]]
+  if[k in `advb`gassign`at; :collectLocals a[2]]
   if[k in `noun`return; :collectLocals a[1]]
   if[k in `mo`app`dy; collectLocals each 1_a; :0]
   if[k=`iassign; collectLocals each a[2]; :collectLocals a[3]]
@@ -109,27 +112,36 @@ collectLocals: {[a]
 
 // -> (code; captured names)
 compileFn: {[params;body]
-  saved: (cops; cargs; cconsts; cscope; ctop; cbase; ccaps; cparents; cloops)
+  saved: (cops; cargs; cconsts; cscope; ctop; cbase; ccaps; cparents; cloops; clines; cline)
   cparents:: $[ctop; (); cparents, ,(cscope; ccaps)]
-  cops:: (); cargs:: (); cconsts:: (); ctop:: 0; ccaps:: (); cloops:: ()
+  cops:: (); cargs:: (); cconsts:: (); ctop:: 0; ccaps:: (); cloops:: (); clines:: (); cline:: 0
   cscope:: params ! til count params
   collectLocals each body
   cbase:: count cscope
   genBody body
-  code: (cops; cargs; cconsts; params; cbase)
+  code: (cops; cargs; cconsts; clines; params; cbase)
   caps: ccaps
-  cops:: saved[0]; cargs:: saved[1]; cconsts:: saved[2]; cscope:: saved[3]; ctop:: saved[4]; cbase:: saved[5]; ccaps:: saved[6]; cparents:: saved[7]; cloops:: saved[8]
+  cops:: saved[0]; cargs:: saved[1]; cconsts:: saved[2]; cscope:: saved[3]; ctop:: saved[4]; cbase:: saved[5]; ccaps:: saved[6]; cparents:: saved[7]; cloops:: saved[8]; clines:: saved[9]; cline:: saved[10]
   (code; caps)}
 
-compileStmt: {[ast] cops:: (); cargs:: (); cconsts:: (); ctop:: 1; cscope:: null; cbase:: 0; ccaps:: (); cparents:: (); cloops:: (); gen ast; (cops; cargs; cconsts)}
+compileStmt: {[ast] cops:: (); cargs:: (); cconsts:: (); clines:: (); cline:: 0; ctop:: 1; cscope:: null; cbase:: 0; ccaps:: (); cparents:: (); cloops:: (); gen ast; (cops; cargs; cconsts; clines)}
 ncompile: {[s] compileStmt each nparse s}
+// error position and call stack of the error @ just caught; must render exactly like Vm::trace_text in src/vm.rs
+etext: {[ln]
+  tr: elast `trace
+  if[0=count tr; :" at line ",string ln]
+  top: tr[0][1]
+  h: " at line ",string $[top>0; top; ln]
+  if[1=count tr; :h]
+  h,"\n","\n" sv {"  ",$[isnull x[0]; ""; "in ",(string x[0])," "],"at line ",string x[1]} each tr}
+
 // the whole pipeline without the Rust front end: source -> tokens -> AST -> bytecode -> result
 nrun: {[s]
   a: nparse s; multi: $[count plines; 1<last plines; 0]   // one-liners (the REPL) get no "at line 1" noise
   r: null; i: 0
   while[i<count a
     u: compileStmt a[i]
-    r: $[multi; @[exec; u; {[ln;e] signal e," at line ",string ln}[slines[i]]]; exec u]
+    r: $[multi; @[exec; u; {[ln;e] signal e,etext ln}[slines[i]]]; exec u]
     i+:1]
-  $[0=count a; r; (last a)[0] in `assign`gassign`iassign; null; r]}   // a trailing assignment is silent, like the REPL
+  $[0=count a; r; (last a)[2][0] in `assign`gassign`iassign; null; r]}   // (last a) is (`at;line;stmt); a trailing assignment is silent, like the REPL
 load: {nrun "\n" sv read0 x}

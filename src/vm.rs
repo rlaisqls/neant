@@ -8,12 +8,38 @@ use std::collections::HashMap;
 use std::rc::Rc;
 use Value::*;
 
+/// Two int atoms through the common verbs, skipping the shape/broadcast machinery in value.rs.
+/// Nulls and every other verb fall through to the general path, which is what defines the semantics.
+fn int_dyad(name: &str, a: i64, b: i64) -> Option<Value> {
+    if name.len() != 1 || a == NI || b == NI { return None; }
+    Some(match name.as_bytes()[0] {
+        b'+' => Int(a.wrapping_add(b)),
+        b'-' => Int(a.wrapping_sub(b)),
+        b'*' => Int(a.wrapping_mul(b)),
+        b'&' => Int(a.min(b)),
+        b'|' => Int(a.max(b)),
+        b'<' => Bool(a < b),
+        b'>' => Bool(a > b),
+        b'=' => Bool(a == b),
+        _ => return None,
+    })
+}
+
+/// The statement inside its line tag.
+fn stmt_of(a: &Ast) -> &Ast { match a { Ast::At(_, x) => stmt_of(x), _ => a } }
+
+/// One call-stack frame of an error: the function's name (None when it is not a plain global call) and
+/// the source line it was on. A frame is named by its *caller*, which knows the global it loaded to call it.
+type Frame = (Option<Rc<str>>, u32);
+
 /// Globals live in a slot vector; names are interned once when code is loaded, so LoadG is an index, not a hash.
-pub struct Vm { vals: Vec<Option<Value>>, names: HashMap<Rc<str>, u32>, slot_names: Vec<Rc<str>>, depth: usize, pool: Vec<Vec<Value>> }
+/// trace: frames an in-flight error is unwinding through, innermost first.
+/// last_trace: the same, kept for `elast` after @[f;x;h] catches.
+pub struct Vm { vals: Vec<Option<Value>>, names: HashMap<Rc<str>, u32>, slot_names: Vec<Rc<str>>, depth: usize, pool: Vec<Vec<Value>>, trace: Vec<Frame>, last_trace: Vec<Frame> }
 
 impl Vm {
     pub fn new() -> Vm {
-        let mut vm = Vm { vals: vec![], names: HashMap::new(), slot_names: vec![], depth: 0, pool: vec![] };
+        let mut vm = Vm { vals: vec![], names: HashMap::new(), slot_names: vec![], depth: 0, pool: vec![], trace: vec![], last_trace: vec![] };
         for p in BUILTINS { vm.set(p.name, Prim(p)); }
         vm
     }
@@ -58,20 +84,52 @@ impl Vm {
         let mut p = Parser::with_lines(toks, lines);
         let asts = p.program()?;
         for (i, ast) in asts.iter().enumerate() {
-            let (ops, mut k) = compile_stmt(ast)?;
+            let (ops, mut k, lines) = compile_stmt(ast)?;
             self.intern(&ops, &mut k);
-            let v = self.execute(&ops, &k, &mut Vec::new())
-                .map_err(|e| if multi { NError(format!("{} at line {}", e.0, p.stmt_lines()[i])) } else { e })?;
-            last = if matches!(ast, Ast::Assign(..) | Ast::GAssign(..) | Ast::IndexAssign(..)) { Null } else { v };
+            self.trace.clear();
+            let v = match self.execute(&ops, &k, &lines, &mut Vec::new()) {
+                Ok(v) => v,
+                Err(e) => return Err(if multi { NError(format!("{}{}", e.0, self.trace_text(p.stmt_lines()[i]))) } else { e }),
+            };
+            last = if matches!(stmt_of(ast), Ast::Assign(..) | Ast::GAssign(..) | Ast::IndexAssign(..)) { Null } else { v };
         }
         Ok(last)
     }
 
-    fn execute(&mut self, ops: &[Op], k: &[Value], loc: &mut Vec<Value>) -> R<Value> {
+    /// Run a frame; on error record the line the failing op came from, so the trace grows innermost-first.
+    /// If this frame failed inside a Call, the op before it loaded the callee — that names the frame below.
+    fn execute(&mut self, ops: &[Op], k: &[Value], lines: &[u32], loc: &mut Vec<Value>) -> R<Value> {
+        let mut ip = 0;
+        let r = self.run_ops(ops, k, loc, &mut ip);
+        if r.is_err() {
+            let at = ip.saturating_sub(1);
+            if let (Some(Op::Call(_)), Some(&Op::LoadG(a))) = (ops.get(at), at.checked_sub(1).and_then(|i| ops.get(i))) {
+                let s = self.gidx(&k[a as usize]);
+                let nm = self.slot_names[s].clone();
+                if let Some(f) = self.trace.last_mut() { if f.0.is_none() { f.0 = Some(nm); } }
+            }
+            self.trace.push((None, lines.get(at).copied().unwrap_or(0)));
+        }
+        r
+    }
+
+    /// `msg` position and call stack: the innermost line, then one indented frame per level outwards.
+    /// boot/compile.nt's `etext` must render this identically for the self-hosted front end.
+    fn trace_text(&self, fallback: u32) -> String {
+        let Some(&(_, top)) = self.trace.first() else { return format!(" at line {fallback}") };
+        let head = format!(" at line {}", if top > 0 { top } else { fallback });
+        if self.trace.len() == 1 { return head; }
+        let frames: Vec<String> = self.trace.iter()
+            .map(|(n, l)| match n { Some(n) => format!("  in {n} at line {l}"), None => format!("  at line {l}") })
+            .collect();
+        format!("{head}\n{}", frames.join("\n"))
+    }
+
+    fn run_ops(&mut self, ops: &[Op], k: &[Value], loc: &mut Vec<Value>, ipc: &mut usize) -> R<Value> {
         let mut st: Vec<Value> = self.pool.pop().unwrap_or_default();
         let mut ip = 0;
         while ip < ops.len() {
-            let op = ops[ip]; ip += 1;
+            let op = ops[ip]; ip += 1; *ipc = ip;   // where the error reporter looks when an op fails
             match op {
                 Op::Push(a) => st.push(k[a as usize].clone()),
                 Op::LoadL(a) => st.push(loc[a as usize].clone()),
@@ -130,7 +188,12 @@ impl Vm {
     pub fn exec(&mut self, data: &Value) -> R<Value> {
         let units = if matches!(data.item(0), Ok(Ints(_))) { vec![data.clone()] } else { data.seq() };
         let mut last = Null;
-        for u in units { let (ops, mut k) = load_unit(&u)?; self.intern(&ops, &mut k); last = self.execute(&ops, &k, &mut Vec::new())?; }
+        for u in units {
+            let (ops, mut k, lines) = load_unit(&u)?;
+            self.intern(&ops, &mut k);
+            self.trace.clear();
+            last = self.execute(&ops, &k, &lines, &mut Vec::new())?;
+        }
         Ok(last)
     }
 
@@ -146,7 +209,7 @@ impl Vm {
         if self.depth > 2000 { return err("stack: recursion too deep"); }
         let mut loc = args; loc.resize(code.nlocals.max(arity), Null); loc.extend_from_slice(caps);
         self.depth += 1;
-        let r = self.execute(&code.ops, &code.consts, &mut loc);
+        let r = self.execute(&code.ops, &code.consts, &code.lines, &mut loc);
         self.depth -= 1;
         loc.clear(); self.pool.push(loc);
         r
@@ -171,7 +234,10 @@ impl Vm {
                 let (g, x, h) = (it.next().unwrap(), it.next().unwrap(), it.next().unwrap());
                 match self.call(&g, vec![x]) {
                     Ok(v) => Ok(v),
-                    Err(e) => if h.is_fn() { self.call(&h, vec![chars(e.0.chars().collect())]) } else { Ok(h) },
+                    Err(e) => {
+                        self.last_trace = std::mem::take(&mut self.trace);
+                        if h.is_fn() { self.call(&h, vec![chars(e.0.chars().collect())]) } else { Ok(h) }
+                    }
                 }
             }
             Prim(_) | Adv(..) => {
@@ -193,6 +259,12 @@ impl Vm {
             Prim(p) => match (p.m, p.name) {
                 (Some(m), _) => m(x),
                 (None, "exec") => self.exec(&x),
+                (None, "elast") => match &x {
+                    Symbol(s) if &**s == "line" => Ok(Int(self.last_trace.first().map_or(0, |f| f.1) as i64)),
+                    Symbol(s) if &**s == "trace" => Ok(pack(self.last_trace.iter()
+                        .map(|(n, l)| pack(vec![Symbol(n.clone().unwrap_or_else(|| Rc::from(""))), Int(*l as i64)])).collect())),
+                    _ => err("type: elast `line or elast `trace"),
+                },
                 _ => err(format!("rank: {} has no monadic form", p.name)),
             },
             Adv(c, g) => self.adv1(*c, g, x),
@@ -201,13 +273,18 @@ impl Vm {
     }
     fn dyad(&mut self, f: &Value, x: Value, y: Value) -> R<Value> {
         match f {
-            Prim(p) => match (p.d, p.name) {
+            Prim(p) => {
+                if let (Int(a), Int(b)) = (&x, &y) {
+                    if let Some(v) = int_dyad(p.name, *a, *b) { return Ok(v); }
+                }
+                match (p.d, p.name) {
                 (Some(d), _) => d(x, y),
                 (None, "each") => self.adv1('\'', &x, y),   // f each x
                 (None, "over") => self.adv1('/', &x, y),
                 (None, "scan") => self.adv1('\\', &x, y),
                 _ => err(format!("rank: {} has no dyadic form", p.name)),
-            },
+                }
+            }
             Adv(c, g) => self.adv2(*c, g, x, y),
             _ => self.call(f, vec![x, y]),
         }

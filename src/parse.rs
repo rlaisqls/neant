@@ -17,6 +17,7 @@ pub enum Ast {
     GAssign(String, Box<Ast>),                 // x::v  assign the global even inside a lambda
     Do(Box<Ast>, Vec<Ast>),                    // do[n; ...]
     Break,                                     // leave the innermost while/do
+    At(u32, Box<Ast>),                         // statement tagged with its source line; compiles to a line-table entry
 }
 
 pub struct Parser { t: Vec<Tok>, lines: Vec<u32>, i: usize, stmt_lines: Vec<u32> }
@@ -24,7 +25,6 @@ pub struct Parser { t: Vec<Tok>, lines: Vec<u32>, i: usize, stmt_lines: Vec<u32>
 const SELECT_KW: [&str; 3] = ["by", "from", "where"];
 
 impl Parser {
-    pub fn new(t: Vec<Tok>) -> Parser { Parser { t, lines: vec![], i: 0, stmt_lines: vec![] } }
     pub fn with_lines(t: Vec<Tok>, lines: Vec<u32>) -> Parser { Parser { t, lines, i: 0, stmt_lines: vec![] } }
     /// Line each top-level statement starts on (for runtime error messages).
     pub fn stmt_lines(&self) -> &[u32] { &self.stmt_lines }
@@ -36,22 +36,27 @@ impl Parser {
 
     /// Parse everything; errors carry the line of the token being looked at.
     pub fn program(&mut self) -> R<Vec<Ast>> {
-        self.stmts(None).map_err(|e| match self.lines.get(self.i.min(self.lines.len().saturating_sub(1))) {
+        self.stmts(None, true).map_err(|e| match self.lines.get(self.i.min(self.lines.len().saturating_sub(1))) {
             Some(l) if !self.lines.is_empty() => NError(format!("{} at line {l}", e.0)),
             _ => e,
         })
     }
 
-    fn stmts(&mut self, close: Option<char>) -> R<Vec<Ast>> {
+    /// `mark`: this is a statement list (lambda/if/while/do body, cond arms, top level), so each statement
+    /// is wrapped in At(line) for the line table. A parenthesized list is a value context and is not marked.
+    fn stmts(&mut self, close: Option<char>, mark: bool) -> R<Vec<Ast>> {
         let mut out = Vec::new();
         loop {
             match self.peek(0) {
                 None => return if close.is_none() { Ok(out) } else { err(format!("parse: missing {}", close.unwrap())) },
                 Some(Tok::Punct(c)) if Some(*c) == close => { self.i += 1; return Ok(out); }
                 Some(Tok::Punct(';')) => self.i += 1,
+                // a closer that is not the one we are waiting for: expr() would consume nothing and we would spin
+                Some(Tok::Punct(c @ (')' | ']' | '}'))) => return err(format!("parse: unexpected {c}")),
                 _ => {
-                    if close.is_none() { self.stmt_lines.push(self.line_here()); }
-                    if let Some(e) = self.expr()? { out.push(e) }
+                    let line = self.line_here();
+                    if close.is_none() { self.stmt_lines.push(line); }
+                    if let Some(e) = self.expr()? { out.push(if mark { Ast::At(line, Box::new(e)) } else { e }) }
                 }
             }
         }
@@ -111,7 +116,7 @@ impl Parser {
             Tok::Str(s) => Ast::Const(if s.len() == 1 { Value::Char(s[0]) } else { chars(s) }),
             Tok::Name(n) if (n == "if" || n == "while" || n == "do") && self.at(0, '[') => {
                 self.i += 1;
-                let mut args = self.stmts(Some(']'))?;
+                let mut args = self.stmts(Some(']'), true)?;
                 if args.is_empty() { return err(format!("parse: {n} needs a condition")); }
                 let c = Box::new(args.remove(0));
                 return Ok(match n.as_str() { "if" => Ast::If(c, args), "while" => Ast::While(c, args), _ => Ast::Do(c, args) });
@@ -119,11 +124,11 @@ impl Parser {
             Tok::Name(n) if n == "select" => return self.select_form(),
             Tok::Name(n) if n == "break" => return Ok(Ast::Break),
             Tok::Name(n) => Ast::Name(n),
-            Tok::Verb('$') if self.at(0, '[') => { self.i += 1; return Ok(Ast::Cond(self.stmts(Some(']'))?)); }
+            Tok::Verb('$') if self.at(0, '[') => { self.i += 1; return Ok(Ast::Cond(self.stmts(Some(']'), true)?)); }
             Tok::Verb(c) => Ast::Verb(c),
             Tok::Adv(c) => return err(format!("parse: dangling adverb {}", advf(c))),
             Tok::Punct('(') => {
-                let mut body = self.stmts(Some(')'))?;
+                let mut body = self.stmts(Some(')'), false)?;
                 match body.len() {
                     1 => { let e = body.pop().unwrap(); if is_fnlike(&e) { Ast::Noun(Box::new(e)) } else { e } }
                     _ => Ast::List(body),
@@ -144,7 +149,7 @@ impl Parser {
                     }
                     params = Some(ps);
                 }
-                let body = self.stmts(Some('}'))?;
+                let body = self.stmts(Some('}'), true)?;
                 let params = params.unwrap_or_else(|| {
                     let mut hi = 0;
                     for s in &body {
@@ -278,6 +283,7 @@ fn colref(a: Ast) -> Ast {
         Ast::GAssign(n, e) => Ast::GAssign(n, b(*e)),
         Ast::IndexAssign(n, i, e) => Ast::IndexAssign(n, many(i), b(*e)),
         Ast::Return(e) => Ast::Return(b(*e)),
+        Ast::At(l, e) => Ast::At(l, b(*e)),
         other => other,
     }
 }
@@ -303,7 +309,7 @@ fn resolve(mut items: VecDeque<Ast>) -> R<Option<Ast>> {
 pub fn walk(a: &Ast, f: &mut impl FnMut(&Ast)) {
     f(a);
     match a {
-        Ast::Advb(_, x) | Ast::Assign(_, x) | Ast::GAssign(_, x) | Ast::Noun(x) | Ast::Return(x) => walk(x, f),
+        Ast::Advb(_, x) | Ast::Assign(_, x) | Ast::GAssign(_, x) | Ast::Noun(x) | Ast::Return(x) | Ast::At(_, x) => walk(x, f),
         Ast::Mo(g, x) | Ast::App(g, x) => { walk(g, f); walk(x, f) }
         Ast::Dy(g, x, y) => { walk(g, f); walk(x, f); walk(y, f) }
         Ast::IndexAssign(_, i, e) => { for x in i { walk(x, f) } walk(e, f) }

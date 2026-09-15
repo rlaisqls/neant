@@ -23,25 +23,40 @@ f[;3] 10            //             projection: f[;3] fixes b, waits for a
 @[{signal "boom"};0;{"caught: ",x}]   // protected call: @[f;x;handler]
 "," vs "a,b"        // ("a";"b")   strings: vs sv ss upper lower trim, `int$"42" `char$65
 read0 "f.txt"       //             IO: read0 write0 print args
+h: hopen "h:80"     //             TCP: hsend[h;bytes] hrecv[h;n] hclose h
 {if[x<0; :`neg]; `pos}              // :x returns early from a lambda
 counter::0; {counter::counter+1}[]  // :: assigns a global from inside a lambda
 1 -2                // vector 1 -2   (glued minus is a literal; `1 - 2` subtracts)
 ```
 
-Verbs: `+ - * % & | < > = ~ , # _ ! ? @ ^ $` (each monadic and dyadic, q meanings).
-Adverbs: `/` fold, `\` scan, `'` each. Control: `if[c;...]`, `while[c;...]`, `$[c;a;b;...]`.
-Standard library (`boot/prelude.nt`, written in neant): `sum avg min max count first last til sort distinct raze
-reverse where sqrt floor string sym type not mod div xexp in within vs sv ss lower upper trim
-neg ceiling round signum med var dev rank xbar bin any all msum mavg mmax mmin ema rotate cut sublist differ ltrim rtrim ssr like hex unhex`.
-Rust builtins, only what needs the host: `exp log sin cos tan atan rand rseed band bor bxor shl shr bnot key value group show print signal exit read0 write0 each over scan`.
-`n rand m` draws n from [0;m) or from the list m; `rseed 7` makes a run reproducible.
-Tables (`boot/table.nt`, in neant — a table is a dict of columns): `tbl row rows tsel tsort tby tappend tcount tshow`. Joins: `lj ij uj aj`.
-JSON (`boot/json.nt`): `jk "{\"a\": [1, 2]}"` parses (objects are dicts, null is `::`), `jj x` serializes.
-Bytes: `0x0aff` literals, `` `byte$"hé" `` UTF-8 encodes, `` `char$0x68c3a9 `` decodes, `` `int$0x0aff `` is `10 255`; arithmetic on bytes gives ints,
-the bit verbs on two byte operands give bytes (`key bxor data`). `boot/crypto.nt`, pure neant on those: `sha256 hmac hkdfExtract hkdfExpand chacha20 poly1305 aeadEncrypt aeadDecrypt x25519`,
 all checked against the RFC vectors (SHA-256 ~0.3ms/block, ChaCha20-Poly1305 ~25ms per 10KB, X25519 ~75ms). 32-bit words live in ints
 masked after each sum; the 2^255-19 and 2^130-5 fields use 22- and 26-bit limbs so products stay exact in an int, and carries run as
-vector passes. What TLS 1.3 still lacks is only the handshake state machine, X.509, and a socket.
+vector passes.
+
+`boot/tls.nt` (loadable, not in the boot image) is a **TLS 1.3 client** on top of those and the socket
+builtins — x25519 key exchange, `TLS_CHACHA20_POLY1305_SHA256`, the RFC 8446 key schedule and record
+layer, all in neant. It completes a real handshake against OpenSSL and verifies the server's Finished.
+
+```
+load "boot/tls.nt"
+h: tlsConnect["localhost"; 44330]
+tlsSend[h; "GET / HTTP/1.0\r\n\r\n"]; `char$ tlsRecv h
+tlsClose h
+```
+
+> **It does not authenticate the server.** The certificate is read off the wire and kept (`tlsCert h`)
+> but never checked: no ASN.1/X.509 parsing, no signature verification, no hostname match, no root
+> store. That is confidentiality against someone recording the traffic and nothing at all against
+> someone sitting in the middle of it. Those three pieces are what stands between this and a usable
+> transport; until then it is a demonstration that the whole stack fits in the language.
+
+`cargo test` checks the key schedule against the RFC 8448 vectors and round-trips the record layer
+offline. For the handshake itself, point it at a local server:
+
+```
+openssl req -x509 -newkey rsa:2048 -keyout key.pem -out cert.pem -days 365 -nodes -subj /CN=localhost
+openssl s_server -accept 44330 -cert cert.pem -key key.pem -tls1_3 -www -quiet
+```
 
 ```
 t: tbl[`name`dept`pay; (`ann`bob`cy; `eng`ops`eng; 120 80 100)]
@@ -59,6 +74,16 @@ tshow tsort[t;`pay]          // aligned grid
 - `in` on a string is per character: `"from" in ("by";"from")` is 0000b. Match whole strings with `~/:`: `|/ "from" ~/: kws`.
 - Closures capture by value; assigning a captured name inside the inner lambda makes it a new local (like q). No mutable counters.
 - A variable assigned anywhere in a lambda is local to it. `x::v` assigns the global.
+
+```
+f: {x+`a}                          // a runtime error points at the line that failed, then unwinds the stack
+g: {f x}
+g 1
+'type: arithmetic on non-numeric at line 1
+  in f at line 1
+  in g at line 2
+  at line 3
+```
 
 ## Run
 
@@ -78,19 +103,28 @@ Stage 0 (done): lexer, parser, compiler, VM in Rust — `src/{lex,parse,compile,
 Stage 1 (in progress): rewrite lex/parse/compile in neant and run them on this VM, PyPy-style; the Rust
 VM and primitives stay as the runtime. `boot/lex.nt` is the lexer — `cargo test` checks it against the
 Rust lexer (exposed as the `lex` builtin) token-for-token. `boot/parse.nt` is the parser: nodes are
-`(`kind; ...)` lists with identifiers as symbols, checked against the Rust parser (`parse` builtin) on the
-same corpus. `boot/compile.nt` is the compiler: it emits bytecode as data — a unit is `(opcodes; args; consts)`,
-consts are tagged `(`k;v)` `(`g;`name)` `(`p;"+")` `(`a;"/";f)` `(`f;code)` — checked against the Rust compiler
+`(`kind; ...)`lists with identifiers as symbols, checked against the Rust parser (`parse` builtin) on the
+same corpus. `boot/compile.nt` is the compiler: it emits bytecode as data — a unit is `(opcodes; args; consts; lines)`
+(`lines[i]` is the source line op `i` came from, 0 for synthetic ops),
+consts are tagged `(`k;v)` `(`g;`name)` `(`p;"+")` `(`a;"/";f)` `(`f;code)`— checked against the Rust compiler
 (`compile` builtin), and `exec` loads and runs it. `nrun src` is the whole pipeline with no Rust front end:
 `cargo test` runs every language case through it, then rebuilds the boot files with themselves (generation 2)
 and checks they still match the oracle. `--build-boot` serializes that bytecode into `boot/boot.nb`
 (`src/image.rs`), which is embedded in the binary: **the default front end is neant compiled by neant**; Rust
 is the VM plus primitives (and a stage-0 front end kept for building the image and as a test oracle).
-Boot compiler speed: `x,: y` compiles to Take+join so appends are in place (20k appends 444ms -> 1ms), globals are
-interned to slots at load, execution stacks are pooled: the 7.7KB parser lexes+parses+compiles itself in ~100ms
-(was ~200ms). `?` `distinct` `group` hash atoms (200k ints/1000 keys: distinct 159ms -> 6ms, group 198ms -> 10ms);
-nested keys fall back to a scan. Next: a register-style calling convention (calls are ~100ns, the boot parser
-makes ~100 per token), and moving more of the VM dispatch into neant-generated specialised code.
+Boot compiler speed:`x,: y` compiles to Take+join so appends are in place (20k appends 444ms -> 1ms), globals are
+interned to slots at load, execution stacks are pooled: the 7.7KB parser lexes+parses+compiles itself in ~34ms
+(was ~200ms). `?` `distinct` `group`hash atoms (200k ints/1000 keys: distinct 159ms -> 6ms, group 198ms -> 10ms);
+nested keys fall back to a scan. Runtime errors carry a line table: the message points at the line that
+actually failed and unwinds a named call stack (`in f at line 1`), the same text from either front end —
+a frame is named by its caller's`LoadG`, so the bytecode carries positions but no names.
+Atom lookup in a typed vector scans the raw elements instead of boxing the vector (`x in y` is a
+`?` over `Syms`, and the boot compiler's`k in \`const\`verb...` dispatch chains run it per AST node), and two
+int atoms through `+ - * & | < > =` skip the shape/broadcast machinery (that pair took the self-rebuild
+from 162ms to 138ms and a `while` iteration from 39ns to 26ns).
+A register-style calling convention was tried and reverted — it measured slower, and the profile says frame setup is ~5% while `Value` clone/drop and small-list allocation are ~35%.
+Next, then, is that allocation: AST nodes and const entries are `Rc<Vec<Value>>` built one `List` op at a time.
+After that, moving more of the VM dispatch into neant-generated specialised code.
 
 ## More syntax and values
 
@@ -112,4 +146,5 @@ kt: xkey[`id;t]; kt 3; unkey kt    // keyed table: key rows -> remaining columns
 (1 2;3 4)?3 4                      // ? on a general list finds a whole row (1); so does `in`
 deltas prev next sums prds maxs mins ratios asc desc except inter union cross fmt
 'parse: missing ) at line 3        // lexer and parser errors carry the line
+@[f;x;{elast `line}]               // elast `line / `trace: where the error @ just caught came from
 ```

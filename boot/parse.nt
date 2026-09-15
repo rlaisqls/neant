@@ -2,7 +2,7 @@
 // which is exposed as `parse` and used as the oracle. Nodes are (`kind; ...) lists, identifiers are symbols:
 //   (`const;v) (`name;`x) (`verb;"+") (`advb;"/";f) (`mo;f;x) (`dy;f;x;y) (`app;f;x) (`call;f;args) (`list;items)
 //   (`assign;`x;e) (`gassign;`x;e) (`iassign;`x;idxs;e) (`return;e) (`fn;params;body) (`if;c;body) (`while;c;body)
-//   (`do;n;body) (`cond;args) (`noun;e)
+//   (`do;n;body) (`cond;args) (`noun;e) (`at;line;stmt)
 // Parser state is two globals: pt (tokens) and pi (position), updated with ::.
 INFIX: `mod`div`xexp`in`within`vs`sv`ss`write0`each`over`scan`except`inter`union`cross`fill`like`rand`msum`mavg`mmax`mmin`ema`xbar`bin`cut`rotate`sublist`band`bor`bxor`shl`shr
 SELKW: ("by";"from";"where")
@@ -17,16 +17,21 @@ need: {if[0=count x; signal "parse: incomplete expression"]; x}
 advf: {$[x="L"; "\\:"; x="R"; "/:"; x]}
 
 // statements up to the closing punct ("\0" = end of input). Empty statements are skipped.
-stmts: {[close]
+// isStmt: a statement list (lambda/if/while/do body, cond arms, top level), so each member is tagged
+// with its line for the line table. A parenthesized list is a value context and is left untagged.
+stmts: {[close;isStmt]
   out: ()
   while[1
     t: peek 0
     if[t[0]=`eof; $[close="\0"; :out; signal "parse: missing ",close]]
     if[isPt[t;close]; pi::pi+1; :out]
+    if[isPt[t;")"] | isPt[t;"]"] | isPt[t;"}"]; signal "parse: unexpected ",t[1]]   // else expr[] eats nothing and we spin
     if[isPt[t;";"]; pi::pi+1]
     if[not isPt[t;";"]
-      if[close="\0"; slines:: slines, plines[pi]]   // line of each top-level statement, for runtime errors
-      out,: ,expr[]]]}
+      ln: plines[pi]
+      if[close="\0"; slines:: slines, ln]   // line of each top-level statement, for runtime errors
+      e: expr[]
+      out,: ,$[isStmt; (`at; ln; e); e]]]}
 
 // the whole rest of the line, or () when empty
 expr: {[]
@@ -67,22 +72,22 @@ primary: {[]
   if[k=`str; node: (`const; $[1=count v; first v; v])]
   if[k=`name
     if[((v~"if") | (v~"while") | v~"do") & isP[0;"["]
-      pi::pi+1; a: stmts["]"]
+      pi::pi+1; a: stmts["]";1]
       if[0=count a; signal "parse: ",v," needs a condition"]
       :(`$v; a[0]; 1_a)]
     if[v~"select"; :selectForm[]]
     if[v~"break"; :,`break]
     node: (`name; `$v)]
   if[k=`verb
-    if[(v="$") & isP[0;"["]; pi::pi+1; :(`cond; stmts["]"])]
+    if[(v="$") & isP[0;"["]; pi::pi+1; :(`cond; stmts["]";1])]
     node: (`verb; v)]
   if[k=`punct
     if[not v in "({"; signal "parse: unexpected ",v]
-    if[v="("; body: stmts[")"]; node: $[1=count body; $[fnlike body[0]; (`noun; body[0]); body[0]]; (`list; body)]]
+    if[v="("; body: stmts[")";0]; node: $[1=count body; $[fnlike body[0]; (`noun; body[0]); body[0]]; (`list; body)]]
     if[v="{"
       hasP: isP[0;"["]
       if[hasP; pi::pi+1; params: paramList[]]
-      body: stmts["}"]
+      body: stmts["}";1]
       if[not hasP; params: `x`y`z[til max 1,implicitMax body]]
       node: (`fn; params; body)]]
   while[1; $[(peek 0)[0]=`adv; node: advb node; isP[0;"["]; node: callp node; :node]]}
@@ -158,6 +163,7 @@ colref: {[a]
   if[k=`call; :(k; colref a[1]; colref each a[2])]
   if[k in `list`cond; :(k; colref each a[1])]
   if[k in `noun`return; :(k; colref a[1])]
+  if[k=`at; :(k; a[1]; colref a[2])]
   if[k=`fn; :(k; a[1]; colref each a[2])]
   if[k in `if`while`do; :(k; colref a[1]; colref each a[2])]
   if[k in `assign`gassign; :(k; a[1]; colref a[2])]
@@ -170,7 +176,7 @@ usesXYZ: {[a]
   k: a[0]
   if[k=`name; :$[a[1]=`x; 1; a[1]=`y; 2; a[1]=`z; 3; 0]]
   if[k in `const`verb`fn; :0]
-  if[k in `advb`assign`gassign; :usesXYZ a[2]]
+  if[k in `advb`assign`gassign`at; :usesXYZ a[2]]
   if[k in `noun`return; :usesXYZ a[1]]
   if[k in `mo`app`dy; :max usesXYZ each 1_a]
   if[k=`iassign; :max (usesXYZ each a[2]), usesXYZ a[3]]
@@ -181,4 +187,4 @@ usesXYZ: {[a]
 // errors carry the line of the token being looked at, like the Rust parser
 nparse: {[s]
   pt:: nlex s; pi:: 0; slines:: ()
-  @[{stmts["\0"]}; 0; {$[count plines; signal x," at line ",string plines[pi & -1+count plines]; signal x]}]}
+  @[{stmts["\0";1]}; 0; {$[count plines; signal x," at line ",string plines[pi & -1+count plines]; signal x]}]}

@@ -16,11 +16,11 @@ impl Scope {
 }
 
 /// loops: one frame per enclosing while/do — (is do-loop, Jmp positions of its breaks to patch)
-pub struct Compiler { pub ops: Vec<Op>, pub consts: Vec<Value>, scope: Option<Scope>, loops: Vec<(bool, Vec<usize>)> }
+pub struct Compiler { pub ops: Vec<Op>, pub consts: Vec<Value>, pub lines: Vec<u32>, cur: u32, scope: Option<Scope>, loops: Vec<(bool, Vec<usize>)> }
 
 impl Compiler {
     fn k(&mut self, v: Value) -> u32 { self.consts.push(v); (self.consts.len() - 1) as u32 }
-    fn emit(&mut self, op: Op) -> usize { self.ops.push(op); self.ops.len() - 1 }
+    fn emit(&mut self, op: Op) -> usize { self.ops.push(op); self.lines.push(self.cur); self.ops.len() - 1 }
     fn patch(&mut self, pos: usize) {
         let t = self.ops.len() as u32;
         self.ops[pos] = match self.ops[pos] { Op::Jmp(_) => Op::Jmp(t), Op::Jmpf(_) => Op::Jmpf(t), Op::Loop(_) => Op::Loop(t), o => o };
@@ -131,6 +131,8 @@ impl Compiler {
                 for b in self.loops.pop().unwrap().1 { self.patch(b); }
                 self.null();
             }
+            // a statement's line: every op emitted for it is tagged with it, then the enclosing line resumes
+            Ast::At(l, e) => { let save = self.cur; self.cur = *l; self.emit_ast(e)?; self.cur = save; }
             Ast::Break => {
                 let Some(&(is_do, _)) = self.loops.last() else { return err("compile: break outside a loop") };
                 if is_do { self.emit(Op::Pop); }   // drop the loop counter
@@ -189,14 +191,14 @@ fn compile_fn(params: &[String], body: &[Ast], parent: Option<Scope>) -> R<(FnCo
         });
     }
     let nbase = slots.len() as u32;
-    let mut c = Compiler { ops: vec![], consts: vec![], scope: Some(Scope { slots, nbase, captures: vec![], parent: parent.map(Box::new) }), loops: vec![] };
+    let mut c = Compiler { ops: vec![], consts: vec![], lines: vec![], cur: 0, scope: Some(Scope { slots, nbase, captures: vec![], parent: parent.map(Box::new) }), loops: vec![] };
     c.body(body)?;
     let sc = c.scope.take().unwrap();
-    Ok((FnCode { ops: c.ops, consts: c.consts, params: params.to_vec(), nlocals: nbase as usize }, sc.captures))
+    Ok((FnCode { ops: c.ops, consts: c.consts, lines: c.lines, params: params.to_vec(), nlocals: nbase as usize }, sc.captures))
 }
 
-pub fn compile_stmt(ast: &Ast) -> R<(Vec<Op>, Vec<Value>)> {
-    let mut c = Compiler { ops: vec![], consts: vec![], scope: None, loops: vec![] };
+pub fn compile_stmt(ast: &Ast) -> R<(Vec<Op>, Vec<Value>, Vec<u32>)> {
+    let mut c = Compiler { ops: vec![], consts: vec![], lines: vec![], cur: 0, scope: None, loops: vec![] };
     c.emit_ast(ast)?;
-    Ok((c.ops, c.consts))
+    Ok((c.ops, c.consts, c.lines))
 }

@@ -104,7 +104,24 @@ fn key_of(v: &Value) -> Option<Key> {
 }
 fn keys_of(xs: &[Value]) -> Option<Vec<Key>> { xs.iter().map(key_of).collect() }
 
+/// Atom lookup in a typed vector: scan the raw elements instead of materializing x as a Vec<Value>.
+/// This is the hot path — every `x in y` in the boot compiler's dispatch chains goes through it.
+fn find_atom(x: &Value, i: &Value) -> Option<i64> {
+    let at = |n: usize, hit: Option<usize>| hit.unwrap_or(n) as i64;
+    Some(match (x, i) {
+        (Syms(v), Symbol(s)) => at(v.len(), v.iter().position(|e| e == s)),
+        (Ints(v), Int(a)) => at(v.len(), v.iter().position(|e| e == a)),
+        (Chars(v), Char(c)) => at(v.len(), v.iter().position(|e| e == c)),
+        (Bools(v), Bool(b)) => at(v.len(), v.iter().position(|e| e == b)),
+        (Floats(v), Float(f)) => at(v.len(), v.iter().position(|e| e == f)),
+        (Dates(v), Date(d)) => at(v.len(), v.iter().position(|e| e == d)),
+        (Times(v), Time(t)) => at(v.len(), v.iter().position(|e| e == t)),
+        (Bytes(v), Byte(b)) => at(v.len(), v.iter().position(|e| e == b)),
+        _ => return None,
+    })
+}
 fn find(x: Value, i: Value) -> R<Value> {
+    if let Some(n) = find_atom(&x, &i) { return Ok(Int(n)); }
     let xs = x.seq();
     let n = xs.len() as i64;
     let small = i.is_atom() || i.count() * xs.len() < 1 << 14;   // few lookups: a scan beats building the table
@@ -322,6 +339,64 @@ fn read0(x: Value) -> R<Value> {
     let p = text(&x);
     Ok(lines(std::fs::read_to_string(&p).map_err(|e| NError(format!("{p}: {e}")))?))
 }
+// ---- TCP sockets. Handles are ints into a process-local table; the VM is single-threaded, so
+// a thread_local is all the state these need and the prims stay plain fn(Value) -> R<Value>.
+thread_local! {
+    static SOCKS: std::cell::RefCell<(i64, HashMap<i64, std::net::TcpStream>)> =
+        std::cell::RefCell::new((0, HashMap::new()));
+}
+fn sock<T>(h: &Value, f: impl FnOnce(&mut std::net::TcpStream) -> R<T>) -> R<T> {
+    let h = int_of(h)?;
+    SOCKS.with(|c| match c.borrow_mut().1.get_mut(&h) { Some(s) => f(s), None => err(format!("hsock: no handle {h}")) })
+}
+/// bytes to put on the wire: a byte vector as-is, a string as UTF-8 (what `` `byte$ `` would give).
+fn wire(v: &Value) -> R<Vec<u8>> {
+    match v {
+        Bytes(b) => Ok(b.as_ref().clone()),
+        Byte(b) => Ok(vec![*b]),
+        Chars(_) | Char(_) | Symbol(_) => Ok(text(v).into_bytes()),
+        _ => err("type: expected bytes or a string"),
+    }
+}
+/// `hopen "host:port"` -> handle; `hopen ("host:port"; timeoutMs)` sets the connect and read timeout.
+fn hopen(x: Value) -> R<Value> {
+    use std::net::{TcpStream, ToSocketAddrs};
+    let (addr, ms) = match &x {
+        List(v) if v.len() == 2 => (text(&v[0]), int_of(&v[1])? as u64),
+        _ => (text(&x), 30_000),
+    };
+    let to = std::time::Duration::from_millis(ms.max(1));
+    // try every resolved address: the first is often IPv6 on a host that only routes IPv4
+    let mut last = NError(format!("hopen {addr}: no address"));
+    let mut sock = None;
+    for sa in addr.to_socket_addrs().map_err(|e| NError(format!("hopen {addr}: {e}")))? {
+        match TcpStream::connect_timeout(&sa, to) { Ok(s) => { sock = Some(s); break } Err(e) => last = NError(format!("hopen {addr}: {e}")) }
+    }
+    let s = sock.ok_or(last)?;
+    s.set_read_timeout(Some(to)).ok();
+    s.set_nodelay(true).ok();
+    Ok(SOCKS.with(|c| { let mut c = c.borrow_mut(); c.0 += 1; let h = c.0; c.1.insert(h, s); Int(h) }))
+}
+fn hclose(x: Value) -> R<Value> {
+    let h = int_of(&x)?;
+    SOCKS.with(|c| c.borrow_mut().1.remove(&h));
+    Ok(Null)
+}
+/// `hsend[h;x]` writes every byte of x; the count written.
+fn hsend(h: Value, x: Value) -> R<Value> {
+    let b = wire(&x)?;
+    sock(&h, |s| std::io::Write::write_all(s, &b).map_err(|e| NError(format!("hsend: {e}"))))?;
+    Ok(Int(b.len() as i64))
+}
+/// `hrecv[h;n]` reads once, up to n bytes. Empty means the peer closed.
+fn hrecv(h: Value, n: Value) -> R<Value> {
+    let n = int_of(&n)?.max(0) as usize;
+    let mut buf = vec![0u8; n];
+    let got = sock(&h, |s| std::io::Read::read(s, &mut buf).map_err(|e| NError(format!("hrecv: {e}"))))?;
+    buf.truncate(got);
+    Ok(bytes(buf))
+}
+
 fn write0(path: Value, x: Value) -> R<Value> {
     let p = text(&path);
     let body = match &x { List(items) => items.iter().map(text).collect::<Vec<_>>().join("\n") + "\n", _ => text(&x) };
@@ -401,6 +476,7 @@ fn ast_value(a: &crate::parse::Ast) -> Value {
         Ast::While(c, b) => vec![s("while"), ast_value(c), many(b)],
         Ast::Cond(xs) => vec![s("cond"), many(xs)],
         Ast::Noun(x) => vec![s("noun"), ast_value(x)],
+        Ast::At(l, x) => vec![s("at"), Int(*l as i64), ast_value(x)],
     })
 }
 fn parse_oracle(x: Value) -> R<Value> {
@@ -445,7 +521,8 @@ pub fn amend(x: &mut Value, i: Value, v: Value) -> R<()> {
         let dm = Rc::make_mut(d);
         return match dm.keys.seq().iter().position(|e| *e == i) {
             Some(p) => amend(&mut dm.vals, Int(p as i64), v),
-            None => { dm.keys = join(dm.keys.clone(), i)?; dm.vals = join(dm.vals.clone(), v)?; Ok(()) }
+            // enlist, not join: a vector value is one entry, so `d[`c]: 10 20` does not splice into vals
+            None => { dm.keys = join(dm.keys.clone(), i)?; dm.vals = join(dm.vals.clone(), enlist(v)?)?; Ok(()) }
         };
     }
     let p = usize::try_from(int_of(&i)?).map_err(|_| NError("index".into()))?;
@@ -576,9 +653,11 @@ pub static BUILTINS: &[PrimDef] = &[
     p!("isnull", Some(isnull), None), p!("now", Some(now), None),
     p!("show", Some(show), None), p!("print", Some(print), None), p!("signal", Some(signal), None), p!("exit", Some(exit), None),
     p!("read0", Some(read0), None), p!("write0", None, Some(write0)),
+    p!("hopen", Some(hopen), None), p!("hclose", Some(hclose), None), p!("hsend", None, Some(hsend)), p!("hrecv", None, Some(hrecv)),
     p!("each", None, None), p!("over", None, None), p!("scan", None, None),   // adverb keywords, dispatched in the VM
     p!("lex", Some(lex_oracle), None), p!("parse", Some(parse_oracle), None), p!("compile", Some(compile_oracle), None),
     p!("exec", None, None),   // runs bytecode data; dispatched in the VM
+    p!("elast", None, None),  // elast `line / `trace: where the last caught error came from; dispatched in the VM
 ];
 /// Named dyads that parse infix like verbs: `7 mod 3`, `x in y`. Most are prelude lambdas; the parser only needs the names.
 pub const INFIX: &[&str] = &["mod", "div", "xexp", "in", "within", "vs", "sv", "ss", "write0", "each", "over", "scan", "except", "inter", "union", "cross", "fill", "like",
@@ -588,13 +667,15 @@ pub const INFIX: &[&str] = &["mod", "div", "xexp", "in", "within", "vs", "sv", "
 pub fn prim(c: char) -> &'static PrimDef { PRIMS.iter().find(|p| p.name.starts_with(c)).expect("known verb") }
 
 // ---- bytecode as data
-// unit  = (opcodes; args; consts)            lambda code = (opcodes; args; consts; params; nlocals)
+// unit  = (opcodes; args; consts; lines)     lambda code = (opcodes; args; consts; lines; params; nlocals)
+// lines[i] is the source line op i came from (0 = synthetic), for runtime error positions.
 // const = (`k;v) literal | (`g;`name) global name | (`p;"+") verb | (`a;"/";const) adverbed | (`f;code) lambda
-fn code_data(ops: &[Op], consts: &[Value]) -> Vec<Value> {
+fn code_data(ops: &[Op], consts: &[Value], lines: &[u32]) -> Vec<Value> {
     let mut is_name = vec![false; consts.len()];
     for op in ops { if let Op::LoadG(a) | Op::StoreG(a) | Op::TakeG(a) = op { is_name[*a as usize] = true; } }
     let (oc, oa): (Vec<i64>, Vec<i64>) = ops.iter().map(|o| o.encode()).unzip();
-    vec![ints(oc), ints(oa), pack(consts.iter().zip(is_name).map(|(v, n)| const_data(v, n)).collect())]
+    vec![ints(oc), ints(oa), pack(consts.iter().zip(is_name).map(|(v, n)| const_data(v, n)).collect()),
+         ints(lines.iter().map(|&l| l as i64).collect())]
 }
 fn const_data(v: &Value, is_name: bool) -> Value {
     let s = |n: &str| Symbol(Rc::from(n));
@@ -603,7 +684,7 @@ fn const_data(v: &Value, is_name: bool) -> Value {
         Prim(p) => vec![s("p"), Char(p.name.chars().next().unwrap())],
         Adv(c, f) => vec![s("a"), Char(*c), const_data(f, false)],
         Lambda(code) => {
-            let mut d = code_data(&code.ops, &code.consts);
+            let mut d = code_data(&code.ops, &code.consts, &code.lines);
             d.push(pack(code.params.iter().map(|p| Symbol(Rc::from(p.as_str()))).collect()));
             d.push(Int(code.nlocals as i64));
             vec![s("f"), pack(d)]
@@ -613,18 +694,21 @@ fn const_data(v: &Value, is_name: bool) -> Value {
 }
 /// The Rust compiler as neant data: one unit per statement. Oracle for boot/compile.nt.
 fn compile_oracle(x: Value) -> R<Value> {
-    let prog = crate::parse::Parser::new(crate::lex::lex(&text(&x))?).program()?;
+    let (t, l) = crate::lex::lex_lines(&text(&x))?;
+    let prog = crate::parse::Parser::with_lines(t, l).program()?;
     Ok(pack(prog.iter().map(|ast| {
-        let (ops, consts) = crate::compile::compile_stmt(ast)?;
-        Ok(pack(code_data(&ops, &consts)))
+        let (ops, consts, lines) = crate::compile::compile_stmt(ast)?;
+        Ok(pack(code_data(&ops, &consts, &lines)))
     }).collect::<R<Vec<_>>>()?))
 }
-pub fn load_unit(u: &Value) -> R<(Vec<Op>, Vec<Value>)> {
+pub fn load_unit(u: &Value) -> R<(Vec<Op>, Vec<Value>, Vec<u32>)> {
     let (Ints(oc), Ints(oa)) = (u.item(0)?, u.item(1)?) else { return err("load: opcodes and args must be int vectors") };
     if oc.len() != oa.len() { return err("load: opcodes and args differ in length"); }
     let ops = oc.iter().zip(oa.iter()).map(|(&o, &a)| Op::decode(o, a)).collect::<R<Vec<_>>>()?;
     let consts = u.item(2)?.seq().iter().map(load_const).collect::<R<Vec<_>>>()?;
-    Ok((ops, consts))
+    // the line table is optional: hand-built bytecode passed to `exec` just gets no positions
+    let lines = match u.item(3) { Ok(Ints(v)) => v.iter().map(|&l| l.max(0) as u32).collect(), _ => vec![] };
+    Ok((ops, consts, lines))
 }
 fn load_const(e: &Value) -> R<Value> {
     let Symbol(tag) = e.item(0)? else { return err("load: const entry needs a tag") };
@@ -635,11 +719,11 @@ fn load_const(e: &Value) -> R<Value> {
         "a" => Ok(Adv(ch(e.item(1)?, ADV_ALL)?, Rc::new(load_const(&e.item(2)?)?))),
         "f" => {
             let d = e.item(1)?;
-            let (ops, consts) = load_unit(&d)?;
-            let params = d.item(3)?.seq().iter().map(|p| match p { Symbol(s) => Ok(s.to_string()), _ => err("load: param names must be symbols") }).collect::<R<Vec<_>>>()?;
-            let nlocals = int_of(&d.item(4)?)? as usize;
+            let (ops, consts, lines) = load_unit(&d)?;
+            let params = d.item(4)?.seq().iter().map(|p| match p { Symbol(s) => Ok(s.to_string()), _ => err("load: param names must be symbols") }).collect::<R<Vec<_>>>()?;
+            let nlocals = int_of(&d.item(5)?)? as usize;
             let nlocals = nlocals.max(params.len());
-            Ok(Lambda(Rc::new(FnCode { ops, consts, params, nlocals })))
+            Ok(Lambda(Rc::new(FnCode { ops, consts, lines, params, nlocals })))
         }
         _ => err(format!("load: unknown const tag `{tag}")),
     }

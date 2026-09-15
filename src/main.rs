@@ -150,7 +150,11 @@ mod tests {
             ("cross[1 2;`a`b]", "((1;`a);(1;`b);(2;`a);(2;`b))"), ("fmt[\"% + % = %\";(1;2;3)]", "\"1 + 2 = 3\""), ("asc 3 1 2", "1 2 3"), ("desc 3 1 2", "3 2 1"), ("asc (\"pear\";\"apple\";\"fig\")", "(\"apple\";\"fig\";\"pear\")"), ("<(2 1;1 9;1 2)", "2 1 0"),
             ("\"hello.nt\" like \"*.nt\"", "1b"), ("\"hello\" like \"h?l*\"", "1b"), ("\"hello\" like \"h?x*\"", "0b"), ("ssr[\"a-b-c\";\"-\";\"+\"]", "\"a+b+c\""),
             ("t:tbl[`a`b;(2 1 1;5 9 2)];xasc[`a`b;t]`b", "2 9 5"), ("t:tbl[`a`b;(2 1 1;5 9 2)];xdesc[`b;t]`a", "1 2 1"),
-            ("x:1\n\ny+1", "'undefined: y at line 3"), ("f:{x+`a}\nf 1", "'type: arithmetic on non-numeric at line 2"),
+            ("x:1\n\ny+1", "'undefined: y at line 3"), // runtime errors point at the failing line and unwind a named call stack
+            ("f:{x+`a}\nf 1", "'type: arithmetic on non-numeric at line 1\n  in f at line 1\n  at line 2"),
+            ("g:{x+`a}\nh:{g x}\nh 1", "'type: arithmetic on non-numeric at line 1\n  in g at line 1\n  in h at line 2\n  at line 3"),
+            ("f:{[a;b] a+b}\nf[1;`x]", "'type: arithmetic on non-numeric at line 1\n  in f at line 1\n  at line 2"),
+            ("f:{x}\nf[1;2]", "'rank: expected 1 args, got 2 at line 2"),
             // select, joins
             ("t:tbl[`k`v;(`x`y`x;1 2 3)];select sum v by k from t", "`k`v!(`x`y;4 2)"),
             ("t:tbl[`a`b;(1 2 3;10 20 30)];select total: sum b, n: count a from t", "`total`n!(,60;,3)"),
@@ -203,6 +207,8 @@ mod tests {
             ("hex x25519[unhex \"5dab087e624a8a4b79e17f8b83800ee66f3bb1292618b6fd1c2f8b27ff88e0eb\";unhex \"8520f0098930a754748b7ddcb43ef75a0dbf3a0d26381af4eba4a98eaa9b4e6a\"]", "\"4a5d9d5ba4ce2de1728e3bf480350f25e07e21c947d19e3376f09b3c1e161742\""),
             // error positions
             ("(1", "'parse: missing ) at line 1"), ("1+2\n(1", "'parse: missing ) at line 2"), ("\"ab\n\nc", "'lex: unterminated string at line 1"),
+            ("}", "'parse: unexpected } at line 1"), (")", "'parse: unexpected ) at line 1"), ("1}", "'parse: unexpected } at line 1"),
+            ("(1;2}", "'parse: unexpected } at line 1"), ("f[1]]", "'parse: unexpected ] at line 1"), ("1+2\nx: 3]", "'parse: unexpected ] at line 2"),
             ("// comment\n5", "5"), ("1+2\n3+4", "7"),
             ("f:+;f[1;2]", "3"), ("f:+/;f 1 2 3", "6"), ("(+/)1 2 3", "6"),  // verbs and adverbed verbs are values
             ("+/{x*x} til 1000", "332833500"),
@@ -211,6 +217,8 @@ mod tests {
             ("x:1 2 3;x[1]:9;x", "1 9 3"), ("x:1 2 3;x[0 2]:7;x", "7 2 7"), ("x:1 2 3;x[1]:`a;x", "(1;`a;3)"),
             ("x:1 2 3;x[5]:1", "'index: amend out of range"), ("x:1 2 3;@[{x[5]:1};0;0];x", "1 2 3"),
             ("d:`a`b!1 2;d[`c]:3;d", "`a`b`c!1 2 3"), ("d:`a`b!1 2;d[`a]:9;d`a", "9"),
+            ("d:`a`b!1 2;d[`c]:10 20;d`c", "10 20"), ("d:`a`b!1 2;d[`c]:10 20;count d", "3"),   // a vector value is one entry
+            ("d:()!();d[7]:1 2 3;d 7", "1 2 3"), ("d:`a!,1 2;d[`b]:3 4;d`a", "1 2"),
             ("n:1;n+:2;n", "3"), ("x:();x,:1;x,:2 3;x", "1 2 3"), ("f:{a:();a,:x;a,:,x;a};f 1 2", "(1;2;1 2)"), ("g::();{g::g,x} each 1 2;g", "1 2"), ("s:\"\";s,:\"a\";s,:\"bc\";s", "\"abc\""), ("x:1 2;y:x;x,:3;y", "1 2"), ("g::1;{g::x} 5;g", "5"), ("g:1;{g:x} 5;g", "1"), ("x:1 2;x,:3;x", "1 2 3"),
             ("f:{x[0]:9;x};y:1 2;f y;y", "1 2"), ("f:{x[0]:9;x};f 1 2", "9 2"),   // value semantics
             ("f:{[x] a:1 2 3;a[0]:9;a};f 0", "9 2 3"),
@@ -221,6 +229,7 @@ mod tests {
             ("{x*2} each 1 2 3", "2 4 6"), ("(+) over 1 2 3", "6"), ("{x+y} scan 1 2 3", "1 3 6"),
             ("@[{x+1};1;{\"caught\"}]", "2"), ("@[{signal \"boom\"};1;{x}]", "\"boom\""), ("@[{1+`a};0;\"fallback\"]", "\"fallback\""),
             ("@[{x+`a};1;{\"err: \",x}]", "\"err: type: arithmetic on non-numeric\""),
+            ("@[{1+`a};0;{elast `line}]", "1"), ("@[{1+`a};0;{elast `trace}]", "((`;1))"), ("elast `nope", "'type: elast `line or elast `trace"),
             // strings, casts
             ("\",\" vs \"a,b,c\"", "(\"a\";\"b\";\"c\")"), ("\",\" sv (\"ab\";\"cd\")", "\"ab,cd\""), ("\"hello\" ss \"l\"", "2 3"),
             ("upper \"ab\"", "\"AB\""), ("trim \"  a \"", "\"a\""), ("\"\\n\" vs \"a\\nb\"", "(\"a\";\"b\")"),
@@ -250,6 +259,72 @@ mod tests {
         let v = prelude_vm().run("+/{x*x} til 2000000").unwrap();
         assert_eq!(v.fmt(), "2666664666667000000");
         assert!(t.elapsed().as_millis() < 500, "took {:?}", t.elapsed());
+    }
+}
+
+/// boot/tls.nt is a loadable module, not part of the image: key schedule and record layer,
+/// checked offline against RFC 8448. The handshake itself needs a server — see the README.
+#[cfg(test)]
+mod tls {
+    use super::*;
+    fn tls_vm() -> vm::Vm {
+        let mut v = tests::table_vm();
+        v.run(&std::fs::read_to_string("boot/tls.nt").unwrap()).unwrap();
+        v
+    }
+    #[test]
+    fn key_schedule_matches_rfc8448() {
+        let mut v = tls_vm();
+        let ev = |v: &mut vm::Vm, src: &str| v.run(src).map(|r| r.fmt()).unwrap_or_else(|e| format!("'{}", e.0));
+        for (src, want) in [
+            // RFC 8448 3: PSK and salt both zero
+            ("hex hkdfExtract[TLSZ; TLSZ]", "\"33ad0a1c607ec03b09e6cd9893680ce210adf300aa1f2660e1b22e10f170f92a\""),
+            ("hex hkdfLabel[32;\"derived\";sha256 0x]",
+             "\"00200d746c733133206465726976656420e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855\""),
+            ("hex deriveSecret[hkdfExtract[TLSZ;TLSZ];\"derived\";0x]",
+             "\"6f2615a108c702c5678f54fc9dbab69716c076189c48250cebeac3576c3611ba\""),
+            // a traffic secret expands to a 32-byte key and a 12-byte iv
+            ("k: trafficKeys hkdfExtract[TLSZ;TLSZ]; (count k[0]; count k[1])", "32 12"),
+        ] {
+            assert_eq!(ev(&mut v, src), want, "source: {src}");
+        }
+    }
+    #[test]
+    fn record_layer_round_trips() {
+        let mut v = tls_vm();
+        let ev = |v: &mut vm::Vm, src: &str| v.run(src).map(|r| r.fmt()).unwrap_or_else(|e| format!("'{}", e.0));
+        // the sequence number lands in the low 8 bytes of the nonce
+        assert_eq!(ev(&mut v, "hex recNonce[12#0x00; 258]"), "\"000000000000000000000102\"");
+        // seal then open gives the content type and body back; a wrong sequence number must not open
+        let setup = "k: `byte$til 32; iv: 12#0x07; r: sealBody[k;iv;5;23;`byte$\"hello tls\"]; ";
+        assert_eq!(ev(&mut v, &format!("{setup}d: openRec[k;iv;5;r[0];wdrop[5;r[1]]]; (d[0]; `char$d[1])")),
+                   "(23;\"hello tls\")");
+        assert_eq!(ev(&mut v, &format!("{setup}openRec[k;iv;6;r[0];wdrop[5;r[1]]]")), "'aead: bad tag");
+    }
+    /// hopen/hsend/hrecv/hclose against a listener in this test's own process.
+    #[test]
+    fn sockets_round_trip() {
+        use std::io::{Read, Write};
+        let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = l.local_addr().unwrap().port();
+        let srv = std::thread::spawn(move || {
+            let (mut s, _) = l.accept().unwrap();
+            let mut b = [0u8; 64];
+            let n = s.read(&mut b).unwrap();
+            s.write_all(&[b"echo:", &b[..n]].concat()).unwrap();
+        });
+        let mut v = tests::table_vm();
+        v.set("port", value::chars(port.to_string().chars().collect()));
+        let got = v.run("h: hopen \"127.0.0.1:\",port; hsend[h;\"hi there\"]; r: hrecv[h;64]; hclose h; `char$r").unwrap();
+        assert_eq!(got.fmt(), "\"echo:hi there\"");
+        srv.join().unwrap();
+    }
+    #[test]
+    fn client_hello_is_well_formed() {
+        let mut v = tls_vm();
+        let got = v.run("ch: clientHello[\"a.b\"; 32#0x01; 32#0x02; 32#0x03]; (count ch; hex 6#ch; hex ch[71+til 5])").unwrap();
+        // 0x01 ClientHello, 24-bit length, then 0x0303; cipher_suites is the one suite 0x1303
+        assert_eq!(got.fmt(), "(160;\"0100009c0303\";\"0002130301\")");
     }
 }
 
@@ -310,7 +385,8 @@ mod boot_parse {
             let want = v.run("parse src").unwrap();
             assert!(got == want, "{src:?}\n  neant: {}\n  rust:  {}", got.fmt(), want.fmt());
         }
-        for (src, msg) in [("1+", "parse: incomplete expression at line 1"), ("(1", "parse: missing ) at line 1"), ("x:", "parse: empty assignment at line 1"), ("f[1", "parse: missing ] at line 1"), ("1\n2\n(", "parse: missing ) at line 3"), ("select a", "parse: select needs from at line 1")] {
+        for (src, msg) in [("1+", "parse: incomplete expression at line 1"), ("(1", "parse: missing ) at line 1"), ("x:", "parse: empty assignment at line 1"), ("f[1", "parse: missing ] at line 1"), ("1\n2\n(", "parse: missing ) at line 3"), ("select a", "parse: select needs from at line 1"),
+                          ("}", "parse: unexpected } at line 1"), ("(1;2}", "parse: unexpected } at line 1"), ("f[1]]", "parse: unexpected ] at line 1")] {
             v.set("src", value::chars(src.chars().collect()));
             assert_eq!(v.run("nparse src").map(|v| v.fmt()).unwrap_or_else(|e| format!("'{}", e.0)), format!("'{msg}"), "{src:?}");
         }
