@@ -1,4 +1,4 @@
-//! neant: a vector language. Stage 0 — compiler and bytecode VM in Rust.
+//! neant: a vector language. Rust is the VM and the primitives; the front end is neant.
 //!
 //! q-like syntax (no operator precedence, strict right-to-left) makes compilation a single
 //! linear pass; typed vectors make the primitives tight native loops.
@@ -9,11 +9,9 @@
 //!     {x*y}[3;4]        // lambda, implicit args x y z
 //!     $[1<2;`yes;`no]   // cond
 //!
-//! Stage 1: port lex/parse/compile to neant itself and run them on this VM.
-mod compile;
+//! Source never reaches Rust: boot/{lex,parse,compile}.nt lex, parse and compile it, and they
+//! themselves run on this VM, loaded from the bytecode image in boot/boot.nb.
 mod image;
-mod lex;
-mod parse;
 mod prims;
 mod value;
 mod vm;
@@ -30,25 +28,16 @@ fn report(r: value::R<value::Value>) -> bool {
 fn main() {
     let argv: Vec<String> = std::env::args().collect();
     let read = |path: &str| std::fs::read_to_string(path).unwrap_or_else(|e| { eprintln!("{path}: {e}"); std::process::exit(2) });
-    let flag = argv.get(1).map(String::as_str);
-    if flag == Some("--build-boot") {   // stage 0: Rust front end loads boot/*.nt, the neant compiler compiles them into the image
-        let mut vm = stage0(&read);
+    let mut vm = boot_vm();
+    if argv.get(1).map(String::as_str) == Some("--build-boot") {   // recompile boot/*.nt with the image's own compiler
         let bytes = build_boot_image(&mut vm, &read).unwrap_or_else(|e| { eprintln!("'{}", e.0); std::process::exit(1) });
         std::fs::write(BOOT_IMAGE_PATH, &bytes).unwrap_or_else(|e| { eprintln!("{BOOT_IMAGE_PATH}: {e}"); std::process::exit(2) });
         println!("wrote {BOOT_IMAGE_PATH} ({} bytes); rebuild to embed it", bytes.len());
         return;
     }
-    let rust_fe = flag == Some("--rust");   // debugging aid: the Rust lexer/parser/compiler instead of the boot image
-    let mut vm = if rust_fe { prelude_vm() } else { boot_vm() };
-    let file = argv.get(1 + rust_fe as usize);
-    vm.set("args", value::list(argv.iter().skip(2 + rust_fe as usize).map(|a| value::chars(a.chars().collect())).collect()));
-    let nrun = vm.get("nrun");
-    let run = |vm: &mut vm::Vm, src: &str| match &nrun {
-        Some(f) => vm.call(f, vec![value::chars(src.chars().collect())]),
-        None => vm.run(src),
-    };
-    if let Some(path) = file {
-        if !report(run(&mut vm, &read(path))) { std::process::exit(1); }
+    vm.set("args", value::list(argv.iter().skip(2).map(|a| value::chars(a.chars().collect())).collect()));
+    if let Some(path) = argv.get(1) {
+        if !report(vm.eval(&read(path))) { std::process::exit(1); }
         return;
     }
     let stdin = std::io::stdin();
@@ -57,40 +46,31 @@ fn main() {
         print!("neant) "); std::io::stdout().flush().ok();
         line.clear();
         if stdin.lock().read_line(&mut line).unwrap_or(0) == 0 { println!(); return; }
-        report(run(&mut vm, &line));
+        report(vm.eval(&line));
     }
 }
 
 const BOOT_FILES: [&str; 7] = ["boot/prelude.nt", "boot/lex.nt", "boot/parse.nt", "boot/compile.nt", "boot/table.nt", "boot/json.nt", "boot/crypto.nt"];
-/// Standard library written in neant; the Rust front end needs it loaded too (`--rust`, tests).
-const PRELUDE: &str = include_str!("../boot/prelude.nt");
-fn prelude_vm() -> vm::Vm {
-    let mut vm = vm::Vm::new();
-    vm.run(PRELUDE).unwrap_or_else(|e| { eprintln!("prelude: '{}", e.0); std::process::exit(2) });
-    vm
-}
 const BOOT_IMAGE_PATH: &str = "boot/boot.nb";
-/// The self-hosted front end, compiled by itself: a list of bytecode units defining nlex/nparse/ncompile/nrun.
+/// The whole front end and standard library as bytecode, compiled by itself: prelude, lexer, parser,
+/// compiler, tables, JSON, crypto. This is the only way into the language — there is no Rust front end,
+/// so a broken image can only be rebuilt by a binary carrying a working one (`--build-boot`, or git).
 const BOOT_IMAGE: &[u8] = include_bytes!("../boot/boot.nb");
 
-/// A VM with the embedded boot image loaded — the normal way to run neant code.
+/// A VM with the embedded boot image loaded — the only way to run neant code.
 fn boot_vm() -> vm::Vm {
     let mut vm = vm::Vm::new();
     let img = image::load(BOOT_IMAGE).and_then(|img| vm.exec(&img));
-    if let Err(e) = img { eprintln!("boot image: '{}  (run `neant --build-boot`, then rebuild)", e.0); std::process::exit(2); }
+    if let Err(e) = img { eprintln!("boot image: '{}  (rebuild it with a binary that still has a working one)", e.0); std::process::exit(2); }
     vm
 }
-/// A VM with boot/*.nt loaded through the Rust front end (only for building the image and for tests).
-fn stage0(read: &dyn Fn(&str) -> String) -> vm::Vm {
-    let mut vm = vm::Vm::new();
-    for f in BOOT_FILES { vm.run(&read(f)).unwrap_or_else(|e| { eprintln!("{f}: '{}", e.0); std::process::exit(2) }); }
-    vm
-}
+/// Compile boot/*.nt with the compiler already in `vm` and serialize the units. Self-hosted: the image
+/// that comes out was produced by the image that went in, so a compiler change needs two rebuilds to settle.
 fn build_boot_image(vm: &mut vm::Vm, read: &dyn Fn(&str) -> String) -> value::R<Vec<u8>> {
+    let ncompile = vm.get("ncompile").ok_or_else(|| value::NError("ncompile: no boot image loaded".into()))?;
     let mut units = Vec::new();
     for f in BOOT_FILES {
-        vm.set("src", value::chars(read(f).chars().collect()));
-        units.extend(vm.run("ncompile src")?.seq());
+        units.extend(vm.call(&ncompile, vec![value::chars(read(f).chars().collect())])?.seq());
     }
     image::dump(&value::pack(units))
 }
@@ -98,12 +78,7 @@ fn build_boot_image(vm: &mut vm::Vm, read: &dyn Fn(&str) -> String) -> value::R<
 #[cfg(test)]
 mod tests {
     use super::*;
-    pub fn table_vm() -> vm::Vm {
-        let mut v = prelude_vm();
-        for f in ["boot/table.nt", "boot/json.nt", "boot/crypto.nt"] { v.run(&std::fs::read_to_string(f).unwrap()).unwrap(); }
-        v
-    }
-    fn ev(src: &str) -> String { table_vm().run(src).map(|v| v.fmt()).unwrap_or_else(|e| format!("'{}", e.0)) }
+    pub fn ev(vm: &mut vm::Vm, src: &str) -> String { vm.eval(src).map(|v| v.fmt()).unwrap_or_else(|e| format!("'{}", e.0)) }
 
     pub const CASES: &[(&str, &str)] = &[
             ("1+2", "3"),
@@ -239,25 +214,30 @@ mod tests {
             ("undefined_name", "'undefined: undefined_name"), ("1 2+1 2 3", "'length"), ("{x}[1;2]", "'rank: expected 1 args, got 2"),
         ];
 
+    /// Every language case through the whole self-hosted pipeline: nlex -> nparse -> ncompile -> exec.
     #[test]
     fn language() {
+        let mut v = boot_vm();
+        let base = v.snapshot();
         for (src, want) in CASES {
-            assert_eq!(ev(src), *want, "source: {src}");
+            v.restore(&base);
+            assert_eq!(ev(&mut v, src), *want, "source: {src}");
         }
     }
 
     #[test]
     fn locals_do_not_leak() {
-        let mut v = vm::Vm::new();
-        v.run("g:{a:x*2;a+1};g 3").unwrap();
+        let mut v = boot_vm();
+        v.eval("g:{a:x*2;a+1};g 3").unwrap();
         assert!(v.get("a").is_none());
     }
 
     #[test]
     fn fused_fold_is_fast() {
+        let mut v = boot_vm();
         let t = std::time::Instant::now();
-        let v = prelude_vm().run("+/{x*x} til 2000000").unwrap();
-        assert_eq!(v.fmt(), "2666664666667000000");
+        let r = v.eval("+/{x*x} til 2000000").unwrap();
+        assert_eq!(r.fmt(), "2666664666667000000");
         assert!(t.elapsed().as_millis() < 500, "took {:?}", t.elapsed());
     }
 }
@@ -268,14 +248,14 @@ mod tests {
 mod tls {
     use super::*;
     fn tls_vm() -> vm::Vm {
-        let mut v = tests::table_vm();
-        v.run(&std::fs::read_to_string("boot/tls.nt").unwrap()).unwrap();
+        let mut v = boot_vm();
+        v.eval(&std::fs::read_to_string("boot/tls.nt").unwrap()).unwrap();
         v
     }
     #[test]
     fn key_schedule_matches_rfc8448() {
         let mut v = tls_vm();
-        let ev = |v: &mut vm::Vm, src: &str| v.run(src).map(|r| r.fmt()).unwrap_or_else(|e| format!("'{}", e.0));
+        let ev = tests::ev;
         for (src, want) in [
             // RFC 8448 3: PSK and salt both zero
             ("hex hkdfExtract[TLSZ; TLSZ]", "\"33ad0a1c607ec03b09e6cd9893680ce210adf300aa1f2660e1b22e10f170f92a\""),
@@ -292,7 +272,7 @@ mod tls {
     #[test]
     fn record_layer_round_trips() {
         let mut v = tls_vm();
-        let ev = |v: &mut vm::Vm, src: &str| v.run(src).map(|r| r.fmt()).unwrap_or_else(|e| format!("'{}", e.0));
+        let ev = tests::ev;
         // the sequence number lands in the low 8 bytes of the nonce
         assert_eq!(ev(&mut v, "hex recNonce[12#0x00; 258]"), "\"000000000000000000000102\"");
         // seal then open gives the content type and body back; a wrong sequence number must not open
@@ -313,16 +293,16 @@ mod tls {
             let n = s.read(&mut b).unwrap();
             s.write_all(&[b"echo:", &b[..n]].concat()).unwrap();
         });
-        let mut v = tests::table_vm();
+        let mut v = boot_vm();
         v.set("port", value::chars(port.to_string().chars().collect()));
-        let got = v.run("h: hopen \"127.0.0.1:\",port; hsend[h;\"hi there\"]; r: hrecv[h;64]; hclose h; `char$r").unwrap();
+        let got = v.eval("h: hopen \"127.0.0.1:\",port; hsend[h;\"hi there\"]; r: hrecv[h;64]; hclose h; `char$r").unwrap();
         assert_eq!(got.fmt(), "\"echo:hi there\"");
         srv.join().unwrap();
     }
     #[test]
     fn client_hello_is_well_formed() {
         let mut v = tls_vm();
-        let got = v.run("ch: clientHello[\"a.b\"; 32#0x01; 32#0x02; 32#0x03]; (count ch; hex 6#ch; hex ch[71+til 5])").unwrap();
+        let got = v.eval("ch: clientHello[\"a.b\"; 32#0x01; 32#0x02; 32#0x03]; (count ch; hex 6#ch; hex ch[71+til 5])").unwrap();
         // 0x01 ClientHello, 24-bit length, then 0x0303; cipher_suites is the one suite 0x1303
         assert_eq!(got.fmt(), "(160;\"0100009c0303\";\"0002130301\")");
     }
@@ -331,138 +311,100 @@ mod tls {
 #[cfg(test)]
 mod boot {
     use super::*;
-    /// The self-hosted lexer (boot/lex.nt) must produce exactly the Rust lexer's token stream.
-    #[test]
-    fn self_hosted_lexer_matches_oracle() {
-        let mut v = prelude_vm();
-        v.run(&std::fs::read_to_string("boot/lex.nt").unwrap()).unwrap();
-        let corpus = [
-            "x: 1 2 3; 2*x+1",
-            "1 -2 - 3 -.5 1e3 2.5e-1 7.",
-            "f:{[a;b] a-b}; f[10;3]",
-            "`a`b!1 2 // comment\nd`b; `; `a.b_c",
-            "\"str\\n\\\"q\\\"\" , \"a\" , \"\"",
-            "+/1 2 3 4;+\\x;{x*x}'1 2 3",
-            "$[1<2;`yes;`no];(1;`a;\"s\")",
-            "x[0]:9;n+:1;{5}[];f[;3] 10; :5",
-            "a_1;1_a;-1_a;x-1;x -1;(x)-1",
-            "if[i<n; v[i]: i*i; i+:1]\n\twhile[0;]",
-            "101b 1b 0N 0W -0W 0n 0w 1 0N 3 2.5 0n", "2026.09.15 12:30:00 12:30:00.25 9:05 2026.13.01 12:30", "2026.01.01 2026.01.03 12:00:00 2026.01.01 5", ".ns.v .z.d x.y 1.5.2",
-            "x +\\: y; x +/: y; f\\:[a;b]; \"a\\nb\" \\ 5", "0x0aff 0x0a 0x; x: 0x01,0xAB",
-        ];
-        for src in corpus {
-            v.set("src", value::chars(src.chars().collect()));
-            let got = v.run("nlex src").unwrap_or_else(|e| panic!("{src:?}: '{}", e.0));
-            let want = v.run("lex src").unwrap();
-            assert!(got == want, "{src:?}\n  neant: {}\n  rust:  {}", got.fmt(), want.fmt());
-        }
-        assert_eq!(v.run("nlex \"1+\\\"x\"").map(|v| v.fmt()).unwrap_or_else(|e| format!("'{}", e.0)), "'lex: unterminated string at line 1");
-    }
-}
 
-#[cfg(test)]
-mod boot_parse {
-    use super::*;
-    /// The self-hosted parser (boot/parse.nt, fed by boot/lex.nt) must produce the Rust parser's AST.
-    #[test]
-    fn self_hosted_parser_matches_oracle() {
-        let mut v = prelude_vm();
-        for f in ["boot/lex.nt", "boot/parse.nt"] { v.run(&std::fs::read_to_string(f).unwrap()).unwrap(); }
-        let corpus = [
-            "x: 1 2 3; 2*x+1", "1 -2 - 3 -.5", "f:{[a;b] a-b}; f[10;3]", "`a`b!1 2 // c\nd`b",
-            "\"str\" , \"a\" , \"\"", "+/1 2 3 4;+\\x;{x*x}'1 2 3;(+/) 1 2;f/", "$[1<2;`yes;`no];(1;`a;\"s\");(1;2)",
-            "x[0]:9;n+:1;x,:5;g::7;{5}[];f[;3] 10;f[1;];f[]", ":5;{if[x<0; :`neg]; `pos}[-1]",
-            "if[i<n; v[i]: i*i; i+:1]\n\twhile[0;]", "{x+y*z};{y};{};{[] 1};{{x} each y}",
-            "a_1;1_a;-1_a;x-1;x -1;(x)-1;x mod 3;7 in 1 2;(f each x) over y",
-            "d: `a`b!1 2\nd[`c]: 3\nf: {[s;i] $[i<count s; s[i]; \"\"]}\n", "()", ";;", "", "print \"hi\"",
-            "x[1;0]:9; c[1]+:10; do[5;n+:2]; x +\\: y; 2026.09.15+1; 101b", "while[1;break]; do[3;if[x;break]]",
-            "select a, sum b by c, d:e+1 from t where x>1, y<2", "select from t where a>1", "select total: sum b from t", "select sum v by k from t",
-            "{n:1;{x+n}}; {a:1;b:{c:2;{a+c+x}};b[][10]}",
-        ];
-        for src in corpus {
-            v.set("src", value::chars(src.chars().collect()));
-            let got = v.run("nparse src").unwrap_or_else(|e| panic!("{src:?}: '{}", e.0));
-            let want = v.run("parse src").unwrap();
-            assert!(got == want, "{src:?}\n  neant: {}\n  rust:  {}", got.fmt(), want.fmt());
-        }
-        for (src, msg) in [("1+", "parse: incomplete expression at line 1"), ("(1", "parse: missing ) at line 1"), ("x:", "parse: empty assignment at line 1"), ("f[1", "parse: missing ] at line 1"), ("1\n2\n(", "parse: missing ) at line 3"), ("select a", "parse: select needs from at line 1"),
-                          ("}", "parse: unexpected } at line 1"), ("(1;2}", "parse: unexpected } at line 1"), ("f[1]]", "parse: unexpected ] at line 1")] {
-            v.set("src", value::chars(src.chars().collect()));
-            assert_eq!(v.run("nparse src").map(|v| v.fmt()).unwrap_or_else(|e| format!("'{}", e.0)), format!("'{msg}"), "{src:?}");
-        }
-    }
-}
+    /// With the Rust front end gone there is no external oracle, so the corpora below are checked for
+    /// *stability* instead: the front end must lex, parse and compile them to exactly the same thing
+    /// after it has been recompiled by itself. A compiler that does not reproduce its own output on
+    /// these fails here; `language` and `embedded_boot_image_is_current` cover what the output means.
+    const LEX_CORPUS: &[&str] = &[
+        "x: 1 2 3; 2*x+1",
+        "1 -2 - 3 -.5 1e3 2.5e-1 7.",
+        "f:{[a;b] a-b}; f[10;3]",
+        "`a`b!1 2 // comment\nd`b; `; `a.b_c",
+        "\"str\\n\\\"q\\\"\" , \"a\" , \"\"",
+        "+/1 2 3 4;+\\x;{x*x}'1 2 3",
+        "$[1<2;`yes;`no];(1;`a;\"s\")",
+        "x[0]:9;n+:1;{5}[];f[;3] 10; :5",
+        "a_1;1_a;-1_a;x-1;x -1;(x)-1",
+        "if[i<n; v[i]: i*i; i+:1]\n\twhile[0;]",
+        "101b 1b 0N 0W -0W 0n 0w 1 0N 3 2.5 0n", "2026.09.15 12:30:00 12:30:00.25 9:05 2026.13.01 12:30",
+        "2026.01.01 2026.01.03 12:00:00 2026.01.01 5", ".ns.v .z.d x.y 1.5.2",
+        "x +\\: y; x +/: y; f\\:[a;b]; \"a\\nb\" \\ 5", "0x0aff 0x0a 0x; x: 0x01,0xAB",
+    ];
+    const PARSE_CORPUS: &[&str] = &[
+        "x: 1 2 3; 2*x+1", "1 -2 - 3 -.5", "f:{[a;b] a-b}; f[10;3]", "`a`b!1 2 // c\nd`b",
+        "\"str\" , \"a\" , \"\"", "+/1 2 3 4;+\\x;{x*x}'1 2 3;(+/) 1 2;f/", "$[1<2;`yes;`no];(1;`a;\"s\");(1;2)",
+        "x[0]:9;n+:1;x,:5;g::7;{5}[];f[;3] 10;f[1;];f[]", ":5;{if[x<0; :`neg]; `pos}[-1]",
+        "if[i<n; v[i]: i*i; i+:1]\n\twhile[0;]", "{x+y*z};{y};{};{[] 1};{{x} each y}",
+        "a_1;1_a;-1_a;x-1;x -1;(x)-1;x mod 3;7 in 1 2;(f each x) over y",
+        "d: `a`b!1 2\nd[`c]: 3\nf: {[s;i] $[i<count s; s[i]; \"\"]}\n", "()", ";;", "", "print \"hi\"",
+        "x[1;0]:9; c[1]+:10; do[5;n+:2]; x +\\: y; 2026.09.15+1; 101b", "while[1;break]; do[3;if[x;break]]",
+        "select a, sum b by c, d:e+1 from t where x>1, y<2", "select from t where a>1", "select total: sum b from t", "select sum v by k from t",
+        "{n:1;{x+n}}; {a:1;b:{c:2;{a+c+x}};b[][10]}",
+    ];
+    const COMPILE_CORPUS: &[&str] = &[
+        "x: 1 2 3; 2*x+1", "f:{[a;b] a-b}; f[10;3]", "+/1 2 3 4;+\\x;{x*x}'1 2 3;(+/) 1 2;f/", "$[1<2;`yes;`no];(1;`a;\"s\");$[0;1]",
+        "x[0]:9;n+:1;x,:5;g::7;{5}[];f[;3] 10", ":5;{if[x<0; :`neg]; `pos}[-1]", "if[i<n; v[i]: i*i; i+:1]\n\twhile[0;]",
+        "{x+y*z};{y};{};{[] 1};{{x} each y};{a:1;b:a+x;a[0]:b;g::a;{c:1;a};b}", "x mod 3;(f each x) over y;{x[i]:1}",
+        "fact:{$[x<2;1;x*fact x-1]}", "", ";;", "()",
+        "f:{n:10;{x+n}}; add:{[a] {[b] a+b}}; h:{a:1;b:{c:2;{a+c+x}};b[][10]}; {n:1;g:{n};n:2;g[]}",
+        "x:(1 2;3 4);x[1;0]:9; c[1]+:10; n:0;do[5;n+:2]; 1 2 3 +\\: 10 20; select sum v by k from t where v>1", "n:0;while[1;n+:1;if[n>4;break]];do[3;break]",
+    ];
 
-#[cfg(test)]
-mod boot_compile {
-    use super::*;
-    fn boot_vm() -> vm::Vm {
-        let mut v = vm::Vm::new();
-        for f in BOOT_FILES { v.run(&std::fs::read_to_string(f).unwrap()).unwrap(); }
-        v
+    /// Every corpus through the stage it belongs to, as one value the two generations can be compared on.
+    fn front_end_output(v: &mut vm::Vm) -> Vec<(String, String)> {
+        let mut out = Vec::new();
+        for (stage, corpus) in [("nlex", LEX_CORPUS), ("nparse", PARSE_CORPUS), ("ncompile", COMPILE_CORPUS)] {
+            for src in corpus {
+                v.set("src", value::chars(src.chars().collect()));
+                let got = v.eval(&format!("{stage} src")).map(|r| r.fmt()).unwrap_or_else(|e| format!("'{}", e.0));
+                out.push((format!("{stage} {src:?}"), got));
+            }
+        }
+        out
     }
-    /// boot/compile.nt must emit exactly the Rust compiler's bytecode.
+
+    /// Generation 2: recompile every boot file through the pipeline it defines, then it must lex, parse and
+    /// compile the corpora byte-identically and still run every language case. This is what the Rust oracle
+    /// used to check — a front end that changes its own output when rebuilt by itself now fails here.
     #[test]
-    fn self_hosted_compiler_matches_oracle() {
+    fn front_end_reproduces_itself() {
         let mut v = boot_vm();
-        let corpus = [
-            "x: 1 2 3; 2*x+1", "f:{[a;b] a-b}; f[10;3]", "+/1 2 3 4;+\\x;{x*x}'1 2 3;(+/) 1 2;f/", "$[1<2;`yes;`no];(1;`a;\"s\");$[0;1]",
-            "x[0]:9;n+:1;x,:5;g::7;{5}[];f[;3] 10", ":5;{if[x<0; :`neg]; `pos}[-1]", "if[i<n; v[i]: i*i; i+:1]\n\twhile[0;]",
-            "{x+y*z};{y};{};{[] 1};{{x} each y};{a:1;b:a+x;a[0]:b;g::a;{c:1;a};b}", "x mod 3;(f each x) over y;{x[i]:1}",
-            "fact:{$[x<2;1;x*fact x-1]}", "", ";;", "()",
-            "f:{n:10;{x+n}}; add:{[a] {[b] a+b}}; h:{a:1;b:{c:2;{a+c+x}};b[][10]}; {n:1;g:{n};n:2;g[]}",
-            "x:(1 2;3 4);x[1;0]:9; c[1]+:10; n:0;do[5;n+:2]; 1 2 3 +\\: 10 20; select sum v by k from t where v>1", "n:0;while[1;n+:1;if[n>4;break]];do[3;break]",
-        ];
-        for src in corpus {
-            v.set("src", value::chars(src.chars().collect()));
-            let got = v.run("ncompile src").unwrap_or_else(|e| panic!("{src:?}: '{}", e.0));
-            let want = v.run("compile src").unwrap();
-            assert!(got == want, "{src:?}\n  neant: {}\n  rust:  {}", got.fmt(), want.fmt());
-        }
-    }
-    /// Every language case, run through the self-hosted pipeline (nlex -> nparse -> ncompile -> exec).
-    #[test]
-    fn self_hosted_pipeline_runs_language_cases() {
-        let mut v = boot_vm();
-        let base = v.snapshot();
-        for (src, want) in super::tests::CASES {
-            v.restore(&base);
-            v.set("src", value::chars(src.chars().collect()));
-            let got = v.run("nrun src").map(|v| v.fmt()).unwrap_or_else(|e| format!("'{}", e.0));
-            assert_eq!(got, *want, "source: {src}");
-        }
-    }
-}
+        let gen1 = front_end_output(&mut v);
 
-#[cfg(test)]
-mod boot_fixpoint {
-    use super::*;
-    /// Generation 2: rebuild the boot compiler with itself (nrun over its own sources), then it must still
-    /// match the Rust oracle and still run the language cases. Also times the whole self-hosted rebuild.
-    #[test]
-    fn self_hosted_compiler_rebuilds_itself() {
-        let mut v = vm::Vm::new();
-        let files = BOOT_FILES;
-        for f in files { v.run(&std::fs::read_to_string(f).unwrap()).unwrap(); }
         let t = std::time::Instant::now();
-        for f in files {
-            v.set("src", value::chars(std::fs::read_to_string(f).unwrap().chars().collect()));
-            v.run("nrun src").unwrap_or_else(|e| panic!("{f}: '{}", e.0));   // redefines every boot function via the neant pipeline
+        for f in BOOT_FILES {
+            v.eval(&std::fs::read_to_string(f).unwrap()).unwrap_or_else(|e| panic!("{f}: '{}", e.0));
         }
         let rebuild = t.elapsed();
-        for src in ["x: 1 2 3; 2*x+1", "f:{[a;b] a-b}; f[10;3]", "{a:1;b:a+x;a[0]:b;g::a;{c:1;a};b}", "fact:{$[x<2;1;x*fact x-1]}"] {
-            v.set("src", value::chars(src.chars().collect()));
-            assert!(v.run("ncompile src").unwrap() == v.run("compile src").unwrap(), "gen2 mismatch on {src:?}");
+
+        for ((what, a), (_, b)) in gen1.iter().zip(front_end_output(&mut v)) {
+            assert_eq!(*a, b, "gen2 differs on {what}");
         }
         let base = v.snapshot();
         for (src, want) in super::tests::CASES {
             v.restore(&base);
-            v.set("src", value::chars(src.chars().collect()));
-            let got = v.run("nrun src").map(|v| v.fmt()).unwrap_or_else(|e| format!("'{}", e.0));
-            assert_eq!(got, *want, "gen2 source: {src}");
+            assert_eq!(super::tests::ev(&mut v, src), *want, "gen2 source: {src}");
         }
         assert!(rebuild.as_millis() < 3000, "self-rebuild took {rebuild:?}");
         eprintln!("self-hosted rebuild of boot/*.nt: {rebuild:?}");
+    }
+
+    /// Lexer and parser errors name the stage and the line. These messages are the front end's only
+    /// remaining contract that no other test pins down.
+    #[test]
+    fn front_end_errors_carry_positions() {
+        let mut v = boot_vm();
+        for (src, msg) in [
+            ("1+\"x", "lex: unterminated string at line 1"), ("\"ab\n\nc", "lex: unterminated string at line 1"),
+            ("1+", "parse: incomplete expression at line 1"), ("(1", "parse: missing ) at line 1"),
+            ("x:", "parse: empty assignment at line 1"), ("f[1", "parse: missing ] at line 1"),
+            ("1\n2\n(", "parse: missing ) at line 3"), ("select a", "parse: select needs from at line 1"),
+            ("}", "parse: unexpected } at line 1"), ("(1;2}", "parse: unexpected } at line 1"), ("f[1]]", "parse: unexpected ] at line 1"),
+        ] {
+            v.set("src", value::chars(src.chars().collect()));
+            assert_eq!(super::tests::ev(&mut v, "nparse src"), format!("'{msg}"), "{src:?}");
+        }
     }
 }
 
@@ -471,29 +413,19 @@ mod boot_image {
     use super::*;
     #[test]
     fn image_roundtrip() {
-        let mut v = vm::Vm::new();
-        let x = v.run("(1;2.5;`a;`b`c;\"s\";\"str\";1 2 3;1.5 2.5;1=1 0;(();`k`j!1 2);$[0;0])").unwrap();
+        let mut v = boot_vm();
+        let x = v.eval("(1;2.5;`a;`b`c;\"s\";\"str\";1 2 3;1.5 2.5;1=1 0;(();`k`j!1 2);$[0;0])").unwrap();
         assert!(image::load(&image::dump(&x).unwrap()).unwrap() == x, "{}", x.fmt());
         assert_eq!(image::load(b"").unwrap_err().0, "image: empty");
     }
-    /// boot/boot.nb must be what the current boot sources compile to. If this fails: `neant --build-boot`, rebuild.
+    /// The image must be a fixpoint: compiling the current boot sources with it reproduces it exactly.
+    /// This fails both when boot/*.nt has moved ahead of boot/boot.nb and when a compiler change has only
+    /// been rebuilt once — run `cargo run --release -- --build-boot` (twice, after a compiler change) and rebuild.
     #[test]
     fn embedded_boot_image_is_current() {
         let read = |p: &str| std::fs::read_to_string(p).unwrap();
-        let mut vm = stage0(&read);
+        let mut vm = boot_vm();
         let fresh = build_boot_image(&mut vm, &read).unwrap();
         assert!(fresh == BOOT_IMAGE, "boot/boot.nb is stale ({} vs {} bytes): run `cargo run --release -- --build-boot` and rebuild", BOOT_IMAGE.len(), fresh.len());
-    }
-    /// The embedded image alone (no Rust front end) runs every language case.
-    #[test]
-    fn embedded_boot_image_runs_language_cases() {
-        let mut vm = boot_vm();
-        let nrun = vm.get("nrun").unwrap();
-        let base = vm.snapshot();
-        for (src, want) in super::tests::CASES {
-            vm.restore(&base);
-            let got = vm.call(&nrun, vec![value::chars(src.chars().collect())]).map(|v| v.fmt()).unwrap_or_else(|e| format!("'{}", e.0));
-            assert_eq!(got, *want, "image source: {src}");
-        }
     }
 }

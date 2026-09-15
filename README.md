@@ -29,14 +29,19 @@ counter::0; {counter::counter+1}[]  // :: assigns a global from inside a lambda
 ## Run
 
 ```
-cargo run --release                     # REPL (self-hosted front end from the embedded boot image)
+cargo run --release                     # REPL
 cargo run --release -- file.nt          # run a file
-cargo run --release -- --rust file.nt   # same, through the Rust lexer/parser/compiler (debugging aid)
 cargo test --release
 ```
 
-After editing `boot/*.nt` or the compiler: `cargo run --release -- --build-boot`, then rebuild —
-`cargo test` fails until the embedded `boot/boot.nb` matches the sources again.
+After editing `boot/*.nt`: `cargo run --release -- --build-boot`, then rebuild — `cargo test` fails
+until the embedded `boot/boot.nb` matches the sources again. A change to the *compiler* needs the cycle
+twice: the first pass compiles the new compiler with the old one, the second is the fixpoint the test
+checks for.
+
+The image is the only front end, so it is also the only seed. A `boot/boot.nb` that cannot compile
+`boot/*.nt` can only be rebuilt by a binary that still carries a working one — the last good build, or
+the copy in git.
 
 ## The language
 
@@ -191,12 +196,13 @@ came from.
 
 ### Stage 0 (done)
 
-Lexer, parser, compiler and VM in Rust — `src/{lex,parse,compile,vm,prims,value}.rs`.
+Lexer, parser, compiler and VM in Rust.
 
-### Stage 1 (in progress)
+### Stage 1 (done)
 
-Rewrite lex/parse/compile in neant and run them on this VM, PyPy-style; the Rust VM and primitives
-stay as the runtime.
+lex/parse/compile rewritten in neant and running on that VM, PyPy-style; the Rust VM and primitives
+stay as the runtime. The Rust front end has been deleted — `src/` is `{vm, prims, value, image, main}.rs`,
+and **source never reaches Rust**.
 
 - `boot/lex.nt` — the lexer.
 - `boot/parse.nt` — the parser. Nodes are ``(`kind; ...)`` lists with identifiers as symbols.
@@ -204,20 +210,30 @@ stay as the runtime.
   `(opcodes; args; consts; lines)`, where `lines[i]` is the source line op `i` came from (0 for
   synthetic ops). Consts are tagged ``(`k;v)`` ``(`g;`name)`` ``(`p;"+")`` ``(`a;"/";f)`` ``(`f;code)``.
   `exec` loads and runs it.
+- `nrun src` is the whole pipeline; `load "f.nt"` is `nrun` over a file. The REPL and the file runner
+  are both one `nrun` call.
 
-`--build-boot` serializes that bytecode into `boot/boot.nb` (`src/image.rs`), which is embedded in
-the binary: **the default front end is neant compiled by neant.** Rust is the VM plus primitives,
-and a stage-0 front end kept for building the image and as a test oracle.
+`--build-boot` compiles `boot/*.nt` **with the compiler already in the image** and serializes the
+bytecode into `boot/boot.nb` (`src/image.rs`), embedded in the binary by `include_bytes!`. Rust is the
+VM plus the primitives, and nothing else.
 
 ### What the tests check
 
-- Each stage against its Rust oracle, exposed as the `lex`, `parse` and `compile` builtins: the
-  self-hosted lexer token-for-token, the parser AST-for-AST, the compiler bytecode-for-bytecode,
-  all on the same corpus.
-- `nrun src` is the whole pipeline with no Rust front end. Every language case runs through it.
-- Generation 2: rebuild the boot files with themselves, then check they still match the oracle and
-  still run every language case.
-- That the embedded `boot/boot.nb` is what the current sources compile to.
+There is no external oracle left, so the front end is pinned by fixpoints and by behaviour:
+
+- **Generation 2.** Recompile every boot file through the pipeline it defines, then require it to lex,
+  parse and compile the corpora to byte-identical output and still run every language case. A compiler
+  that does not reproduce its own output when rebuilt by itself fails here — this is what the Rust
+  oracle used to catch.
+- **The image is a fixpoint.** Compiling the current `boot/*.nt` with the embedded image reproduces
+  that image exactly. Catches both a stale `boot.nb` and a compiler change rebuilt only once.
+- **The language cases.** ~250 source/result pairs — semantics, error messages, error line numbers and
+  call stacks — every one through `nrun`.
+- **Front-end errors.** Lexer and parser messages and their line numbers, asserted literally.
+- RFC vectors for the crypto and the TLS key schedule; the record layer round-trips offline.
+
+What this gives up relative to the oracle: a bug that the compiler introduces *and* reproduces
+consistently is no longer caught by construction — it is caught only if a language case exercises it.
 
 ### Performance
 
@@ -243,3 +259,9 @@ target is that allocation: AST nodes and const entries are `Rc<Vec<Value>>` buil
 time. After that, moving more of the VM dispatch into neant-generated specialised code.
 
 For TLS, what is missing is ASN.1 DER, RSA/ECDSA signature verification, and a root store.
+builtin is the prerequisite for the rest meaning anything.
+
+Ed25519 needs one runtime change and no language change: the bit verbs already give exact 64-bit
+unsigned semantics on the `i64` pattern (`shr` is logical, `shl` discards, `+` wraps), so SHA-512 fits
+— except that `1 shl 63` is `0N`, and `+ - *` propagate that as null. A wrapping add alongside
+`band`/`bor`/`bxor`, which ignores null like they do, closes it.

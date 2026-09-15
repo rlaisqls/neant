@@ -449,57 +449,6 @@ fn now(x: Value) -> R<Value> {
     }
 }
 
-/// The Rust parser as neant data: each node is (`kind; ...) with identifiers as symbols. Oracle for boot/parse.nt.
-fn ast_value(a: &crate::parse::Ast) -> Value {
-    use crate::parse::Ast;
-    let s = |n: &str| Symbol(Rc::from(n));
-    let name = |n: &String| Symbol(Rc::from(n.as_str()));
-    let many = |xs: &[Ast]| pack(xs.iter().map(ast_value).collect());
-    pack(match a {
-        Ast::Const(v) => vec![s("const"), v.clone()],
-        Ast::Name(n) => vec![s("name"), name(n)],
-        Ast::Verb(c) => vec![s("verb"), Char(*c)],
-        Ast::Advb(c, x) => vec![s("advb"), Char(*c), ast_value(x)],
-        Ast::Mo(f, x) => vec![s("mo"), ast_value(f), ast_value(x)],
-        Ast::Dy(f, x, y) => vec![s("dy"), ast_value(f), ast_value(x), ast_value(y)],
-        Ast::App(f, x) => vec![s("app"), ast_value(f), ast_value(x)],
-        Ast::Call(f, args) => vec![s("call"), ast_value(f), many(args)],
-        Ast::List(xs) => vec![s("list"), many(xs)],
-        Ast::Assign(n, e) => vec![s("assign"), name(n), ast_value(e)],
-        Ast::GAssign(n, e) => vec![s("gassign"), name(n), ast_value(e)],
-        Ast::IndexAssign(n, i, e) => vec![s("iassign"), name(n), many(i), ast_value(e)],
-        Ast::Do(c, b) => vec![s("do"), ast_value(c), many(b)],
-        Ast::Break => vec![s("break")],
-        Ast::Return(e) => vec![s("return"), ast_value(e)],
-        Ast::Lambda(ps, body) => vec![s("fn"), pack(ps.iter().map(name).collect()), many(body)],
-        Ast::If(c, b) => vec![s("if"), ast_value(c), many(b)],
-        Ast::While(c, b) => vec![s("while"), ast_value(c), many(b)],
-        Ast::Cond(xs) => vec![s("cond"), many(xs)],
-        Ast::Noun(x) => vec![s("noun"), ast_value(x)],
-        Ast::At(l, x) => vec![s("at"), Int(*l as i64), ast_value(x)],
-    })
-}
-fn parse_oracle(x: Value) -> R<Value> {
-    let (t, l) = crate::lex::lex_lines(&text(&x))?;
-    let prog = crate::parse::Parser::with_lines(t, l).program()?;
-    Ok(pack(prog.iter().map(ast_value).collect()))
-}
-
-/// The Rust lexer as neant data: a list of (`kind; value) pairs. Oracle for the self-hosted lexer in boot/lex.nt.
-fn lex_oracle(x: Value) -> R<Value> {
-    use crate::lex::Tok;
-    let sym = |s: &str| Symbol(Rc::from(s));
-    Ok(pack(crate::lex::lex(&text(&x))?.into_iter().map(|t| pack(match t {
-        Tok::Num(v) => vec![sym("num"), v],
-        Tok::Str(s) => vec![sym("str"), chars(s)],
-        Tok::Syms(v) => vec![sym("sym"), v],
-        Tok::Name(n) => vec![sym("name"), chars(n.chars().collect())],
-        Tok::Verb(c) => vec![sym("verb"), Char(c)],
-        Tok::Adv(c) => vec![sym("adv"), Char(c)],
-        Tok::Punct(c) => vec![sym("punct"), Char(c)],
-    })).collect()))
-}
-
 /// `x[i;j]:v`: amend along a path. All but the last index must be atoms.
 pub fn amend_path(x: &mut Value, idx: &[Value], v: Value) -> R<()> {
     if idx.len() == 1 { return amend(x, idx[0].clone(), v); }
@@ -643,7 +592,7 @@ pub static PRIMS: &[PrimDef] = &[
     p!("^", Some(sqrt), Some(pow)),
     p!("$", Some(string), Some(cast)),
 ];
-/// Only what needs Rust: IO, dict internals, transcendental math, VM-dispatched keywords, and the stage-0 oracles.
+/// Only what needs Rust: IO, dict internals, transcendental math, and the VM-dispatched keywords.
 /// Everything expressible with the verbs lives in boot/prelude.nt (sum avg count first in mod vs upper ...).
 pub static BUILTINS: &[PrimDef] = &[
     p!("exp", Some(exp), None), p!("log", Some(log), None), p!("sin", Some(sin), None), p!("cos", Some(cos), None), p!("tan", Some(tan), None), p!("atan", Some(atan), None),
@@ -655,52 +604,13 @@ pub static BUILTINS: &[PrimDef] = &[
     p!("read0", Some(read0), None), p!("write0", None, Some(write0)),
     p!("hopen", Some(hopen), None), p!("hclose", Some(hclose), None), p!("hsend", None, Some(hsend)), p!("hrecv", None, Some(hrecv)),
     p!("each", None, None), p!("over", None, None), p!("scan", None, None),   // adverb keywords, dispatched in the VM
-    p!("lex", Some(lex_oracle), None), p!("parse", Some(parse_oracle), None), p!("compile", Some(compile_oracle), None),
     p!("exec", None, None),   // runs bytecode data; dispatched in the VM
     p!("elast", None, None),  // elast `line / `trace: where the last caught error came from; dispatched in the VM
 ];
-/// Named dyads that parse infix like verbs: `7 mod 3`, `x in y`. Most are prelude lambdas; the parser only needs the names.
-pub const INFIX: &[&str] = &["mod", "div", "xexp", "in", "within", "vs", "sv", "ss", "write0", "each", "over", "scan", "except", "inter", "union", "cross", "fill", "like",
-    "rand", "msum", "mavg", "mmax", "mmin", "ema", "xbar", "bin", "cut", "rotate", "sublist",
-    "band", "bor", "bxor", "shl", "shr"];
-
-pub fn prim(c: char) -> &'static PrimDef { PRIMS.iter().find(|p| p.name.starts_with(c)).expect("known verb") }
-
 // ---- bytecode as data
 // unit  = (opcodes; args; consts; lines)     lambda code = (opcodes; args; consts; lines; params; nlocals)
 // lines[i] is the source line op i came from (0 = synthetic), for runtime error positions.
 // const = (`k;v) literal | (`g;`name) global name | (`p;"+") verb | (`a;"/";const) adverbed | (`f;code) lambda
-fn code_data(ops: &[Op], consts: &[Value], lines: &[u32]) -> Vec<Value> {
-    let mut is_name = vec![false; consts.len()];
-    for op in ops { if let Op::LoadG(a) | Op::StoreG(a) | Op::TakeG(a) = op { is_name[*a as usize] = true; } }
-    let (oc, oa): (Vec<i64>, Vec<i64>) = ops.iter().map(|o| o.encode()).unzip();
-    vec![ints(oc), ints(oa), pack(consts.iter().zip(is_name).map(|(v, n)| const_data(v, n)).collect()),
-         ints(lines.iter().map(|&l| l as i64).collect())]
-}
-fn const_data(v: &Value, is_name: bool) -> Value {
-    let s = |n: &str| Symbol(Rc::from(n));
-    pack(match v {
-        _ if is_name => vec![s("g"), v.clone()],
-        Prim(p) => vec![s("p"), Char(p.name.chars().next().unwrap())],
-        Adv(c, f) => vec![s("a"), Char(*c), const_data(f, false)],
-        Lambda(code) => {
-            let mut d = code_data(&code.ops, &code.consts, &code.lines);
-            d.push(pack(code.params.iter().map(|p| Symbol(Rc::from(p.as_str()))).collect()));
-            d.push(Int(code.nlocals as i64));
-            vec![s("f"), pack(d)]
-        }
-        _ => vec![s("k"), v.clone()],
-    })
-}
-/// The Rust compiler as neant data: one unit per statement. Oracle for boot/compile.nt.
-fn compile_oracle(x: Value) -> R<Value> {
-    let (t, l) = crate::lex::lex_lines(&text(&x))?;
-    let prog = crate::parse::Parser::with_lines(t, l).program()?;
-    Ok(pack(prog.iter().map(|ast| {
-        let (ops, consts, lines) = crate::compile::compile_stmt(ast)?;
-        Ok(pack(code_data(&ops, &consts, &lines)))
-    }).collect::<R<Vec<_>>>()?))
-}
 pub fn load_unit(u: &Value) -> R<(Vec<Op>, Vec<Value>, Vec<u32>)> {
     let (Ints(oc), Ints(oa)) = (u.item(0)?, u.item(1)?) else { return err("load: opcodes and args must be int vectors") };
     if oc.len() != oa.len() { return err("load: opcodes and args differ in length"); }

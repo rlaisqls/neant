@@ -2,7 +2,7 @@
 // unit = (opcodes; args; consts; lines); lambda code = (opcodes; args; consts; lines; params; nlocals)
 // lines[i] is the source line op i came from (0 = synthetic), for runtime error positions.
 // const entries: (`k;v) literal  (`g;`name) global  (`p;"+") verb  (`a;"/";f) adverbed verb  (`f;code) lambda
-// Same output as src/compile.rs, exposed as `compile` (the oracle). State lives in globals updated with ::.
+// State lives in globals updated with :: — cops, cargs, cconsts, clines and the scope stack.
 // A lambda reading an enclosing lambda's local captures it by value (mkclosure); captured slots follow its own locals.
 OPS: `push`loadg`storeg`loadl`storel`monad`dyad`call`mkadv`jmp`jmpf`pop`list`takel`takeg`amend`ret`mkclosure`loop ! til 19
 
@@ -126,7 +126,7 @@ compileFn: {[params;body]
 
 compileStmt: {[ast] cops:: (); cargs:: (); cconsts:: (); clines:: (); cline:: 0; ctop:: 1; cscope:: null; cbase:: 0; ccaps:: (); cparents:: (); cloops:: (); gen ast; (cops; cargs; cconsts; clines)}
 ncompile: {[s] compileStmt each nparse s}
-// error position and call stack of the error @ just caught; must render exactly like Vm::trace_text in src/vm.rs
+// error position and call stack of the error @ just caught; reads the frames the VM recorded via elast
 etext: {[ln]
   tr: elast `trace
   if[0=count tr; :" at line ",string ln]
@@ -135,7 +135,7 @@ etext: {[ln]
   if[1=count tr; :h]
   h,"\n","\n" sv {"  ",$[isnull x[0]; ""; "in ",(string x[0])," "],"at line ",string x[1]} each tr}
 
-// the whole pipeline without the Rust front end: source -> tokens -> AST -> bytecode -> result
+// the whole pipeline: source -> tokens -> AST -> bytecode -> result. The REPL and `load` are both this.
 nrun: {[s]
   a: nparse s; multi: $[count plines; 1<last plines; 0]   // one-liners (the REPL) get no "at line 1" noise
   r: null; i: 0

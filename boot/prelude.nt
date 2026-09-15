@@ -1,4 +1,4 @@
-// neant standard library, in neant. Loaded first, before the boot compiler (and by --rust).
+// neant standard library, in neant. First unit in the boot image, loaded before the compiler.
 // A name bound to a verb gets both valences, like q's first = *:  — count[1;2] is 1 2 take.
 null: $[0;0]
 count: #

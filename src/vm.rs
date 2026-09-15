@@ -1,7 +1,5 @@
 //! Stack VM. Adverbs live here because they call back into user functions.
-use crate::compile::compile_stmt;
-use crate::lex::lex_lines;
-use crate::parse::{Ast, Parser};
+//! There is no front end here: source becomes bytecode in boot/{lex,parse,compile}.nt, which run on this VM.
 use crate::prims::{amend_path, fold_fast, index_at, load_unit, scan_fast, BUILTINS};
 use crate::value::*;
 use std::collections::HashMap;
@@ -24,9 +22,6 @@ fn int_dyad(name: &str, a: i64, b: i64) -> Option<Value> {
         _ => return None,
     })
 }
-
-/// The statement inside its line tag.
-fn stmt_of(a: &Ast) -> &Ast { match a { Ast::At(_, x) => stmt_of(x), _ => a } }
 
 /// One call-stack frame of an error: the function's name (None when it is not a plain global call) and
 /// the source line it was on. A frame is named by its *caller*, which knows the global it loaded to call it.
@@ -76,24 +71,11 @@ impl Vm {
         match c { Int(s) => *s as usize, Symbol(n) => self.slot(n) as usize, _ => unreachable!() }
     }
 
-    /// Run a program; value of the last statement (assignments yield Null so the REPL stays quiet).
-    pub fn run(&mut self, src: &str) -> R<Value> {
-        let mut last = Null;
-        let (toks, lines) = lex_lines(src)?;
-        let multi = lines.last().is_some_and(|&l| l > 1);   // one-liners (the REPL) get no "at line 1" noise
-        let mut p = Parser::with_lines(toks, lines);
-        let asts = p.program()?;
-        for (i, ast) in asts.iter().enumerate() {
-            let (ops, mut k, lines) = compile_stmt(ast)?;
-            self.intern(&ops, &mut k);
-            self.trace.clear();
-            let v = match self.execute(&ops, &k, &lines, &mut Vec::new()) {
-                Ok(v) => v,
-                Err(e) => return Err(if multi { NError(format!("{}{}", e.0, self.trace_text(p.stmt_lines()[i]))) } else { e }),
-            };
-            last = if matches!(stmt_of(ast), Ast::Assign(..) | Ast::GAssign(..) | Ast::IndexAssign(..)) { Null } else { v };
-        }
-        Ok(last)
+    /// Run source through the self-hosted front end: `nrun` from the boot image (boot/compile.nt).
+    /// Value of the last statement; a trailing assignment yields Null so the REPL stays quiet.
+    pub fn eval(&mut self, src: &str) -> R<Value> {
+        let f = self.get("nrun").ok_or_else(|| NError("nrun: no boot image loaded".into()))?;
+        self.call(&f, vec![chars(src.chars().collect())])
     }
 
     /// Run a frame; on error record the line the failing op came from, so the trace grows innermost-first.
@@ -111,18 +93,6 @@ impl Vm {
             self.trace.push((None, lines.get(at).copied().unwrap_or(0)));
         }
         r
-    }
-
-    /// `msg` position and call stack: the innermost line, then one indented frame per level outwards.
-    /// boot/compile.nt's `etext` must render this identically for the self-hosted front end.
-    fn trace_text(&self, fallback: u32) -> String {
-        let Some(&(_, top)) = self.trace.first() else { return format!(" at line {fallback}") };
-        let head = format!(" at line {}", if top > 0 { top } else { fallback });
-        if self.trace.len() == 1 { return head; }
-        let frames: Vec<String> = self.trace.iter()
-            .map(|(n, l)| match n { Some(n) => format!("  in {n} at line {l}"), None => format!("  at line {l}") })
-            .collect();
-        format!("{head}\n{}", frames.join("\n"))
     }
 
     fn run_ops(&mut self, ops: &[Op], k: &[Value], loc: &mut Vec<Value>, ipc: &mut usize) -> R<Value> {

@@ -1,5 +1,5 @@
-// neant parser, in neant. Consumes nlex tokens (boot/lex.nt); produces the same AST as src/parse.rs,
-// which is exposed as `parse` and used as the oracle. Nodes are (`kind; ...) lists, identifiers are symbols:
+// neant parser, in neant. Consumes nlex tokens (boot/lex.nt) and produces the AST the compiler walks.
+// Nodes are (`kind; ...) lists, identifiers are symbols:
 //   (`const;v) (`name;`x) (`verb;"+") (`advb;"/";f) (`mo;f;x) (`dy;f;x;y) (`app;f;x) (`call;f;args) (`list;items)
 //   (`assign;`x;e) (`gassign;`x;e) (`iassign;`x;idxs;e) (`return;e) (`fn;params;body) (`if;c;body) (`while;c;body)
 //   (`do;n;body) (`cond;args) (`noun;e) (`at;line;stmt)
@@ -184,7 +184,7 @@ usesXYZ: {[a]
   if[k in `call`if`while`do; :max (usesXYZ a[1]), usesXYZ each a[2]]
   0}
 
-// errors carry the line of the token being looked at, like the Rust parser
+// errors carry the line of the token being looked at
 nparse: {[s]
   pt:: nlex s; pi:: 0; slines:: ()
   @[{stmts["\0";1]}; 0; {$[count plines; signal x," at line ",string plines[pi & -1+count plines]; signal x]}]}

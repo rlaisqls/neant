@@ -1,4 +1,4 @@
-// neant lexer, in neant. Same token stream as src/lex.rs, which is exposed as `lex` and used as the oracle.
+// neant lexer, in neant. Tokens are (`kind; value) pairs; nlex is the parser's only input.
 // Token: (`kind; value). kinds: num str sym name verb adv punct. Newline and ; both lex as punct ";".
 // Literals: 1 2 3 vectors, 101b bools, 0N 0W 0n 0w null/infinity, 2026.09.15 dates, 12:30:00 times.
 // Adverbs \: and /: are one token each, spelled "L" and "R". nlex also sets plines: the line each token starts on.

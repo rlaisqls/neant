@@ -21,17 +21,8 @@ pub enum Op {
 }
 
 impl Op {
-    /// Bytecode-as-data form: (opcode; arg). Shared by the `compile` oracle, the loader, and boot/compile.nt's OPS table.
-    pub fn encode(self) -> (i64, i64) {
-        match self {
-            Op::Push(a) => (0, a as i64), Op::LoadG(a) => (1, a as i64), Op::StoreG(a) => (2, a as i64),
-            Op::LoadL(a) => (3, a as i64), Op::StoreL(a) => (4, a as i64), Op::Monad(a) => (5, a as i64),
-            Op::Dyad(a) => (6, a as i64), Op::Call(a) => (7, a as i64), Op::MkAdv(c) => (8, c as i64),
-            Op::Jmp(a) => (9, a as i64), Op::Jmpf(a) => (10, a as i64), Op::Pop => (11, 0), Op::List(a) => (12, a as i64),
-            Op::TakeL(a) => (13, a as i64), Op::TakeG(a) => (14, a as i64), Op::Amend(a) => (15, a as i64), Op::Ret => (16, 0),
-            Op::MkClosure(a) => (17, a as i64), Op::Loop(a) => (18, a as i64),
-        }
-    }
+    /// Bytecode-as-data form: (opcode; arg). This numbering is the loader's contract with
+    /// boot/compile.nt's OPS table — the compiler emits these ints, `load_unit` turns them back into ops.
     pub fn decode(o: i64, a: i64) -> R<Op> {
         let u = a as u32;
         Ok(match o {
