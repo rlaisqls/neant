@@ -4,7 +4,7 @@
 //   (`assign;`x;e) (`gassign;`x;e) (`iassign;`x;idxs;e) (`return;e) (`fn;params;body) (`if;c;body) (`while;c;body)
 //   (`do;n;body) (`cond;args) (`noun;e) (`at;line;stmt)
 // Parser state is two globals: pt (tokens) and pi (position), updated with ::.
-INFIX: `mod`div`xexp`in`within`vs`sv`ss`write0`each`over`scan`except`inter`union`cross`fill`like`rand`msum`mavg`mmax`mmin`ema`xbar`bin`cut`rotate`sublist`band`bor`bxor`shl`shr
+INFIX: `mod`div`xexp`in`within`vs`sv`ss`write0`each`over`scan`except`inter`union`cross`fill`like`rand`msum`mavg`mmax`mmin`ema`xbar`bin`cut`rotate`sublist`badd`band`bor`bxor`shl`shr
 SELKW: ("by";"from";"where")
 
 peek: {[k] $[(pi+k)<count pt; pt[pi+k]; (`eof;" ")]}

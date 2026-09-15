@@ -93,7 +93,7 @@ Only what needs the host; everything expressible with the verbs lives in the pre
 |---|---|
 | Math | `exp log sin cos tan atan` |
 | Random | `rand rseed` — `n rand m` draws n from `[0;m)` or from the list m, `rseed 7` makes a run reproducible |
-| Bits | `band bor bxor shl shr bnot` |
+| Bits | `badd band bor bxor shl shr bnot` — on the raw 64-bit pattern; `badd` is `+` without the int-null case, for u64 words |
 | Dicts | `key value group` |
 | Values | `isnull now` |
 | Output | `show print signal exit` |

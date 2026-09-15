@@ -562,11 +562,15 @@ fn bitop(x: Value, y: Value, f: fn(u64, u64) -> u64) -> R<Value> {
     Ok(if by { match r { Out::A(v) => Byte(v as u8), Out::V(v) => bytes(v.iter().map(|&i| i as u8).collect()) } } else { oi(r) })
 }
 // named so the VM can reach the same function for two int atoms (PrimDef::ib) as bitop does for vectors
+pub fn ib_add(a: u64, b: u64) -> u64 { a.wrapping_add(b) }
 pub fn ib_and(a: u64, b: u64) -> u64 { a & b }
 pub fn ib_or(a: u64, b: u64) -> u64 { a | b }
 pub fn ib_xor(a: u64, b: u64) -> u64 { a ^ b }
 pub fn ib_shl(a: u64, n: u64) -> u64 { a.checked_shl(n as u32).unwrap_or(0) }
 pub fn ib_shr(a: u64, n: u64) -> u64 { a.checked_shr(n as u32).unwrap_or(0) }
+/// `+` on raw 64-bit patterns: no int-null special case, so a word may be any bit pattern —
+/// what SHA-512 and anything else working in u64 needs, since `1 shl 63` is 0N to `+ - *`.
+fn badd(x: Value, y: Value) -> R<Value> { bitop(x, y, ib_add) }
 fn band(x: Value, y: Value) -> R<Value> { bitop(x, y, ib_and) }
 fn bor(x: Value, y: Value) -> R<Value> { bitop(x, y, ib_or) }
 fn bxor(x: Value, y: Value) -> R<Value> { bitop(x, y, ib_xor) }
@@ -658,7 +662,7 @@ pub static PRIMS: &[PrimDef] = &[
 pub static BUILTINS: &[PrimDef] = &[
     p!("exp", Some(exp), None), p!("log", Some(log), None), p!("sin", Some(sin), None), p!("cos", Some(cos), None), p!("tan", Some(tan), None), p!("atan", Some(atan), None),
     p!("rand", Some(rand1), Some(rand2)), p!("rseed", Some(rseed), None),
-    p!("band", None, Some(band), ib_and), p!("bor", None, Some(bor), ib_or), p!("bxor", None, Some(bxor), ib_xor),
+    p!("badd", None, Some(badd), ib_add), p!("band", None, Some(band), ib_and), p!("bor", None, Some(bor), ib_or), p!("bxor", None, Some(bxor), ib_xor),
     p!("shl", None, Some(shl), ib_shl), p!("shr", None, Some(shr), ib_shr), p!("bnot", Some(bnot), None),
     p!("key", Some(key), None), p!("value", Some(value), None), p!("group", Some(group), None),
     p!("isnull", Some(isnull), None), p!("now", Some(now), None),
