@@ -49,6 +49,10 @@ mod arm64 {
         len: usize,
         arity: usize,
         nlocals: usize,
+        /// Param/capture slots `src/neant/jit/arm64.nt`'s `jitClassifySlots` proved are only ever
+        /// read via `x[i]` or written via `x[i]:v` — see `try_run`/`try_run_raw` below for how
+        /// these get a vector pointer instead of a plain int at entry.
+        vec_slots: Vec<usize>,
         entry: unsafe extern "C" fn(*mut i64, *mut i64, *mut Vm) -> i64,
     }
     unsafe impl Send for Compiled {}
@@ -74,23 +78,41 @@ mod arm64 {
     /// at all; `jit_call` (the recursive-call path) runs this once per call, so this is the
     /// difference between "a loop iteration's cost" and "a loop iteration's cost plus a malloc".
     const MAX_SLOTS: usize = 64;
+    /// A vector-classified local's slot in `buf` holds a pointer into this side table instead of
+    /// a plain int (see `try_run`/`try_run_raw`) — capped separately from `MAX_SLOTS` since real
+    /// functions have at most a couple of vector params/captures, never dozens.
+    const MAX_VEC_SLOTS: usize = 8;
 
     impl Compiled {
-        /// `None` means the entry guard failed (some arg/capture isn't a plain non-null int), the
-        /// compiled body deopted partway through, or there were more locals/captures than
-        /// `MAX_SLOTS` (generous for anything realistic) — all of which just mean "run the
+        /// `None` means the entry guard failed (some arg/capture isn't the type its slot was
+        /// classified as — plain non-null int, or `Ints` for a `vec_slots` entry), the compiled
+        /// body deopted partway through, or there were more locals/captures than `MAX_SLOTS`/
+        /// `MAX_VEC_SLOTS` (generous for anything realistic) — all of which just mean "run the
         /// interpreter instead". Nothing observable has happened yet *by this function*:
         /// everything it calls is independently proven pure the same way (see the module doc
         /// comment), so re-running from scratch is always safe.
         pub fn try_run(&self, loc: &[Value], vm: &mut Vm) -> Option<Value> {
-            if loc.len() > MAX_SLOTS { return None; }
-            // args (0..arity) and captures (nlocals..) must already be plain, non-null ints; the
-            // slots in between are the interpreter's own Null-until-first-StoreL scratch locals,
-            // which the compilability check guarantees are always written before they're read.
+            if loc.len() > MAX_SLOTS || self.vec_slots.len() > MAX_VEC_SLOTS { return None; }
+            // args (0..arity) and captures (nlocals..) must already be the right type; the slots
+            // in between are the interpreter's own Null-until-first-StoreL scratch locals, which
+            // the compilability check guarantees are always written before they're read (and,
+            // separately, never classified as vector slots — see jitClassifySlots's own comment).
             let mut buf = [0i64; MAX_SLOTS];
+            // Cloned (Arc bump) `Ints` values a vector-classified slot's pointer aims at, kept
+            // alive here for exactly as long as `buf`'s pointers into it need to be — this same
+            // stack frame, for the whole duration of `run` below.
+            let mut vecbuf: [Value; MAX_VEC_SLOTS] = std::array::from_fn(|_| Value::Null);
+            let mut vk = 0usize;
             for (i, v) in loc.iter().enumerate() {
                 if i < self.arity || i >= self.nlocals {
-                    match v { Value::Int(n) if *n != crate::value::NI => buf[i] = *n, _ => return None }
+                    if self.vec_slots.contains(&i) {
+                        let Value::Ints(_) = v else { return None };
+                        vecbuf[vk] = v.clone();
+                        buf[i] = &mut vecbuf[vk] as *mut Value as i64;
+                        vk += 1;
+                    } else {
+                        match v { Value::Int(n) if *n != crate::value::NI => buf[i] = *n, _ => return None }
+                    }
                 }
             }
             self.run(buf.as_mut_ptr(), vm).map(Value::Int)
@@ -99,15 +121,33 @@ mod arm64 {
         /// ints (they came from another compiled function's own int-typed registers, per the same
         /// invariant that makes any of this sound), so this skips `try_run`'s general `Value`
         /// boxing/unboxing and the heap allocation a `Vec` would otherwise need — the args and the
-        /// captures it still has to validate go straight into a stack buffer.
+        /// captures it still has to validate go straight into a stack buffer. A callee whose own
+        /// *parameter* is vector-classified can't be entered this way at all — `jit_call` only
+        /// ever has plain ints for `arg0`/`arg1`, never a vector pointer to hand over, since this
+        /// slot's classification is a fact about the callee's own body, invisible to whichever
+        /// other compiled function is calling it — so that one call just deopts instead, same as
+        /// any other guarded point. Captures, unlike args, are real `Value`s here (from the
+        /// callee's own closure) and get the same vector-slot treatment `try_run` gives them.
         fn try_run_raw(&self, argc: usize, arg0: i64, arg1: i64, caps: &[Value], vm: &mut Vm) -> Option<i64> {
             let total = self.nlocals.max(self.arity) + caps.len();
-            if total > MAX_SLOTS { return None; }
+            if total > MAX_SLOTS || self.vec_slots.len() > MAX_VEC_SLOTS { return None; }
+            if self.vec_slots.iter().any(|&s| s < argc) { return None; }
             let mut buf = [0i64; MAX_SLOTS];
+            let mut vecbuf: [Value; MAX_VEC_SLOTS] = std::array::from_fn(|_| Value::Null);
+            let mut vk = 0usize;
             if argc >= 1 { buf[0] = arg0; }
             if argc >= 2 { buf[1] = arg1; }
+            let capbase = self.nlocals.max(self.arity);
             for (i, v) in caps.iter().enumerate() {
-                match v { Value::Int(n) if *n != crate::value::NI => buf[self.nlocals.max(self.arity) + i] = *n, _ => return None }
+                let slot = capbase + i;
+                if self.vec_slots.contains(&slot) {
+                    let Value::Ints(_) = v else { return None };
+                    vecbuf[vk] = v.clone();
+                    buf[slot] = &mut vecbuf[vk] as *mut Value as i64;
+                    vk += 1;
+                } else {
+                    match v { Value::Int(n) if *n != crate::value::NI => buf[slot] = *n, _ => return None }
+                }
             }
             self.run(buf.as_mut_ptr(), vm)
         }
@@ -156,6 +196,32 @@ mod arm64 {
         }
     }
 
+    /// `x[i]` from compiled code (`jitOpVecGet`, `src/neant/jit/arm64.nt`): `vp` is a pointer into
+    /// the `vecbuf` side table `try_run`/`try_run_raw` populated at entry, live for the whole
+    /// compiled call. All `Arc`/COW handling stays here in Rust rather than being inlined as
+    /// hand-rolled AArch64 pointer arithmetic — see README "Stage 2" for why. Bounds-checked; out
+    /// of range, or (shouldn't happen given the entry guard, but checked anyway) not actually
+    /// `Ints`, both deopt like any other guarded point in a compiled function.
+    unsafe extern "C" fn jit_vec_get(vp: *mut Value, idx: i64, ok: *mut i64) -> i64 {
+        let v = unsafe { &*vp };
+        let Value::Ints(items) = v else { unsafe { *ok = 0 }; return 0 };
+        if idx < 0 || idx as usize >= items.len() { unsafe { *ok = 0 }; return 0 }
+        unsafe { *ok = 1 };
+        items[idx as usize]
+    }
+
+    /// `x[i]:v` from compiled code (`jitOpVecSet`): the same copy-on-write discipline the
+    /// interpreter's own `Op::Amend`/`scatter` (`src/prims.rs`) use — `Arc::make_mut` clones only
+    /// if this vector isn't uniquely owned, so a second live reference to the same vector never
+    /// observes the write.
+    unsafe extern "C" fn jit_vec_set(vp: *mut Value, idx: i64, val: i64, ok: *mut i64) {
+        let v = unsafe { &mut *vp };
+        let Value::Ints(items) = v else { unsafe { *ok = 0 }; return };
+        if idx < 0 || idx as usize >= items.len() { unsafe { *ok = 0 }; return }
+        Arc::make_mut(items)[idx as usize] = val;
+        unsafe { *ok = 1 };
+    }
+
     thread_local! { static COMPILING: std::cell::Cell<u32> = const { std::cell::Cell::new(0) }; }
     /// True while a `jitCompile` call is already on the Rust stack (see `compile` below) — checked
     /// by `FnCode::jit_now` (src/value.rs) before it will even attempt a new one.
@@ -164,8 +230,12 @@ mod arm64 {
     pub fn compile(code: &Arc<FnCode>, vm: &mut Vm) -> Option<super::Compiled> {
         let f = vm.get("jitCompile")?;
         // neant has no way to take a Rust function's address itself — hand it over explicitly, the
-        // same value the old Rust encoder used to compute inline (`jit_call as *const () as i64`).
-        let trampoline = Value::Int(jit_call as *const () as i64);
+        // same way the old Rust encoder used to compute `jit_call`'s address inline.
+        let trampolines = Value::List(Arc::new(vec![
+            Value::Int(jit_call as *const () as i64),
+            Value::Int(jit_vec_get as *const () as i64),
+            Value::Int(jit_vec_set as *const () as i64),
+        ]));
         // `jitCompile` and its own helpers (jitOpDyad, ...) are neant functions too, and their own
         // bytecode contains the very op kinds they exist to handle — a Dyad inside `jitOpDyad`'s own
         // body, for instance. So compiling *any* of them, once its own call count crosses the
@@ -175,16 +245,26 @@ mod arm64 {
         // would recurse: the JIT's own implementation is never a JIT target, full stop — it only
         // ever affects how long one-time compilation takes, never a compiled function's own speed.
         COMPILING.with(|c| c.set(c.get() + 1));
-        let result = vm.call(&f, vec![code.jit_input(), trampoline]);
+        let result = vm.call(&f, vec![code.jit_input(), trampolines]);
         COMPILING.with(|c| c.set(c.get() - 1));
-        let bytes = match result {
-            Ok(Value::Bytes(b)) => b,
+        // Success is `(bytes; vecSlots)` — the classified param/capture slots (`jitClassifySlots`)
+        // ride along so the entry guard below knows which ones need `Ints`, not a plain int.
+        let (bytes, vec_slots) = match result {
+            Ok(Value::List(items)) if items.len() == 2 => {
+                let bytes = match &items[0] { Value::Bytes(b) => b.clone(), _ => return None };
+                let vec_slots: Vec<usize> = match &items[1] {
+                    Value::Ints(v) => v.iter().map(|&n| n as usize).collect(),
+                    _ => return None,
+                };
+                (bytes, vec_slots)
+            }
             _ => return None, // Null (not compilable) or a runtime error in the codegen itself
         };
-        emit(&bytes, code.params.len(), code.nlocals)
+        emit(&bytes, code.params.len(), code.nlocals, vec_slots)
     }
 
-    fn emit(bytes: &[u8], arity: usize, nlocals: usize) -> Option<super::Compiled> {
+    fn emit(bytes: &[u8], arity: usize, nlocals: usize, vec_slots: Vec<usize>) -> Option<super::Compiled> {
+        if vec_slots.len() > MAX_VEC_SLOTS { return None; }
         let page = 4096usize;
         let len = bytes.len().div_ceil(page) * page;
         unsafe {
@@ -194,7 +274,7 @@ mod arm64 {
             if mprotect(mem, len, PROT_READ | PROT_EXEC) != 0 { munmap(mem, len); return None; }
             __clear_cache(mem as *mut std::ffi::c_char, (mem as *mut u8).add(len) as *mut std::ffi::c_char);
             let entry: unsafe extern "C" fn(*mut i64, *mut i64, *mut Vm) -> i64 = std::mem::transmute(mem);
-            Some(super::Compiled { mem: mem as *mut u8, len, arity, nlocals, entry })
+            Some(super::Compiled { mem: mem as *mut u8, len, arity, nlocals, vec_slots, entry })
         }
     }
 }

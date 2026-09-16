@@ -367,6 +367,35 @@ the loop case since a call still costs more than a loop iteration even with the 
 allocation gone (marshalling arguments, the depth guard, resolving the callee), just far less than
 before.
 
+**Vector indexing inside a compiled loop.** `x[i]` and `x[i]:v` on an `Ints` **parameter or
+capture** (not a scratch local — nothing in the compilable subset can construct a fresh vector
+value, so only a param/capture is ever actually populated with one at entry) are compilable too,
+for a scalar int index. `x[i]` compiles through the same `Op::Call` a plain application (`f x`)
+does — this language has no dedicated indexing opcode, a vector applied to an int just *is*
+indexing (`src/neant/core/compile.nt`'s `app` node) — so `jitClassifySlots`
+(`src/neant/jit/arm64.nt`) walks the bytecode once up front and accepts a param/capture slot only
+if *every* appearance of it is one of exactly two shapes: `LoadL(s)` immediately consumed by
+`Call(1)` (a read), or the literal 3-op run `TakeL(s); Amend(1); StoreL(s)` `iassign` always emits
+back to back (a write). Any other appearance — an ordinary arithmetic read, a bare return of the
+vector itself, anything mixing the two — disqualifies that slot and, same as any other unsupported
+pattern, just falls back to the interpreter for the whole function; there's no partial/mixed
+typing.
+
+Unlike everything above, a vector access doesn't get inlined machine code — it calls out to a
+small fixed trampoline (`jit_vec_get`/`jit_vec_set`, `src/jit.rs`), the same shape as `jit_call`.
+That's deliberate: a write needs the exact copy-on-write discipline `Op::Amend`/`scatter`
+(`src/prims.rs`) already use — `Arc::make_mut`, cloning only if the vector isn't uniquely owned, so
+a second live reference never observes the write — and re-implementing that as hand-rolled AArch64
+pointer arithmetic against `Arc`'s internal layout would trade a real safety property for a
+memory-layout assumption this project has no reason to make. At entry, a classified slot's param/
+capture value must be `Ints` (else, same as a non-int plain arg, the whole call just doesn't run
+compiled), a clone of it lives in a small side table (`vecbuf`, `try_run`/`try_run_raw`) for the
+duration of the call, and that slot's register holds a pointer into it instead of a plain int — the
+trampolines bounds-check and deopt exactly like every other guarded point. Measured: **~64x**
+(`jit_tests::manual_vector_perf_measurement`) — in the same range as the plain scalar loop, since
+the cost this removes (interpreter dispatch, `Value` boxing per element) dominates over the one
+`bl` per access that's still there.
+
 ### What the tests check
 
 There is no external oracle left, so the front end is pinned by fixpoints and by behaviour:

@@ -397,6 +397,82 @@ mod jit_tests {
         for _ in 0..100 { last = tests::ev(&mut compiled, "p 3"); }
         assert_eq!(last, want);
     }
+
+    /// `x[i]` on a vector *parameter* is the one pattern `src/neant/jit/arm64.nt`'s
+    /// `jitClassifySlots` recognizes as compilable (see README "Stage 2") — a `LoadL` immediately
+    /// consumed by `Call(1)`, the same shape `x[i]` and plain application (`f x`) both compile to.
+    #[test]
+    fn vector_index_read_compiled_and_interpreted_agree() {
+        let mut v = boot_vm();
+        let got = v.eval(
+            "f: {[x;n] s:0; i:0; while[i<n; s: s+x[i]; i: i+1]; s}; \
+             r: (); i: 0; while[i<100; r,: f[1 2 3 4 5 6 7 8 9 10; 10]; i+:1]; \
+             distinct r",
+        ).unwrap();
+        assert_eq!(got.fmt(), ",55");
+    }
+
+    /// `x[i]:v` on a vector parameter — `TakeL;Amend;StoreL`, always emitted back to back for a
+    /// single-index amend. Returns `x[n-1]` (a scalar), not `x` itself: nothing in this scheme can
+    /// return a vector — see `jitOpVecSet`'s doc comment on why that's fine, the write only needs
+    /// to be visible to *later reads within the same compiled call*, exactly like this one.
+    #[test]
+    fn vector_index_write_compiled_and_interpreted_agree() {
+        let mut v = boot_vm();
+        let got = v.eval(
+            "f: {[x;n] i:0; while[i<n; x[i]: x[i]*2; i: i+1]; x[n-1]}; \
+             r: (); i: 0; while[i<100; r,: f[1 2 3 4 5; 5]; i+:1]; \
+             distinct r",
+        ).unwrap();
+        assert_eq!(got.fmt(), ",10");
+    }
+
+    /// An out-of-range index is a bounds check inside `jit_vec_get`/`jit_vec_set` (src/jit.rs),
+    /// not something the codegen can prove away at compile time — same deopt convention as every
+    /// other guarded point: bail to the interpreter, which reports it as a real error.
+    #[test]
+    fn vector_index_out_of_range_deopts_instead_of_diverging() {
+        let mut interpreted = boot_vm();
+        let want = tests::ev(&mut interpreted, "f: {[x;n] x[n]}; f[1 2 3; 3]");
+        let mut compiled = boot_vm();
+        compiled.eval("f: {[x;n] x[n]}").unwrap();
+        let mut last = String::new();
+        for _ in 0..100 { last = tests::ev(&mut compiled, "f[1 2 3; 3]"); }
+        assert_eq!(last, want);
+    }
+
+    /// The one thing that would be silently *wrong*, not loud, if `jit_vec_set` (src/jit.rs) ever
+    /// skipped its `Arc::make_mut` check: a second live binding to the same vector observing a
+    /// write it never asked for. `try_run`'s own clone into `vecbuf` guarantees the refcount is
+    /// already >1 by the time any write happens, so this is exercised on every single call, not
+    /// just this test — but this is the one that would actually catch a broken check, the same
+    /// role `impure_callee_never_fires_its_side_effect_twice` plays for the call path.
+    #[test]
+    fn vector_write_never_corrupts_a_live_second_reference() {
+        let mut v = boot_vm();
+        v.eval("f: {[x;n] i:0; while[i<n; x[i]: x[i]*2; i: i+1]; x[0]}").unwrap();
+        for _ in 0..70 { v.eval("f[1 2 3; 3]").unwrap(); } // cross the tier-up threshold
+        assert_eq!(
+            tests::ev(&mut v, "orig: 1 2 3; also: orig; r: f[orig;3]; (r; orig; also)"),
+            "(2;1 2 3;1 2 3)",
+        );
+    }
+
+    #[test]
+    #[ignore]
+    fn manual_vector_perf_measurement() {
+        let mut v = boot_vm();
+        v.eval("f: {[x;y;n] s:0; i:0; while[i<n; s: s+x[i]*y[i]; i: i+1]; s}").unwrap();
+        v.eval("xs: til 1000000; ys: til 1000000").unwrap();
+        let t0 = std::time::Instant::now();
+        v.eval("f[xs;ys;1000000]").unwrap();
+        let cold = t0.elapsed();
+        for _ in 0..70 { v.eval("f[1 2 3 4 5;1 2 3 4 5;5]").unwrap(); } // cross the tier-up threshold
+        let t1 = std::time::Instant::now();
+        v.eval("f[xs;ys;1000000]").unwrap();
+        let hot = t1.elapsed();
+        println!("interpreted {cold:?}  compiled {hot:?}  ratio {:.1}x", cold.as_secs_f64() / hot.as_secs_f64());
+    }
 }
 
 /// `spawn`/`join`/`shared`/`supd`: real OS threads over Arc-refcounted, copy-on-write values.

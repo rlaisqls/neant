@@ -2,10 +2,12 @@
 // Always loaded (part of the boot image) so the JIT can call `jitCompile` on any hot function, but
 // nothing here is meant to be called directly from ordinary scripts.
 //
-// jitCompile[input;trampoline] -> Bytes (machine code) or null (not compilable).
+// jitCompile[input;trampolines] -> (Bytes; Ints) (machine code, classified vector param/capture
+// slots) or null (not compilable).
 // input = (opcodes:Ints; args:Ints; consts:List; arity:Int; nlocals:Int) — FnCode::jit_input, src/value.rs.
-// trampoline = the address of src/jit.rs's `jit_call`, as an int (neant has no way to take a Rust
-// function's address itself, so Rust hands it over).
+// trampolines = (call;vecget;vecset), the addresses of src/jit.rs's `jit_call`/`jit_vec_get`/
+// `jit_vec_set`, as ints (neant has no way to take a Rust function's address itself, so Rust hands
+// them over).
 
 // ---- little-endian byte packing: a 32-bit "word" (built via bor/shl on a plain int) -> 4 bytes.
 // A literal like 0xA9800000 (or 0xffff, or 0x07FFFF) is hex-*byte* digits, i.e. a Bytes vector, not
@@ -91,6 +93,44 @@ jitDyadKind: {[name]
   ks: "+-*&|<>="
   i: ks ss name
   $[0=count i; null; first i]}
+
+// A local slot is `intvec`-eligible only if *every* appearance of it is one of two exact shapes:
+// `x[i]` read — `LoadL(s)` immediately consumed by `Call(1)` (`app` in compile.nt: `gen index; gen
+// x; emit call 1` — a vector applied as its own indexing function, no dedicated opcode) — or
+// `x[i]:v` write — the literal 3-op run `TakeL(s); Amend(1); StoreL(s)` `iassign` always emits back
+// to back (value and index are generated *before* this triple, not inside it). Any other
+// appearance of `s` (an ordinary arithmetic LoadL, a StoreL that isn't the tail of that triple, a
+// TakeL used for `x,: y` instead) disqualifies it — mixed typing isn't supported, the whole
+// function just doesn't get this local's accesses fused and falls through to the ordinary (and
+// here, rejecting) op handling for it. Restricted to slots `<arity` or `>=nlocals` (params/
+// captures) even when a scratch local matches the shape: nothing in the compilable op subset can
+// construct a fresh vector value (no arbitrary `LoadG`, no `List`), so only a param/capture is ever
+// actually populated with one at entry (`Compiled::try_run`, src/jit.rs) — a scratch local has
+// nothing valid written into its slot for this scheme to read as a pointer.
+jitClassifySlots: {[opcodes;opargs;n;arity;nlocals]
+  readSlots: (); writeSlots: (); intUseSlots: ()
+  i: 0
+  while[i<n
+    op: opcodes[i]; a: opargs[i]
+    // `&` is eager (no short-circuit): `opcodes[i+1]` can't sit alongside `(i+1)<n` in one, or it
+    // reads out of range whenever the bounds check is what makes it false — same trap as
+    // `isStoreHead` below, fixed the same way (a real branch around the bounds-dependent part).
+    // And `(i+1)<n`, not `i+1<n` — no operator precedence here, `i+1<n` groups as `i+(1<n)`.
+    isReadHead: $[(op=3) & ((i+1)<n); (opcodes[i+1]=7) & ((opargs[i+1])=1); 0b]
+    isWriteHead: $[(not isReadHead) & (op=13) & ((i+2)<n); (opcodes[i+1]=15) & ((opargs[i+1])=1) & (opcodes[i+2]=4) & ((opargs[i+2])=a); 0b]
+    if[isReadHead; readSlots: readSlots,a]
+    if[isWriteHead; writeSlots: writeSlots,a]
+    if[(not isReadHead) & (not isWriteHead) & ((op=3)|(op=4)|(op=13)); intUseSlots: intUseSlots,a]
+    i: i + $[isReadHead;2; isWriteHead;3; 1]]
+  vecSlots: distinct readSlots,writeSlots
+  bad: distinct intUseSlots
+  cand: ()
+  i: 0
+  while[i<count vecSlots
+    s: vecSlots[i]
+    if[(not s in bad) & ((s<arity)|(not s<nlocals)); cand: cand,s]
+    i: i+1]
+  `int$cand}
 
 // State carried through the walk, as a dict so each op-case function can take/return it whole:
 // asm (word list), depth, fixups (list of (word;target;isCbz)), cbzRegs (dict word->reg),
@@ -222,11 +262,72 @@ jitOpCall: {[st;consts;trampoline;slot;argc]
   while[i<live; asm: asm,jitLdrImm[jitSTACK+i; jitSP; jitSPILLBASE+(i*8)]; i: i+1]
   st[`asm]: asm
   st[`depth]: live+1
+  st[`pending]: null
   st}
 
-jitCompile: {[input;trampoline]
+// x[i]: pop the index (top of the virtual stack), call `vecgetAddr(vp; idx; &ok) -> v`, push the
+// result. Same spill/restore shape as jitOpCall (live values below the consumed operand survive
+// the call in the fixed spill area, jitSPILLBASE.., since `bl` clobbers the caller-saved operand
+// registers) and the same deopt-on-zero-ok convention (out of range or, defensively, wrong type).
+jitOpVecGet: {[st;vecgetAddr;slot]
+  if[(st[`depth])<1; :null]
+  live: (st[`depth])-1
+  asm: st[`asm]
+  i: 0
+  while[i<live; asm: asm,jitStrImm[jitSTACK+i; jitSP; jitSPILLBASE+(i*8)]; i: i+1]
+  asm: asm,jitMovR[1; jitSTACK+((st[`depth])-1)]
+  asm: asm,jitLdrImm[0; jitLOC; slot*8]
+  asm: asm,jitAddImm[2;jitSP;jitCALLOK]
+  asm: jitLoadConst[asm;jitSCRATCH;vecgetAddr]
+  asm: asm,jitBlr[jitSCRATCH]
+  asm: asm,jitLdrImm[jitSCRATCH;jitSP;jitCALLOK]
+  st[`deoptFixups]: (st[`deoptFixups]),enlist ((count asm);jitSCRATCH)
+  asm: asm,0
+  asm: asm,jitMovR[jitSTACK+live; 0]
+  i: 0
+  while[i<live; asm: asm,jitLdrImm[jitSTACK+i; jitSP; jitSPILLBASE+(i*8)]; i: i+1]
+  st[`asm]: asm
+  st[`depth]: live+1
+  st[`pending]: null
+  st}
+
+// x[i]:v — pop index (top) and value (next; push order was `gen value; gen index`, so index ends
+// up on top), call `vecsetAddr(vp; idx; val; &ok)` (no return value — the trampoline mutates the
+// vector in place, copy-on-write, through the same pointer `vp` was loaded from, so the following
+// `StoreL` this always precedes is a no-op: nothing to store, the write already happened). Net
+// depth is -1, not -2: the interpreter's own `Op::StoreL` peeks rather than pops (`iassign`'s own
+// value — normally the amended vector — is left on the stack, same as `assign`/`gassign` leave
+// theirs, for a statement-level trailing `Pop` to discard). There's no real value to leave here —
+// compiled code has nothing to represent a vector with — but the slot still needs to exist so that
+// `Pop`'s depth bookkeeping lines up; nothing ever reads it (`jitClassifySlots` guarantees the
+// write triple is always immediately followed by exactly that `StoreL`+something-that-pops-it).
+jitOpVecSet: {[st;vecsetAddr;slot]
+  if[(st[`depth])<2; :null]
+  live: (st[`depth])-2
+  asm: st[`asm]
+  i: 0
+  while[i<live; asm: asm,jitStrImm[jitSTACK+i; jitSP; jitSPILLBASE+(i*8)]; i: i+1]
+  asm: asm,jitMovR[1; jitSTACK+((st[`depth])-1)]
+  asm: asm,jitMovR[2; jitSTACK+((st[`depth])-2)]
+  asm: asm,jitLdrImm[0; jitLOC; slot*8]
+  asm: asm,jitAddImm[3;jitSP;jitCALLOK]
+  asm: jitLoadConst[asm;jitSCRATCH;vecsetAddr]
+  asm: asm,jitBlr[jitSCRATCH]
+  asm: asm,jitLdrImm[jitSCRATCH;jitSP;jitCALLOK]
+  st[`deoptFixups]: (st[`deoptFixups]),enlist ((count asm);jitSCRATCH)
+  asm: asm,0
+  i: 0
+  while[i<live; asm: asm,jitLdrImm[jitSTACK+i; jitSP; jitSPILLBASE+(i*8)]; i: i+1]
+  st[`asm]: asm
+  st[`depth]: live+1
+  st[`pending]: (`vecwritedone;slot)
+  st}
+
+jitCompile: {[input;trampolines]
   opcodes: input[0]; opargs: input[1]; consts: input[2]; arity: input[3]; nlocals: input[4]
   n: count opcodes
+  callAddr: trampolines[0]; vecgetAddr: trampolines[1]; vecsetAddr: trampolines[2]
+  vecSlots: jitClassifySlots[opcodes;opargs;n;arity;nlocals]
 
   asm: ()
   asm: asm,jitStpPre[29;30;jitSP;neg jitFRAME]
@@ -248,11 +349,28 @@ jitCompile: {[input;trampoline]
     op: opcodes[ip]
     a: opargs[ip]
     pending: st[`pending]
+    pendKind: $[isnull pending; null; pending[0]]
+    isVecSlot: a in vecSlots
     isCallHead: (op=7) & ((a=1)|(a=2))
-    if[(not isnull pending) & (not isCallHead); :null]
+    isAmendHead: (op=15) & (a=1)
+    // `&`/`|` are eager (no short-circuit) in this language, so `pending[1]` can't sit inside one
+    // alongside an `isnull pending` check — has to be a real branch (`$[...]`) instead, evaluating
+    // it only once pending is already known to be a 2-element list.
+    isStoreHead: $[isnull pending; 0b; (pendKind=`vecwritedone) & (op=4) & (a=(pending[1]))]
+    // whatever set `pending` demands one exact op immediately next — see jitClassifySlots's header
+    // comment for why every occurrence of a classified slot is guaranteed to fit this shape.
+    okNext: $[isnull pending; 1b
+             ; pendKind=`call; isCallHead
+             ; pendKind=`vecread; isCallHead
+             ; pendKind=`vecwrite; isAmendHead
+             ; pendKind=`vecwritedone; isStoreHead
+             ; 0b]
+    if[not okNext; :null]
 
     $[op=0; st: jitOpPush[st;ip;opcodes;consts;a]
+    ; (op=3) & isVecSlot; st[`pending]: (`vecread;a)
     ; op=3; st: jitOpLoadL[st;a]
+    ; isStoreHead; st[`pending]: null
     ; op=4; st: jitOpStoreL[st;a]
     ; op=11; st: jitOpPop st
     ; op=16; st: jitOpRet st
@@ -260,12 +378,13 @@ jitCompile: {[input;trampoline]
     ; op=9; st: jitOpJmp[st;a]
     ; op=10; st: jitOpJmpf[st;a]
     ; op=18; st: jitOpLoop[st;a]
+    ; (op=13) & isVecSlot; st[`pending]: (`vecwrite;a)
     ; op=1
     ; $[not (`int)=type consts[a]; st: null
-        ; st[`pending]: consts[a]]
-    ; isCallHead
-    ; $[isnull pending; st: null
-        ; st: jitOpCall[st;consts;trampoline;pending;a]; st[`pending]: null]
+        ; st[`pending]: (`call;consts[a])]
+    ; (pendKind=`vecwrite) & isAmendHead; st: jitOpVecSet[st;vecsetAddr;pending[1]]
+    ; (pendKind=`call) & isCallHead; st: jitOpCall[st;consts;callAddr;pending[1];a]
+    ; (pendKind=`vecread) & isCallHead; st: jitOpVecGet[st;vecgetAddr;pending[1]]
     ; st: null]
 
     if[isnull st; :null]
@@ -301,4 +420,4 @@ jitCompile: {[input;trampoline]
     asm[word]: $[isnull kind; jitBcond[jitCondEQ;delta]; jitCbz[kind;delta]]
     i: i+1]
 
-  ,/jitLE each asm}
+  (,/jitLE each asm; vecSlots)}
