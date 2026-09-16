@@ -608,6 +608,10 @@ pub fn amend(x: &mut Value, i: Value, v: Value) -> R<()> {
     Ok(())
 }
 fn show(x: Value) -> R<Value> { out(&x.fmt()); Ok(Null) }
+/// What `show` would print, as a string. The one thing `$` cannot give: `$` casts elementwise
+/// ("," sv string 1 2 3), this is the whole value the way the REPL renders it — so tests/lang.nt
+/// can pin display forms (2f, ,`a, 101b) from neant instead of from Rust.
+fn repr(x: Value) -> R<Value> { Ok(chars(x.fmt().chars().collect())) }
 fn key(x: Value) -> R<Value> { match x { Dict(d) => Ok(d.keys.clone()), _ => til(x) } }
 fn value(x: Value) -> R<Value> { match x { Dict(d) => Ok(d.vals.clone()), _ => Ok(x) } }
 fn sqrt(x: Value) -> R<Value> { map_f(&x, f64::sqrt) }
@@ -742,7 +746,7 @@ pub static BUILTINS: &[PrimDef] = &[
     p!("shl", None, Some(shl), ib_shl), p!("shr", None, Some(shr), ib_shr), p!("bnot", Some(bnot), None),
     p!("key", Some(key), None), p!("value", Some(value), None), p!("group", Some(group), None),
     p!("isnull", Some(isnull), None), p!("now", Some(now), None), p!("fbits", Some(fbits), None),
-    p!("show", Some(show), None), p!("print", Some(print), None), p!("signal", Some(signal), None), p!("exit", Some(exit), None),
+    p!("show", Some(show), None), p!("repr", Some(repr), None), p!("print", Some(print), None), p!("signal", Some(signal), None), p!("exit", Some(exit), None),
     p!("read0", Some(read0), None), p!("write0", None, Some(write0)),
     p!("hopen", Some(hopen), None), p!("hclose", Some(hclose), None), p!("hsend", None, Some(hsend)), p!("hrecv", None, Some(hrecv)),
     p!("hlisten", Some(hlisten), None), p!("accept", Some(accept), None),

@@ -1,5 +1,6 @@
 // stdlib tests: ./target/release/neant tests/run.nt   exits with the failure count
 // There is no directory listing builtin, so every test file is loaded by name.
+load "tests/lang.nt"
 load "tests/prelude.nt"
 load "tests/stdlib2.nt"
 load "tests/json.nt"

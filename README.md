@@ -116,7 +116,7 @@ Only what needs the host; everything expressible with the verbs lives in the pre
 | Bits | `badd band bor bxor shl shr bnot` — on the raw 64-bit pattern; `badd` is `+` without the int-null case, for u64 words |
 | Dicts | `key value group` |
 | Values | `isnull now` |
-| Output | `show print signal exit` |
+| Output | `show print signal exit repr` — `repr x` is the text `show` would print, the one thing `$` cannot give (`$` casts elementwise); `tests/lang.nt` pins display forms with it |
 | Files | `read0 write0` |
 | Sockets | `hopen hclose hsend hrecv hlisten accept` |
 | Concurrency | `spawn join shared sget sset supd` — see [Concurrency](#concurrency) |
@@ -222,8 +222,10 @@ neither a long subject nor a long run recurses, and `(a*)*` terminates. A malfor
 ./target/release/neant tests/run.nt      # loads every tests/*.nt by name, prints "N passed, M failed", exits with M
 ```
 
-`cargo test` runs the same file (`nt_tests`, src/main.rs), so a stdlib change is tested where it lives: add a
-`teq` line to the matching `tests/*.nt` rather than a case in Rust.
+`tests/lang.nt` is the language itself — the 363 source/result pairs that used to be the `CASES` table in
+src/main.rs. `cargo test` runs the whole set twice: once directly (`nt_tests`) and once against the
+front end rebuilt by itself (`front_end_reproduces_itself`), both in src/main.rs. So a language or stdlib
+change is tested where it lives: add a `teq` line to the matching `tests/*.nt` rather than a case in Rust.
 
 ## Encodings
 
@@ -585,13 +587,15 @@ iteration than the original, so each number is a few percent optimistic.
 There is no external oracle left, so the front end is pinned by fixpoints and by behaviour:
 
 - **Generation 2.** Recompile every boot file through the pipeline it defines, then require it to lex,
-  parse and compile the corpora to byte-identical output and still run every language case. A compiler
+  parse and compile the corpora to byte-identical output and still pass every `tests/*.nt`. A compiler
   that does not reproduce its own output when rebuilt by itself fails here — this is what the Rust
   oracle used to catch.
 - **The image is a fixpoint.** Compiling the current sources with the embedded image reproduces
   that image exactly. Catches both a stale `image.nb` and a compiler change rebuilt only once.
-- **The language cases.** ~250 source/result pairs — semantics, error messages, error line numbers and
-  call stacks — every one through `nrun`.
+- **The language cases.** 363 source/result pairs — semantics, error messages, error line numbers and
+  call stacks — every one through `nrun`. They live in `tests/lang.nt`, in neant: a case is
+  `("1+2"; "3")`, run with `repr join spawn {nrun s}`, where the `spawn` gives it the fresh globals
+  the Rust harness used to get from `snapshot`/`restore`.
 - **Front-end errors.** Lexer and parser messages and their line numbers, asserted literally.
 - **The JIT against the interpreter.** Every compiled path is checked by running the same loop
   twice — once so it tiers up, once with `- -` spliced in so it provably never can — and requiring
