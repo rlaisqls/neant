@@ -344,11 +344,16 @@ over every `tbs`, every validity window including the anchor's, basicConstraints
 carries a critical extension the parser does not model, that the chain reaches the trust store, and
 that the leaf covers the host — a wildcard only as the whole leftmost label, standing for exactly
 one label. What it does **not** check: **ECDSA and Ed25519** signatures anywhere (RSA-SHA256, PKCS#1
-v1.5 or PSS, is the whole list, so an ECDSA chain — most of the public web — is *refused*, not
-accepted), **revocation** (no CRL, no OCSP), name constraints and certificate policies, and
-extendedKeyUsage. There is **no client certificate and no TLS server side**. This is a verifier
-written from scratch to be read, not a substitute for a reviewed TLS stack, and nothing in it is
-constant-time.
+v1.5 or PSS, is the whole list), **revocation** (no CRL, no OCSP), name constraints and certificate
+policies, and extendedKeyUsage. There is **no client certificate and no TLS server side**.
+
+The ECDSA gap is the price of the verification, and it is a large one: Google, Cloudflare and most
+modern CDNs serve ECDSA-only chains, and the ClientHello no longer offers
+`ecdsa_secp256r1_sha256` — so **this client cannot reach those servers at all**. They are
+unreachable rather than silently unverified, which is the right way round, but nothing here should
+be read as broad compatibility; ECDSA P-256 verification is what would buy it back. This is a
+verifier written from scratch to be read, not a substitute for a reviewed TLS stack, and nothing in
+it is constant-time.
 
 ## Errors
 

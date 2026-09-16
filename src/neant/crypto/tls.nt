@@ -16,9 +16,16 @@
 //
 // What is NOT checked, because src/neant/crypto/verify.nt cannot check it: ECDSA and Ed25519
 // signatures anywhere in the chain or in CertificateVerify — RSA-SHA256 (PKCS#1 v1.5 or PSS) is the
-// whole list, so an ECDSA server is refused, not accepted; certificate revocation (no CRL, no
-// OCSP); name constraints and certificate policies. There is no client certificate and no server
-// side. Everything is a verifier written from scratch to be read rather than a reviewed TLS stack,
+// whole list; certificate revocation (no CRL, no OCSP); name constraints and certificate policies.
+// There is no client certificate and no server side.
+//
+// Be clear about what the ECDSA gap costs, since it is the price of the verification above and not
+// a detail: Google, Cloudflare and most modern CDNs serve ECDSA-only chains, and the ClientHello no
+// longer offers ecdsa_secp256r1_sha256, so this client cannot talk to them at all. They are
+// UNREACHABLE, not silently unverified — which is the right way round, but do not read any of this
+// as broad compatibility. ECDSA P-256 verification is what would buy it back.
+//
+// Everything here is a verifier written from scratch to be read rather than a reviewed TLS stack,
 // and the AEAD and the key exchange are not constant-time.
 
 // ---- integers on the wire, big-endian; lp<n> prefixes a block with its n-byte length
