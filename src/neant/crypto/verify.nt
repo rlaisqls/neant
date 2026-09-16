@@ -1,0 +1,293 @@
+// Certificate path validation in neant: hostname matching (RFC 6125), chain verification
+// (RFC 5280 6.1) and a PEM trust store, on src/neant/crypto/{bignum,rsa,der,x509}.nt.
+// Not part of the boot image — load all five, in this order:
+//   load "src/neant/crypto/bignum.nt"    load "src/neant/crypto/rsa.nt"
+//   load "src/neant/crypto/der.nt"       load "src/neant/crypto/x509.nt"
+//   load "src/neant/crypto/verify.nt"
+//
+//   x509CheckHost[cert;host]              -> 1b / 0b
+//   x509LoadRoots[path]                   -> a trust store over a PEM bundle
+//   x509SystemRoots[]                     -> x509LoadRoots X509CAPATH
+//   x509VerifyChain[chain;roots;host;now] -> 1b, or signals "x509: <the specific reason>"
+//
+// `chain` is the server's certificates parsed by x509Parse, leaf first, exactly in the order they
+// arrived — nothing here reorders them or goes looking for a missing link, because a chain that is
+// not the chain the server sent is a chain nobody audited. `now` is the caller's (date;time) in
+// UTC, never read from the clock in here, so a fixed certificate can be tested at a fixed instant.
+//
+// Every refusal signals with its own sentence, because "the connection was refused" is not an
+// answer anybody can act on. Verification is all-or-nothing: x509VerifyChain returns 1b or signals.
+//
+// WHAT IS CHECKED, link by link:
+//   * the names chain: each certificate's `issuerCanon equals the next one's `subjectCanon
+//   * the signature over each certificate's `tbs bytes, with the issuer's `spki
+//   * the validity window of every certificate, the trust anchor included, against `now`
+//   * basicConstraints cA on every certificate above the leaf, and on the anchor
+//   * pathLenConstraint against the number of intermediates actually hanging below
+//   * keyUsage: a CA that carries the extension must allow keyCertSign
+//   * no certificate carries a critical extension x509.nt does not model (`critUnknown)
+//   * the chain ends in, or is signed by, a certificate the trust store holds
+//   * the leaf is valid for the host: SAN dNSNames, or SAN iPAddresses for an address literal
+//
+// WHAT IS NOT, and what that costs you:
+//   * only RSASSA-PKCS1-v1_5-SHA256 and RSASSA-PSS-SHA256 signatures can be checked — rsa.nt's
+//     DigestInfo table and PSS verifier are SHA-256 only, and no ECDSA or Ed25519 verifier is
+//     wired in. Every other algorithm is refused BY NAME rather than skipped. An ECDSA chain,
+//     which is most of the public web, does not verify here; it is rejected, not accepted.
+//   * revocation: no CRL, no OCSP. A certificate revoked this morning still verifies.
+//   * name constraints, policy constraints, policy mapping, inhibitAnyPolicy (RFC 5280 6.1.4's
+//     policy machinery) are not implemented — but a critical extension nobody models is refused,
+//     so a CA constrained by a critical nameConstraints is refused rather than used unconstrained.
+//   * extendedKeyUsage is parsed and ignored: a certificate issued for e-mail will serve a web
+//     request here.
+//   * no public-suffix list, so `*.co.uk` in a certificate is treated as an ordinary wildcard.
+//   * IPv6 literals are refused outright rather than matched, since nothing here parses one.
+// This is a verifier written from scratch to be read, not a substitute for a reviewed one.
+
+// ---- time. (date;time) pairs, the values x509.nt's `notBefore / `notAfter hand back.
+x509Le: {[a;b] $[a[0]<b[0]; 1b; $[b[0]<a[0]; 0b; not b[1]<a[1]]]}
+x509When: {[t] (string t[0]),"T",string t[1]}
+
+// ---- hostnames (RFC 6125)
+// One trailing root dot is not part of the name; everything else is compared lowercased, which is
+// RFC 4343's "DNS names are case-insensitive" and as far as this goes — no IDNA, no Unicode.
+x509Host: {[host]
+  h: lower host
+  if[0=count h; signal "x509: an empty hostname"]
+  if["."=h[(count h)-1]; h: ((count h)-1)#h]
+  if[0=count h; signal "x509: an empty hostname"]
+  h}
+
+// dotted-quad -> its four octets, or () for anything that is not one. A part with a leading zero is
+// refused rather than read as octal the way inet_aton would: two readings of one string is exactly
+// the ambiguity a verifier must not have.
+x509Ip4: {[h]
+  ps: "." vs h
+  if[not 4=count ps; :()]
+  ok: 1b; out: 0x; i: 0
+  while[i<4
+    p: ps[i]
+    if[(0=count p) | 3<count p; ok: 0b]
+    if[ok; if[not all p in "0123456789"; ok: 0b]]
+    if[ok; if[(1<count p) & "0"=p[0]; ok: 0b]]
+    if[ok
+      v: 0; j: 0
+      while[j<count p; v: (10*v)+(`code$p[j])-48; j+:1]
+      if[255<v; ok: 0b]
+      if[ok; out,: `byte$v]]
+    i+:1]
+  $[ok; out; ()]}
+
+// x509.nt returns the dNSName entries of a SAN and says a verifier wanting iPAddress walks the
+// nodes itself, so this does: `tbs is the tbsCertificate as it arrived, its extensions are its last
+// field, and an iPAddress is GeneralName [7] IMPLICIT OCTET STRING — 4 octets or 16, unexamined.
+x509SanIps: {[c]
+  k: derKids derParse c`tbs
+  if[0=count k; :()]
+  e: k[(count k)-1]
+  if[not (`ctx=e`cls) & 3=e`tag; :()]
+  es: derKids (derKids e)[0]
+  out: (); i: 0
+  while[i<count es
+    f: derKids es[i]
+    if[(derOid f[0]) ~ X509EXTSAN
+      gs: derKids derParse derOct f[(count f)-1]
+      j: 0
+      while[j<count gs
+        g: gs[j]
+        if[(`ctx=g`cls) & (7=g`tag) & not g`cons; out,: enlist g`v]
+        j+:1]]
+    i+:1]
+  out}
+
+// RFC 6125 6.4.3, narrowed the way every browser narrows it: a wildcard is allowed only as the
+// whole leftmost label and stands for exactly one label. So *.a.com matches x.a.com and matches
+// neither a.com (there is no label for the star to be) nor x.y.a.com (one star, one label). A star
+// anywhere else, or a partial label like w*.a.com, is not a wildcard and therefore matches nothing
+// — reading it as one is how a certificate for w*.com becomes a certificate for the whole TLD.
+x509DnsMatch: {[pat;host]
+  p: lower pat
+  if[0=count p; :0b]
+  if[not "*" in p; :p ~ host]
+  ls: "." vs p
+  if[1=count ls; :0b]                                  // "*" on its own is not a name
+  if[not (ls[0]) ~ ,"*"; :0b]                          // the star is the whole leftmost label
+  rest: "." sv 1_ls
+  if["*" in rest; :0b]                                 // and the only one
+  hs: "." vs host
+  if[not (count hs)=count ls; :0b]                     // exactly one label, never zero
+  if[0=count hs[0]; :0b]
+  rest ~ "." sv 1_hs}
+
+// The subject CN is deliberately never consulted: RFC 6125 6.4.4 deprecated it, every modern
+// verifier ignores it, and a CN that is not in the SAN is a name nobody attested to.
+x509CheckHost: {[c;host]
+  h: x509Host host
+  if[":" in h; :0b]                                    // an IPv6 literal, which is not parsed here
+  ip: x509Ip4 h
+  ok: 0b; i: 0
+  if[0<count ip                                        // an address literal matches an iPAddress
+    ips: x509SanIps c                                  // SAN or nothing: never a dNSName
+    while[i<count ips; if[ip ~ ips[i]; ok: 1b]; i+:1]
+    :ok]
+  ns: c`san
+  while[i<count ns; if[x509DnsMatch[ns[i];h]; ok: 1b]; i+:1]
+  ok}
+
+// ---- signatures
+// rsa.nt verifies SHA-256 with PKCS#1 v1.5 or PSS and nothing else, so those two are the whole
+// list. SHA-1 would be refused even if rsa.nt knew it. Everything unlisted — ECDSA, Ed25519,
+// SHA-384/512, an OID x509.nt could not name — is refused by name below rather than skipped,
+// because a verifier that shrugs at an algorithm it cannot check accepts every certificate
+// that uses it.
+x509SigOk: {[c] (c`sigAlg) in `rsaPkcs1Sha256`rsaPssSha256}
+x509SigVerify: {[c;spki]
+  if[not `rsa ~ spki`alg; :0b]
+  d: sha256 c`tbs                                      // the span as it arrived, not a re-encoding
+  if[`rsaPkcs1Sha256 ~ c`sigAlg; :rsaVerifyPkcs1[spki`n; spki`e; `sha256; d; c`sig]]
+  if[`rsaPssSha256 ~ c`sigAlg; :rsaVerifyPss[spki`n; spki`e; d; c`sig]]
+  0b}
+// one link: c, signed by the key in spki, which belongs to the name c claims issued it
+x509Link: {[c;spki]
+  if[not x509SigOk c
+    m: "x509: ",(c`subject)," is signed with ",string c`sigAlg
+    m,: " (",(c`sigAlgOid),"), which this build cannot verify"
+    signal m]
+  if[not x509SigVerify[c;spki]
+    m: "x509: the signature on ",(c`subject)," does not verify with "
+    signal m,(c`issuer),"'s key"]
+  1b}
+
+// ---- the trust store
+// `subjects`certs`skipped!(symbols; parsed certificates; int): the canonical subject each root is
+// found by, the root itself, and how many blocks in the bundle would not parse.
+//
+// A root this build cannot read is dropped rather than refused: the alternative is that one odd
+// certificate in a system bundle takes down every connection, and dropping a root only ever makes
+// the store trust less. `skipped` is there so a caller can notice.
+//
+// Measured on this machine, /etc/ssl/certs/ca-certificates.crt, 146 roots:
+//   pemLoad (read0 + base64)  134 ms      x509Parse of all 146   97 ms      231 ms in total
+// Everything is parsed up front. Indexing by subject and parsing a root only when a chain reached
+// it could save at most that 97 ms — the base64 has to be decoded before there is a subject to
+// index by at all — and parsing eagerly is what makes a malformed root a load-time problem instead
+// of a mid-handshake one. 231 ms once per process is not worth trading that away for.
+X509CAPATH: "/etc/ssl/certs/ca-certificates.crt"
+x509LoadRoots: {[path]
+  ds: pemLoad path
+  sj: (); cs: (); bad: 0; i: 0
+  while[i<count ds
+    c: @[x509Parse; ds[i]; {`x509bad}]
+    if[`x509bad ~ c; bad+:1]
+    if[not `x509bad ~ c; sj,: `$c`subjectCanon; cs,: enlist c]
+    i+:1]
+  `subjects`certs`skipped!(sj;cs;bad)}
+x509SystemRoots: {[] x509LoadRoots X509CAPATH}
+// every root with this subject: a rollover can put two keys under one name, and the right one is
+// whichever verifies, so all of them are tried rather than the first
+x509Find: {[roots;canon]
+  sj: roots`subjects
+  if[0=count sj; :()]
+  where sj = `$canon}
+// the chain already ends in a trust anchor: same subject AND the same SubjectPublicKeyInfo, byte
+// for byte. An anchor is trusted by identity, so its own self-signature is not what makes it one —
+// checking that signature would prove nothing an attacker who swapped the root could not also fake.
+x509IsAnchor: {[roots;c]
+  ix: x509Find[roots; c`subjectCanon]
+  ok: 0b; j: 0
+  while[j<count ix; if[(c`spkiRaw) ~ ((roots`certs)[ix[j]])`spkiRaw; ok: 1b]; j+:1]
+  ok}
+
+// ---- the checks every certificate faces on its own
+x509CheckOne: {[c;now]
+  if[0<count c`critUnknown
+    m: "x509: ",(c`subject)," has a critical extension this verifier does not model: "
+    signal m,(c`critUnknown)[0]]
+  if[not x509Le[c`notBefore;now]
+    signal "x509: ",(c`subject)," is not valid until ",x509When c`notBefore]
+  if[not x509Le[now;c`notAfter]
+    signal "x509: ",(c`subject)," expired on ",x509When c`notAfter]
+  1b}
+// and the extra ones a certificate faces for being above the leaf. `below` is how many
+// intermediates hang under it — RFC 5280 4.2.1.9's pathLenConstraint counts exactly those, the leaf
+// excluded. An absent constraint (0N) is no constraint.
+x509CheckCa: {[c;below]
+  if[not c`isCa
+    m: "x509: ",(c`subject)," is not a CA (no basicConstraints cA)"
+    signal m," and may not have issued the certificate below it"]
+  if[0<count c`keyUsage
+    if[not `keyCertSign in c`keyUsage
+      signal "x509: ",(c`subject),"'s keyUsage does not allow signing certificates"]]
+  if[not isnull c`pathLen
+    if[(c`pathLen)<below
+      m: "x509: ",(c`subject)," has pathLenConstraint ",string c`pathLen
+      m,: " but ",(string below)," certificates hang below it"
+      signal m]]
+  1b}
+// a trust anchor, with its own sentences so "the root is expired" is never reported as if the
+// server had sent something wrong
+x509CheckAnchor: {[r;now;below]
+  if[not x509Le[r`notBefore;now]
+    signal "x509: the trusted root ",(r`subject)," is not valid until ",x509When r`notBefore]
+  if[not x509Le[now;r`notAfter]
+    signal "x509: the trusted root ",(r`subject)," expired on ",x509When r`notAfter]
+  if[0<count r`critUnknown
+    m: "x509: the trusted root ",(r`subject)
+    signal m," has a critical extension this verifier does not model"]
+  if[not r`isCa; signal "x509: the trusted root ",(r`subject)," is not a CA"]
+  x509CheckCa[r;below]}
+// tried against one candidate root; packaged as one argument so the caller can trap it and move on
+// to the next root with the first refusal kept as the reason if none of them work out
+x509TryAnchor: {[a]
+  x509CheckAnchor[a[1];a[2];a[3]]
+  x509Link[a[0];(a[1])`spki]
+  (1b;1b)}
+
+// ---- the chain.
+// The order of the checks is deliberate: the cheap structural ones first, so a chain that is out of
+// order is told that it is out of order rather than that its leaf is not valid for the host, and so
+// that nothing reaches an RSA exponentiation until the shape of the chain is already right.
+x509VerifyChain: {[chain;roots;host;now]
+  n: count chain
+  if[0=n; signal "x509: an empty certificate chain"]
+
+  i: 0                                                 // 1. the names chain, leaf upwards
+  while[i<(n-1)
+    if[not ((chain[i])`issuerCanon) ~ (chain[i+1])`subjectCanon
+      m: "x509: ",((chain[i])`subject)," was not issued by the next certificate in the chain, "
+      m,: ((chain[i+1])`subject),"; the server sent them in the wrong order or left one out"
+      signal m]
+    i+:1]
+
+  i: 0                                                 // 2. each certificate on its own terms
+  while[i<n
+    x509CheckOne[chain[i];now]
+    if[0<i; x509CheckCa[chain[i];i-1]]                 // i-1 intermediates hang below chain[i]
+    i+:1]
+
+  if[not x509CheckHost[chain[0];host]                  // 3. the leaf is for this host
+    sn: (chain[0])`san
+    m: "x509: ",((chain[0])`subject)," is not valid for ",host
+    m,: " (subjectAltName: ",($[0=count sn; "none"; "," sv sn]),")"
+    signal m]
+
+  i: 0                                                 // 4. the signatures, which cost real time
+  while[i<(n-1); x509Link[chain[i];(chain[i+1])`spki]; i+:1]
+
+  top: chain[n-1]                                      // 5. and it must reach the trust store
+  if[x509IsAnchor[roots;top]; :1b]                     // the server sent the root itself
+  if[((top`issuerCanon) ~ top`subjectCanon) & 1=n
+    signal "x509: ",(top`subject)," signed itself and is not in the trust store"]
+  ix: x509Find[roots; top`issuerCanon]
+  if[0=count ix
+    m: "x509: no trusted root named ",(top`issuer)
+    signal m,", which issued ",top`subject]
+  why: ""; j: 0; ok: 0b
+  while[j<count ix
+    if[not ok
+      r: @[x509TryAnchor; (top;(roots`certs)[ix[j]];now;n-1); {(0b;x)}]
+      if[r[0]; ok: 1b]
+      if[(not r[0]) & 0=count why; why: r[1]]]
+    j+:1]
+  if[not ok; signal why]
+  1b}
