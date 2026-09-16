@@ -151,6 +151,11 @@ mod arm64 {
             }
             self.run(buf.as_mut_ptr(), vm)
         }
+        /// Only the returned value and `ok` come back out. The compiled code loads its locals from
+        /// `buf` into registers once in its prologue and never writes them back (see the
+        /// locals-in-registers comment in src/neant/jit/arm64.nt), which is sound precisely
+        /// because nothing here — or in either entry point above — reads `buf` after this call.
+        /// That's a fact the codegen relies on, not an accident: keep it true.
         fn run(&self, buf: *mut i64, vm: &mut Vm) -> Option<i64> {
             let mut ok: i64 = 0;
             let val = unsafe { (self.entry)(buf, &mut ok as *mut i64, vm as *mut Vm) };
@@ -165,7 +170,11 @@ mod arm64 {
     /// `self.depth` guard (src/vm.rs) needs one, and a lower one: `try_run_raw`'s `[i64; MAX_SLOTS]`
     /// stack buffer makes each level here heavier than a plain interpreted call. Calibrated the
     /// same way — empirically, against the smallest stack this can run on (a `spawn`ed thread
-    /// defaults to 2MiB) — with real margin below where it actually overflows.
+    /// defaults to 2MiB) — with real margin below where it actually overflows. Re-measured after
+    /// the locals moved into registers (`jitLREGS`, src/neant/jit/arm64.nt), which grew the
+    /// compiled frame from 112 to 192 bytes for the callee-saved saves and the spill area: with
+    /// this guard lifted, `{[x] $[x<1; 0; 1+h[x-1]]}` on a 2MiB thread now overflows between 1800
+    /// and 1900 levels (2000–2100 before), so 500 still leaves a >3x margin and stays.
     const MAX_CALL_DEPTH: u32 = 500;
 
     /// The one fixed trampoline every compiled call site reaches via `blr` (see the module doc

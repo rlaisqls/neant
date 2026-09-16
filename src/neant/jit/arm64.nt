@@ -27,9 +27,9 @@ jitSCRATCH: 15
 jitSTACK: 9
 jitMAXDEPTH: 6
 jitSP: 31
-jitSPILLBASE: 48
-jitCALLOK: 96
-jitFRAME: 112
+jitSPILLBASE: 96
+jitCALLOK: 184
+jitFRAME: 192
 jitCondLT: 11
 jitCondGT: 12
 jitCondEQ: 0
@@ -97,22 +97,125 @@ jitLoadConst: {[asm;rd;v]
     hw: hw+1]
   asm}
 
-jitEmitEpilogue: {[asm]
+// ---- locals in registers (README "Stage 2"). Every slot a compiled function touches as a local
+// (LoadL/StoreL/TakeL — params, scratch locals and captures alike, in first-seen bytecode order,
+// `jitLocalSlots`) gets one register for the whole function, and LoadL/StoreL become register
+// moves. The buffer x0 points at on entry (`buf`, src/jit.rs `try_run`/`try_run_raw`) is only how
+// the values get *in*, loaded once in the prologue; they are never written back out. That's safe
+// because `Compiled::run` reads only the returned value (x0) and the ok word, and neither entry
+// point looks at `buf` again after the call, so a return or a deopt just abandons the registers.
+// Both entry paths — `try_run` from the interpreter and `try_run_raw` from `jit_call` — marshal
+// into the same layout (slot i at `buf[i]`) and reach the same entry, so one prologue serves both.
+//
+// Unlike a compiled trace, a compiled function makes calls (`blr` to the `jit_call`/`jit_vec_get`/
+// `jit_vec_set` trampolines), and its locals have to survive them. The first jitLCALLEE registers
+// handed out are callee-saved (x23..x28; x19..x22 are taken, see the top of the file): the
+// trampolines preserve them for free, at the cost of one `stp`/`ldp` per two of them in the
+// prologue/epilogue — paid once per call *of* the compiled function, not once per call it makes,
+// and only for the pairs actually in use. That covers the common function outright. The next
+// five are caller-saved (x6..x8, x16, x17 — free because our own code only ever uses x0..x5 for
+// trampoline arguments and x15 as scratch, and x16/x17 are only IP0/IP1 across a linker veneer,
+// which a `blr` to an absolute address never goes through). Those are spilled to jitLSPILLBASE
+// around every `blr`, the same way the live operand stack already is (jitSPILLBASE): a per-call
+// cost, but one only a function with more than six locals *and* a call in it ever pays, and
+// still cheaper than what it replaces (every LoadL/StoreL of those locals was a memory access).
+// A slot past the last register — the twelfth local on — just stays in `buf` and is reached
+// through x19 exactly as every local used to be, per slot: no function is rejected for having
+// too many locals, its overflow ones only run the old way. (Twelve is well past what real
+// functions here have — `traced_loop_allocates_a_register_per_local`'s deliberately wide loop
+// has eleven — so the overflow path exists for correctness, not speed.)
+//
+// A vector-classified slot (`jitClassifySlots`) gets a register like any other: its value is a
+// pointer into `vecbuf`, a plain 64-bit word; it's only ever passed to `jit_vec_get`/`jit_vec_set`
+// as their first argument and never StoreL'd (the write triple's own StoreL is a no-op, see
+// jitOpVecSet), so the register holds the same pointer for the whole call and the trampolines see
+// exactly the word they used to be handed from `buf`. Their semantics don't change.
+//
+// Frame layout (jitFRAME bytes, 16-aligned; stp's pre-index immediate reaches 512):
+//   0 x29,x30  16 x19,x20  32 x21,x22  48..96 x23..x28 (jitLSAVEBASE; only the pairs in use)
+//   96..144 live operand-stack spill around a blr (jitSPILLBASE, jitMAXDEPTH words)
+//   144..184 caller-saved local spill around a blr (jitLSPILLBASE, one word per such register)
+//   184 the ok word a trampoline writes (jitCALLOK)
+jitLREGS: 23 24 25 26 27 28 6 7 8 16 17
+jitLCALLEE: 6
+jitLSAVEBASE: 48
+jitLSPILLBASE: 144
+
+// Every slot the bytecode touches as a local (LoadL/StoreL/TakeL), in first-seen order — a local's
+// position here is its index into jitLREGS, for as long as that list lasts.
+jitLocalSlots: {[opcodes;opargs;n]
+  slots: ()
+  i: 0
+  while[i<n
+    op: opcodes[i]
+    if[(op=3)|(op=4)|(op=13)
+      ; a: opargs[i]
+        if[(slots?a)=count slots; slots: slots,a]]
+    i: i+1]
+  `int$slots}
+
+// The register local `a` lives in, or null if it's an overflow slot still in `buf`.
+jitLocalReg: {[st;a]
+  p: (st[`lslots])?a
+  $[p<count st[`lregs]; (st[`lregs])[p]; null]}
+
+// rd <- local a / local a <- rs: a register move when the local has a register, else the load/
+// store through x19 every local used to get.
+jitLocalToReg: {[st;asm;rd;a]
+  r: jitLocalReg[st;a]
+  $[isnull r; asm,jitLdrImm[rd;jitLOC;a*8]; asm,jitMovR[rd;r]]}
+jitRegToLocal: {[st;asm;a;rs]
+  r: jitLocalReg[st;a]
+  $[isnull r; asm,jitStrImm[rs;jitLOC;a*8]; asm,jitMovR[r;rs]]}
+
+// Around a `blr`: the live operand-stack registers (x9.. below the operands the call consumes)
+// and the `ncr` caller-saved local registers in use both go to the frame before and come back
+// after, since the trampoline may clobber any of them. The callee-saved local registers need
+// nothing here — that's why they're handed out first.
+jitSaveLive: {[asm;live;ncr]
+  i: 0
+  while[i<live; asm: asm,jitStrImm[jitSTACK+i; jitSP; jitSPILLBASE+(i*8)]; i: i+1]
+  i: 0
+  while[i<ncr; asm: asm,jitStrImm[jitLREGS[jitLCALLEE+i]; jitSP; jitLSPILLBASE+(i*8)]; i: i+1]
+  asm}
+jitRestoreLive: {[asm;live;ncr]
+  i: 0
+  while[i<live; asm: asm,jitLdrImm[jitSTACK+i; jitSP; jitSPILLBASE+(i*8)]; i: i+1]
+  i: 0
+  while[i<ncr; asm: asm,jitLdrImm[jitLREGS[jitLCALLEE+i]; jitSP; jitLSPILLBASE+(i*8)]; i: i+1]
+  asm}
+
+// The `ncs` callee-saved local registers in use, saved (prologue) or restored (epilogue) in
+// pairs; an odd count saves one register nobody uses, which is harmless and simpler than a
+// single-register form.
+jitSaveCallee: {[asm;ncs]
+  k: 0
+  while[(2*k)<ncs; asm: asm,jitStpOff[jitLREGS[2*k];jitLREGS[(2*k)+1];jitSP;jitLSAVEBASE+(16*k)]; k: k+1]
+  asm}
+jitRestoreCallee: {[asm;ncs]
+  k: 0
+  while[(2*k)<ncs; asm: asm,jitLdpOff[jitLREGS[2*k];jitLREGS[(2*k)+1];jitSP;jitLSAVEBASE+(16*k)]; k: k+1]
+  asm}
+
+// Locals aren't stored back to `buf` on the way out (see the block comment above) — the epilogue
+// only undoes the prologue's register saves.
+jitEmitEpilogue: {[asm;ncs]
+  asm: jitRestoreCallee[asm;ncs]
   asm: asm,jitLdpOff[21;22;jitSP;32]
   asm: asm,jitLdpOff[19;20;jitSP;16]
   asm: asm,jitLdpPost[29;30;jitSP;jitFRAME]
   asm,jitRet[]}
 
-jitEmitReturn: {[asm;valreg]
+jitEmitReturn: {[asm;valreg;ncs]
   asm: asm,jitMovR[0;valreg]
   asm: jitLoadConst[asm;5;1]
   asm: asm,jitStrImm[5;jitOK;0]
-  jitEmitEpilogue asm}
+  jitEmitEpilogue[asm;ncs]}
 
-jitEmitDeopt: {[asm]
+jitEmitDeopt: {[asm;ncs]
   asm: jitLoadConst[asm;5;0]
   asm: asm,jitStrImm[5;jitOK;0]
-  jitEmitEpilogue asm}
+  jitEmitEpilogue[asm;ncs]}
 
 // Which dyadic verbs this backend inlines — exactly `int_dyad`'s set (src/vm.rs). Kind: 0=+ 1=- 2=*
 // 3=& (min) 4=| (max) 5=< 6=> 7==.
@@ -162,8 +265,13 @@ jitClassifySlots: {[opcodes;opargs;n;arity;nlocals]
 // State carried through the walk, as a dict so each op-case function can take/return it whole:
 // asm (word list), depth, fixups (list of (word;target;isCbz)), cbzRegs (dict word->reg),
 // deoptFixups (list of (word;kind), kind null=flags-based B.EQ, else a register for CBZ),
-// depthAt (dict ip->depth, overrides the naive linear accumulation — see Loop below), pendingCallSlot.
-jitNewState: {[asm] `asm`depth`fixups`cbzRegs`deoptFixups`depthAt`pending!(asm;0;();()!();();()!();null)}
+// depthAt (dict ip->depth, overrides the naive linear accumulation — see Loop below), pendingCallSlot,
+// and the register assignment the op handlers consult: lslots/lregs (see jitLocalSlots/jitLREGS),
+// ncs/ncr (how many of those registers are callee-saved / caller-saved, for the epilogue and the
+// around-a-blr spills respectively).
+jitNewState: {[asm;lslots;lregs]
+  ncs: (count lregs) & jitLCALLEE
+  `asm`depth`fixups`cbzRegs`deoptFixups`depthAt`pending`lslots`lregs`ncs`ncr!(asm;0;();()!();();()!();null;lslots;lregs;ncs;(count lregs)-ncs)}
 
 // ---- per-op handlers. Each takes the state dict (plus whatever else it needs) and returns the
 // updated state dict, or null to reject the whole function — checked by the caller after every
@@ -182,14 +290,15 @@ jitOpPush: {[st;ip;opcodes;consts;a]
 
 jitOpLoadL: {[st;a]
   if[not a<4096; :null]
-  st[`asm]: st[`asm],jitLdrImm[jitSTACK+(st[`depth]); jitLOC; a*8]
+  st[`asm]: jitLocalToReg[st; st[`asm]; jitSTACK+(st[`depth]); a]
   st[`depth]: (st[`depth])+1
   st}
 
+// Doesn't pop — same as the interpreter's own `Op::StoreL`, which only peeks the top.
 jitOpStoreL: {[st;a]
   if[(st[`depth])<1; :null]
   if[not a<4096; :null]
-  st[`asm]: st[`asm],jitStrImm[jitSTACK+((st[`depth])-1); jitLOC; a*8]
+  st[`asm]: jitRegToLocal[st; st[`asm]; a; jitSTACK+((st[`depth])-1)]
   st}
 
 jitOpPop: {[st]
@@ -199,7 +308,7 @@ jitOpPop: {[st]
 
 jitOpRet: {[st]
   if[(st[`depth])<1; :null]
-  st[`asm]: jitEmitReturn[st[`asm]; jitSTACK+((st[`depth])-1)]
+  st[`asm]: jitEmitReturn[st[`asm]; jitSTACK+((st[`depth])-1); st[`ncs]]
   st}
 
 jitOpDyad: {[st;consts;a]
@@ -270,9 +379,7 @@ jitOpLoop: {[st;t]
 jitOpCall: {[st;consts;trampoline;slot;argc]
   if[(st[`depth])<argc; :null]
   live: (st[`depth])-argc
-  asm: st[`asm]
-  i: 0
-  while[i<live; asm: asm,jitStrImm[jitSTACK+i; jitSP; jitSPILLBASE+(i*8)]; i: i+1]
+  asm: jitSaveLive[st[`asm]; live; st[`ncr]]
   asm: asm,jitMovR[3; jitSTACK+((st[`depth])-1)]
   if[argc=2; asm: asm,jitMovR[4; jitSTACK+((st[`depth])-2)]]
   asm: asm,jitMovR[0;jitVM]
@@ -285,25 +392,23 @@ jitOpCall: {[st;consts;trampoline;slot;argc]
   st[`deoptFixups]: (st[`deoptFixups]),enlist ((count asm);jitSCRATCH)
   asm: asm,0
   asm: asm,jitMovR[jitSTACK+live; 0]
-  i: 0
-  while[i<live; asm: asm,jitLdrImm[jitSTACK+i; jitSP; jitSPILLBASE+(i*8)]; i: i+1]
-  st[`asm]: asm
+  st[`asm]: jitRestoreLive[asm; live; st[`ncr]]
   st[`depth]: live+1
   st[`pending]: null
   st}
 
 // x[i]: pop the index (top of the virtual stack), call `vecgetAddr(vp; idx; &ok) -> v`, push the
-// result. Same spill/restore shape as jitOpCall (live values below the consumed operand survive
-// the call in the fixed spill area, jitSPILLBASE.., since `bl` clobbers the caller-saved operand
-// registers) and the same deopt-on-zero-ok convention (out of range or, defensively, wrong type).
+// result. Same spill/restore shape as jitOpCall (jitSaveLive/jitRestoreLive: live operand values
+// below the consumed one, and the caller-saved local registers, survive the call in the frame,
+// since `blr` clobbers them) and the same deopt-on-zero-ok convention (out of range or,
+// defensively, wrong type). The vector pointer itself comes from the slot's register (or `buf`
+// for an overflow slot) — see the locals-in-registers comment above.
 jitOpVecGet: {[st;vecgetAddr;slot]
   if[(st[`depth])<1; :null]
   live: (st[`depth])-1
-  asm: st[`asm]
-  i: 0
-  while[i<live; asm: asm,jitStrImm[jitSTACK+i; jitSP; jitSPILLBASE+(i*8)]; i: i+1]
+  asm: jitSaveLive[st[`asm]; live; st[`ncr]]
   asm: asm,jitMovR[1; jitSTACK+((st[`depth])-1)]
-  asm: asm,jitLdrImm[0; jitLOC; slot*8]
+  asm: jitLocalToReg[st;asm;0;slot]
   asm: asm,jitAddImm[2;jitSP;jitCALLOK]
   asm: jitLoadConst[asm;jitSCRATCH;vecgetAddr]
   asm: asm,jitBlr[jitSCRATCH]
@@ -311,9 +416,7 @@ jitOpVecGet: {[st;vecgetAddr;slot]
   st[`deoptFixups]: (st[`deoptFixups]),enlist ((count asm);jitSCRATCH)
   asm: asm,0
   asm: asm,jitMovR[jitSTACK+live; 0]
-  i: 0
-  while[i<live; asm: asm,jitLdrImm[jitSTACK+i; jitSP; jitSPILLBASE+(i*8)]; i: i+1]
-  st[`asm]: asm
+  st[`asm]: jitRestoreLive[asm; live; st[`ncr]]
   st[`depth]: live+1
   st[`pending]: null
   st}
@@ -331,21 +434,17 @@ jitOpVecGet: {[st;vecgetAddr;slot]
 jitOpVecSet: {[st;vecsetAddr;slot]
   if[(st[`depth])<2; :null]
   live: (st[`depth])-2
-  asm: st[`asm]
-  i: 0
-  while[i<live; asm: asm,jitStrImm[jitSTACK+i; jitSP; jitSPILLBASE+(i*8)]; i: i+1]
+  asm: jitSaveLive[st[`asm]; live; st[`ncr]]
   asm: asm,jitMovR[1; jitSTACK+((st[`depth])-1)]
   asm: asm,jitMovR[2; jitSTACK+((st[`depth])-2)]
-  asm: asm,jitLdrImm[0; jitLOC; slot*8]
+  asm: jitLocalToReg[st;asm;0;slot]
   asm: asm,jitAddImm[3;jitSP;jitCALLOK]
   asm: jitLoadConst[asm;jitSCRATCH;vecsetAddr]
   asm: asm,jitBlr[jitSCRATCH]
   asm: asm,jitLdrImm[jitSCRATCH;jitSP;jitCALLOK]
   st[`deoptFixups]: (st[`deoptFixups]),enlist ((count asm);jitSCRATCH)
   asm: asm,0
-  i: 0
-  while[i<live; asm: asm,jitLdrImm[jitSTACK+i; jitSP; jitSPILLBASE+(i*8)]; i: i+1]
-  st[`asm]: asm
+  st[`asm]: jitRestoreLive[asm; live; st[`ncr]]
   st[`depth]: live+1
   st[`pending]: (`vecwritedone;slot)
   st}
@@ -355,17 +454,30 @@ jitCompile: {[input;trampolines]
   n: count opcodes
   callAddr: trampolines[0]; vecgetAddr: trampolines[1]; vecsetAddr: trampolines[2]
   vecSlots: jitClassifySlots[opcodes;opargs;n;arity;nlocals]
+  lslots: jitLocalSlots[opcodes;opargs;n]
+  // Register-resident or not, every slot is reached in `buf` through jitLdrImm/jitStrImm's 12-bit
+  // scaled offset at least once (the prologue load below, or every access for an overflow slot).
+  p: 0
+  while[p<count lslots; if[not (lslots[p])<4096; :null]; p: p+1]
+  lregs: ((count lslots) & count jitLREGS)#jitLREGS
+  ncs: (count lregs) & jitLCALLEE
 
   asm: ()
   asm: asm,jitStpPre[29;30;jitSP;neg jitFRAME]
   asm: asm,jitStpOff[19;20;jitSP;16]
   asm: asm,jitStpOff[21;22;jitSP;32]
+  asm: jitSaveCallee[asm;ncs]
   asm: asm,jitMovR[jitLOC;0]
   asm: asm,jitMovR[jitVM;2]
   asm: asm,jitMovR[jitOK;1]
   asm: jitLoadConst[asm;jitNI;0N]
+  // buf -> the local registers, once (see the locals-in-registers comment above). Every one of
+  // them, not just the params/captures: a scratch local's slot is the 0 `buf` was zeroed with,
+  // exactly what an ldr through x19 would have read before its first StoreL.
+  p: 0
+  while[p<count lregs; asm: asm,jitLdrImm[lregs[p]; jitLOC; 8*lslots[p]]; p: p+1]
 
-  st: jitNewState asm
+  st: jitNewState[asm;lslots;lregs]
   ipWord: (n+1)#0   // n+1: a jump target can be the position right after the last op (e.g. a `do` loop's exit)
   ip: 0
   while[ip<n
@@ -423,10 +535,10 @@ jitCompile: {[input;trampolines]
   lastOp: $[n>0; opcodes[n-1]; -1]
   if[not lastOp=16
     ; if[(st[`depth])<1; :null]
-      st[`asm]: jitEmitReturn[st[`asm]; jitSTACK+((st[`depth])-1)]]
+      st[`asm]: jitEmitReturn[st[`asm]; jitSTACK+((st[`depth])-1); ncs]]
 
   deoptAt: count st[`asm]
-  asm: jitEmitDeopt st[`asm]
+  asm: jitEmitDeopt[st[`asm]; ncs]
 
   fixups: st[`fixups]
   cbzRegs: st[`cbzRegs]
