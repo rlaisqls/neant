@@ -509,6 +509,13 @@ pub fn parse_time(s: &str) -> R<i64> {
     };
     Ok(((h * 60 + m) * 60 + sec) * 1000 + ms)
 }
+/// A float's raw IEEE bit pattern as an int — not a numeric cast (which truncates), a
+/// reinterpretation, e.g. for the tracing JIT's codegen (`src/neant/jit/arm64.nt`) to load a
+/// float constant's bits via the same integer-only `jitLoadConst` used everywhere else, then
+/// `FMOV` them into a `D` register.
+fn fbits(x: Value) -> R<Value> {
+    match x { Float(f) => Ok(Int(f.to_bits() as i64)), _ => err("type: fbits on non-float") }
+}
 /// null per item: 0N 0n ` " " :: and null date/time
 fn isnull(x: Value) -> R<Value> {
     fn one(v: &Value) -> bool {
@@ -734,7 +741,7 @@ pub static BUILTINS: &[PrimDef] = &[
     p!("badd", None, Some(badd), ib_add), p!("band", None, Some(band), ib_and), p!("bor", None, Some(bor), ib_or), p!("bxor", None, Some(bxor), ib_xor),
     p!("shl", None, Some(shl), ib_shl), p!("shr", None, Some(shr), ib_shr), p!("bnot", Some(bnot), None),
     p!("key", Some(key), None), p!("value", Some(value), None), p!("group", Some(group), None),
-    p!("isnull", Some(isnull), None), p!("now", Some(now), None),
+    p!("isnull", Some(isnull), None), p!("now", Some(now), None), p!("fbits", Some(fbits), None),
     p!("show", Some(show), None), p!("print", Some(print), None), p!("signal", Some(signal), None), p!("exit", Some(exit), None),
     p!("read0", Some(read0), None), p!("write0", None, Some(write0)),
     p!("hopen", Some(hopen), None), p!("hclose", Some(hclose), None), p!("hsend", None, Some(hsend)), p!("hrecv", None, Some(hrecv)),

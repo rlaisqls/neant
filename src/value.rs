@@ -55,14 +55,70 @@ impl Op {
 pub struct FnCode {
     pub ops: Vec<Op>, pub consts: Vec<Value>, pub lines: Vec<u32>, pub params: Vec<String>, pub nlocals: usize,
     calls: AtomicU32, jit: std::sync::OnceLock<Option<Arc<crate::jit::Compiled>>>,
+    /// Per-loop-header state for the tracing JIT (`Vm::run_ops`, src/vm.rs). A `Mutex<HashMap>`
+    /// rather than something lock-free: only ever touched by a backward jump, not every op,
+    /// unlike `calls`/`jit` above which are on every call's fast path.
+    loops: Mutex<std::collections::HashMap<u32, LoopSlot>>,
 }
+
+enum LoopSlot {
+    Counting(u32),
+    Compiled(Arc<crate::jit::CompiledTrace>),
+    /// Recording was attempted and failed (an op outside Milestone 1's scope, a slot whose
+    /// observed type conflicted, ...) — permanent for this header, same as the method-JIT's own
+    /// "rejected once, stays rejected" convention (`FnCode::jit`, below).
+    Rejected,
+}
+
+/// What `Vm::run_ops` should do about a backward jump to this header, right now.
+pub(crate) enum LoopAction {
+    /// Already compiled: jump into it directly instead of continuing to interpret.
+    Run(Arc<crate::jit::CompiledTrace>),
+    /// Just crossed the threshold: record one more pass through the loop body as a trace.
+    StartRecording,
+    /// Still cold, or already rejected — interpret this iteration normally, same as always.
+    None,
+}
+
 /// After this many calls, try once to compile — and remember whether that succeeded, so a
 /// function that didn't qualify isn't re-walked on every later call.
 const JIT_THRESHOLD: u32 = 64;
+/// After this many times a loop header is reached via a backward jump, record one more pass
+/// through the loop body as a trace. Separate from `JIT_THRESHOLD`: a loop can go hot long before
+/// its containing function's own call count does (one top-level call can iterate a loop thousands
+/// of times), so this is checked independently, per header, not per function.
+const TRACE_THRESHOLD: u32 = 64;
 
 impl FnCode {
     pub fn new(ops: Vec<Op>, consts: Vec<Value>, lines: Vec<u32>, params: Vec<String>, nlocals: usize) -> FnCode {
-        FnCode { ops, consts, lines, params, nlocals, calls: AtomicU32::new(0), jit: std::sync::OnceLock::new() }
+        FnCode { ops, consts, lines, params, nlocals, calls: AtomicU32::new(0), jit: std::sync::OnceLock::new(), loops: Mutex::new(std::collections::HashMap::new()) }
+    }
+    /// `Vm::run_ops` calls this on every backward `Jmp` it executes (see its own doc comment for
+    /// why only `Jmp`, never `Op::Loop`) and acts on whatever `LoopAction` comes back.
+    pub(crate) fn loop_action(&self, header_ip: u32) -> LoopAction {
+        let mut loops = self.loops.lock().unwrap();
+        match loops.get(&header_ip) {
+            Some(LoopSlot::Compiled(t)) => return LoopAction::Run(t.clone()),
+            Some(LoopSlot::Rejected) => return LoopAction::None,
+            _ => {}
+        }
+        let slot = loops.entry(header_ip).or_insert(LoopSlot::Counting(0));
+        if let LoopSlot::Counting(n) = slot {
+            *n += 1;
+            if *n == TRACE_THRESHOLD { return LoopAction::StartRecording; }
+        }
+        LoopAction::None
+    }
+    /// Recording finished (`crate::trace::Recorder`) and compiled successfully — remember it so
+    /// every later hit of this header jumps straight into it (`LoopAction::Run`) instead of
+    /// recording or interpreting again.
+    pub(crate) fn set_trace_compiled(&self, header_ip: u32, t: Arc<crate::jit::CompiledTrace>) {
+        self.loops.lock().unwrap().insert(header_ip, LoopSlot::Compiled(t));
+    }
+    /// Recording finished but didn't compile (or never finished at all — an op outside scope
+    /// mid-recording) — never try this header again.
+    pub(crate) fn set_trace_rejected(&self, header_ip: u32) {
+        self.loops.lock().unwrap().insert(header_ip, LoopSlot::Rejected);
     }
     /// `(opcodes; args; consts; arity; nlocals)` — what the neant codegen function
     /// (`src/neant/jit/arm64.nt`) reads. Built fresh from the already-interned `ops`/`consts` each

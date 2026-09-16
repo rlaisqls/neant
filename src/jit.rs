@@ -277,15 +277,104 @@ mod arm64 {
             Some(super::Compiled { mem: mem as *mut u8, len, arity, nlocals, vec_slots, entry })
         }
     }
+
+    /// A compiled trace (tracing JIT Milestone 1, `src/trace.rs`): a hot `while` loop's body,
+    /// running natively until a guard disagrees with what was recorded. Unlike `Compiled` above,
+    /// there's no "return" — every exit is a bail, handing back exactly where in the original
+    /// bytecode to resume interpreting and the current value of every local the trace touched, so
+    /// `Vm::run_ops` can just splice them into its own `loc`/`ip` and keep going, indistinguishable
+    /// from having interpreted the whole time. Sound because recording only ever *observes* —
+    /// nothing here can make an already-correct program produce a different result, only run some
+    /// of it faster.
+    pub struct CompiledTrace {
+        mem: *mut u8,
+        len: usize,
+        /// Every local this trace reads or writes, in the fixed order codegen assigned them a
+        /// buffer slot in — `run()` marshals exactly these, in this order, both in and out.
+        touched: Vec<(usize, crate::trace::TraceTy)>,
+        entry: unsafe extern "C" fn(*mut i64, *mut i64),
+    }
+    unsafe impl Send for CompiledTrace {}
+    unsafe impl Sync for CompiledTrace {}
+    impl Drop for CompiledTrace {
+        fn drop(&mut self) { unsafe { munmap(self.mem as *mut std::ffi::c_void, self.len); } }
+    }
+    /// Generous but fixed, same choice `MAX_SLOTS`/`MAX_VEC_SLOTS` already make: a loop body with
+    /// more than this many distinct locals live in it just doesn't get traced.
+    const MAX_TOUCHED: usize = 16;
+
+    impl CompiledTrace {
+        /// Runs the trace until a guard bails, writes every touched local's new value back into
+        /// `loc`, and returns the bytecode `ip` to resume interpreting from. `None` means the
+        /// *current* values in `loc` don't match the types this trace was compiled assuming (the
+        /// same kind of guard `try_run`'s entry check already makes for the method-JIT) — same
+        /// fallback as everywhere else here: just don't use the compiled version this time.
+        pub fn run(&self, loc: &mut [Value]) -> Option<usize> {
+            if self.touched.len() > MAX_TOUCHED { return None; }
+            let mut buf = [0i64; MAX_TOUCHED];
+            for (i, (slot, ty)) in self.touched.iter().enumerate() {
+                buf[i] = match (ty, &loc[*slot]) {
+                    (crate::trace::TraceTy::Int, Value::Int(n)) => *n,
+                    (crate::trace::TraceTy::Float, Value::Float(f)) => f.to_bits() as i64,
+                    _ => return None,
+                };
+            }
+            let mut bail_ip: i64 = 0;
+            unsafe { (self.entry)(buf.as_mut_ptr(), &mut bail_ip as *mut i64); }
+            for (i, (slot, ty)) in self.touched.iter().enumerate() {
+                loc[*slot] = match ty {
+                    crate::trace::TraceTy::Int => Value::Int(buf[i]),
+                    crate::trace::TraceTy::Float => Value::Float(f64::from_bits(buf[i] as u64)),
+                };
+            }
+            Some(bail_ip as usize)
+        }
+    }
+
+    pub fn compile_trace(trace: &crate::trace::Trace, consts: &[Value], vm: &mut Vm) -> Option<CompiledTrace> {
+        let touched = trace.touched_locals()?; // None: a slot's observed type conflicted across the trace
+        let f = vm.get("jitCompileTrace")?;
+        let (kinds, args, tys) = trace.to_neant_input();
+        let input = Value::List(Arc::new(vec![
+            crate::value::ints(kinds), crate::value::ints(args), crate::value::ints(tys),
+            crate::value::list(consts.to_vec()),
+        ]));
+        // Same reentrancy guard `compile` above uses: `jitCompileTrace`'s own helpers are neant
+        // functions too and could cross the JIT threshold while compiling themselves.
+        COMPILING.with(|c| c.set(c.get() + 1));
+        let result = vm.call(&f, vec![input]);
+        COMPILING.with(|c| c.set(c.get() - 1));
+        let bytes = match result { Ok(Value::Bytes(b)) => b, other => { eprintln!("DEBUG jitCompileTrace result: {:?}", other); return None; } };
+        let touched = touched.into_iter().map(|(s, t)| (s as usize, t)).collect();
+        emit_trace(&bytes, touched)
+    }
+
+    fn emit_trace(bytes: &[u8], touched: Vec<(usize, crate::trace::TraceTy)>) -> Option<CompiledTrace> {
+        let page = 4096usize;
+        let len = bytes.len().div_ceil(page) * page;
+        unsafe {
+            let mem = mmap(std::ptr::null_mut(), len, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+            if mem as isize == -1 { return None; }
+            std::ptr::copy_nonoverlapping(bytes.as_ptr(), mem as *mut u8, bytes.len());
+            if mprotect(mem, len, PROT_READ | PROT_EXEC) != 0 { munmap(mem, len); return None; }
+            __clear_cache(mem as *mut std::ffi::c_char, (mem as *mut u8).add(len) as *mut std::ffi::c_char);
+            let entry: unsafe extern "C" fn(*mut i64, *mut i64) = std::mem::transmute(mem);
+            Some(CompiledTrace { mem: mem as *mut u8, len, touched, entry })
+        }
+    }
 }
 
 #[cfg(target_arch = "aarch64")]
 pub(crate) use arm64::already_compiling;
 #[cfg(target_arch = "aarch64")]
-pub use arm64::{compile as compile_arm64, Compiled};
+pub use arm64::{compile as compile_arm64, compile_trace as compile_trace_arm64, Compiled, CompiledTrace};
 
 #[cfg(target_arch = "aarch64")]
 pub fn compile(code: &Arc<FnCode>, vm: &mut Vm) -> Option<Compiled> { compile_arm64(code, vm) }
+#[cfg(target_arch = "aarch64")]
+pub fn compile_trace(trace: &crate::trace::Trace, consts: &[Value], vm: &mut Vm) -> Option<CompiledTrace> {
+    compile_trace_arm64(trace, consts, vm)
+}
 
 #[cfg(not(target_arch = "aarch64"))]
 pub(crate) fn already_compiling() -> bool { false }
@@ -297,3 +386,11 @@ impl Compiled {
 }
 #[cfg(not(target_arch = "aarch64"))]
 pub fn compile(_code: &Arc<FnCode>, _vm: &mut Vm) -> Option<Compiled> { None }
+#[cfg(not(target_arch = "aarch64"))]
+pub struct CompiledTrace(std::convert::Infallible);
+#[cfg(not(target_arch = "aarch64"))]
+impl CompiledTrace {
+    pub fn run(&self, _loc: &mut [Value]) -> Option<usize> { match self.0 {} }
+}
+#[cfg(not(target_arch = "aarch64"))]
+pub fn compile_trace(_trace: &crate::trace::Trace, _consts: &[Value], _vm: &mut Vm) -> Option<CompiledTrace> { None }

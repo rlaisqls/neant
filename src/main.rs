@@ -14,6 +14,7 @@
 mod image;
 mod jit;
 mod prims;
+mod trace;
 mod value;
 mod vm;
 

@@ -92,9 +92,14 @@ impl Vm {
 
     /// Run a frame; on error record the line the failing op came from, so the trace grows innermost-first.
     /// If this frame failed inside a Call, the op before it loaded the callee — that names the frame below.
-    fn execute(&mut self, ops: &[Op], k: &[Value], lines: &[u32], loc: &mut Vec<Value>) -> R<Value> {
+    /// `code`: `Some` when this frame belongs to an actual `FnCode` (a lambda/closure call,
+    /// `Vm::call_code`) — the only case `Op::Jmp`/`Op::Loop` backward jumps can trigger the
+    /// tracing JIT's per-loop-header hotness counting (`FnCode::loop_hot`); `None` for top-level
+    /// unit execution (`Vm::exec`), which has no `FnCode` to key that counter on and isn't the
+    /// tracing JIT's target anyway.
+    fn execute(&mut self, code: Option<&Arc<FnCode>>, ops: &[Op], k: &[Value], lines: &[u32], loc: &mut Vec<Value>) -> R<Value> {
         let mut ip = 0;
-        let r = self.run_ops(ops, k, loc, &mut ip);
+        let r = self.run_ops(code, ops, k, loc, &mut ip);
         if r.is_err() {
             let at = ip.saturating_sub(1);
             if let (Some(Op::Call(_)), Some(&Op::LoadG(a))) = (ops.get(at), at.checked_sub(1).and_then(|i| ops.get(i))) {
@@ -107,11 +112,49 @@ impl Vm {
         r
     }
 
-    fn run_ops(&mut self, ops: &[Op], k: &[Value], loc: &mut Vec<Value>, ipc: &mut usize) -> R<Value> {
+    fn run_ops(&mut self, code: Option<&Arc<FnCode>>, ops: &[Op], k: &[Value], loc: &mut Vec<Value>, ipc: &mut usize) -> R<Value> {
         let mut st: Vec<Value> = self.pool.pop().unwrap_or_default();
         let mut ip = 0;
+        let mut recorder: Option<crate::trace::Recorder> = None;
         while ip < ops.len() {
             let op = ops[ip]; ip += 1; *ipc = ip;   // where the error reporter looks when an op fails
+            let ip_before_op = ip as u32;
+            let was_recording = recorder.is_some();
+            // A backward `Jmp` is a loop header being reached again — both `while` (jumps back to
+            // its own condition check) and `do` (jumps back to its body after decrementing) emit
+            // this shape; `Op::Loop`'s own target is always *forward* (the loop's exit), never a
+            // header, so it's not checked here. Only meaningful with a real `FnCode` to key the
+            // per-header counter on (see `execute`'s doc comment). An empty stack at this point is
+            // what distinguishes `while` (traceable — see src/trace.rs's module doc comment) from
+            // `do` (its counter is still live here, so it's silently left untraced this pass).
+            if recorder.is_none() {
+                if let Op::Jmp(t) = op {
+                    if (t as usize) < ip {
+                        if let Some(code) = code {
+                            match code.loop_action(t) {
+                                LoopAction::Run(trace) => {
+                                    // Already compiled: run it instead of interpreting this
+                                    // iteration. A `None` here means the current locals don't
+                                    // match the types this trace assumed — same "just don't use
+                                    // the compiled version this time" fallback as everywhere else
+                                    // in the JIT; falls through to the ordinary `Op::Jmp` below.
+                                    if let Some(bail_ip) = trace.run(loc) {
+                                        eprintln!("DEBUG trace run: header={t} bail_ip={bail_ip}");
+                                        ip = bail_ip; *ipc = ip;
+                                        continue;
+                                    } else {
+                                        eprintln!("DEBUG trace run: type mismatch, skipped");
+                                    }
+                                }
+                                LoopAction::StartRecording if st.is_empty() => {
+                                    recorder = Some(crate::trace::Recorder::start(t));
+                                }
+                                _ => {}
+                            }
+                        }
+                    }
+                }
+            }
             match op {
                 Op::Push(a) => st.push(k[a as usize].clone()),
                 Op::LoadL(a) => st.push(loc[a as usize].clone()),
@@ -176,6 +219,22 @@ impl Vm {
                 Op::Ret => { let v = st.pop().unwrap_or(Null); st.clear(); self.pool.push(st); return Ok(v); }
                 Op::List(n) => { let items = (0..n).map(|_| st.pop().unwrap()).collect(); st.push(pack(items)); }
             }
+            if was_recording {
+                if let Some(rec) = recorder.as_mut() {
+                    if rec.step(op, ip_before_op, ip as u32, &st) {
+                        let t = recorder.take().unwrap().finish();
+                        if let Some(code) = code {
+                            match crate::jit::compile_trace(&t, &code.consts, self) {
+                                Some(compiled) => { eprintln!("DEBUG trace compiled: header={} steps={}", t.header, t.steps.len()); code.set_trace_compiled(t.header, Arc::new(compiled)); }
+                                None => { eprintln!("DEBUG trace compile FAILED: header={} steps={}", t.header, t.steps.len()); code.set_trace_rejected(t.header); }
+                            }
+                        }
+                    } else if rec.failed() {
+                        if let Some(code) = code { code.set_trace_rejected(rec.header()); }
+                        recorder = None;
+                    }
+                }
+            }
         }
         let v = st.pop().unwrap_or(Null);
         st.clear(); self.pool.push(st);
@@ -190,7 +249,7 @@ impl Vm {
             let (ops, mut k, lines) = load_unit(&u)?;
             self.intern(&ops, &mut k);
             self.trace.clear();
-            last = self.execute(&ops, &k, &lines, &mut Vec::new())?;
+            last = self.execute(None, &ops, &k, &lines, &mut Vec::new())?;
         }
         Ok(last)
     }
@@ -218,7 +277,7 @@ impl Vm {
         let jit_result = match &compiled { Some(c) => c.try_run(&loc, self), None => None };
         let r = match jit_result {
             Some(v) => Ok(v),
-            None => self.execute(&code.ops, &code.consts, &code.lines, &mut loc),
+            None => self.execute(Some(code), &code.ops, &code.consts, &code.lines, &mut loc),
         };
         self.depth -= 1;
         loc.clear(); self.pool.push(loc);

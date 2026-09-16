@@ -34,6 +34,17 @@ jitCondLT: 11
 jitCondGT: 12
 jitCondEQ: 0
 
+// ---- tracing JIT registers (src/trace.rs / jitCompileTrace below): a compiled trace makes no
+// calls at all (Milestone 1 has no `Call` in scope), so it needs no prologue/epilogue and no
+// callee-saved registers — everything lives in caller-saved ones. x0=buffer pointer (touched
+// locals, in and out — see jit.rs's `CompiledTrace`), x1=out bail-ip pointer, both held for the
+// trace's whole lifetime since nothing ever clobbers them (no `blr`). d16..d21 mirror x9..x14 as
+// a parallel float operand stack (chosen above d0-d7 so a later pass giving trampolines float
+// arguments wouldn't collide with it).
+jitTrBUF: 0
+jitTrOUT: 1
+jitFSTACK: 16
+
 // ---- instruction encoders. Every formula here was cross-checked against `objdump -d` output on
 // a snippet assembled with this box's own `as`/`gcc` before being trusted (see README "Stage 2").
 jitMovz: {[rd;imm16;hw] (jitW 0xD2800000) bor (hw shl 21) bor (imm16 shl 5) bor rd}
@@ -51,6 +62,7 @@ jitRet: {[] jitW 0xD65F03C0}
 jitBlr: {[rn] (jitW 0xD63F0000) bor (rn shl 5)}
 jitB: {[imm26] (jitW 0x14000000) bor (imm26 band (jitW 0x03FFFFFF))}
 jitCbz: {[rt;imm19] (jitW 0xB4000000) bor ((imm19 band (jitW 0x07FFFF)) shl 5) bor rt}
+jitCbnz: {[rt;imm19] (jitW 0xB5000000) bor ((imm19 band (jitW 0x07FFFF)) shl 5) bor rt}
 jitBcond: {[cond;imm19] (jitW 0x54000000) bor ((imm19 band (jitW 0x07FFFF)) shl 5) bor cond}
 jitCmpImm: {[rn;imm12] (jitW 0xF1000000) bor (imm12 shl 10) bor (rn shl 5) bor 31}
 jitSubImm: {[rd;rn;imm12] (jitW 0xD1000000) bor (imm12 shl 10) bor (rn shl 5) bor rd}
@@ -59,6 +71,20 @@ jitStpPre: {[rt1;rt2;rn;immBytes] (jitW 0xA9800000) bor (((immBytes div 8) band 
 jitStpOff: {[rt1;rt2;rn;byteOff] (jitW 0xA9000000) bor (((byteOff div 8) band 0x7F) shl 15) bor (rt2 shl 10) bor (rn shl 5) bor rt1}
 jitLdpOff: {[rt1;rt2;rn;byteOff] (jitW 0xA9400000) bor (((byteOff div 8) band 0x7F) shl 15) bor (rt2 shl 10) bor (rn shl 5) bor rt1}
 jitLdpPost: {[rt1;rt2;rn;byteOff] (jitW 0xA8C00000) bor (((byteOff div 8) band 0x7F) shl 15) bor (rt2 shl 10) bor (rn shl 5) bor rt1}
+
+// ---- float (Dn) encoders, for the tracing JIT (src/trace.rs) — a trace records *observed*
+// types, so unlike the whole-function JIT there's no static-typing problem to solve here, just
+// the AArch64 float ISA itself. jitFDyad's op: 0=FMUL 1=FDIV 2=FADD 3=FSUB 4=FMAX 5=FMIN
+// 6=FMAXNM 7=FMINNM — `&`/`|` use FMINNM/FMAXNM specifically, not FMIN/FMAX: Rust's `f64::min`/
+// `max` (src/prims.rs's `min2`/`max2`) are IEEE minNum/maxNum (propagate the non-NaN side when
+// only one operand is NaN), which is FMINNM/FMAXNM's behavior, not plain FMIN/FMAX's (NaN if
+// *either* side is NaN) — an easy mix-up since the mnemonics look interchangeable.
+jitFDyad: {[rd;rn;rm;op] (jitW 0x1E600800) bor (op shl 12) bor (rm shl 16) bor (rn shl 5) bor rd}
+jitFCmp: {[rn;rm] (jitW 0x1E602000) bor (rm shl 16) bor (rn shl 5)}
+jitFMovToF: {[dd;xn] (jitW 0x9E670000) bor (xn shl 5) bor dd}   // Dd <- Xn, raw bits
+jitFMovToX: {[xd;dn] (jitW 0x9E660000) bor (dn shl 5) bor xd}   // Xd <- Dn, raw bits
+jitFLdrImm: {[dt;rn;byteOff] (jitW 0xFD400000) bor ((byteOff div 8) shl 10) bor (rn shl 5) bor dt}
+jitFStrImm: {[dt;rn;byteOff] (jitW 0xFD000000) bor ((byteOff div 8) shl 10) bor (rn shl 5) bor dt}
 
 // rd = a 64-bit constant, via movz + up to 3 movk (skipping zero chunks).
 jitLoadConst: {[asm;rd;v]
@@ -421,3 +447,226 @@ jitCompile: {[input;trampolines]
     i: i+1]
 
   (,/jitLE each asm; vecSlots)}
+
+// ==== tracing JIT (Milestone 1, src/trace.rs): compile one recorded `while`-loop iteration ====
+//
+// jitCompileTrace[input] -> Bytes or null.
+// input = (kinds:Ints; args:Ints; tys:Ints; consts:List) — Trace::to_neant_input, src/trace.rs.
+// kinds: 0=Push 1=PushNull 2=LoadL 3=StoreL 4=Dyad 5=Pop 6=Guard(taken) 7=Guard(not taken).
+// tys: 0=int 1=float (per-step; for Dyad this is the *result* type, not necessarily the operand
+// type — comparisons narrow float operands to an int/bool result, so jitTrDyad below derives the
+// operand type from its own tracked stack, then double-checks it against this as a sanity check).
+//
+// No prologue/epilogue: a trace makes no calls (Milestone 1 has no `Call` in scope), so nothing
+// here is callee-saved and there's nothing to restore. x0 (`jitTrBUF`) is the touched-locals
+// buffer, indexed by *position* in the touched-slot list (not by raw slot number — computed once,
+// up front, the same "first LoadL/StoreL occurrence order" `Trace::touched_locals` (src/trace.rs)
+// already used to build that same buffer on the Rust side; the two must agree exactly, or the
+// compiled trace and its caller would disagree about which position means which local).
+//
+// `tstack` (in the state dict below) is the trace's own virtual operand stack, but unlike the
+// whole-function JIT's single `depth` counter, it's a list of `` `int``/`` `float `` tags — the
+// int and float stacks (`jitSTACK`/`jitFSTACK`) grow independently, so codegen needs to know, at
+// each point, how many of *each* type are already live to find the next free physical register
+// (`jitTrPos`) — the same problem a real per-value type this JIT never had to solve until a trace
+// could hold either kind of value on the same notional stack.
+
+// every param/capture slot a trace ever `LoadL`s or `StoreL`s, first-seen order — must match
+// `Trace::touched_locals`'s own scan exactly (src/trace.rs), since this order *is* the buffer's
+// layout on both sides of the Rust/neant boundary.
+jitTraceTouchedSlots: {[kinds;args]
+  slots: ()
+  i: 0
+  n: count kinds
+  while[i<n
+    k: kinds[i]
+    if[(k=2)|(k=3); s: args[i]; if[not s in slots; slots: slots,s]]
+    i: i+1]
+  slots}
+
+// how many `ty`-tagged entries are already on `tstack` — also the next free physical register
+// offset for a new push of that type, and (minus 1, minus 2) the top/second-from-top of that
+// same type once at least two are live.
+jitTrPos: {[tstack;ty] 0+/tstack=ty}
+
+jitTrPush: {[st;consts;a;ty]
+  tstack: st[`tstack]
+  reg: jitTrPos[tstack;ty]
+  if[not reg<jitMAXDEPTH; :null]
+  c: consts[a]
+  asm: st[`asm]
+  if[ty=`float
+    ; asm: jitLoadConst[asm;jitSCRATCH; fbits c]
+      asm: asm,jitFMovToF[jitFSTACK+reg;jitSCRATCH]]
+  if[not ty=`float; asm: jitLoadConst[asm; jitSTACK+reg; c]]
+  st[`asm]: asm
+  st[`tstack]: tstack,ty
+  st}
+
+// `if`/`while`/`do`'s own statement-value convention (see jitOpPush's comment) — a true no-op,
+// but still needs a placeholder tag so the `Pop` that always immediately follows has something
+// to drop; nothing ever reads it, so which type it's tagged doesn't matter.
+jitTrPushNull: {[st] st[`tstack]: (st[`tstack]),`int; st}
+
+jitTrLoadL: {[st;slots;a;ty]
+  tstack: st[`tstack]
+  reg: jitTrPos[tstack;ty]
+  if[not reg<jitMAXDEPTH; :null]
+  pos: slots?a
+  if[pos=count slots; :null]
+  asm: st[`asm]
+  if[ty=`float; asm: asm,jitFLdrImm[jitFSTACK+reg; jitTrBUF; pos*8]]
+  if[not ty=`float; asm: asm,jitLdrImm[jitSTACK+reg; jitTrBUF; pos*8]]
+  st[`asm]: asm
+  st[`tstack]: tstack,ty
+  st}
+
+// Doesn't pop — same as the interpreter's own `Op::StoreL`, which only peeks the top (see
+// jitOpStoreL's comment) — the buffer is the trace's *only* copy of a local's value (nothing
+// caches it in a register across ops), so this write is immediately the new ground truth.
+jitTrStoreL: {[st;slots;a;ty]
+  tstack: st[`tstack]
+  n: count tstack
+  if[n<1; :null]
+  if[not (tstack[n-1])=ty; :null]
+  reg: (jitTrPos[tstack;ty])-1
+  pos: slots?a
+  if[pos=count slots; :null]
+  asm: st[`asm]
+  if[ty=`float; asm: asm,jitFStrImm[jitFSTACK+reg; jitTrBUF; pos*8]]
+  if[not ty=`float; asm: asm,jitStrImm[jitSTACK+reg; jitTrBUF; pos*8]]
+  st[`asm]: asm
+  st}
+
+jitTrPop: {[st]
+  tstack: st[`tstack]
+  n: count tstack
+  if[n<1; :null]
+  st[`tstack]: (n-1)#tstack
+  st}
+
+jitTrDyadFCmp: {[asm;x;y;dst;kind]
+  cond: $[kind=5;jitCondLT; kind=6;jitCondGT; jitCondEQ]
+  (asm,jitFCmp[y;x]),jitCset[dst;cond]}
+jitTrDyadICmp: {[asm;x;y;dst;kind]
+  cond: $[kind=5;jitCondLT; kind=6;jitCondGT; jitCondEQ]
+  (asm,jitCmpR[y;x]),jitCset[dst;cond]}
+// jitFDyad op numbering (see its own comment): 0=FMUL 1=FDIV 2=FADD 3=FSUB 4=FMAX 5=FMIN
+// 6=FMAXNM 7=FMINNM — `&`/`|` (kind 3/4) need the NM (NaN-propagates-only-if-both-NaN) forms.
+jitTrDyadFArith: {[asm;x;y;dst;kind]
+  fop: $[kind=0;2; kind=1;3; kind=2;0; kind=3;7; 6]
+  asm,jitFDyad[dst;y;x;fop]}
+jitTrDyadIArith: {[asm;x;y;dst;kind]
+  $[kind=0; asm,jitAddR[dst;x;y]
+  ; kind=1; asm,jitSubR[dst;x;y]
+  ; kind=2; asm,jitMulR[dst;x;y]
+  ; kind=3; (asm,jitCmpR[x;y]),jitCsel[dst;x;y;jitCondLT]
+  ; (asm,jitCmpR[x;y]),jitCsel[dst;x;y;jitCondGT]]}
+
+// Both operands must already be the *same* tracked type — no implicit int/float promotion this
+// pass (deferred, same as the whole-function JIT's own float extension would need to decide the
+// same question) — a mismatch just rejects the whole trace, same fail-closed default as
+// everywhere else here. A comparison's result is always `` `int `` (a bool, 0/1) regardless of
+// the operands' type; arithmetic's result stays the operands' own type.
+jitTrDyad: {[st;consts;a;ty]
+  tstack: st[`tstack]
+  n: count tstack
+  if[n<2; :null]
+  opTy: tstack[n-1]
+  if[not opTy=(tstack[n-2]); :null]
+  p: consts[a]
+  kind: jitDyadKind string p
+  if[isnull kind; :null]
+  isCmp: kind>4
+  resultTy: $[isCmp; `int; opTy]
+  if[not resultTy=ty; :null]
+  isFloat: opTy=`float
+  base: $[isFloat; jitFSTACK; jitSTACK]
+  x: base+((jitTrPos[tstack;opTy])-1)
+  y: base+((jitTrPos[tstack;opTy])-2)
+  newTstack: (n-2)#tstack
+  dst: $[isCmp; jitSTACK+(jitTrPos[newTstack;`int]); y]
+  asm: $[isCmp & isFloat; jitTrDyadFCmp[st[`asm];x;y;dst;kind]
+       ; isCmp; jitTrDyadICmp[st[`asm];x;y;dst;kind]
+       ; isFloat; jitTrDyadFArith[st[`asm];x;y;dst;kind]
+       ; jitTrDyadIArith[st[`asm];x;y;dst;kind]]
+  st[`asm]: asm
+  st[`tstack]: newTstack,resultTy
+  st}
+
+// The recorded direction of a branch this trace took: `taken` (this `Jmpf` jumped, i.e. the
+// condition was false) needs the condition to *still* be false on replay (bail via `CBNZ` if
+// not); `not taken` needs it to still be true (bail via `CBZ` if not). Each guard gets its own
+// stub (fixed 2 words: load the bail `ip` constant, branch to the one shared epilogue) rather
+// than inlining the load — keeps every `CBZ`/`CBNZ`'s branch distance small and uniform instead
+// of depending on how big each bail `ip` constant happens to be.
+jitTrGuard: {[st;taken;bailIp]
+  tstack: st[`tstack]
+  n: count tstack
+  if[n<1; :null]
+  if[not (tstack[n-1])=`int; :null]
+  reg: jitSTACK+((jitTrPos[tstack;`int])-1)
+  bails: (st[`bails]),bailIp
+  stubIdx: (count bails)-1
+  asm: st[`asm]
+  word: count asm
+  asm: asm,$[taken; jitCbnz[reg;0]; jitCbz[reg;0]]
+  st[`asm]: asm
+  st[`bails]: bails
+  st[`fixups]: (st[`fixups]),enlist (word;stubIdx;reg;taken)
+  st[`tstack]: (n-1)#tstack
+  st}
+
+jitCompileTrace: {[input]
+  kinds: input[0]; args: input[1]; tys: input[2]; consts: input[3]
+  n: count kinds
+  slots: jitTraceTouchedSlots[kinds;args]
+
+  st: `asm`tstack`fixups`bails!((); (); (); ())
+  i: 0
+  while[i<n
+    kind: kinds[i]; a: args[i]
+    ty: $[(tys[i])=1; `float; `int]
+    show ("i";i;"kind";kind;"a";a;"ty";ty;"tstack";st[`tstack])
+    $[kind=0; st: jitTrPush[st;consts;a;ty]
+    ; kind=1; st: jitTrPushNull st
+    ; kind=2; st: jitTrLoadL[st;slots;a;ty]
+    ; kind=3; st: jitTrStoreL[st;slots;a;ty]
+    ; kind=4; st: jitTrDyad[st;consts;a;ty]
+    ; kind=5; st: jitTrPop st
+    ; kind=6; st: jitTrGuard[st;1b;a]
+    ; kind=7; st: jitTrGuard[st;0b;a]
+    ; st: null]
+    if[isnull st; :null]
+    i: i+1]
+
+  asm: st[`asm]
+  backWord: count asm
+  asm: asm,jitB[neg backWord]   // the loop's own back edge: to word 0, no prologue to skip
+
+  bails: st[`bails]
+  numGuards: count bails
+  stubAt: count asm
+  epilogueAt: stubAt+(2*numGuards)
+  gi: 0
+  while[gi<numGuards
+    bailIp: bails[gi]
+    if[not bailIp<65536; :null]   // a function too large for a single MOVZ's bail ip: don't compile
+    asm: asm,jitMovz[jitSCRATCH; bailIp; 0]
+    thisWord: count asm
+    asm: asm,jitB[epilogueAt-thisWord]
+    gi: gi+1]
+
+  asm: asm,jitStrImm[jitSCRATCH; jitTrOUT; 0]   // *outBailIp = jitSCRATCH (set by whichever stub got here)
+  asm: asm,jitRet[]
+
+  fixups: st[`fixups]
+  fi: 0
+  while[fi<count fixups
+    e: fixups[fi]
+    word: e[0]; stubIdx: e[1]; reg: e[2]; taken: e[3]
+    delta: (stubAt+(2*stubIdx))-word
+    asm[word]: $[taken; jitCbnz[reg;delta]; jitCbz[reg;delta]]
+    fi: fi+1]
+
+  ,/jitLE each asm}
