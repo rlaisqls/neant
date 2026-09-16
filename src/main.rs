@@ -619,6 +619,240 @@ mod jit_tests {
         println!("interpreted {interpreted:?}  traced {traced:?}  ratio {:.1}x", interpreted.as_secs_f64() / traced.as_secs_f64());
     }
 
+    /// The simplest call a loop can make — one plain lambda, one int argument, straight-line body
+    /// — inlined into the trace (`Recorder::enter_frame`, src/trace.rs): the callee's frame is
+    /// recorded as `FramePush`, a `StoreL`+`Pop` binding its argument into a slot past the loop's
+    /// own frame, its body, and `FrameEnd`. The argument slot is *virtual* (at or past
+    /// `real_upto`) — never loaded from or written back to the interpreter's frame — so this is
+    /// also what would catch a trace writing a callee's local over one of the loop's own. Sizes
+    /// straddle the 64-iteration threshold at which the trace is recorded.
+    #[test]
+    fn traced_call_and_interpreted_agree() {
+        let mut v = boot_vm();
+        let got = v.eval(
+            "f: {x*2}; \
+             g: {[k] s:0; i:0; while[i<k; s: s+f i; i: i+1]; s}; \
+             gSlow: {[k] s:0; i:0; while[i<k; s: s+(- - f i); i: i+1]; s}; \
+             {[k] (g k)=gSlow k} each 0 1 63 64 65 66 200 1000",
+        ).unwrap();
+        assert_eq!(got.fmt(), "11111111b");
+    }
+
+    /// `Op::Call` pops the callee, then parameter 0, then parameter 1 — so the first argument is
+    /// the *top* of the stack when the frame opens, and `enter_frame` binds top-down in that order.
+    /// `a*b+1` — `a*(b+1)`, right to left — is deliberately asymmetric in its two arguments:
+    /// `m[i;3]` summed over `i<10` is 180, and with the arguments swapped it would be 165, which
+    /// is exactly what a binding in the wrong order would produce.
+    #[test]
+    fn traced_two_arg_call_binds_arguments_in_order() {
+        let mut v = boot_vm();
+        let got = v.eval(
+            "m: {[a;b] a*b+1}; \
+             g: {[k] s:0; i:0; while[i<k; s: s+m[i;3]; i: i+1]; s}; \
+             gSlow: {[k] s:0; i:0; while[i<k; s: s+(- - m[i;3]); i: i+1]; s}; \
+             ({[k] (g k)=gSlow k} each 63 64 65 200), (,180=g 10)",
+        ).unwrap();
+        assert_eq!(got.fmt(), "11111b");
+    }
+
+    /// A branch *inside* a callee can't bail to the branch's other edge the way one in the loop's
+    /// own frame does — that `ip` is in the callee's bytecode, and the interpreter is not in that
+    /// frame — so it is a `GuardRewind` (src/trace.rs): abandon the half-finished iteration and
+    /// resume interpreting at the loop header from the values it started with. Here the callee's
+    /// condition holds for the first 100 iterations (which is when the trace is recorded) and
+    /// flips after, so from `i=101` on every entry rewinds, the iteration runs interpreted, and
+    /// the next backward jump re-enters the trace — which then rewinds again. `k=99` never flips.
+    #[test]
+    fn traced_call_rewinds_when_a_callee_branch_flips() {
+        let mut v = boot_vm();
+        let got = v.eval(
+            "ab: {$[x<0;0-x;x]}; \
+             g: {[k] s:0; i:0; while[i<k; s: s+ab[100-i]; i: i+1]; s}; \
+             gSlow: {[k] s:0; i:0; while[i<k; s: s+(- - ab[100-i]); i: i+1]; s}; \
+             {[k] (g k)=gSlow k} each 63 64 65 99 100 101 102 300",
+        ).unwrap();
+        assert_eq!(got.fmt(), "11111111b");
+    }
+
+    /// An early `:x` in a callee is an `Op::Ret` mid-frame: the interpreter leaves `run_ops`
+    /// there, so the recorder never sees the op at all — `Vm::call_code`'s `exit_frame` is what
+    /// closes the frame, and `FrameEnd` takes whatever is on top of the trace's stack as the
+    /// result. The `if` in front of it is a `GuardRewind`, so this also covers the return being
+    /// *skipped* for the first 100 iterations and *taken* after.
+    #[test]
+    fn traced_call_with_early_return_and_interpreted_agree() {
+        let mut v = boot_vm();
+        let got = v.eval(
+            "er: {if[x<0; :0]; x*3}; \
+             g: {[k] s:0; i:0; while[i<k; s: s+er[100-i]; i: i+1]; s}; \
+             gSlow: {[k] s:0; i:0; while[i<k; s: s+(- - er[100-i]); i: i+1]; s}; \
+             {[k] (g k)=gSlow k} each 63 64 65 100 101 300",
+        ).unwrap();
+        assert_eq!(got.fmt(), "111111b");
+    }
+
+    /// Frames nest: `f[h[i]]` has `h`'s frame open and closed *while `f`'s argument is being
+    /// built* (the compiler emits arguments before the callee, `gen`, src/neant/core/compile.nt),
+    /// and `c` calls `h` from inside its own body, so its frame is open when `h`'s opens. Each
+    /// frame gets its own trace-local slot range (`next_base`) and its own entry in `frames`; a
+    /// result left in the wrong register by `FrameEnd` — or the two frames' slots colliding —
+    /// gives a wrong sum here. Two distinct callees also means two entries in the entry guard.
+    #[test]
+    fn traced_nested_calls_and_interpreted_agree() {
+        let mut v = boot_vm();
+        let got = v.eval(
+            "f: {x*2}; h: {x+1}; c: {h[x]*3}; \
+             g: {[k] s:0; i:0; while[i<k; s: s+f[h[i]]; i: i+1]; s}; \
+             gSlow: {[k] s:0; i:0; while[i<k; s: s+(- - f[h[i]]); i: i+1]; s}; \
+             g2: {[k] s:0; i:0; while[i<k; s: s+c i; i: i+1]; s}; \
+             g2Slow: {[k] s:0; i:0; while[i<k; s: s+(- - c i); i: i+1]; s}; \
+             ({[k] (g k)=gSlow k} each 63 64 65 200), {[k] (g2 k)=g2Slow k} each 63 64 65 200",
+        ).unwrap();
+        assert_eq!(got.fmt(), "11111111b");
+    }
+
+    /// A float argument is bound the same way an int one is, into the float register file, and
+    /// the callee's result comes back on the float operand stack — `FrameEnd` has to move it by
+    /// the float file's numbering, not the int one's. `x` counts up in floats so nothing here
+    /// mixes types (an int/float `Dyad` is out of scope for a trace, calls or not).
+    #[test]
+    fn traced_float_call_and_interpreted_agree() {
+        let mut v = boot_vm();
+        let got = v.eval(
+            "ff: {x*1.5}; \
+             g: {[k] s:0.0; x:0.0; i:0; while[i<k; s: s+ff x; x: x+1.0; i: i+1]; s}; \
+             gSlow: {[k] s:0.0; x:0.0; i:0; while[i<k; s: s+(- - ff x); x: x+1.0; i: i+1]; s}; \
+             {[k] (g k)=gSlow k} each 63 64 65 200 5000",
+        ).unwrap();
+        assert_eq!(got.fmt(), "11111b");
+    }
+
+    /// A callee's own scratch local is another virtual slot — written every iteration, never
+    /// loaded on entry (it has no value before the loop) and never written back (nobody wants it
+    /// after). `jitTraceTouched` (src/neant/jit/arm64.nt) keeps it out of the `stored` list, so
+    /// this is the case that would catch a virtual slot being stored to the buffer, or worse,
+    /// written back into the interpreter's frame at a slot index the loop's own frame doesn't have.
+    #[test]
+    fn traced_call_with_a_scratch_local_and_interpreted_agree() {
+        let mut v = boot_vm();
+        let got = v.eval(
+            "sq: {[x] t: x+1; t*t}; \
+             g: {[k] s:0; i:0; while[i<k; s: s+sq i; i: i+1]; s}; \
+             gSlow: {[k] s:0; i:0; while[i<k; s: s+(- - sq i); i: i+1]; s}; \
+             {[k] (g k)=gSlow k} each 63 64 65 200",
+        ).unwrap();
+        assert_eq!(got.fmt(), "1111b");
+    }
+
+    /// The same lambda called twice in one iteration is inlined twice, each call site with its
+    /// own slot range (so the two bindings of `x` don't clobber each other — `f[i]` is still
+    /// live on the stack while `f[i+1]`'s frame runs), but one entry in the entry guard: the
+    /// global is checked once, not once per site (`Recorder::enter_frame`).
+    #[test]
+    fn traced_call_at_two_sites_and_interpreted_agree() {
+        let mut v = boot_vm();
+        let got = v.eval(
+            "f: {x*2}; \
+             g: {[k] s:0; i:0; while[i<k; s: s+f[i]+f[i+1]; i: i+1]; s}; \
+             gSlow: {[k] s:0; i:0; while[i<k; s: s+(- - f[i])+f[i+1]; i: i+1]; s}; \
+             {[k] (g k)=gSlow k} each 63 64 65 200",
+        ).unwrap();
+        assert_eq!(got.fmt(), "1111b");
+    }
+
+    /// Which lambda a global holds is checked once per entry (`CompiledTrace::run`'s `callees`,
+    /// src/jit.rs), and a trace whose callee has been reassigned is retired rather than refused
+    /// forever: the header counts afresh and is recorded again against the new definition
+    /// (`FnCode::retrace`, src/value.rs), up to `MAX_RETRACE` times, after which the loop simply
+    /// stays interpreted. Every run here has to follow the *current* `f` — the first two are the
+    /// original trace and its replacement, the last two are past the budget — and a trace that
+    /// kept running the old body would give the old answer.
+    #[test]
+    fn traced_call_follows_a_reassigned_global() {
+        let mut v = boot_vm();
+        let got = v.eval(
+            "g: {[k] s:0; i:0; while[i<k; s: s+f i; i: i+1]; s}; \
+             f: {x*2}; r: ,g 200; f: {x*3}; r,: g 200; f: {x*4}; r,: g 200; f: {x*5}; r,: g 200; \
+             f: {x*6}; r,: g 200; f: {x*7}; r,: g 200; f: {x*8}; r,: g 200; \
+             r=19900*2 3 4 5 6 7 8",
+        ).unwrap();
+        assert_eq!(got.fmt(), "1111111b");
+    }
+
+    /// Everything a call site can name that is *not* a plain lambda held by a global: a closure
+    /// (`Value::Closure`, not `Lambda`), a primitive (`Op::Call`'s own fast path — no frame is
+    /// ever entered, so the `Call` arrives at the recorder with nothing `returned`), a projection
+    /// (`call_code` returns before `enter_frame`), an arity mismatch (which *is* a projection),
+    /// and a callee that reads a global (`LoadG` of a non-lambda). Each must fail the recording —
+    /// and the result must be right whether or not it did, which the twin checks. The whole-
+    /// function JIT is never in play: one call each.
+    #[test]
+    fn traced_call_rejects_what_it_cannot_inline_and_stays_correct() {
+        let mut v = boot_vm();
+        let got = v.eval(
+            "mk: {[n] {[x] x*n}}; cl: mk 4; m: {[a;b] a*b+1}; pj: m[;3]; G: 7; rg: {x+G}; \
+             gc: {[k] s:0; i:0; while[i<k; s: s+cl i; i: i+1]; s}; \
+             gcSlow: {[k] s:0; i:0; while[i<k; s: s+(- - cl i); i: i+1]; s}; \
+             gp: {[k] s:0; i:0; while[i<k; s: s+neg i; i: i+1]; s}; \
+             gpSlow: {[k] s:0; i:0; while[i<k; s: s+(- - neg i); i: i+1]; s}; \
+             gj: {[k] s:0; i:0; while[i<k; s: s+pj i; i: i+1]; s}; \
+             gjSlow: {[k] s:0; i:0; while[i<k; s: s+(- - pj i); i: i+1]; s}; \
+             ga: {[k] s:0; i:0; while[i<k; p: m[i]; s: s+p 3; i: i+1]; s}; \
+             gaSlow: {[k] s:0; i:0; while[i<k; p: m[i]; s: s+(- - p 3); i: i+1]; s}; \
+             gg: {[k] s:0; i:0; while[i<k; s: s+rg i; i: i+1]; s}; \
+             ggSlow: {[k] s:0; i:0; while[i<k; s: s+(- - rg i); i: i+1]; s}; \
+             ({[k] (gc k)=gcSlow k} each 63 65 200), ({[k] (gp k)=gpSlow k} each 63 65 200), \
+             ({[k] (gj k)=gjSlow k} each 63 65 200), ({[k] (ga k)=gaSlow k} each 63 65 200), \
+             {[k] (gg k)=ggSlow k} each 63 65 200",
+        ).unwrap();
+        assert_eq!(got.fmt(), "111111111111111b");
+    }
+
+    /// A recursive callee is followed as far as the recorded iteration actually recursed — each
+    /// level is one more inlined frame with one more slot range — and stopped by whichever cap
+    /// it hits first: `MAX_TRACE_STEPS`/`MAX_TRACE_LOCALS` (src/trace.rs) on the recording side,
+    /// or the register file (`jitTrLocalRegs`, src/neant/jit/arm64.nt) on the codegen side, as
+    /// here (`rc 5` is six frames, more int locals than the file holds). Either way the loop has
+    /// to stay interpreted and correct, with no hang and no stack growth beyond the interpreter's
+    /// own. `big` is the same limit reached without recursion: one callee with more locals than
+    /// the register file.
+    #[test]
+    fn traced_call_rejects_a_deep_recursion_and_too_many_locals_cleanly() {
+        let mut v = boot_vm();
+        let got = v.eval(
+            "rc: {$[x<1; 0; x+rc[x-1]]}; \
+             g: {[k] s:0; i:0; while[i<k; s: s+rc 5; i: i+1]; s}; \
+             gSlow: {[k] s:0; i:0; while[i<k; s: s+(- - rc 5); i: i+1]; s}; \
+             big: {a:x+1;b:a+1;c:b+1;d:c+1;e:d+1;f:e+1;g:f+1;h:g+1;a+b+c+d+e+f+g+h}; \
+             gb: {[k] s:0; i:0; while[i<k; s: s+big i; i: i+1]; s}; \
+             gbSlow: {[k] s:0; i:0; while[i<k; s: s+(- - big i); i: i+1]; s}; \
+             ({[k] (g k)=gSlow k} each 63 64 65 200), {[k] (gb k)=gbSlow k} each 63 64 65 200",
+        ).unwrap();
+        assert_eq!(got.fmt(), "11111111b");
+    }
+
+    /// The calling loop against the same loop with `- -` spliced in — the untraceable twin, which
+    /// is the interpreted baseline here since a `do` loop can't call a function per iteration
+    /// any more cheaply than a `while` one can. One call each, so the whole-function JIT (64
+    /// calls) never enters; what this measures is a trace with an inlined call against the
+    /// interpreter's own `Op::Call` → `call_code` → `execute` per iteration.
+    #[test]
+    #[ignore]
+    fn manual_trace_call_perf_measurement() {
+        let mut v = boot_vm();
+        v.eval("f: {x*2}").unwrap();
+        v.eval("g: {[k] s:0; i:0; while[i<k; s: s+f i; i: i+1]; s}").unwrap();
+        v.eval("gSlow: {[k] s:0; i:0; while[i<k; s: s+(- - f i); i: i+1]; s}").unwrap();
+        let t0 = std::time::Instant::now();
+        let slow = v.eval("gSlow 5000000").unwrap();
+        let interpreted = t0.elapsed();
+        let t1 = std::time::Instant::now();
+        let fast = v.eval("g 5000000").unwrap();
+        let traced = t1.elapsed();
+        assert_eq!(slow.fmt(), fast.fmt());
+        println!("interpreted {interpreted:?}  traced {traced:?}  ratio {:.1}x", interpreted.as_secs_f64() / traced.as_secs_f64());
+    }
+
     #[test]
     #[ignore]
     fn manual_vector_perf_measurement() {
