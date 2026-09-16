@@ -1,7 +1,7 @@
 //! Primitive verbs (single chars) and named builtins. All pure: they never call back into the VM.
 use crate::value::*;
 use std::collections::HashMap;
-use std::rc::Rc;
+use std::sync::{Arc, Mutex};
 use Value::*;
 
 // ---- dyads
@@ -56,8 +56,8 @@ fn pow(x: Value, y: Value) -> R<Value> {
 }
 /// `x,: y` after the compiler's Take: x is uniquely owned, so append in place instead of rebuilding.
 fn try_append(x: &mut Value, y: &Value) -> bool {
-    macro_rules! push { ($a:expr, $b:expr) => { match Rc::get_mut($a) { Some(v) => { v.push($b); true } None => false } } }
-    macro_rules! ext { ($a:expr, $b:expr) => { match Rc::get_mut($a) { Some(v) => { v.extend_from_slice($b); true } None => false } } }
+    macro_rules! push { ($a:expr, $b:expr) => { match Arc::get_mut($a) { Some(v) => { v.push($b); true } None => false } } }
+    macro_rules! ext { ($a:expr, $b:expr) => { match Arc::get_mut($a) { Some(v) => { v.extend_from_slice($b); true } None => false } } }
     match (x, y) {
         (Ints(a), Int(b)) => push!(a, *b), (Ints(a), Ints(b)) => ext!(a, b),
         (Floats(a), Float(b)) => push!(a, *b), (Floats(a), Floats(b)) => ext!(a, b),
@@ -67,7 +67,7 @@ fn try_append(x: &mut Value, y: &Value) -> bool {
         (Dates(a), Date(b)) => push!(a, *b), (Dates(a), Dates(b)) => ext!(a, b),
         (Times(a), Time(b)) => push!(a, *b), (Times(a), Times(b)) => ext!(a, b),
         (Bytes(a), Byte(b)) => push!(a, *b), (Bytes(a), Bytes(b)) => ext!(a, b),
-        (List(a), b) => match Rc::get_mut(a) { Some(v) => { v.extend(b.seq()); true } None => false },
+        (List(a), b) => match Arc::get_mut(a) { Some(v) => { v.extend(b.seq()); true } None => false },
         _ => false,
     }
 }
@@ -93,11 +93,11 @@ fn drop(n: Value, x: Value) -> R<Value> {
 fn dict(k: Value, v: Value) -> R<Value> {
     let vc = if is_table(&v) { v.item(0).map(|c| c.count()).unwrap_or(0) } else { v.count() };   // keyed table: one key per row
     if k.count() != vc { return err("length: dict"); }
-    Ok(Dict(Rc::new(crate::value::Dict { keys: k, vals: v })))
+    Ok(Dict(Arc::new(crate::value::Dict { keys: k, vals: v })))
 }
 /// Hashable form of an atom, so find/distinct/group are O(n). Lists and nested values fall back to a linear scan.
 #[derive(Hash, PartialEq, Eq)]
-enum Key { N, B(bool), I(i64), F(u64), C(char), S(Rc<str>), D(i32), T(i64), Y(u8) }
+enum Key { N, B(bool), I(i64), F(u64), C(char), S(Arc<str>), D(i32), T(i64), Y(u8) }
 fn key_of(v: &Value) -> Option<Key> {
     Some(match v {
         Null => Key::N, Bool(b) => Key::B(*b), Int(i) => Key::I(*i), Char(c) => Key::C(*c), Symbol(s) => Key::S(s.clone()),
@@ -151,14 +151,14 @@ fn is_table(v: &Value) -> bool {
 /// Row i of a table as a dict.
 fn row_at(t: &Value, i: usize) -> R<Value> {
     let Dict(d) = t else { unreachable!() };
-    Ok(Dict(Rc::new(crate::value::Dict { keys: d.keys.clone(), vals: pack(d.vals.seq().iter().map(|c| c.item(i)).collect::<R<Vec<_>>>()?) })))
+    Ok(Dict(Arc::new(crate::value::Dict { keys: d.keys.clone(), vals: pack(d.vals.seq().iter().map(|c| c.item(i)).collect::<R<Vec<_>>>()?) })))
 }
 pub fn index_at(x: Value, i: Value) -> R<Value> {
     if let Dict(d) = &x {
         if is_table(&x) && matches!(i, Int(_) | Ints(_) | Bool(_) | Bools(_)) {   // t[2] row, t[0 2] rows
             let n = d.vals.item(0)?.count();
             if i.is_atom() { return row_at(&x, usize::try_from(int_of(&i)?).ok().filter(|&p| p < n).ok_or_else(|| NError("index".into()))?); }
-            return Ok(Dict(Rc::new(crate::value::Dict { keys: d.keys.clone(), vals: list(d.vals.seq().into_iter().map(|c| index_at(c, i.clone())).collect::<R<Vec<_>>>()?) })));
+            return Ok(Dict(Arc::new(crate::value::Dict { keys: d.keys.clone(), vals: list(d.vals.seq().into_iter().map(|c| index_at(c, i.clone())).collect::<R<Vec<_>>>()?) })));
         }
         let keys = d.keys.seq();
         let keyed = is_table(&d.vals);   // xkey: values are a table, lookups yield rows
@@ -280,11 +280,12 @@ fn distinct(x: Value) -> R<Value> {
     Ok(pack(out))
 }
 fn type_(x: Value) -> R<Value> {
-    Ok(Symbol(Rc::from(match x {
+    Ok(Symbol(Arc::from(match x {
         Null => "null", Bool(_) => "bool", Int(_) => "int", Float(_) => "float", Char(_) => "char", Symbol(_) => "sym",
         Bools(_) => "bools", Ints(_) => "ints", Floats(_) => "floats", Chars(_) => "chars", Syms(_) => "syms",
         Date(_) => "date", Time(_) => "time", Dates(_) => "dates", Times(_) => "times", Byte(_) => "byte", Bytes(_) => "bytes",
         List(_) => "list", Dict(_) => "dict", Lambda(_) | Prim(_) | Adv(..) | Proj(..) | Closure(..) => "fn",
+        Shared(_) => "shared", Thread(_) => "thread",
     })))
 }
 fn flip(x: Value) -> R<Value> {
@@ -297,7 +298,7 @@ pub fn to_chars(x: &Value) -> Vec<char> {
     match x { Chars(v) => v.as_ref().clone(), Symbol(s) => s.chars().collect(), Char(c) => vec![*c], Null => vec![], _ => x.fmt().chars().collect() }
 }
 fn string(x: Value) -> R<Value> { Ok(chars(to_chars(&x))) }
-fn sym(x: Value) -> R<Value> { Ok(Symbol(Rc::from(to_chars(&x).into_iter().collect::<String>()))) }
+fn sym(x: Value) -> R<Value> { Ok(Symbol(Arc::from(to_chars(&x).into_iter().collect::<String>()))) }
 /// `tag$x`: `` `int `` `` `float `` `` `char `` `` `sym `` `` `string `` convert; chars parse; `` `code `` gives code points.
 fn cast(t: Value, x: Value) -> R<Value> {
     let Symbol(tag) = &t else { return err("type: cast tag must be a symbol") };
@@ -422,6 +423,19 @@ fn hrecv(h: Value, n: Value) -> R<Value> {
     Ok(bytes(buf))
 }
 
+/// `shared x` wraps x in a mutable cell: the one value that is not lock-free COW, for state
+/// that is genuinely meant to be shared and mutated across `spawn`ed threads. Everything else
+/// stays a plain value, safe to pass to a spawned thread by ordinary (cheap, Arc-refcounted) clone.
+fn shared(x: Value) -> R<Value> { Ok(Shared(Arc::new(Mutex::new(x)))) }
+fn sget(x: Value) -> R<Value> {
+    match x { Shared(c) => Ok(c.lock().unwrap().clone()), _ => err("type: sget expected a shared cell") }
+}
+/// `sset[s;v]` locks, overwrites, and returns v. A plain read-then-write built from `sget`/`sset`
+/// in neant would race; `supd` (in the VM, since it calls back into a lambda) is the atomic one.
+fn sset(s: Value, v: Value) -> R<Value> {
+    match s { Shared(c) => { *c.lock().unwrap() = v.clone(); Ok(v) } _ => err("type: sset expected a shared cell") }
+}
+
 fn write0(path: Value, x: Value) -> R<Value> {
     let p = text(&path);
     let body = match &x { List(items) => items.iter().map(text).collect::<Vec<_>>().join("\n") + "\n", _ => text(&x) };
@@ -493,11 +507,11 @@ fn scatter(x: &mut Value, idx: &[i64], v: &Value) -> bool {
         let n = $r.len() as i64;
         if idx.iter().any(|&j| j < 0 || j >= n) { return false; }
         match v {
-            $one => { let a = $get; let t = Rc::make_mut($r); for &j in idx { t[j as usize] = a.clone(); } true }
+            $one => { let a = $get; let t = Arc::make_mut($r); for &j in idx { t[j as usize] = a.clone(); } true }
             $many => {
                 let src = $src;
                 if src.len() != idx.len() { return false; }
-                let t = Rc::make_mut($r);
+                let t = Arc::make_mut($r);
                 for (&j, a) in idx.iter().zip(src.iter()) { t[j as usize] = a.clone(); }
                 true
             }
@@ -523,7 +537,7 @@ pub fn amend(x: &mut Value, i: Value, v: Value) -> R<()> {
         return Ok(());
     }
     if let Dict(d) = x {
-        let dm = Rc::make_mut(d);
+        let dm = Arc::make_mut(d);
         return match dm.keys.seq().iter().position(|e| *e == i) {
             Some(p) => amend(&mut dm.vals, Int(p as i64), v),
             // enlist, not join: a vector value is one entry, so `d[`c]: 10 20` does not splice into vals
@@ -533,16 +547,16 @@ pub fn amend(x: &mut Value, i: Value, v: Value) -> R<()> {
     let p = usize::try_from(int_of(&i)?).map_err(|_| NError("index".into()))?;
     if x.is_atom() || p >= x.count() { return err("index: amend out of range"); }
     let typed = match (&mut *x, &v) {
-        (Ints(r), Int(a)) => { Rc::make_mut(r)[p] = *a; true }
-        (Floats(r), Float(a)) => { Rc::make_mut(r)[p] = *a; true }
-        (Floats(r), Int(a)) => { Rc::make_mut(r)[p] = *a as f64; true }
-        (Bools(r), Bool(a)) => { Rc::make_mut(r)[p] = *a; true }
-        (Chars(r), Char(a)) => { Rc::make_mut(r)[p] = *a; true }
-        (Bytes(r), Byte(a)) => { Rc::make_mut(r)[p] = *a; true }
-        (Syms(r), Symbol(a)) => { Rc::make_mut(r)[p] = a.clone(); true }
-        (Dates(r), Date(a)) => { Rc::make_mut(r)[p] = *a; true }
-        (Times(r), Time(a)) => { Rc::make_mut(r)[p] = *a; true }
-        (List(r), _) => { Rc::make_mut(r)[p] = v.clone(); true }
+        (Ints(r), Int(a)) => { Arc::make_mut(r)[p] = *a; true }
+        (Floats(r), Float(a)) => { Arc::make_mut(r)[p] = *a; true }
+        (Floats(r), Int(a)) => { Arc::make_mut(r)[p] = *a as f64; true }
+        (Bools(r), Bool(a)) => { Arc::make_mut(r)[p] = *a; true }
+        (Chars(r), Char(a)) => { Arc::make_mut(r)[p] = *a; true }
+        (Bytes(r), Byte(a)) => { Arc::make_mut(r)[p] = *a; true }
+        (Syms(r), Symbol(a)) => { Arc::make_mut(r)[p] = a.clone(); true }
+        (Dates(r), Date(a)) => { Arc::make_mut(r)[p] = *a; true }
+        (Times(r), Time(a)) => { Arc::make_mut(r)[p] = *a; true }
+        (List(r), _) => { Arc::make_mut(r)[p] = v.clone(); true }
         _ => false,
     };
     if !typed { let mut s = x.seq(); s[p] = v; *x = pack(s); }   // type widens to a general list
@@ -686,9 +700,11 @@ pub static BUILTINS: &[PrimDef] = &[
     p!("show", Some(show), None), p!("print", Some(print), None), p!("signal", Some(signal), None), p!("exit", Some(exit), None),
     p!("read0", Some(read0), None), p!("write0", None, Some(write0)),
     p!("hopen", Some(hopen), None), p!("hclose", Some(hclose), None), p!("hsend", None, Some(hsend)), p!("hrecv", None, Some(hrecv)),
+    p!("shared", Some(shared), None), p!("sget", Some(sget), None), p!("sset", None, Some(sset)),
     p!("each", None, None), p!("over", None, None), p!("scan", None, None),   // adverb keywords, dispatched in the VM
     p!("exec", None, None),   // runs bytecode data; dispatched in the VM
     p!("elast", None, None),  // elast `line / `trace: where the last caught error came from; dispatched in the VM
+    p!("spawn", None, None), p!("join", None, None), p!("supd", None, None),  // concurrency: dispatched in the VM (call back into user code)
 ];
 // ---- bytecode as data
 // unit  = (opcodes; args; consts; lines)     lambda code = (opcodes; args; consts; lines; params; nlocals)
@@ -709,14 +725,14 @@ fn load_const(e: &Value) -> R<Value> {
     match &*tag {
         "k" | "g" => e.item(1),
         "p" => { let c = ch(e.item(1)?, VERBS_ALL)?; PRIMS.iter().find(|p| p.name.starts_with(c)).map(Prim).ok_or_else(|| NError("load: bad verb".into())) }
-        "a" => Ok(Adv(ch(e.item(1)?, ADV_ALL)?, Rc::new(load_const(&e.item(2)?)?))),
+        "a" => Ok(Adv(ch(e.item(1)?, ADV_ALL)?, Arc::new(load_const(&e.item(2)?)?))),
         "f" => {
             let d = e.item(1)?;
             let (ops, consts, lines) = load_unit(&d)?;
             let params = d.item(4)?.seq().iter().map(|p| match p { Symbol(s) => Ok(s.to_string()), _ => err("load: param names must be symbols") }).collect::<R<Vec<_>>>()?;
             let nlocals = int_of(&d.item(5)?)? as usize;
             let nlocals = nlocals.max(params.len());
-            Ok(Lambda(Rc::new(FnCode { ops, consts, lines, params, nlocals })))
+            Ok(Lambda(Arc::new(FnCode::new(ops, consts, lines, params, nlocals))))
         }
         _ => err(format!("load: unknown const tag `{tag}")),
     }

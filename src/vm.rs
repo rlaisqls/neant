@@ -3,7 +3,7 @@
 use crate::prims::{amend_path, fold_fast, index_at, load_unit, scan_fast, BUILTINS};
 use crate::value::*;
 use std::collections::HashMap;
-use std::rc::Rc;
+use std::sync::{Arc, Mutex};
 use Value::*;
 
 /// Two int atoms through the common verbs, skipping the shape/broadcast machinery in value.rs.
@@ -28,12 +28,12 @@ fn f_at(st: &[Value], n: usize) -> &Value { &st[st.len() - 1 - n] }
 
 /// One call-stack frame of an error: the function's name (None when it is not a plain global call) and
 /// the source line it was on. A frame is named by its *caller*, which knows the global it loaded to call it.
-type Frame = (Option<Rc<str>>, u32);
+type Frame = (Option<Arc<str>>, u32);
 
 /// Globals live in a slot vector; names are interned once when code is loaded, so LoadG is an index, not a hash.
 /// trace: frames an in-flight error is unwinding through, innermost first.
 /// last_trace: the same, kept for `elast` after @[f;x;h] catches.
-pub struct Vm { vals: Vec<Option<Value>>, names: HashMap<Rc<str>, u32>, slot_names: Vec<Rc<str>>, depth: usize, pool: Vec<Vec<Value>>, trace: Vec<Frame>, last_trace: Vec<Frame> }
+pub struct Vm { vals: Vec<Option<Value>>, names: HashMap<Arc<str>, u32>, slot_names: Vec<Arc<str>>, depth: usize, pool: Vec<Vec<Value>>, trace: Vec<Frame>, last_trace: Vec<Frame> }
 
 impl Vm {
     pub fn new() -> Vm {
@@ -41,15 +41,24 @@ impl Vm {
         for p in BUILTINS { vm.set(p.name, Prim(p)); }
         vm
     }
+    /// A fresh VM for a `spawn`ed thread: the parent's globals and name→slot map (so the child
+    /// resolves `LoadG`/`StoreG` in already-compiled bytecode identically), a clean call stack.
+    fn forked(vals: Vec<Option<Value>>, names: HashMap<Arc<str>, u32>, slot_names: Vec<Arc<str>>) -> Vm {
+        Vm { vals, names, slot_names, depth: 0, pool: vec![], trace: vec![], last_trace: vec![] }
+    }
     fn slot(&mut self, name: &str) -> u32 {
         if let Some(&s) = self.names.get(name) { return s; }
         let s = self.vals.len() as u32;
-        let rc: Rc<str> = Rc::from(name);
+        let rc: Arc<str> = Arc::from(name);
         self.vals.push(None); self.names.insert(rc.clone(), s); self.slot_names.push(rc);
         s
     }
     pub fn set(&mut self, name: &str, v: Value) { let s = self.slot(name) as usize; self.vals[s] = Some(v); }
     pub fn get(&self, name: &str) -> Option<Value> { self.names.get(name).and_then(|&s| self.vals[s as usize].clone()) }
+    /// A global by its already-interned slot index (see `intern`/`gidx`) — what the JIT's `jit_call`
+    /// trampoline (src/jit.rs) uses to resolve a compiled call site's callee, the same lookup
+    /// `Op::LoadG` does in `run_ops` below.
+    pub(crate) fn global_at(&self, slot: usize) -> Option<Value> { self.vals.get(slot).cloned().flatten() }
     /// All global values, for save/restore around test cases (slots only grow, so a snapshot stays valid).
     #[allow(dead_code)]
     pub fn snapshot(&self) -> Vec<Option<Value>> { self.vals.clone() }
@@ -66,7 +75,7 @@ impl Vm {
         }
         for c in consts.iter_mut() {
             if let Lambda(code) = c {
-                if let Some(code) = Rc::get_mut(code) { let FnCode { ops, consts, .. } = code; self.intern(ops, consts); }
+                if let Some(code) = Arc::get_mut(code) { let FnCode { ops, consts, .. } = code; self.intern(ops, consts); }
             }
         }
     }
@@ -127,7 +136,7 @@ impl Vm {
                 Op::MkClosure(n) => {
                     let Lambda(code) = st.pop().unwrap() else { return err("closure: not a lambda") };
                     let mut caps: Vec<Value> = (0..n).map(|_| st.pop().unwrap()).collect(); caps.reverse();
-                    st.push(Closure(code, Rc::new(caps)));
+                    st.push(Closure(code, Arc::new(caps)));
                 }
                 Op::Loop(t) => {
                     let n = int_of(st.last().unwrap())?;
@@ -149,7 +158,7 @@ impl Vm {
                         if prim { self.monad(&f, x)? } else { index_at(f, x)? }   // x[i] on a vector or dict
                     } else {
                         let y = st.pop().unwrap();
-                        if prim && (matches!(x, Null) || matches!(y, Null)) { Proj(Rc::new(f), Rc::new(vec![x, y])) }
+                        if prim && (matches!(x, Null) || matches!(y, Null)) { Proj(Arc::new(f), Arc::new(vec![x, y])) }
                         else { self.dyad(&f, x, y)? }   // a non-callable here still errors, in `call`
                     };
                     st.push(r);
@@ -160,7 +169,7 @@ impl Vm {
                     for _ in 0..n { args.push(st.pop().unwrap()); }
                     let r = self.call(&f, args)?; st.push(r);
                 }
-                Op::MkAdv(c) => { let f = st.pop().unwrap(); st.push(Adv(c, Rc::new(f))); }
+                Op::MkAdv(c) => { let f = st.pop().unwrap(); st.push(Adv(c, Arc::new(f))); }
                 Op::Jmp(t) => ip = t as usize,
                 Op::Jmpf(t) => if !st.pop().unwrap().truthy() { ip = t as usize },
                 Op::Pop => { st.pop(); }
@@ -187,18 +196,30 @@ impl Vm {
     }
 
     /// Lambda or closure call: args, then its own locals, then captured values (slots the compiler assigned).
-    fn call_code(&mut self, code: &Rc<FnCode>, caps: &[Value], f: &Value, args: Vec<Value>) -> R<Value> {
+    fn call_code(&mut self, code: &Arc<FnCode>, caps: &[Value], f: &Value, args: Vec<Value>) -> R<Value> {
         let arity = code.params.len();
         if args.len() > arity { return err(format!("rank: expected {arity} args, got {}", args.len())); }
         let empty_unary = args.is_empty() && arity == 1;   // f[] calls a unary with null, like q
         if !empty_unary && (args.len() < arity || args.iter().any(|a| matches!(a, Null))) {   // projection
             let mut held = args; held.resize(arity, Null);
-            return Ok(Proj(Rc::new(f.clone()), Rc::new(held)));
+            return Ok(Proj(Arc::new(f.clone()), Arc::new(held)));
         }
-        if self.depth > 2000 { return err("stack: recursion too deep"); }
+        // Lower than it looks: each level is a real Rust stack frame, and this needs to be safe on
+        // the smallest stack this can run on, not just the main thread's — a `spawn`ed thread
+        // (src/prims.rs) defaults to a 2MiB OS stack. 1800 levels of plain recursion overflows one;
+        // this leaves real margin. src/jit.rs's `MAX_CALL_DEPTH` mirrors this for the same reason.
+        if self.depth > 1000 { return err("stack: recursion too deep"); }
         let mut loc = args; loc.resize(code.nlocals.max(arity), Null); loc.extend_from_slice(caps);
         self.depth += 1;
-        let r = self.execute(&code.ops, &code.consts, &code.lines, &mut loc);
+        // A hot, integer-only function may have a compiled native version (src/jit.rs); its entry
+        // guard and its own deopt path both just mean "run it on the interpreter instead", so a
+        // `None` here always falls straight through to the same `execute` that runs everything else.
+        let compiled = code.jitted();
+        let jit_result = match &compiled { Some(c) => c.try_run(&loc, self), None => None };
+        let r = match jit_result {
+            Some(v) => Ok(v),
+            None => self.execute(&code.ops, &code.consts, &code.lines, &mut loc),
+        };
         self.depth -= 1;
         loc.clear(); self.pool.push(loc);
         r
@@ -230,7 +251,7 @@ impl Vm {
                 }
             }
             Prim(_) | Adv(..) => {
-                if args.len() == 2 && args.iter().any(|a| matches!(a, Null)) { return Ok(Proj(Rc::new(f.clone()), Rc::new(args))); }
+                if args.len() == 2 && args.iter().any(|a| matches!(a, Null)) { return Ok(Proj(Arc::new(f.clone()), Arc::new(args))); }
                 let mut it = args.into_iter();
                 match (it.next(), it.next(), it.next()) {
                     (Some(x), None, _) => self.monad(f, x),
@@ -243,6 +264,41 @@ impl Vm {
         }
     }
 
+    /// `spawn f`: runs niladic f on a new OS thread with its own VM, forked from this one's
+    /// globals (a snapshot: an Arc-bump clone of the slot table, not a shared one — the new
+    /// thread sees today's globals and nothing this thread assigns afterwards). No lock is
+    /// taken; ordinary values are safe to hand across because they are lock-free COW.
+    fn spawn(&mut self, f: Value) -> R<Value> {
+        let (vals, names, slot_names) = (self.vals.clone(), self.names.clone(), self.slot_names.clone());
+        let handle = std::thread::spawn(move || Vm::forked(vals, names, slot_names).call(&f, vec![]));
+        Ok(Thread(Arc::new(Mutex::new(Some(handle)))))
+    }
+    /// `join h` blocks for the spawned thread's result; a runtime error raised inside it
+    /// surfaces here rather than being lost, and joining twice is a clean error, not a panic.
+    fn join(&mut self, h: Value) -> R<Value> {
+        match h {
+            Thread(cell) => match cell.lock().unwrap().take() {
+                Some(h) => h.join().unwrap_or_else(|_| err("thread: panicked")),
+                None => err("thread: already joined"),
+            }
+            _ => err("type: join expected a thread handle"),
+        }
+    }
+    /// `supd[s;f]` is the one atomic read-modify-write: it holds s's lock for the whole call to
+    /// f, so concurrent `supd`s on the same cell serialize instead of losing an update the way a
+    /// bare `sset[s; f sget s]` would if two threads interleaved between the get and the set.
+    fn supd(&mut self, s: Value, f: Value) -> R<Value> {
+        match s {
+            Shared(cell) => {
+                let mut guard = cell.lock().unwrap();
+                let r = self.call(&f, vec![guard.clone()])?;
+                *guard = r.clone();
+                Ok(r)
+            }
+            _ => err("type: supd expected a shared cell"),
+        }
+    }
+
     fn monad(&mut self, f: &Value, x: Value) -> R<Value> {
         match f {
             Prim(p) => match (p.m, p.name) {
@@ -251,9 +307,11 @@ impl Vm {
                 (None, "elast") => match &x {
                     Symbol(s) if &**s == "line" => Ok(Int(self.last_trace.first().map_or(0, |f| f.1) as i64)),
                     Symbol(s) if &**s == "trace" => Ok(pack(self.last_trace.iter()
-                        .map(|(n, l)| pack(vec![Symbol(n.clone().unwrap_or_else(|| Rc::from(""))), Int(*l as i64)])).collect())),
+                        .map(|(n, l)| pack(vec![Symbol(n.clone().unwrap_or_else(|| Arc::from(""))), Int(*l as i64)])).collect())),
                     _ => err("type: elast `line or elast `trace"),
                 },
+                (None, "spawn") => self.spawn(x),
+                (None, "join") => self.join(x),
                 _ => err(format!("rank: {} has no monadic form", p.name)),
             },
             Adv(c, g) => self.adv1(*c, g, x),
@@ -272,6 +330,7 @@ impl Vm {
                 (None, "each") => self.adv1('\'', &x, y),   // f each x
                 (None, "over") => self.adv1('/', &x, y),
                 (None, "scan") => self.adv1('\\', &x, y),
+                (None, "supd") => self.supd(x, y),
                 _ => err(format!("rank: {} has no dyadic form", p.name)),
                 }
             }
@@ -303,7 +362,7 @@ impl Vm {
             _ => {
                 let out = pack(x.seq().into_iter().map(|v| self.monad(g, v)).collect::<R<Vec<_>>>()?);
                 match x {   // each over a dict maps the values and keeps the keys
-                    Dict(d) => Ok(Dict(Rc::new(crate::value::Dict { keys: d.keys.clone(), vals: out }))),
+                    Dict(d) => Ok(Dict(Arc::new(crate::value::Dict { keys: d.keys.clone(), vals: out }))),
                     _ => Ok(out),
                 }
             }

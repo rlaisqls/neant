@@ -1,7 +1,7 @@
 //! Boot image: bytecode data (see "bytecode as data" in prims.rs) as a flat tagged binary.
 //! `neant --build-boot` writes boot/boot.nb with the neant compiler; main.rs embeds it with include_bytes!.
 use crate::value::*;
-use std::rc::Rc;
+use std::sync::Arc;
 use Value::*;
 
 pub fn dump(v: &Value) -> R<Vec<u8>> { let mut out = Vec::new(); put(v, &mut out)?; Ok(out) }
@@ -39,6 +39,7 @@ fn put(v: &Value, o: &mut Vec<u8>) -> R<()> {
         Byte(b) => { o.push(17); o.push(*b); }
         Bytes(v) => { o.push(18); put_len(o, v.len()); o.extend_from_slice(v); }
         Lambda(_) | Prim(_) | Adv(..) | Proj(..) | Closure(..) => return err("image: functions are not serializable"),
+        Shared(_) | Thread(_) => return err("image: shared cells and thread handles are not serializable"),
     }
     Ok(())
 }
@@ -64,14 +65,14 @@ fn get(b: &[u8], p: &mut usize) -> R<Value> {
         2 => Int(get_i64(b, p)?),
         3 => Float(get_f64(b, p)?),
         4 => Char(char::from_u32(get_len(b, p)? as u32).unwrap_or('?')),
-        5 => Symbol(Rc::from(get_str(b, p)?)),
+        5 => Symbol(Arc::from(get_str(b, p)?)),
         6 => { let n = get_len(b, p)?; bools(take(b, p, n)?.iter().map(|&x| x != 0).collect()) }
         7 => { let n = get_len(b, p)?; ints((0..n).map(|_| get_i64(b, p)).collect::<R<_>>()?) }
         8 => { let n = get_len(b, p)?; floats((0..n).map(|_| get_f64(b, p)).collect::<R<_>>()?) }
         9 => chars(get_str(b, p)?.chars().collect()),
-        10 => { let n = get_len(b, p)?; syms((0..n).map(|_| get_str(b, p).map(Rc::from)).collect::<R<_>>()?) }
+        10 => { let n = get_len(b, p)?; syms((0..n).map(|_| get_str(b, p).map(Arc::from)).collect::<R<_>>()?) }
         11 => { let n = get_len(b, p)?; list((0..n).map(|_| get(b, p)).collect::<R<_>>()?) }
-        12 => { let keys = get(b, p)?; let vals = get(b, p)?; Dict(Rc::new(crate::value::Dict { keys, vals })) }
+        12 => { let keys = get(b, p)?; let vals = get(b, p)?; Dict(Arc::new(crate::value::Dict { keys, vals })) }
         13 => Date(i32::from_le_bytes(take(b, p, 4)?.try_into().unwrap())),
         14 => Time(get_i64(b, p)?),
         15 => { let n = get_len(b, p)?; dates((0..n).map(|_| take(b, p, 4).map(|s| i32::from_le_bytes(s.try_into().unwrap()))).collect::<R<_>>()?) }

@@ -1,7 +1,9 @@
 //! Values, bytecode, and the numeric kernel (typed vectors, broadcasting).
 use std::borrow::Cow;
 use std::cmp::Ordering;
-use std::rc::Rc;
+use std::sync::atomic::{AtomicU32, Ordering as AtomicOrdering};
+use std::sync::{Arc, Mutex};
+use std::thread::JoinHandle;
 
 pub type R<T> = Result<T, NError>;
 
@@ -36,7 +38,39 @@ impl Op {
 }
 
 /// `lines[i]` is the source line op `i` came from (0 = synthetic), for runtime error positions.
-pub struct FnCode { pub ops: Vec<Op>, pub consts: Vec<Value>, pub lines: Vec<u32>, pub params: Vec<String>, pub nlocals: usize }
+pub struct FnCode {
+    pub ops: Vec<Op>, pub consts: Vec<Value>, pub lines: Vec<u32>, pub params: Vec<String>, pub nlocals: usize,
+    calls: AtomicU32, jit: std::sync::OnceLock<Option<Arc<crate::jit::Compiled>>>,
+}
+/// After this many calls, try once to compile — and remember whether that succeeded, so a
+/// function that didn't qualify isn't re-walked on every later call.
+const JIT_THRESHOLD: u32 = 64;
+
+impl FnCode {
+    pub fn new(ops: Vec<Op>, consts: Vec<Value>, lines: Vec<u32>, params: Vec<String>, nlocals: usize) -> FnCode {
+        FnCode { ops, consts, lines, params, nlocals, calls: AtomicU32::new(0), jit: std::sync::OnceLock::new() }
+    }
+    /// The compiled version, attempting compilation once the call count crosses the threshold.
+    /// `None` means "run it on the bytecode interpreter", whether because it's still cold, because
+    /// it doesn't qualify (see src/jit.rs's compilability check), or because this arch has no backend.
+    pub fn jitted(self: &Arc<FnCode>) -> Option<Arc<crate::jit::Compiled>> {
+        if self.calls.fetch_add(1, AtomicOrdering::Relaxed) + 1 < JIT_THRESHOLD { return None; }
+        self.jit_now()
+    }
+    /// Same cache as `jitted`, but without the call-count gate: a compiled function calling this
+    /// one directly (src/jit.rs's `jit_call` trampoline) needs to know *immediately* whether the
+    /// callee is equally pure, since that's what makes it safe to call at all (see README "Stage
+    /// 2" and the trampoline's doc comment) — it can't wait for this callee's own count to warm up.
+    pub(crate) fn jit_for_call(self: &Arc<FnCode>) -> Option<Arc<crate::jit::Compiled>> { self.jit_now() }
+    /// Built once, read many times lock-free after that: `OnceLock` gives every call after the
+    /// first a plain atomic load instead of a mutex lock — this is called on every single
+    /// recursive step through `jit_call` (src/jit.rs), so that difference is the whole point.
+    /// Compilation is still attempted at most once (whichever caller gets here first wins;
+    /// `OnceLock` itself serializes a same-time race, so no attempt is ever wasted or repeated).
+    fn jit_now(self: &Arc<FnCode>) -> Option<Arc<crate::jit::Compiled>> {
+        self.jit.get_or_init(|| crate::jit::compile(self).map(Arc::new)).clone()
+    }
+}
 
 pub struct PrimDef {
     pub name: &'static str,
@@ -62,26 +96,28 @@ pub const DATE_EPOCH: i64 = 10957;
 #[derive(Clone)]
 pub enum Value {
     Null,
-    Bool(bool), Int(i64), Float(f64), Char(char), Symbol(Rc<str>), Byte(u8),
+    Bool(bool), Int(i64), Float(f64), Char(char), Symbol(Arc<str>), Byte(u8),
     Date(i32), Time(i64),   // days since 2000.01.01; milliseconds since midnight
-    Bools(Rc<Vec<bool>>), Ints(Rc<Vec<i64>>), Floats(Rc<Vec<f64>>), Chars(Rc<Vec<char>>), Syms(Rc<Vec<Rc<str>>>),
-    Dates(Rc<Vec<i32>>), Times(Rc<Vec<i64>>), Bytes(Rc<Vec<u8>>),   // 0x0aff: raw bytes, shown as hex; arithmetic promotes them to ints
-    List(Rc<Vec<Value>>), Dict(Rc<Dict>),
-    Lambda(Rc<FnCode>), Prim(&'static PrimDef), Adv(char, Rc<Value>),
-    Proj(Rc<Value>, Rc<Vec<Value>>),          // partial application; Null marks an open slot
-    Closure(Rc<FnCode>, Rc<Vec<Value>>),      // lambda plus captured outer locals (appended after its own locals)
+    Bools(Arc<Vec<bool>>), Ints(Arc<Vec<i64>>), Floats(Arc<Vec<f64>>), Chars(Arc<Vec<char>>), Syms(Arc<Vec<Arc<str>>>),
+    Dates(Arc<Vec<i32>>), Times(Arc<Vec<i64>>), Bytes(Arc<Vec<u8>>),   // 0x0aff: raw bytes, shown as hex; arithmetic promotes them to ints
+    List(Arc<Vec<Value>>), Dict(Arc<Dict>),
+    Lambda(Arc<FnCode>), Prim(&'static PrimDef), Adv(char, Arc<Value>),
+    Proj(Arc<Value>, Arc<Vec<Value>>),          // partial application; Null marks an open slot
+    Closure(Arc<FnCode>, Arc<Vec<Value>>),      // lambda plus captured outer locals (appended after its own locals)
+    Shared(Arc<Mutex<Value>>),                  // `shared x`: an opt-in mutable cell; every other value is lock-free COW
+    Thread(Arc<Mutex<Option<JoinHandle<R<Value>>>>>),   // `spawn f`; the Option lets `join` take the handle so joining twice errors cleanly
 }
 use Value::*;
 
-pub fn ints(v: Vec<i64>) -> Value { Ints(Rc::new(v)) }
-pub fn floats(v: Vec<f64>) -> Value { Floats(Rc::new(v)) }
-pub fn bools(v: Vec<bool>) -> Value { Bools(Rc::new(v)) }
-pub fn chars(v: Vec<char>) -> Value { Chars(Rc::new(v)) }
-pub fn syms(v: Vec<Rc<str>>) -> Value { Syms(Rc::new(v)) }
-pub fn dates(v: Vec<i32>) -> Value { Dates(Rc::new(v)) }
-pub fn times(v: Vec<i64>) -> Value { Times(Rc::new(v)) }
-pub fn list(v: Vec<Value>) -> Value { List(Rc::new(v)) }
-pub fn bytes(v: Vec<u8>) -> Value { Bytes(Rc::new(v)) }
+pub fn ints(v: Vec<i64>) -> Value { Ints(Arc::new(v)) }
+pub fn floats(v: Vec<f64>) -> Value { Floats(Arc::new(v)) }
+pub fn bools(v: Vec<bool>) -> Value { Bools(Arc::new(v)) }
+pub fn chars(v: Vec<char>) -> Value { Chars(Arc::new(v)) }
+pub fn syms(v: Vec<Arc<str>>) -> Value { Syms(Arc::new(v)) }
+pub fn dates(v: Vec<i32>) -> Value { Dates(Arc::new(v)) }
+pub fn times(v: Vec<i64>) -> Value { Times(Arc::new(v)) }
+pub fn list(v: Vec<Value>) -> Value { List(Arc::new(v)) }
+pub fn bytes(v: Vec<u8>) -> Value { Bytes(Arc::new(v)) }
 
 impl Value {
     pub fn len(&self) -> Option<usize> {
@@ -242,11 +278,13 @@ impl PartialEq for Value {
             (Floats(a), Floats(b)) => a.len() == b.len() && a.iter().zip(b.iter()).all(|(p, q)| p == q || (p.is_nan() && q.is_nan())),
             (List(a), List(b)) => a == b,
             (Dict(a), Dict(b)) => a.keys == b.keys && a.vals == b.vals,
-            (Lambda(a), Lambda(b)) => Rc::ptr_eq(a, b),
-            (Closure(a, x), Closure(b, y)) => Rc::ptr_eq(a, b) && x == y,
+            (Lambda(a), Lambda(b)) => Arc::ptr_eq(a, b),
+            (Closure(a, x), Closure(b, y)) => Arc::ptr_eq(a, b) && x == y,
             (Prim(a), Prim(b)) => a.name == b.name,
             (Adv(c, a), Adv(d, b)) => c == d && a == b,
             (Proj(f, a), Proj(g, b)) => f == g && a == b,
+            (Shared(a), Shared(b)) => Arc::ptr_eq(a, b),
+            (Thread(a), Thread(b)) => Arc::ptr_eq(a, b),
             _ => false,
         }
     }
@@ -335,6 +373,8 @@ impl Value {
             Prim(p) => p.name.into(),
             Proj(f, held) => format!("{}[{}]", f.fmt(), held.iter().map(|a| if matches!(a, Null) { String::new() } else { a.fmt() }).collect::<Vec<_>>().join(";")),
             Adv(c, f) => format!("{}{}", f.fmt(), advf(*c)),
+            Shared(_) => "<shared>".into(),
+            Thread(_) => "<thread>".into(),
         }
     }
 }

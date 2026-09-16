@@ -99,6 +99,7 @@ Only what needs the host; everything expressible with the verbs lives in the pre
 | Output | `show print signal exit` |
 | Files | `read0 write0` |
 | Sockets | `hopen hclose hsend hrecv` |
+| Concurrency | `spawn join shared sget sset supd` — see [Concurrency](#concurrency) |
 | Adverb keywords | `each over scan` |
 | Errors | `elast` |
 
@@ -197,6 +198,26 @@ g 1
 `@[f;x;handler]` catches; inside the handler, ``elast `line`` and ``elast `trace`` say where the error
 came from.
 
+## Concurrency
+
+```
+n: 10; h: spawn {n+1}; join h        // 11 — a niladic closure on its own OS thread; join blocks for the result
+s: shared 0                          // an opt-in mutable cell; every other value stays lock-free
+supd[s; {x+1}]; sget s               // 1 — atomic read-modify-write: locks s for the whole call to the function
+hs: {spawn {work n}} each til 4      // one shared VM snapshot forked to four threads
+{join x} each hs
+```
+
+`Value` is `Arc`-refcounted and copy-on-write, the same discipline `x[i]:v`/`n+:1` already use for
+in-place amend (mutate only when uniquely owned, else copy) — so ordinary values cross threads for
+free, with no lock and no global interpreter lock serializing them. `spawn f` runs a niladic `f` on a
+new OS thread with its own VM, forked from a snapshot of the caller's globals at the moment of the
+call; `join h` blocks for the result, or re-raises an error signalled inside `f`, or errors if `h` was
+already joined. The one exception to lock-free is `shared x`, an explicit mutable cell: `sget`/`sset`
+read and overwrite it, but only `supd[s;f]` is atomic — it holds the lock for the whole call to `f`, so
+concurrent `supd`s on the same cell serialize instead of losing an update the way `sset[s; f sget s]`
+would if two threads interleaved between the get and the set.
+
 ## Gotchas (shared with q)
 
 - `i+1<n` is `i+(1<n)`. Write `(i+1)<n`. Every comparison inside arithmetic needs parens.
@@ -232,6 +253,52 @@ and **source never reaches Rust**.
 `--build-boot` compiles `boot/*.nt` **with the compiler already in the image** and serializes the
 bytecode into `boot/boot.nb` (`src/image.rs`), embedded in the binary by `include_bytes!`. Rust is the
 VM plus the primitives, and nothing else.
+
+### Stage 2 (started): a baseline JIT for integer loops and calls
+
+`src/jit.rs`, AArch64 only, no crate dependency (`mmap`/`mprotect`/`__clear_cache` declared directly
+as `extern "C"`, already linked in via libc/libgcc). After 64 calls a `FnCode` is walked once and,
+if every op in it is provably pure integer arithmetic over its own locals — `+ - * & | < > =`,
+`Push`/`LoadL`/`StoreL`/`Pop`/`Ret`, `Jmp`/`Jmpf`/`Loop` (`while`/`if`/`do` control flow), and a
+call to another function that is *itself* provably pure the same way — it's compiled to native code
+and the result cached on the function (`FnCode::jitted`, `src/value.rs`); anything else (a global, a
+closure, a float, a call to something impure) is rejected once and runs interpreted forever after,
+same as always. This follows the atomic-swap-in discipline [Concurrency](#concurrency) already
+committed to: `intern()` (`src/vm.rs`) patches a `FnCode`'s consts in place today via the same
+"mutate only when uniquely owned" check `x[i]:v` uses, which the JIT doesn't reuse for compiled
+code — a compiled function is built complete, then stored once behind a lock, never edited in
+place, so two threads racing to compile the same hot function just waste one's work instead of
+racing on it.
+
+`Loop` (`do[n;..]`) is the one op whose two edges leave the interpreter's stack at different depths
+— decrementing in place and falling through to the body leaves it unchanged, but exiting also pops
+— so it's the one place the compiler can't just accumulate stack depth linearly through the
+bytecode; the exit edge's depth is recorded and used to override that accumulation when the scan
+reaches it, which also makes nested `do` loops compile correctly.
+
+A compiled function is guarded at entry (every arg and capture must be a plain, non-null int) and
+can still bail out mid-run back to the interpreter (`deopt`) at a few points it can't just trust
+blindly: two ordinary ints wrapping to exactly the null sentinel by coincidence (`0W+1`); a call
+whose arity doesn't match or whose callee turns out not to be a plain function; runaway recursion
+(compiled-to-compiled calls go through `blr`, not `Vm::call_code`'s own recursion-depth guard, so
+they need their own — `MAX_CALL_DEPTH`, mirroring `call_code`'s limit for the same reason: it has to
+stay safe on the smallest stack this can run on, not just the main thread's, since a `spawn`ed
+thread defaults to a 2MiB one). Since the compilable subset can't observe anything outside its own
+locals — and a call is only made at all once the callee is independently proven just as pure, by
+literally attempting to compile it too — every one of these is always safe to just re-run from
+scratch on the interpreter.
+
+Calling another compiled function goes through one fixed trampoline (`jit_call`) reached via `blr`:
+it resolves the callee exactly like `Op::LoadG` would, proves it pure (or refuses to call it at all
+if not — the only way to avoid firing a real side effect twice if the *caller* later deopts), and
+recurses through compiled code directly, never dropping back into the bytecode interpreter unless
+something along the way deopts.
+
+Measured on this machine: a tight scalar `while` loop is **~58x** faster compiled (cold/interpreted
+vs. warm — `cargo test --release jit_tests::manual_perf_measurement -- --ignored --nocapture`).
+Recursive calls (`fib`) are a more modest **~1.6x** — each call still pays a trampoline lookup, a
+lock on the callee's compiled-code cache, and a heap allocation for its locals, none of which a
+loop iteration needs (`jit_tests::manual_recursive_perf_measurement`).
 
 ### What the tests check
 

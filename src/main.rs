@@ -12,6 +12,7 @@
 //! Source never reaches Rust: boot/{lex,parse,compile}.nt lex, parse and compile it, and they
 //! themselves run on this VM, loaded from the bytecode image in boot/boot.nb.
 mod image;
+mod jit;
 mod prims;
 mod value;
 mod vm;
@@ -250,6 +251,186 @@ mod tests {
         let r = v.eval("+/{x*x} til 2000000").unwrap();
         assert_eq!(r.fmt(), "2666664666667000000");
         assert!(t.elapsed().as_millis() < 500, "took {:?}", t.elapsed());
+    }
+}
+
+/// The AArch64 baseline JIT (src/jit.rs): compiles hot integer-only loops after enough calls.
+/// `#[cfg(target_arch = "aarch64")]` because that's the only backend — on any other arch
+/// `jit::compile` always returns `None` and these functions just run interpreted throughout,
+/// which is also exactly what the entry guard falls back to below, so nothing here is arch-specific
+/// behavior worth asserting on other architectures.
+#[cfg(all(test, target_arch = "aarch64"))]
+mod jit_tests {
+    use super::*;
+
+    /// Calls the same closure enough times to cross the tier-up threshold partway through, and
+    /// checks every call — interpreted and compiled alike — agrees on the result.
+    #[test]
+    fn compiled_and_interpreted_agree() {
+        let mut v = boot_vm();
+        let got = v.eval(
+            "f: {[k] n:0; i:0; while[i<k; n: n+i*i; i: i+1]; n}; \
+             r: (); i: 0; while[i<100; r,: f 1000; i+:1]; \
+             distinct r",
+        ).unwrap();
+        assert_eq!(got.fmt(), ",332833500"); // one distinct value across 100 calls
+    }
+
+    #[test]
+    #[ignore]
+    fn manual_perf_measurement() {
+        let mut v = boot_vm();
+        v.eval("f: {[k] n:0; i:0; while[i<k; n: n+i*i; i: i+1]; n}").unwrap();
+        let t0 = std::time::Instant::now();
+        v.eval("f 1000000").unwrap();
+        let cold = t0.elapsed();
+        for _ in 0..70 { v.eval("f 10").unwrap(); } // cross the tier-up threshold
+        let t1 = std::time::Instant::now();
+        v.eval("f 1000000").unwrap();
+        let hot = t1.elapsed();
+        println!("interpreted {cold:?}  compiled {hot:?}  ratio {:.1}x", cold.as_secs_f64() / hot.as_secs_f64());
+    }
+
+    /// `do[n;..]` (`Op::Loop`) is the one op with an asymmetric stack-depth delta between its two
+    /// edges (fall through unchanged, exit pops one) — nested loops are the case that would catch
+    /// a depth-bookkeeping mistake in the compiler itself, not just a codegen mistake.
+    #[test]
+    fn do_loop_compiled_and_interpreted_agree() {
+        let mut v = boot_vm();
+        let got = v.eval(
+            "f: {[k] n:0; do[k; do[3; n: n+1]]; n}; \
+             r: (); i: 0; while[i<100; r,: f 10; i+:1]; \
+             distinct r",
+        ).unwrap();
+        assert_eq!(got.fmt(), ",30");
+    }
+
+    /// A single top-level call to a recursive function is itself hundreds of thousands of calls
+    /// through `call_code` for `fib(27)`-sized input, so it crosses the tier-up threshold within
+    /// its own first invocation — there's no way to time a "cold" `fib` against itself. Instead,
+    /// compare against `fibSlow`, the identical algorithm with two monadic negations (`- -`, an
+    /// identity) spliced in purely to make it permanently uncompilable (`Op::Monad` is never
+    /// accepted) — same result, same recursive shape, guaranteed interpreted throughout, so the
+    /// ratio isolates what compiling the calls themselves is worth.
+    #[test]
+    #[ignore]
+    fn manual_recursive_perf_measurement() {
+        let mut v = boot_vm();
+        v.eval("fib: {$[x<2;x;fib[x-1]+fib[x-2]]}").unwrap();
+        v.eval("fibSlow: {$[x<2;x;(- - fibSlow[x-1])+(- - fibSlow[x-2])]}").unwrap();
+        for _ in 0..70 { v.eval("fib 5").unwrap(); } // cross the tier-up threshold
+        let t0 = std::time::Instant::now();
+        let hot = v.eval("fib 27").unwrap();
+        let hot_time = t0.elapsed();
+        let t1 = std::time::Instant::now();
+        let slow = v.eval("fibSlow 27").unwrap();
+        let slow_time = t1.elapsed();
+        assert_eq!(hot.fmt(), slow.fmt());
+        println!("interpreted {slow_time:?}  compiled {hot_time:?}  ratio {:.1}x", slow_time.as_secs_f64() / hot_time.as_secs_f64());
+    }
+
+    /// `x*fact(x-1)`: `x` is live across the recursive call, so a compiler that spills/reloads the
+    /// wrong registers around a call would silently corrupt this even while getting simpler,
+    /// non-live-across-call recursion right.
+    #[test]
+    fn recursive_call_compiled_and_interpreted_agree() {
+        let mut v = boot_vm();
+        let got = v.eval(
+            "fact: {$[x<2;1;x*fact x-1]}; \
+             r: (); i: 0; while[i<100; r,: fact 15; i+:1]; \
+             distinct r",
+        ).unwrap();
+        assert_eq!(got.fmt(), ",1307674368000"); // 15!
+    }
+
+    /// Two recursive calls in one function — the trampoline used twice per invocation, and twice
+    /// as much live-register pressure across each call as the `fact` case.
+    #[test]
+    fn double_recursive_call_compiled_and_interpreted_agree() {
+        let mut v = boot_vm();
+        let got = v.eval(
+            "fib: {$[x<2;x;fib[x-1]+fib[x-2]]}; \
+             r: (); i: 0; while[i<100; r,: fib 20; i+:1]; \
+             distinct r",
+        ).unwrap();
+        assert_eq!(got.fmt(), ",6765");
+    }
+
+    /// Runaway recursion through compiled calls goes through `blr`, not `Vm::call_code`'s own
+    /// `self.depth` guard — without its own limit (`MAX_CALL_DEPTH`, src/jit.rs) this would blow
+    /// the real machine stack instead of failing like every other kind of infinite recursion here.
+    #[test]
+    fn deep_recursion_fails_cleanly_instead_of_overflowing_the_stack() {
+        let mut v = boot_vm();
+        v.eval("h: {[x] $[x<1; 0; 1+h[x-1]]}; i:0; while[i<80; r: h 500; i+:1]").unwrap();
+        assert_eq!(tests::ev(&mut v, "h 1000000"), "'stack: recursion too deep");
+    }
+
+    /// Calling an impure function (here, one that mutates a `shared` cell) from a hot caller must
+    /// never fire that side effect twice. The trampoline (src/jit.rs `jit_call`) proves a callee is
+    /// just as pure as the caller *before* calling it — `supd` resolves to a `Prim`, not a
+    /// `Lambda`/`Closure`, so it's never actually reached through the compiled path at all, and
+    /// every one of these calls runs on the interpreter instead, exactly once each.
+    #[test]
+    fn impure_callee_never_fires_its_side_effect_twice() {
+        let mut v = boot_vm();
+        v.eval("s: shared 0; bump: {[x] supd[s;{x+1}]; x+1}; f: {[x] bump x}").unwrap();
+        for i in 0..80 { v.eval(&format!("f {i}")).unwrap(); }
+        assert_eq!(tests::ev(&mut v, "sget s"), "80");
+    }
+
+    /// `0W + 1` wraps to exactly the null sentinel — the one case raw compiled arithmetic can't
+    /// just trust (see src/jit.rs). Run past the tier-up threshold so this specific call is the
+    /// compiled version, and check it still lands on the interpreter's answer, proving deopt fired
+    /// instead of silently propagating a wrapped garbage value.
+    #[test]
+    fn deopts_on_null_collision_instead_of_diverging() {
+        let mut interpreted = boot_vm();
+        let want = tests::ev(&mut interpreted, "p: {[k] n: 0W; i:0; while[i<k; n: n+1; i+:1]; n}; p 3");
+        let mut compiled = boot_vm();
+        compiled.eval("p: {[k] n: 0W; i:0; while[i<k; n: n+1; i+:1]; n}").unwrap();
+        let mut last = String::new();
+        for _ in 0..100 { last = tests::ev(&mut compiled, "p 3"); }
+        assert_eq!(last, want);
+    }
+}
+
+/// `spawn`/`join`/`shared`/`supd`: real OS threads over Arc-refcounted, copy-on-write values.
+/// No global lock — only a `shared` cell takes one, and only for its own critical section.
+#[cfg(test)]
+mod conc {
+    use super::*;
+
+    #[test]
+    fn spawn_join_returns_result() {
+        let mut v = boot_vm();
+        assert_eq!(tests::ev(&mut v, "n: 10; h: spawn {n+1}; join h"), "11");
+    }
+
+    #[test]
+    fn spawn_join_propagates_error() {
+        let mut v = boot_vm();
+        assert_eq!(tests::ev(&mut v, "h: spawn {signal \"boom\"}; join h"), "'boom");
+    }
+
+    #[test]
+    fn join_twice_errors_instead_of_panicking() {
+        let mut v = boot_vm();
+        assert_eq!(tests::ev(&mut v, "h: spawn {1}; join h; join h"), "'thread: already joined");
+    }
+
+    /// 8 threads each doing 2000 `supd` increments on one shared counter: if `supd` ever lost an
+    /// update to a race, this would fail intermittently instead of landing on exactly 16000.
+    #[test]
+    fn shared_cell_serializes_updates() {
+        let mut v = boot_vm();
+        let got = v.eval(
+            "s: shared 0; \
+             hs: {spawn {i:0; while[i<2000; supd[s;{x+1}]; i+:1]}} each til 8; \
+             {join x} each hs; \
+             sget s",
+        ).unwrap();
+        assert_eq!(got.fmt(), "16000");
     }
 }
 
@@ -526,3 +707,4 @@ mod boot_image {
         assert!(fresh == BOOT_IMAGE, "boot/boot.nb is stale ({} vs {} bytes): run `cargo run --release -- --build-boot` and rebuild", BOOT_IMAGE.len(), fresh.len());
     }
 }
+
