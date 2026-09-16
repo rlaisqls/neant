@@ -294,19 +294,40 @@ in it (`crypto.nt`) and what's loaded on demand (`ed25519.nt`, `tls.nt` — see 
 
 ### Stage 2 (started): a baseline JIT for integer loops and calls
 
-`src/jit.rs`, AArch64 only, no crate dependency (`mmap`/`mprotect`/`__clear_cache` declared directly
-as `extern "C"`, already linked in via libc/libgcc). After 64 calls a `FnCode` is walked once and,
-if every op in it is provably pure integer arithmetic over its own locals — `+ - * & | < > =`,
+The codegen itself — the compilability walk over `Op`s and every AArch64 instruction encoder — is
+self-hosted the same way Stage 1 is: `src/neant/jit/arm64.nt` is a neant function, `jitCompile`,
+that takes a `FnCode`'s bytecode as data (`(opcodes;args;consts;arity;nlocals)`,
+`FnCode::jit_input`) and returns either a `Bytes` value (the encoded machine code) or `::` (not
+compilable), the same null-signals-failure convention used elsewhere. Only what genuinely needs the
+host stays in Rust (`src/jit.rs`, AArch64 only, no crate dependency): `mmap`/`mprotect`/
+`__clear_cache` declared directly as `extern "C"` (already linked in via libc/libgcc), owning the
+resulting executable memory (`Compiled`), and the `jit_call` trampoline that a compiled function
+uses to call another one directly. After 64 calls a `FnCode` is walked once by `jitCompile`, and if
+every op in it is provably pure integer arithmetic over its own locals — `+ - * & | < > =`,
 `Push`/`LoadL`/`StoreL`/`Pop`/`Ret`, `Jmp`/`Jmpf`/`Loop` (`while`/`if`/`do` control flow), and a
 call to another function that is *itself* provably pure the same way — it's compiled to native code
-and the result cached on the function (`FnCode::jitted`, `src/value.rs`); anything else (a global, a
-closure, a float, a call to something impure) is rejected once and runs interpreted forever after,
-same as always. This follows the atomic-swap-in discipline [Concurrency](#concurrency) already
-committed to: `intern()` (`src/vm.rs`) patches a `FnCode`'s consts in place today via the same
-"mutate only when uniquely owned" check `x[i]:v` uses, which the JIT doesn't reuse for compiled
-code — a compiled function is built complete, then stored once behind a lock, never edited in
-place, so two threads racing to compile the same hot function just waste one's work instead of
-racing on it.
+and the result cached on the function (`FnCode::jitted`, `src/value.rs`); anything else (a global
+that isn't an immediately-called function, a closure, a float, a call to something impure) is
+rejected once and runs interpreted forever after, same as always. This follows the atomic-swap-in
+discipline [Concurrency](#concurrency) already committed to: `intern()` (`src/vm.rs`) patches a
+`FnCode`'s consts in place today via the same "mutate only when uniquely owned" check `x[i]:v`
+uses, which the JIT doesn't reuse for compiled code — a compiled function is built complete, then
+stored once behind a lock (`OnceLock`), never edited in place, so two threads racing to compile the
+same hot function just waste one's work instead of racing on it.
+
+Compiling now means *running* neant code (`Vm::call`), which needs `&mut Vm` — sound to reborrow
+even from inside the `jit_call` trampoline (which only ever holds a raw `*mut Vm`) under the same
+discipline every other reentrant interpreter-calls-host-calls-interpreter path already relies on
+(adverbs like `each` call back into `self.call` the same way): single-threaded, strictly nested,
+the outer call's own `&mut self` untouched while the nested one runs. One wrinkle unique to a JIT
+that compiles itself: `jitCompile` and its own helpers are neant functions too, and their own
+bytecode contains the very op kinds they exist to handle — a `Dyad` inside the code that handles
+`Op::Dyad`, for instance. Once one of those crosses the same 64-call threshold, compiling it would
+mean *calling* it to walk its own bytecode, reentering its own `OnceLock` from inside that same
+`OnceLock`'s initializer. A thread-local guard (`already_compiling`, `src/jit.rs`) shuts that off
+for the whole nested call, not just the one function that would recurse — the JIT's own
+implementation is never a JIT target, full stop, which only ever affects how long one-time
+compilation takes, never a compiled function's own speed.
 
 `Loop` (`do[n;..]`) is the one op whose two edges leave the interpreter's stack at different depths
 — decrementing in place and falling through to the body leaves it unchanged, but exiting also pops

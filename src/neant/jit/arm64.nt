@@ -1,0 +1,304 @@
+// AArch64 codegen for the baseline JIT (src/jit.rs owns memory/execution; see README "Stage 2").
+// Always loaded (part of the boot image) so the JIT can call `jitCompile` on any hot function, but
+// nothing here is meant to be called directly from ordinary scripts.
+//
+// jitCompile[input;trampoline] -> Bytes (machine code) or null (not compilable).
+// input = (opcodes:Ints; args:Ints; consts:List; arity:Int; nlocals:Int) — FnCode::jit_input, src/value.rs.
+// trampoline = the address of src/jit.rs's `jit_call`, as an int (neant has no way to take a Rust
+// function's address itself, so Rust hands it over).
+
+// ---- little-endian byte packing: a 32-bit "word" (built via bor/shl on a plain int) -> 4 bytes.
+// A literal like 0xA9800000 (or 0xffff, or 0x07FFFF) is hex-*byte* digits, i.e. a Bytes vector, not
+// one big int — jitW reconstructs the (big-endian, as written) int these encoders need, the same
+// fold `src/neant/crypto/tls.nt`'s `wbe` already uses for the same reason.
+jitW: {[h] 0 {(256*x)+y}/ `int$h}
+jitLE: {[w] `byte$ (w band 0xff; (w shr 8) band 0xff; (w shr 16) band 0xff; (w shr 24) band 0xff)}
+
+// ---- registers: x19=loc ptr, x20=NI constant, x21=vm ptr, x22=this call's ok-out ptr — all
+// callee-saved, survive nested blr for free. x9..x14 the operand stack (caller-saved, spilled
+// around calls). x15 a dedicated call-scratch register. See src/jit.rs's fuller comment.
+jitLOC: 19
+jitNI: 20
+jitVM: 21
+jitOK: 22
+jitSCRATCH: 15
+jitSTACK: 9
+jitMAXDEPTH: 6
+jitSP: 31
+jitSPILLBASE: 48
+jitCALLOK: 96
+jitFRAME: 112
+jitCondLT: 11
+jitCondGT: 12
+jitCondEQ: 0
+
+// ---- instruction encoders. Every formula here was cross-checked against `objdump -d` output on
+// a snippet assembled with this box's own `as`/`gcc` before being trusted (see README "Stage 2").
+jitMovz: {[rd;imm16;hw] (jitW 0xD2800000) bor (hw shl 21) bor (imm16 shl 5) bor rd}
+jitMovk: {[rd;imm16;hw] (jitW 0xF2800000) bor (hw shl 21) bor (imm16 shl 5) bor rd}
+jitAddR: {[rd;rn;rm] (jitW 0x8B000000) bor (rm shl 16) bor (rn shl 5) bor rd}
+jitSubR: {[rd;rn;rm] (jitW 0xCB000000) bor (rm shl 16) bor (rn shl 5) bor rd}
+jitMulR: {[rd;rn;rm] (jitW 0x9B007C00) bor (rm shl 16) bor (rn shl 5) bor rd}
+jitCmpR: {[rn;rm] (jitW 0xEB00001F) bor (rm shl 16) bor (rn shl 5)}
+jitCsel: {[rd;rn;rm;cond] (jitW 0x9A800000) bor (rm shl 16) bor (cond shl 12) bor (rn shl 5) bor rd}
+jitCset: {[rd;cond] (jitW 0x9A9F07E0) bor ((cond bxor 1) shl 12) bor rd}
+jitLdrImm: {[rt;rn;byteOff] (jitW 0xF9400000) bor ((byteOff div 8) shl 10) bor (rn shl 5) bor rt}
+jitStrImm: {[rt;rn;byteOff] (jitW 0xF9000000) bor ((byteOff div 8) shl 10) bor (rn shl 5) bor rt}
+jitMovR: {[rd;rn] (jitW 0xAA0003E0) bor (rn shl 16) bor rd}
+jitRet: {[] jitW 0xD65F03C0}
+jitBlr: {[rn] (jitW 0xD63F0000) bor (rn shl 5)}
+jitB: {[imm26] (jitW 0x14000000) bor (imm26 band (jitW 0x03FFFFFF))}
+jitCbz: {[rt;imm19] (jitW 0xB4000000) bor ((imm19 band (jitW 0x07FFFF)) shl 5) bor rt}
+jitBcond: {[cond;imm19] (jitW 0x54000000) bor ((imm19 band (jitW 0x07FFFF)) shl 5) bor cond}
+jitCmpImm: {[rn;imm12] (jitW 0xF1000000) bor (imm12 shl 10) bor (rn shl 5) bor 31}
+jitSubImm: {[rd;rn;imm12] (jitW 0xD1000000) bor (imm12 shl 10) bor (rn shl 5) bor rd}
+jitAddImm: {[rd;rn;imm12] (jitW 0x91000000) bor (imm12 shl 10) bor (rn shl 5) bor rd}
+jitStpPre: {[rt1;rt2;rn;immBytes] (jitW 0xA9800000) bor (((immBytes div 8) band 0x7F) shl 15) bor (rt2 shl 10) bor (rn shl 5) bor rt1}
+jitStpOff: {[rt1;rt2;rn;byteOff] (jitW 0xA9000000) bor (((byteOff div 8) band 0x7F) shl 15) bor (rt2 shl 10) bor (rn shl 5) bor rt1}
+jitLdpOff: {[rt1;rt2;rn;byteOff] (jitW 0xA9400000) bor (((byteOff div 8) band 0x7F) shl 15) bor (rt2 shl 10) bor (rn shl 5) bor rt1}
+jitLdpPost: {[rt1;rt2;rn;byteOff] (jitW 0xA8C00000) bor (((byteOff div 8) band 0x7F) shl 15) bor (rt2 shl 10) bor (rn shl 5) bor rt1}
+
+// rd = a 64-bit constant, via movz + up to 3 movk (skipping zero chunks).
+jitLoadConst: {[asm;rd;v]
+  asm: asm,jitMovz[rd; v band (jitW 0xffff); 0]
+  hw: 1
+  while[hw<4
+    chunk: (v shr (hw*16)) band (jitW 0xffff)
+    if[not chunk=0; asm: asm,jitMovk[rd;chunk;hw]]
+    hw: hw+1]
+  asm}
+
+jitEmitEpilogue: {[asm]
+  asm: asm,jitLdpOff[21;22;jitSP;32]
+  asm: asm,jitLdpOff[19;20;jitSP;16]
+  asm: asm,jitLdpPost[29;30;jitSP;jitFRAME]
+  asm,jitRet[]}
+
+jitEmitReturn: {[asm;valreg]
+  asm: asm,jitMovR[0;valreg]
+  asm: jitLoadConst[asm;5;1]
+  asm: asm,jitStrImm[5;jitOK;0]
+  jitEmitEpilogue asm}
+
+jitEmitDeopt: {[asm]
+  asm: jitLoadConst[asm;5;0]
+  asm: asm,jitStrImm[5;jitOK;0]
+  jitEmitEpilogue asm}
+
+// Which dyadic verbs this backend inlines — exactly `int_dyad`'s set (src/vm.rs). Kind: 0=+ 1=- 2=*
+// 3=& (min) 4=| (max) 5=< 6=> 7==.
+jitDyadKind: {[name]
+  ks: "+-*&|<>="
+  i: ks ss name
+  $[0=count i; null; first i]}
+
+// State carried through the walk, as a dict so each op-case function can take/return it whole:
+// asm (word list), depth, fixups (list of (word;target;isCbz)), cbzRegs (dict word->reg),
+// deoptFixups (list of (word;kind), kind null=flags-based B.EQ, else a register for CBZ),
+// depthAt (dict ip->depth, overrides the naive linear accumulation — see Loop below), pendingCallSlot.
+jitNewState: {[asm] `asm`depth`fixups`cbzRegs`deoptFixups`depthAt`pending!(asm;0;();()!();();()!();null)}
+
+// ---- per-op handlers. Each takes the state dict (plus whatever else it needs) and returns the
+// updated state dict, or null to reject the whole function — checked by the caller after every
+// call, since `:null` inside one of these returns from *that* function, not from jitCompile.
+
+jitOpPush: {[st;ip;opcodes;consts;a]
+  c: consts[a]
+  $[isnull c
+    ; $[not (opcodes[ip+1])=11; null   // Null is only ever immediately Pop'd (if/while/do's own statement value) — see README "Stage 2"
+        ; st[`asm]: st[`asm],(); st[`depth]: (st[`depth])+1; st]
+    ; not (`int)=type c
+    ; null
+    ; c=0N
+    ; null
+    ; st[`asm]: jitLoadConst[st[`asm]; jitSTACK+(st[`depth]); c]; st[`depth]: (st[`depth])+1; st]}
+
+jitOpLoadL: {[st;a]
+  if[not a<4096; :null]
+  st[`asm]: st[`asm],jitLdrImm[jitSTACK+(st[`depth]); jitLOC; a*8]
+  st[`depth]: (st[`depth])+1
+  st}
+
+jitOpStoreL: {[st;a]
+  if[(st[`depth])<1; :null]
+  if[not a<4096; :null]
+  st[`asm]: st[`asm],jitStrImm[jitSTACK+((st[`depth])-1); jitLOC; a*8]
+  st}
+
+jitOpPop: {[st]
+  if[(st[`depth])<1; :null]
+  st[`depth]: (st[`depth])-1
+  st}
+
+jitOpRet: {[st]
+  if[(st[`depth])<1; :null]
+  st[`asm]: jitEmitReturn[st[`asm]; jitSTACK+((st[`depth])-1)]
+  st}
+
+jitOpDyad: {[st;consts;a]
+  if[(st[`depth])<2; :null]
+  p: consts[a]
+  kind: jitDyadKind string p
+  if[isnull kind; :null]
+  x: jitSTACK+((st[`depth])-1)
+  y: jitSTACK+((st[`depth])-2)
+  dst: y
+  asm: st[`asm]
+  df: st[`deoptFixups]
+  $[kind=0
+    ; asm: asm,jitAddR[dst;x;y]
+    ; kind=1
+    ; asm: asm,jitSubR[dst;x;y]
+    ; kind=2
+    ; asm: asm,jitMulR[dst;x;y]
+    ; kind=3
+    ; asm: (asm,jitCmpR[x;y]),jitCsel[dst;x;y;jitCondLT]
+    ; kind=4
+    ; asm: (asm,jitCmpR[x;y]),jitCsel[dst;x;y;jitCondGT]
+    ; kind=5
+    ; asm: (asm,jitCmpR[x;y]),jitCset[dst;jitCondLT]
+    ; kind=6
+    ; asm: (asm,jitCmpR[x;y]),jitCset[dst;jitCondGT]
+    ; asm: (asm,jitCmpR[x;y]),jitCset[dst;jitCondEQ]]
+  if[kind<3
+    ; asm: asm,jitCmpR[dst;jitNI]
+    ; df: df,enlist ((count asm);null)
+    ; asm: asm,0]
+  st[`asm]: asm
+  st[`deoptFixups]: df
+  st[`depth]: (st[`depth])-1
+  st}
+
+jitOpJmp: {[st;t]
+  st[`depthAt;t]: st[`depth]
+  st[`fixups]: (st[`fixups]),enlist ((count st[`asm]);t;0b)
+  st[`asm]: (st[`asm]),0
+  st}
+
+jitOpJmpf: {[st;t]
+  if[(st[`depth])<1; :null]
+  r: jitSTACK+((st[`depth])-1)
+  st[`depth]: (st[`depth])-1
+  st[`depthAt;t]: st[`depth]
+  st[`cbzRegs;count st[`asm]]: r
+  st[`fixups]: (st[`fixups]),enlist ((count st[`asm]);t;1b)
+  st[`asm]: (st[`asm]),0
+  st}
+
+// do[n;..]: n>0 -> decrement in place, fall through (depth unchanged); else pop and jump to the
+// exit (depth-1 — the one thing the naive linear scan can't see, so it's recorded in depthAt).
+jitOpLoop: {[st;t]
+  if[(st[`depth])<1; :null]
+  r: jitSTACK+((st[`depth])-1)
+  asm: st[`asm]
+  asm: asm,jitCmpImm[r;0]
+  asm: asm,jitBcond[jitCondGT;2]
+  st[`depthAt;t]: (st[`depth])-1
+  st[`fixups]: (st[`fixups]),enlist ((count asm);t;0b)
+  asm: asm,0
+  asm: asm,jitSubImm[r;r;1]
+  st[`asm]: asm
+  st}
+
+jitOpCall: {[st;consts;trampoline;slot;argc]
+  if[(st[`depth])<argc; :null]
+  live: (st[`depth])-argc
+  asm: st[`asm]
+  i: 0
+  while[i<live; asm: asm,jitStrImm[jitSTACK+i; jitSP; jitSPILLBASE+(i*8)]; i: i+1]
+  asm: asm,jitMovR[3; jitSTACK+((st[`depth])-1)]
+  if[argc=2; asm: asm,jitMovR[4; jitSTACK+((st[`depth])-2)]]
+  asm: asm,jitMovR[0;jitVM]
+  asm: jitLoadConst[asm;1;slot]
+  asm: jitLoadConst[asm;2;argc]
+  asm: asm,jitAddImm[5;jitSP;jitCALLOK]
+  asm: jitLoadConst[asm;jitSCRATCH;trampoline]
+  asm: asm,jitBlr[jitSCRATCH]
+  asm: asm,jitLdrImm[jitSCRATCH;jitSP;jitCALLOK]
+  st[`deoptFixups]: (st[`deoptFixups]),enlist ((count asm);jitSCRATCH)
+  asm: asm,0
+  asm: asm,jitMovR[jitSTACK+live; 0]
+  i: 0
+  while[i<live; asm: asm,jitLdrImm[jitSTACK+i; jitSP; jitSPILLBASE+(i*8)]; i: i+1]
+  st[`asm]: asm
+  st[`depth]: live+1
+  st}
+
+jitCompile: {[input;trampoline]
+  opcodes: input[0]; opargs: input[1]; consts: input[2]; arity: input[3]; nlocals: input[4]
+  n: count opcodes
+
+  asm: ()
+  asm: asm,jitStpPre[29;30;jitSP;neg jitFRAME]
+  asm: asm,jitStpOff[19;20;jitSP;16]
+  asm: asm,jitStpOff[21;22;jitSP;32]
+  asm: asm,jitMovR[jitLOC;0]
+  asm: asm,jitMovR[jitVM;2]
+  asm: asm,jitMovR[jitOK;1]
+  asm: jitLoadConst[asm;jitNI;0N]
+
+  st: jitNewState asm
+  ipWord: (n+1)#0   // n+1: a jump target can be the position right after the last op (e.g. a `do` loop's exit)
+  ip: 0
+  while[ip<n
+    if[not isnull (st[`depthAt])[ip]; st[`depth]: (st[`depthAt])[ip]]
+    ipWord[ip]: count st[`asm]
+    if[(st[`depth])<0; :null]
+    if[(st[`depth])>jitMAXDEPTH; :null]
+    op: opcodes[ip]
+    a: opargs[ip]
+    pending: st[`pending]
+    isCallHead: (op=7) & ((a=1)|(a=2))
+    if[(not isnull pending) & (not isCallHead); :null]
+
+    $[op=0; st: jitOpPush[st;ip;opcodes;consts;a]
+    ; op=3; st: jitOpLoadL[st;a]
+    ; op=4; st: jitOpStoreL[st;a]
+    ; op=11; st: jitOpPop st
+    ; op=16; st: jitOpRet st
+    ; op=6; st: jitOpDyad[st;consts;a]
+    ; op=9; st: jitOpJmp[st;a]
+    ; op=10; st: jitOpJmpf[st;a]
+    ; op=18; st: jitOpLoop[st;a]
+    ; op=1
+    ; $[not (`int)=type consts[a]; st: null
+        ; st[`pending]: consts[a]]
+    ; isCallHead
+    ; $[isnull pending; st: null
+        ; st: jitOpCall[st;consts;trampoline;pending;a]; st[`pending]: null]
+    ; st: null]
+
+    if[isnull st; :null]
+    ip: ip+1]
+
+  if[not isnull st[`pending]; :null]
+  ipWord[n]: count st[`asm]
+
+  lastOp: $[n>0; opcodes[n-1]; -1]
+  if[not lastOp=16
+    ; if[(st[`depth])<1; :null]
+      st[`asm]: jitEmitReturn[st[`asm]; jitSTACK+((st[`depth])-1)]]
+
+  deoptAt: count st[`asm]
+  asm: jitEmitDeopt st[`asm]
+
+  fixups: st[`fixups]
+  cbzRegs: st[`cbzRegs]
+  i: 0
+  while[i<count fixups
+    e: fixups[i]
+    word: e[0]; target: e[1]; isCbz: e[2]
+    delta: (ipWord[target])-word
+    asm[word]: $[isCbz; jitCbz[cbzRegs[word];delta]; jitB delta]
+    i: i+1]
+
+  deoptFixups: st[`deoptFixups]
+  i: 0
+  while[i<count deoptFixups
+    e: deoptFixups[i]
+    word: e[0]; kind: e[1]
+    delta: deoptAt-word
+    asm[word]: $[isnull kind; jitBcond[jitCondEQ;delta]; jitCbz[kind;delta]]
+    i: i+1]
+
+  ,/jitLE each asm}

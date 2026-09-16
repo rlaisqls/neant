@@ -214,7 +214,7 @@ impl Vm {
         // A hot, integer-only function may have a compiled native version (src/jit.rs); its entry
         // guard and its own deopt path both just mean "run it on the interpreter instead", so a
         // `None` here always falls straight through to the same `execute` that runs everything else.
-        let compiled = code.jitted();
+        let compiled = code.jitted(self);
         let jit_result = match &compiled { Some(c) => c.try_run(&loc, self), None => None };
         let r = match jit_result {
             Some(v) => Ok(v),

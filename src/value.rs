@@ -35,6 +35,20 @@ impl Op {
             _ => return err(format!("load: unknown opcode {o}")),
         })
     }
+    /// The inverse of `decode` — what `FnCode::jit_input` (below) uses to hand the JIT's neant
+    /// codegen (`src/neant/jit/arm64.nt`) the same bytecode-as-data shape, built fresh from the
+    /// already-interned `ops` each time rather than kept in sync some other way.
+    pub fn encode(&self) -> (i64, i64) {
+        match *self {
+            Op::Push(u) => (0, u as i64), Op::LoadG(u) => (1, u as i64), Op::StoreG(u) => (2, u as i64),
+            Op::LoadL(u) => (3, u as i64), Op::StoreL(u) => (4, u as i64),
+            Op::Monad(u) => (5, u as i64), Op::Dyad(u) => (6, u as i64), Op::Call(u) => (7, u as i64),
+            Op::MkAdv(c) => (8, c as i64),
+            Op::Jmp(u) => (9, u as i64), Op::Jmpf(u) => (10, u as i64), Op::Pop => (11, 0), Op::List(u) => (12, u as i64),
+            Op::TakeL(u) => (13, u as i64), Op::TakeG(u) => (14, u as i64), Op::Amend(u) => (15, u as i64),
+            Op::Ret => (16, 0), Op::MkClosure(u) => (17, u as i64), Op::Loop(u) => (18, u as i64),
+        }
+    }
 }
 
 /// `lines[i]` is the source line op `i` came from (0 = synthetic), for runtime error positions.
@@ -50,25 +64,58 @@ impl FnCode {
     pub fn new(ops: Vec<Op>, consts: Vec<Value>, lines: Vec<u32>, params: Vec<String>, nlocals: usize) -> FnCode {
         FnCode { ops, consts, lines, params, nlocals, calls: AtomicU32::new(0), jit: std::sync::OnceLock::new() }
     }
+    /// `(opcodes; args; consts; arity; nlocals)` — what the neant codegen function
+    /// (`src/neant/jit/arm64.nt`) reads. Built fresh from the already-interned `ops`/`consts` each
+    /// time (rather than kept as a separate snapshot from before `Vm::intern` ran, which would go
+    /// stale the moment interning rewrites a `LoadG`/`StoreG`/`TakeG` const from a name to a slot).
+    /// `consts` needs no tagging the way the wire format does for serialization — each entry is
+    /// already the exact `Value` (an `Int`, a `Prim`, `Null`, ...) the interpreter itself uses, so
+    /// it's just a plain neant list.
+    pub fn jit_input(&self) -> Value {
+        let opcodes: Vec<i64> = self.ops.iter().map(|op| op.encode().0).collect();
+        let args: Vec<i64> = self.ops.iter().map(|op| op.encode().1).collect();
+        list(vec![ints(opcodes), ints(args), list(self.consts.clone()), Int(self.params.len() as i64), Int(self.nlocals as i64)])
+    }
     /// The compiled version, attempting compilation once the call count crosses the threshold.
     /// `None` means "run it on the bytecode interpreter", whether because it's still cold, because
-    /// it doesn't qualify (see src/jit.rs's compilability check), or because this arch has no backend.
-    pub fn jitted(self: &Arc<FnCode>) -> Option<Arc<crate::jit::Compiled>> {
+    /// it doesn't qualify (see src/neant/jit/arm64.nt's compilability check), or because this arch
+    /// has no backend.
+    pub fn jitted(self: &Arc<FnCode>, vm: &mut crate::vm::Vm) -> Option<Arc<crate::jit::Compiled>> {
         if self.calls.fetch_add(1, AtomicOrdering::Relaxed) + 1 < JIT_THRESHOLD { return None; }
-        self.jit_now()
+        self.jit_now(vm)
     }
     /// Same cache as `jitted`, but without the call-count gate: a compiled function calling this
     /// one directly (src/jit.rs's `jit_call` trampoline) needs to know *immediately* whether the
     /// callee is equally pure, since that's what makes it safe to call at all (see README "Stage
     /// 2" and the trampoline's doc comment) — it can't wait for this callee's own count to warm up.
-    pub(crate) fn jit_for_call(self: &Arc<FnCode>) -> Option<Arc<crate::jit::Compiled>> { self.jit_now() }
+    pub(crate) fn jit_for_call(self: &Arc<FnCode>, vm: &mut crate::vm::Vm) -> Option<Arc<crate::jit::Compiled>> { self.jit_now(vm) }
     /// Built once, read many times lock-free after that: `OnceLock` gives every call after the
     /// first a plain atomic load instead of a mutex lock — this is called on every single
     /// recursive step through `jit_call` (src/jit.rs), so that difference is the whole point.
     /// Compilation is still attempted at most once (whichever caller gets here first wins;
     /// `OnceLock` itself serializes a same-time race, so no attempt is ever wasted or repeated).
-    fn jit_now(self: &Arc<FnCode>) -> Option<Arc<crate::jit::Compiled>> {
-        self.jit.get_or_init(|| crate::jit::compile(self).map(Arc::new)).clone()
+    ///
+    /// Compiling now means *running* the neant codegen function (`src/neant/jit/arm64.nt`), which
+    /// needs `&mut Vm` — sound to reborrow from a raw `*mut Vm` here (see `jit_call`'s doc comment,
+    /// src/jit.rs) as long as the original reference this was derived from is never touched again
+    /// while this nested call runs, the same discipline `Vm::call_code` already relies on for every
+    /// other reentrant call (adverbs like `each` call back into `self.call` the same way).
+    fn jit_now(self: &Arc<FnCode>, vm: &mut crate::vm::Vm) -> Option<Arc<crate::jit::Compiled>> {
+        // `jitCompile` and its own helpers are neant functions too, called only ever from inside
+        // some `jitCompile` invocation — so if one's already running, this call exists *because* of
+        // it, and attempting to compile here would mean calling this same function again to walk
+        // its own bytecode, reentering this exact `OnceLock` from inside its own initializer (see
+        // src/jit.rs's `compile` for the full argument). Deliberately not cached as Rejected: skip
+        // the `OnceLock` entirely rather than settle it, so a later, non-nested call still gets a
+        // real attempt — though for the JIT's own internals specifically, every call happens during
+        // some `jitCompile` run, so that real attempt in practice just never comes, which is exactly
+        // the intended outcome: the compiler is never its own JIT target.
+        // Fast path: once settled, this is a lock-free read that never runs the closure below, so
+        // it can't reenter anything — skip the thread-local guard entirely for the (overwhelmingly
+        // common) steady-state case instead of paying for it on every call.
+        if let Some(cached) = self.jit.get() { return cached.clone(); }
+        if crate::jit::already_compiling() { return None; }
+        self.jit.get_or_init(|| crate::jit::compile(self, vm).map(Arc::new)).clone()
     }
 }
 

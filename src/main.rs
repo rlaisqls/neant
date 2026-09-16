@@ -51,9 +51,9 @@ fn main() {
     }
 }
 
-const BOOT_FILES: [&str; 7] = [
+const BOOT_FILES: [&str; 8] = [
     "src/neant/stdlib/prelude.nt", "src/neant/core/lex.nt", "src/neant/core/parse.nt", "src/neant/core/compile.nt",
-    "src/neant/stdlib/table.nt", "src/neant/stdlib/json.nt", "src/neant/crypto/crypto.nt",
+    "src/neant/stdlib/table.nt", "src/neant/stdlib/json.nt", "src/neant/crypto/crypto.nt", "src/neant/jit/arm64.nt",
 ];
 const BOOT_IMAGE_PATH: &str = "src/neant/image.nb";
 /// The whole front end and standard library as bytecode, compiled by itself: prelude, lexer, parser,
