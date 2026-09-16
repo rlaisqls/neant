@@ -142,8 +142,9 @@ lock rather than a thread-local one: the accepting thread and the worker handlin
 different OS threads, and both need to resolve the same handle. That lock is held only for the
 lookup, never across the actual blocking read/write/accept (each clones the underlying file
 descriptor and blocks on the clone) — otherwise one worker still waiting on a slow client would
-stall every other socket in the process, exactly the concurrency this is for. No TLS server side yet
-— `src/neant/crypto/tls.nt`'s handshake code is still client-only.
+stall every other socket in the process, exactly the concurrency this is for. No TLS server side —
+`src/neant/crypto/tls.nt` is a client only, though its handshake does authenticate the server it
+talks to ("Bytes and crypto" below).
 
 ## Tables
 
@@ -319,8 +320,10 @@ headers keyed by lowercased symbol (build
 one with `` `$"content-length" ``, not a literal `` `content-length `` — a hyphen in a *literal*
 symbol token is the `-` verb, not part of the name; casting a string with `` `$ `` has no such
 limit). A handler returns `(status; reason; headers; body)`. No chunked transfer-encoding, no
-keep-alive (`hclose` after every response), no HTTPS yet — `src/neant/crypto/tls.nt` is
-still client-only.
+keep-alive (`hclose` after every response), and no HTTPS *here*: `src/neant/crypto/tls.nt` is a
+verifying TLS 1.3 client ("Bytes and crypto"), so an outbound HTTPS request is a matter of writing
+`httpRecv`/`httpSend` over `tlsSend`/`tlsRecv` instead of `hsend`/`hrecv`, but nothing does that
+yet and there is no TLS server side for `httpServe` to sit behind.
 
 ## Bytes and crypto
 
@@ -353,6 +356,65 @@ null and poison the round. The curve reuses `fadd fsub fmul fsq finv fencode fde
 extended coordinates with the complete addition law, and Shamir's trick does both scalars in one pass
 of 253 doublings. Scalars reduce mod L one bit at a time. Verification only: no signing, and nothing
 is constant-time, which is what a verifier's all-public inputs allow.
+
+`src/neant/crypto/der.nt` and `src/neant/crypto/x509.nt` (loadable, not in the boot image) read
+**ASN.1 DER and X.509 certificates** — parsing only, no signature check and no chain building:
+
+```
+load "src/neant/crypto/der.nt"; load "src/neant/crypto/x509.nt"
+c: x509Parse (pemLoad "tests/data/chain-google.pem")[0]
+c`subject                          // "CN=www.google.com"          RFC 2253, as OpenSSL prints it
+c`san                              // ("www.google.com")
+hex sha256 c`tbs                   // the bytes the signature is over, as they arrived
+(c`spki)`n                         // for `rsa: the modulus, big-endian, sign octet stripped
+```
+
+A parsed DER element carries the raw span it was cut from, because verifying a certificate hashes
+the *original* encoding of tbsCertificate and a re-serialisation would not do. The reader is strict
+on purpose — indefinite lengths, non-minimal lengths and tags, padded INTEGERs and OIDs, a BIT
+STRING whose unused bits are set, a DEFAULT that DER should have omitted, and trailing bytes after
+the top-level element all signal rather than being guessed at. `x509Parse` returns one dict, its
+keys documented at the top of x509.nt; an unrecognised *critical* extension is reported in
+`` `critUnknown `` rather than dropped, since silently ignoring one is how a verifier gets fooled.
+
+`src/neant/crypto/verify.nt` and `src/neant/crypto/tls.nt` (loadable, not in the boot image) are a
+**TLS 1.3 client that authenticates the server** — x25519, `TLS_CHACHA20_POLY1305_SHA256`, and a
+certificate path validator written on the four files above:
+
+```
+{load "src/neant/crypto/",x} each ("bignum.nt";"rsa.nt";"der.nt";"x509.nt";"verify.nt";"tls.nt")
+h: tlsConnect["example.com"; 443]        // verifies, or signals with the reason and closes
+tlsSend[h; "GET / HTTP/1.0\r\n\r\n"]
+tlsRecv h                                 // one application-data record, 0x at end of stream
+tlsClose h
+
+x509CheckHost[cert; "a.example.com"]      // RFC 6125: SAN dNSNames and iPAddresses, never the CN
+roots: x509LoadRoots "/etc/ssl/certs/ca-certificates.crt"        // 146 roots in 231ms
+x509VerifyChain[chain; roots; host; (now`date; now`time)]        // 1b, or signals why not
+```
+
+`tlsConnect` parses the Certificate message, checks the server's CertificateVerify signature over
+the handshake transcript (RFC 8446 4.4.3), verifies the chain to the trust store and matches the
+hostname; any one failing closes the connection and signals. Verification is the default and the
+opt-out — `tlsConnectOpts[host;port;(enlist `verify)!enlist 0b]` — has to be written at the call
+site. A two-link chain costs ~22ms, which is two RSA-2048 verifications at ~11ms each.
+
+What `x509VerifyChain` checks, each with its own refusal message: the names chain, the signature
+over every `tbs`, every validity window including the anchor's, basicConstraints `cA` and
+`pathLenConstraint` on everything above the leaf, `keyUsage` `keyCertSign`, that no certificate
+carries a critical extension the parser does not model, that the chain reaches the trust store, and
+that the leaf covers the host — a wildcard only as the whole leftmost label, standing for exactly
+one label. What it does **not** check: **ECDSA and Ed25519** signatures anywhere (RSA-SHA256, PKCS#1
+v1.5 or PSS, is the whole list), **revocation** (no CRL, no OCSP), name constraints and certificate
+policies, and extendedKeyUsage. There is **no client certificate and no TLS server side**.
+
+The ECDSA gap is the price of the verification, and it is a large one: Google, Cloudflare and most
+modern CDNs serve ECDSA-only chains, and the ClientHello no longer offers
+`ecdsa_secp256r1_sha256` — so **this client cannot reach those servers at all**. They are
+unreachable rather than silently unverified, which is the right way round, but nothing here should
+be read as broad compatibility; ECDSA P-256 verification is what would buy it back. This is a
+verifier written from scratch to be read, not a substitute for a reviewed TLS stack, and nothing in
+it is constant-time.
 
 ## Errors
 
@@ -801,7 +863,12 @@ clone/drop — Rc traffic through the operand stack — so the remaining levers 
 into neant-generated specialised code, and a user-function call, which still costs ~37ns of frame
 setup on top of its body.
 
-For TLS, what is missing is ASN.1 DER, RSA/ECDSA signature verification, and a root store.
+For TLS, the client now verifies the server: DER, X.509, RSA verification, a trust store, chain
+validation and hostname matching are in (`der.nt`, `x509.nt`, `rsa.nt`, `verify.nt`). What is
+missing is **ECDSA P-256 verification**, which most public chains need and which every refusal
+message currently names by algorithm; **revocation**, which means OCSP or CRL fetching and so an
+HTTP client over TLS first; client certificates; and a server side. SHA-384/512 would come with
+ECDSA — `rsa.nt`'s DigestInfo table and PSS verifier are SHA-256 only today.
 
 `tlsConnect` used to draw the x25519 private key from `rand`, and then the ClientHello random from it
 too. That random goes out in the clear, xorshift64 is linear and invertible, and 32 bytes of it are
@@ -809,6 +876,8 @@ enough to solve for the state and roll back to the key — a passive break, no c
 material now comes from `urand`, and `rand` keeps the reproducibility its tests want.
 
 Ed25519 is in (`src/neant/crypto/ed25519.nt`), which took one runtime primitive — `badd` — and no language
-change. The remaining signature work is RSA-PSS and ECDSA P-256, which real certificates actually use;
-both need a general modular reduction (Montgomery or Barrett) rather than the special-prime folding
-the 2^255-19 field gets away with. RSA *verification* stays cheap because the exponent is 65537.
+change. RSA-PKCS#1 and RSA-PSS followed (`bignum.nt`, `rsa.nt`), on the general modular reduction
+that real certificates need — Montgomery, not the special-prime folding the 2^255-19 field gets away
+with. RSA *verification* stays cheap because the exponent is 65537: 16 squarings and 2 multiplies,
+~11ms at 2048 bits. ECDSA P-256 is the one left, and it needs that same bignum arithmetic over a
+curve rather than a modulus.

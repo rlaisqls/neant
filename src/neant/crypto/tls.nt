@@ -1,11 +1,32 @@
 // TLS 1.3 client (RFC 8446) in neant, on src/neant/crypto/crypto.nt: x25519 key exchange,
 // TLS_CHACHA20_POLY1305_SHA256, no resumption, no client certificate.
-// Not part of the boot image — load it with  load "src/neant/crypto/tls.nt"
+// Not part of the boot image. tlsConnect needs the verifier, so load all six, in this order:
+//   load "src/neant/crypto/bignum.nt"    load "src/neant/crypto/rsa.nt"
+//   load "src/neant/crypto/der.nt"       load "src/neant/crypto/x509.nt"
+//   load "src/neant/crypto/verify.nt"    load "src/neant/crypto/tls.nt"
+// (the key schedule, the record layer and clientHello stand on their own; tlsConnect is what
+// reaches for the verifier.)
 //
-// !! The server certificate is read off the wire and NOT verified: no X.509 parsing, no signature
-// !! check, no hostname match, no trust store. That is confidentiality against someone recording
-// !! the traffic and nothing at all against someone sitting in the middle of it. What is missing
-// !! before this is a safe transport is ASN.1 DER, RSA/ECDSA verification, and a root store.
+// The server is authenticated. tlsConnect parses the Certificate message, verifies the server's
+// CertificateVerify signature over the handshake transcript, verifies the certificate chain to a
+// trust store and matches the hostname; any one of those failing closes the connection and signals
+// with the reason. Verification is the default and there is no way to reach it by accident:
+// tlsConnectOpts[host;port;(enlist `verify)!enlist 0b] is the opt-out, it has to be written at the
+// call site, and what it gives you is an encrypted channel to whoever answered the socket.
+//
+// What is NOT checked, because src/neant/crypto/verify.nt cannot check it: ECDSA and Ed25519
+// signatures anywhere in the chain or in CertificateVerify — RSA-SHA256 (PKCS#1 v1.5 or PSS) is the
+// whole list; certificate revocation (no CRL, no OCSP); name constraints and certificate policies.
+// There is no client certificate and no server side.
+//
+// Be clear about what the ECDSA gap costs, since it is the price of the verification above and not
+// a detail: Google, Cloudflare and most modern CDNs serve ECDSA-only chains, and the ClientHello no
+// longer offers ecdsa_secp256r1_sha256, so this client cannot talk to them at all. They are
+// UNREACHABLE, not silently unverified — which is the right way round, but do not read any of this
+// as broad compatibility. ECDSA P-256 verification is what would buy it back.
+//
+// Everything here is a verifier written from scratch to be read rather than a reviewed TLS stack,
+// and the AEAD and the key exchange are not constant-time.
 
 // ---- integers on the wire, big-endian; lp<n> prefixes a block with its n-byte length
 wu8:   {[n] `byte$ ,n band 255}
@@ -70,7 +91,11 @@ shKeyShare: {[b]
 clientHello: {[host;pub;rnd;sid]
   exts: wext[0; wlp16 0x00, wlp16 `byte$host]                   // server_name
   exts,: wext[10; wlp16 wu16 29]                                // supported_groups: x25519
-  exts,: wext[13; wlp16 raze wu16 each 2052 1027 1025]          // signature_algorithms
+  // signature_algorithms: rsa_pss_rsae_sha256, then rsa_pkcs1_sha256 — which RFC 8446 4.4.3 allows
+  // only on a *certificate*, and which is why it is still offered. ecdsa_secp256r1_sha256 (1027) is
+  // deliberately not offered: verify.nt has no ECDSA verifier, and advertising a scheme you cannot
+  // check just means a server with both chains sends the one you have to refuse afterwards.
+  exts,: wext[13; wlp16 raze wu16 each 2052 1025]               // signature_algorithms
   exts,: wext[43; wlp8 wu16 772]                                // supported_versions: TLS 1.3
   exts,: wext[51; wlp16 (wu16 29), wlp16 pub]                   // key_share
   body: 0x0303, rnd, (wlp8 sid), (wlp16 wu16 4867), 0x0100, wlp16 exts
@@ -78,10 +103,98 @@ clientHello: {[host;pub;rnd;sid]
 
 // handle -> (client key; client iv; client seq; server key; server iv; server seq)
 TLSC: ()!()
+// handle -> the server's certificate chain as DER, leaf first, exactly as it arrived
 TLSCERT: ()!()
 
+// ---- the server's certificate
+// Certificate (RFC 8446 4.4.2): certificate_request_context<0..255>, then a
+// certificate_list<0..2^24-1> of (cert_data<1..2^24-1>, extensions<0..2^16-1>). The context is
+// empty for server authentication, and anything else means this is not the message we think it
+// is. The per-entry extensions — SCTs, a stapled OCSP response — are read past and dropped:
+// nothing here checks either, and the header says so rather than leaving a caller to assume it.
+parseCerts: {[body]
+  if[0=count body; signal "tls: an empty Certificate message"]
+  if[0<`int$body[0]
+    signal "tls: the server sent a certificate_request_context, which 4.4.2 forbids"]
+  b: wdrop[1;body]
+  if[(count b)<3; signal "tls: a truncated Certificate message"]
+  n: wbe b[til 3]
+  b: wdrop[3;b]
+  if[not n=count b
+    signal "tls: the certificate_list length does not match the Certificate message"]
+  out: (); i: 0
+  while[i<count b
+    if[(count b)<i+3; signal "tls: a truncated certificate entry"]
+    cn: wbe b[i+til 3]
+    i+:3
+    if[0=cn; signal "tls: an empty certificate in the chain"]
+    if[(count b)<i+cn; signal "tls: a certificate runs past the end of the Certificate message"]
+    out,: enlist b[i+til cn]
+    i+:cn
+    if[(count b)<i+2; signal "tls: a certificate entry with no extensions"]
+    i: (i+2)+wbe b[i+til 2]
+    if[(count b)<i; signal "tls: a certificate entry's extensions run past the end of the message"]]
+  if[0=count out; signal "tls: the server sent no certificates"]
+  out}
+
+// CertificateVerify (RFC 8446 4.4.3): the signature covers 64 octets of 0x20, this exact context
+// string, one 0x00 separator, and the transcript hash through the Certificate message. The padding
+// and the label are the whole point — they are what stops a signature made by a server for one role
+// or one protocol version being replayed as a signature for another.
+TLSCVCTX: (64#0x20), (`byte$"TLS 1.3, server CertificateVerify"), 0x00
+// 2052 = rsa_pss_rsae_sha256, 2057 = rsa_pss_pss_sha256; both are PSS over SHA-256, which is what
+// rsa.nt verifies. rsa_pkcs1_* is refused here even though the ClientHello offers it, because 4.4.3
+// says those code points "are not defined for use in signed TLS handshake messages"; ecdsa_* and
+// ed25519 are refused because nothing here can check them.
+certVerify: {[a]
+  spki: a[0]; scheme: a[1]; sig: a[2]; thash: a[3]
+  if[not `rsa ~ spki`alg
+    signal "tls: the server's key is not RSA, which is the only kind this build verifies"]
+  if[not scheme in 2052 2057
+    m: "tls: CertificateVerify uses signature scheme ",string scheme
+    signal m,", which this build cannot verify"]
+  if[not rsaVerifyPss[spki`n; spki`e; sha256 TLSCVCTX, thash; sig]
+    signal "tls: the server's CertificateVerify did not verify"]
+  1b}
+
+// chain + hostname, packaged as one argument so tlsConnect can trap it. Returns the leaf's key,
+// which is what CertificateVerify is checked against — binding the handshake to the chain.
+checkChain: {[a]
+  chain: x509Parse each a[0]
+  x509VerifyChain[chain; a[2]; a[1]; a[3]]
+  (chain[0])`spki}
+
+// a check whose failure has to take the socket down with it: a connection left open after the peer
+// failed to authenticate is a connection someone will go on writing to.
+tlsGuard: {[h;f;a]
+  r: @[{[p] g: p[0]; (1b; g p[1])}; (f;a); {(0b;x)}]
+  if[not r[0]; hclose h; signal r[1]]
+  r[1]}
+
+// The system trust store, loaded once and kept: x509LoadRoots is ~230ms over the 146 roots in
+// /etc/ssl/certs/ca-certificates.crt, and a program that opens several connections should pay that
+// once rather than per handshake.
+TLSROOTS: ()!()
+tlsRoots: {[]
+  if[0=count TLSROOTS; TLSROOTS:: x509SystemRoots[]]
+  TLSROOTS}
+
 // ---- the handshake. Returns a handle for tlsSend / tlsRecv / tlsClose.
-tlsConnect: {[host;port]
+// tlsConnect verifies. tlsConnectOpts takes a dict that may carry any of:
+//   `roots   a store from x509LoadRoots. Default: the system store, x509SystemRoots[], cached
+//   `now     the (date;time) to judge validity windows at. Default: the machine clock, UTC
+//   `verify  0b to skip EVERY certificate check. UNSAFE, and it means it: the handshake still
+//            encrypts, but to whoever answered the socket, which against anyone able to sit in the
+//            middle of the connection is the same as no protection at all. Tests only, and only
+//            because a test wants to reach the record layer without a trust store.
+tlsConnect: {[host;port] tlsConnectOpts[host;port;()!()]}
+tlsConnectOpts: {[host;port;opts]
+  vfy: 1b; roots: ()!(); nw: (now`date; now`time)
+  if[0<count opts
+    if[`verify in key opts; vfy: opts`verify]
+    if[`roots in key opts; roots: opts`roots]
+    if[`now in key opts; nw: opts`now]]
+  if[vfy; if[0=count roots; roots: tlsRoots[]]]
   priv: urand 32                                           // `rand` is a reproducible PRNG, never a key
   pub: x25519[priv; X25519BASE]
   ch: clientHello[host; pub; urand 32; urand 32]
@@ -103,7 +216,7 @@ tlsConnect: {[host;port]
   ck: trafficKeys cHS
   sk: trafficKeys sHS
 
-  hbuf: 0x; sseq: 0; fin: 0
+  hbuf: 0x; sseq: 0; fin: 0; spki: ()!(); sawCert: 0; sawCv: 0
   while[not fin
     r: readRec h
     if[r[0]=21; signal "tls: alert from server: ",hex r[2]]
@@ -116,9 +229,31 @@ tlsConnect: {[host;port]
         if[(count hbuf)<n; break]
         mt: `int$hbuf[0]
         raw: n#hbuf
-        if[mt=11; TLSCERT[h]: wdrop[4;raw]]               // Certificate, kept but not checked
+        // Certificate: parse it, then verify the chain and the hostname before anything else is
+        // done with it. Cheap structural refusals come first, inside x509VerifyChain.
+        if[mt=11
+          certs: tlsGuard[h; parseCerts; wdrop[4;raw]]
+          TLSCERT[h]: certs
+          sawCert: 1
+          if[vfy; spki: tlsGuard[h; checkChain; (certs;host;roots;nw)]]]
+        // CertificateVerify: `tr` holds the transcript through the Certificate message, because
+        // every message is appended only after it has been handled — which is exactly the hash
+        // RFC 8446 4.4.3 signs over.
+        if[mt=15
+          if[not sawCert; tlsGuard[h; {signal "tls: CertificateVerify before any Certificate"}; 0]]
+          cv: wdrop[4;raw]
+          if[(count cv)<4; tlsGuard[h; {signal "tls: a truncated CertificateVerify"}; 0]]
+          sl: wbe cv[2 3]
+          if[not (count cv)=4+sl; tlsGuard[h; {signal "tls: a malformed CertificateVerify"}; 0]]
+          if[vfy; tlsGuard[h; certVerify; (spki; wbe cv[0 1]; cv[4+til sl]; sha256 tr)]]
+          sawCv: 1]
         if[mt=20
+          // A server that simply left the authentication out must not reach the Finished check.
+          if[vfy
+            if[not sawCert; tlsGuard[h; {signal "tls: the server sent no Certificate"}; 0]]
+            if[not sawCv; tlsGuard[h; {signal "tls: the server sent no CertificateVerify"}; 0]]]
           if[not (wdrop[4;raw]) ~ hmac[expandLabel[sHS;"finished";0x;32]; sha256 tr]
+            hclose h
             signal "tls: the server's Finished did not verify"]
           fin: 1]
         tr,: raw
@@ -150,4 +285,5 @@ tlsRecv: {[h]
       if[d[0]=23; :d[1]]]]}
 
 tlsClose: {[h] TLSC[h]: (); hclose h}
+// the chain the server sent, as DER, leaf first — already verified by the time tlsConnect returns
 tlsCert: {[h] TLSCERT h}

@@ -1,0 +1,173 @@
+// Certificate path validation: hostname matching, chain verification and the trust store in
+// src/neant/crypto/verify.nt, and the two TLS 1.3 handshake messages in tls.nt that use them.
+// None of the six modules is in the boot image, so they are loaded on demand here exactly as a
+// program would load them. What stays in Rust (mod verify in src/main.rs) is only what needs the
+// host: an `openssl s_server` to handshake against, and the two timings.
+//
+// The fixture PKI is built by tests/data/pki-gen.sh, which records the exact openssl commands and
+// pins every date, so pki-expired.pem stays expired and pki-leaf.pem stays valid. Every certificate
+// in it is one specific way a chain can be wrong.
+tsection "verify"
+{load "src/neant/crypto/",x} each ("bignum.nt";"rsa.nt";"der.nt";"x509.nt";"verify.nt";"tls.nt")
+
+vfyP: {[f] x509Parse (pemLoad "tests/data/",f,".pem")[0]}
+vfyRoots: x509LoadRoots "tests/data/pki-root.pem"          // the fixture root, and nothing else
+vfyNow: (2026.09.16; 12:00:00.000)                         // inside every good window, outside the bad
+vfyChain: {[c;h] x509VerifyChain[c; vfyRoots; h; vfyNow]}
+// the subjects, spelled the way x509.nt's RFC 2253 `subject spells them
+vfyL: "CN=leaf.neant.test,O=neant fixtures,C=US"
+vfyI: "CN=neant fixture intermediate,O=neant fixtures,C=US"
+vfyR: "CN=neant fixture root,O=neant fixtures,C=US"
+
+// ---- hostnames. RFC 6125, and only the part of it every modern verifier keeps: SAN entries,
+// never the CN. Every fixture below has CN=leaf.neant.test, so a case that passed on the CN would
+// show up here as a wrong answer rather than as nothing at all.
+vfyHosts: (("pki-leaf";"leaf.neant.test";1b;"the dNSName, exactly")
+  ;("pki-leaf";"LEAF.NEANT.TEST";1b;"DNS names are case-insensitive")
+  ;("pki-leaf";"leaf.neant.test.";1b;"one trailing root dot is not part of the name")
+  ;("pki-leaf";"other.neant.test";0b;"a name nobody attested to")
+  ;("pki-leaf";"leaf.neant.test.evil.example";0b;"a prefix is not a match")
+  ;("pki-leaf";"eaf.neant.test";0b;"nor is a suffix")
+  ;("pki-leaf";"127.0.0.1";1b;"the iPAddress SAN, for an address literal")
+  ;("pki-leaf";"127.0.0.2";0b;"a different address")
+  ;("pki-leaf";"127.000.000.001";0b;"a leading zero is refused, not read as octal")
+  ;("pki-leaf";"::1";0b;"an IPv6 literal is never matched here")
+  ;("pki-selfsigned";"127.0.0.1";1b;"an address literal never falls through to a dNSName")
+  ;("pki-wildcard";"a.wild.neant.test";1b;"* is the whole leftmost label")
+  ;("pki-wildcard";"A.WiLd.NeAnT.TeSt";1b;"and still case-insensitive")
+  ;("pki-wildcard";"wild.neant.test";0b;"* stands for one label, never zero")
+  ;("pki-wildcard";"a.b.wild.neant.test";0b;"and never two")
+  ;("pki-wildcard";"host.two.neant.test";1b;"the plain second SAN entry")
+  ;("pki-wrong-host";"leaf.neant.test";0b;"CN says leaf, SAN says other: the SAN wins"))
+{[t] teq["host: ",(t[3])," (",(t[1]),")"; x509CheckHost[vfyP t[0]; t[1]]; t[2]]} each vfyHosts
+terrLike["host: an empty name"; {[] x509CheckHost[vfyP "pki-leaf"; ""]}; "x509: an empty hostname"]
+
+// a pattern is matched, never re-read: these are the wildcards that are not wildcards. Reading
+// "w*.a.test" as a wildcard is how a certificate for "w*.com" becomes one for a whole TLD.
+vfyPats: (("*.a.test";"x.a.test";1b);("w*.a.test";"wx.a.test";0b);("*.*.a.test";"x.y.a.test";0b)
+  ;("*";"a";0b);("a.*.test";"a.x.test";0b);("*.a.test";".a.test";0b);("a.test";"a.test";1b))
+{[t] teq["wildcard: ",(t[0])," vs ",t[1]; x509DnsMatch[t[0];t[1]]; t[2]]} each vfyPats
+
+// ---- the chains that must verify
+teq["chain: leaf, intermediate, trusted root"; vfyChain[(vfyP "pki-leaf"; vfyP "pki-int"); "leaf.neant.test"]; 1b]
+teq["chain: the same one by address"; vfyChain[(vfyP "pki-leaf"; vfyP "pki-int"); "127.0.0.1"]; 1b]
+// a server that also sends the root: an anchor is trusted by identity, so a chain that already
+// ends in one simply ends there rather than looking for something above it
+teq["chain: the server sent the root too"; vfyChain[(vfyP "pki-leaf"; vfyP "pki-int"; vfyP "pki-root"); "leaf.neant.test"]; 1b]
+teq["chain: a wildcard leaf"; vfyChain[(vfyP "pki-wildcard"; vfyP "pki-int"); "a.wild.neant.test"]; 1b]
+// pinning: a trust store may hold the leaf itself, which is the one case where a self-signed
+// certificate is allowed to verify
+vfyPin: x509LoadRoots "tests/data/pki-selfsigned.pem"
+teq["chain: a self-signed certificate that is itself trusted"; x509VerifyChain[enlist vfyP "pki-selfsigned"; vfyPin; "leaf.neant.test"; vfyNow]; 1b]
+
+// ---- and every way one can be wrong, each with the sentence a caller would have to act on. The
+// point of asserting the exact text is that these stay *distinguishable*: a verifier that answered
+// "refused" to all of them would pass a test that only looked for a signal.
+vfyBad: (("the chain in an order the server should not have sent"
+    ;{[] vfyChain[(vfyP "pki-int"; vfyP "pki-leaf"); "leaf.neant.test"]}
+    ;"x509: ",vfyI," was not issued by the next certificate in the chain, ",vfyL,"; the server sent them in the wrong order or left one out")
+  ;("the intermediate left out"
+    ;{[] vfyChain[enlist vfyP "pki-leaf"; "leaf.neant.test"]}
+    ;"x509: no trusted root named ",vfyI,", which issued ",vfyL)
+  ;("a leaf that signed itself"
+    ;{[] vfyChain[enlist vfyP "pki-selfsigned"; "leaf.neant.test"]}
+    ;"x509: ",vfyL," signed itself and is not in the trust store")
+  ;("an expired leaf"
+    ;{[] vfyChain[(vfyP "pki-expired"; vfyP "pki-int"); "leaf.neant.test"]}
+    ;"x509: ",vfyL," expired on 2021.01.01T00:00:00.000")
+  ;("a leaf that is not valid yet"
+    ;{[] vfyChain[(vfyP "pki-future"; vfyP "pki-int"); "leaf.neant.test"]}
+    ;"x509: ",vfyL," is not valid until 2035.01.01T00:00:00.000")
+  ;("a SAN for a different host"
+    ;{[] vfyChain[(vfyP "pki-wrong-host"; vfyP "pki-int"); "leaf.neant.test"]}
+    ;"x509: ",vfyL," is not valid for leaf.neant.test (subjectAltName: other.neant.test)")
+  ;("a wildcard reaching one label too far"
+    ;{[] vfyChain[(vfyP "pki-wildcard"; vfyP "pki-int"); "a.b.wild.neant.test"]}
+    ;"x509: ",vfyL," is not valid for a.b.wild.neant.test (subjectAltName: *.wild.neant.test,host.two.neant.test)")
+  ;("an intermediate with basicConstraints CA:FALSE"
+    ;{[] vfyChain[(vfyP "pki-under-notca"; vfyP "pki-notca"); "leaf.neant.test"]}
+    ;"x509: CN=neant fixture not-a-ca,O=neant fixtures,C=US is not a CA (no basicConstraints cA) and may not have issued the certificate below it")
+  ;("one CA too many under a pathlen:0 intermediate"
+    ;{[] vfyChain[(vfyP "pki-deep"; vfyP "pki-int2"; vfyP "pki-int"); "leaf.neant.test"]}
+    ;"x509: ",vfyI," has pathLenConstraint 0 but 1 certificates hang below it")
+  ;("a critical extension nobody models"
+    ;{[] vfyChain[(vfyP "pki-critical"; vfyP "pki-int"); "leaf.neant.test"]}
+    ;"x509: ",vfyL," has a critical extension this verifier does not model: 1.3.6.1.4.1.99999.1")
+  ;("a flipped bit in the leaf's signature"
+    ;{[] c: vfyP "pki-leaf"; c[`sig]: (255#c`sig),bnot (c`sig)[255]; vfyChain[(c; vfyP "pki-int"); "leaf.neant.test"]}
+    ;"x509: the signature on ",vfyL," does not verify with ",vfyI,"'s key")
+  ;("a trust store that does not hold the root"
+    ;{[] x509VerifyChain[(vfyP "pki-leaf"; vfyP "pki-int"); x509LoadRoots "tests/data/selfsigned-rsa.pem"; "leaf.neant.test"; vfyNow]}
+    ;"x509: no trusted root named ",vfyR,", which issued ",vfyI)
+  ;("an empty chain"; {[] vfyChain[(); "leaf.neant.test"]}; "x509: an empty certificate chain"))
+{[t] terrLike["chain: ",t[0]; t[1]; t[2]]} each vfyBad
+
+// A real chain off the public web, refused for the one reason that matters here: nothing in this
+// build verifies ECDSA, so it says no by name instead of waving the chain through. Verifying this
+// chain is what ECDSA P-256 would buy, and until then servers like it are unreachable, not trusted.
+vfyG: x509Parse each pemLoad "tests/data/chain-google.pem"
+vfyGmsg: "x509: CN=www.google.com is signed with ecdsaSha256 (1.2.840.10045.4.3.2), which this build cannot verify"
+terrLike["chain: an algorithm this build cannot check"; {[] x509VerifyChain[2#vfyG; vfyRoots; "www.google.com"; vfyNow]}; vfyGmsg]
+// the same certificate against the wrong key, with nothing else changed
+teq["sig: the wrong issuer's key"; x509SigVerify[vfyP "pki-leaf"; (vfyP "pki-root")`spki]; 0b]
+
+// ---- the trust store itself
+vfyRgot: (count vfyRoots`certs; vfyRoots`skipped; count x509Find[vfyRoots; (vfyP "pki-root")`subjectCanon])
+teq["roots: one root, found by the subject a chain comes looking with"; vfyRgot; 1 0 1]
+teq["roots: a subject no root has"; count x509Find[vfyRoots; "2.5.4.3=nobody"]; 0]
+
+// ---- the TLS 1.3 Certificate message (RFC 8446 4.4.2), built here and taken apart again
+vfyDs: (pemLoad "tests/data/pki-leaf.pem"), pemLoad "tests/data/pki-int.pem"
+// context(1) | lp24 [ lp24 cert | lp16 extensions ]*
+vfyMsg: 0x00, wlp24 raze {(wlp24 x), wlp16 0x} each vfyDs
+teq["Certificate: round-trips"; (parseCerts vfyMsg) ~ vfyDs; 1b]
+// a per-entry extension — an SCT, a stapled OCSP response — is read past and dropped, which is
+// exactly what the tls.nt header says happens to it
+teq["Certificate: entry extensions are read past"; (parseCerts 0x00, wlp24 raze {(wlp24 x), wlp16 0x0005000100} each vfyDs) ~ vfyDs; 1b]
+vfyCertBad: (("a certificate_request_context"; {[] parseCerts 0x01ff, wdrop[1;vfyMsg]}
+    ;"tls: the server sent a certificate_request_context, which 4.4.2 forbids")
+  ;("an empty message"; {[] parseCerts 0x}; "tls: an empty Certificate message")
+  ;("a truncated header"; {[] parseCerts 0x000000}; "tls: a truncated Certificate message")
+  ;("a list length that lies"; {[] parseCerts 0x00, (wu24 1+wbe vfyMsg[1 2 3]), wdrop[4;vfyMsg]}
+    ;"tls: the certificate_list length does not match the Certificate message")
+  ;("a certificate running off the end"; {[] parseCerts 0x00, wlp24 (wu24 999), (wu16 0), 0x00}
+    ;"tls: a certificate runs past the end of the Certificate message")
+  ;("a zero-length certificate"; {[] parseCerts 0x00, wlp24 (wu24 0), wu16 0}
+    ;"tls: an empty certificate in the chain")
+  ;("an entry with no extensions"; {[] parseCerts 0x00, wlp24 (wlp24 0x05), 0x00}
+    ;"tls: a certificate entry with no extensions")
+  ;("extensions running off the end"; {[] parseCerts 0x00, wlp24 (wlp24 0x05), wu16 9}
+    ;"tls: a certificate entry's extensions run past the end of the message")
+  ;("no certificates at all"; {[] parseCerts 0x00, wu24 0}; "tls: the server sent no certificates"))
+{[t] terrLike["Certificate: ",t[0]; t[1]; t[2]]} each vfyCertBad
+
+// ---- CertificateVerify (RFC 8446 4.4.3). The signature covers 64 octets of 0x20, the context
+// string, one 0x00 and the transcript hash; the vector below is that content with the transcript
+// hash fixed at 00..1f, signed by the fixture leaf's key:
+//   python3 -c 'import sys; sys.stdout.buffer.write(b"\x20"*64 \
+//     + b"TLS 1.3, server CertificateVerify" + b"\x00" + bytes(range(32)))' > cv.bin
+//   openssl dgst -sha256 -sigopt rsa_padding_mode:pss -sigopt rsa_pss_saltlen:32 \
+//     -sign tests/data/pki-leaf.key -out cv.sig cv.bin              (OpenSSL 3.6.2)
+// It is tied to pki-leaf.key as committed, so re-running tests/data/pki-gen.sh means re-running
+// these two as well.
+vfyCtx: (count TLSCVCTX; `char$TLSCVCTX[64+til 33]; TLSCVCTX[97])
+teq["CertificateVerify: the context, byte for byte"; vfyCtx; (98;"TLS 1.3, server CertificateVerify";0x00)]
+vfyK: (vfyP "pki-leaf")`spki
+vfySig: unhex "22ae9f0797d06c6829e68dc4d35bd7ae62c7ff0da23c275f9869699aa5882c1a73c9269b32a7c73461be198f5fac0c58b7df96558601b15a0ed595b1add83bb909bc4af14338eb10b99d542b384aeded45729e8c2a0c80043b4c531c3ead88ee750412fed374e28a6626b8cccdaf2cec2a70bca0ec6fc33d62df58f7938c3b627768538794eca66cbc026ce00a5e2d5f47f29e9804a1baa41ff7f0a769cf7fc4bb9f9ce535277f6e99b9c9ef2f2a55864d425ff49cf618b447abb3466e7a262e2d12e3baced09f999ab96d5fa426550f14b7fe69c489ed5b5060582a523182b0620d5c6d97f83a64167c18218a05a42a00e07c7cc4a70fed45188802e3234e46"
+vfyTh: `byte$til 32
+teq["CertificateVerify: openssl's rsa_pss_rsae_sha256"; certVerify[(vfyK; 2052; vfySig; vfyTh)]; 1b]
+// 1027 is ecdsa_secp256r1_sha256; 1025 is rsa_pkcs1_sha256, which 4.4.3 forbids in a handshake
+// signature whoever holds the key — those code points are for certificates only
+vfyCvBad: (("ecdsa_secp256r1_sha256"; {[] certVerify[(vfyK; 1027; vfySig; vfyTh)]}
+    ;"tls: CertificateVerify uses signature scheme 1027, which this build cannot verify")
+  ;("rsa_pkcs1_sha256"; {[] certVerify[(vfyK; 1025; vfySig; vfyTh)]}
+    ;"tls: CertificateVerify uses signature scheme 1025, which this build cannot verify")
+  ;("a different transcript"; {[] certVerify[(vfyK; 2052; vfySig; 32#0x00)]}
+    ;"tls: the server's CertificateVerify did not verify")
+  ;("a flipped signature bit"; {[] certVerify[(vfyK; 2052; (255#vfySig),bnot vfySig[255]; vfyTh)]}
+    ;"tls: the server's CertificateVerify did not verify")
+  ;("the wrong server's key"; {[] certVerify[((vfyP "pki-int")`spki; 2052; vfySig; vfyTh)]}
+    ;"tls: the server's CertificateVerify did not verify")
+  ;("a key that is not RSA"; {[] certVerify[((vfyP "selfsigned-ec")`spki; 2052; vfySig; vfyTh)]}
+    ;"tls: the server's key is not RSA, which is the only kind this build verifies"))
+{[t] terrLike["CertificateVerify: ",t[0]; t[1]; t[2]]} each vfyCvBad
