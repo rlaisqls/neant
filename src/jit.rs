@@ -1,4 +1,5 @@
-//! A conservative, hand-rolled AArch64 baseline JIT for integer-only hot loops and calls.
+//! A conservative, hand-rolled baseline JIT for integer-only hot loops and calls, on AArch64 and
+//! x86-64.
 //!
 //! Scope (see README "Stage 2"): compiles a whole `FnCode` to native code only if every op in it
 //! is provably a pure integer computation over its own locals — arithmetic, comparison,
@@ -11,21 +12,33 @@
 //! (`FnCode::jitted`, src/value.rs) just falls back to the bytecode interpreter, which is always
 //! correct and always present.
 //!
-//! **Codegen lives in neant, not here** (`src/neant/jit/arm64.nt`) — the compilability walk and
-//! the instruction encoders are pure computation over bytecode-as-data, the same kind of job
-//! `src/neant/core/compile.nt` already does, so it's self-hosted the same way. What's left here is
-//! only what genuinely needs the host: executable memory (`mmap`/`mprotect`/`__clear_cache`,
-//! declared directly as `extern "C"` — already linked in via libc/libgcc, so `Cargo.toml` stays
-//! empty), owning it (`Compiled`), and the trampoline a compiled call reaches through `blr` to get
-//! back into the interpreter. `compile()` below is the one place these two halves meet: it calls
-//! the neant codegen function (`FnCode::jit_now`, src/value.rs, does the actual call — this module
-//! only turns whatever `Bytes` comes back into executable memory).
+//! **Codegen lives in neant, not here** — `src/neant/jit/arm64.nt` for AArch64 and
+//! `src/neant/jit/x86.nt` for x86-64. The compilability walk and the instruction encoders are pure
+//! computation over bytecode-as-data, the same kind of job `src/neant/core/compile.nt` already
+//! does, so it's self-hosted the same way; the walk itself is literally the same code for both
+//! targets (the x86-64 file calls arm64.nt's), so the two backends accept and reject exactly the
+//! same functions and traces. What's left here is only what genuinely needs the host: executable
+//! memory (`mmap`/`mprotect`, plus `__clear_cache` where the architecture needs it, declared
+//! directly as `extern "C"` — already linked in via libc/libgcc, so `Cargo.toml` stays empty),
+//! owning it (`Compiled`), and the trampoline a compiled call reaches through an indirect call
+//! (`blr` on AArch64, `call` on x86-64) to get back into the interpreter. `compile()` below is the
+//! one place these two halves meet: it calls this target's neant codegen function (`CODEGEN`;
+//! `FnCode::jit_now`, src/value.rs, does the actual call — this module only turns whatever `Bytes`
+//! comes back into executable memory).
+//!
+//! **Only the AArch64 backend has ever executed.** Both are compiled and both are covered by tests
+//! that check what can be checked without running (README "Stage 2", x86-64 subsection): the
+//! development machine is AArch64, so the x86-64 encoders are verified against `nasm`'s bytes and
+//! the glue here against `cargo check --target x86_64-unknown-linux-gnu`, not against a running
+//! program. Everything below is fail-closed either way — a backend that returns `None`, or a
+//! codegen function that isn't in the boot image, just leaves the interpreter to do the work.
 //!
 //! **Calling another compiled function.** A compiled function that calls something is no longer
 //! pure by inspection alone — it's pure only if the callee is too, and if it isn't, calling it and
 //! then later deopting (re-running the *caller* from scratch on the interpreter) would invoke the
 //! callee a second time, corrupting any real side effect it had. So `jit_call` (the one fixed
-//! trampoline every compiled call site reaches via `blr`) proves the callee is equally pure —
+//! trampoline every compiled call site reaches through an indirect call) proves the callee is
+//! equally pure —
 //! by literally attempting to compile it too (`FnCode::jit_for_call`, unlocked by the same
 //! compilability check as everything else) — *before* making the call at all. If that fails, no
 //! call happens and the compiled caller deopts immediately, and the interpreter makes that one
@@ -37,9 +50,18 @@ use crate::value::{FnCode, Value};
 use crate::vm::Vm;
 use std::sync::Arc;
 
-#[cfg(target_arch = "aarch64")]
-mod arm64 {
+#[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
+mod native {
     use super::*;
+
+    /// This target's two neant codegen entry points, `(whole function, trace)`. Same contract on
+    /// both — bytecode as data in, a `Bytes` of machine code (plus the layout the other half has
+    /// to agree on) or null out — so this is the only place in the module that the target
+    /// architecture is named at all, apart from the cache flush in `emit`/`emit_trace`.
+    #[cfg(target_arch = "aarch64")]
+    const CODEGEN: (&str, &str) = ("jitCompile", "jitCompileTrace");
+    #[cfg(target_arch = "x86_64")]
+    const CODEGEN: (&str, &str) = ("jitCompileX86", "jitCompileTraceX86");
 
     /// One compiled function: owns its executable memory and knows how to call into it. Dropping
     /// it unmaps the memory — safe because nothing calls in once the owning `FnCode`'s cached
@@ -65,6 +87,8 @@ mod arm64 {
         fn mmap(addr: *mut std::ffi::c_void, len: usize, prot: i32, flags: i32, fd: i32, off: i64) -> *mut std::ffi::c_void;
         fn munmap(addr: *mut std::ffi::c_void, len: usize) -> i32;
         fn mprotect(addr: *mut std::ffi::c_void, len: usize, prot: i32) -> i32;
+        /// Only declared where it is needed: see the call sites in `emit`/`emit_trace`.
+        #[cfg(target_arch = "aarch64")]
         fn __clear_cache(start: *mut std::ffi::c_char, end: *mut std::ffi::c_char);
     }
     const PROT_READ: i32 = 1;
@@ -153,7 +177,7 @@ mod arm64 {
         }
         /// Only the returned value and `ok` come back out. The compiled code loads its locals from
         /// `buf` into registers once in its prologue and never writes them back (see the
-        /// locals-in-registers comment in src/neant/jit/arm64.nt), which is sound precisely
+        /// locals-in-registers comment in this target's codegen file), which is sound precisely
         /// because nothing here — or in either entry point above — reads `buf` after this call.
         /// That's a fact the codegen relies on, not an accident: keep it true.
         fn run(&self, buf: *mut i64, vm: &mut Vm) -> Option<i64> {
@@ -164,7 +188,8 @@ mod arm64 {
     }
 
     thread_local! { static CALL_DEPTH: std::cell::Cell<u32> = const { std::cell::Cell::new(0) }; }
-    /// Compiled-to-compiled calls go through `blr`, not `Vm::call_code`, so they'd otherwise blow
+    /// Compiled-to-compiled calls go through a native indirect call, not `Vm::call_code`, so
+    /// they'd otherwise blow
     /// the real machine stack (a hard crash) instead of failing like every other kind of runaway
     /// recursion in this language does — needs its own limit for the same reason `call_code`'s
     /// `self.depth` guard (src/vm.rs) needs one, and a lower one: `try_run_raw`'s `[i64; MAX_SLOTS]`
@@ -172,7 +197,10 @@ mod arm64 {
     /// same way — empirically, against the smallest stack this can run on (a `spawn`ed thread
     /// defaults to 2MiB) — with real margin below where it actually overflows. Re-measured after
     /// the locals moved into registers (`jitLREGS`, src/neant/jit/arm64.nt), which grew the
-    /// compiled frame from 112 to 192 bytes for the callee-saved saves and the spill area: with
+    /// compiled frame from 112 to 192 bytes for the callee-saved saves and the spill area. (The
+    /// x86-64 frame is smaller — six pushes and a 72-byte frame, 128 bytes with the return address
+    /// — so the same limit is if anything more conservative there; it has not been re-measured on
+    /// x86-64 hardware, because nothing that backend emits has ever run.) With
     /// this guard lifted, `{[x] $[x<1; 0; 1+h[x-1]]}` on a 2MiB thread now overflows between 1800
     /// and 1900 levels (2000–2100 before), so 500 still leaves a >3x margin and stays.
     ///
@@ -186,12 +214,13 @@ mod arm64 {
     /// interpreted levels already fit, and a compiled level is the lighter of the two.
     const MAX_CALL_DEPTH: u32 = 500;
 
-    /// The one fixed trampoline every compiled call site reaches via `blr` (see the module doc
+    /// The one fixed trampoline every compiled call site reaches through an indirect call —
+    /// `blr x15` on AArch64, `call rax` on x86-64 (see the module doc
     /// comment for why proving the callee pure *before* calling it is the safety argument here,
     /// and why `vm` is `*mut` — compiling an unseen callee here runs the neant codegen function,
     /// which needs `&mut Vm`). `vm`/`slot` resolve the callee exactly like `Op::LoadG`; `argc`/
     /// `arg0`/`arg1` are its already int-typed arguments (this language caps calls at two); `ok`
-    /// is a scratch flag the caller reads right after the `blr` returns.
+    /// is a scratch flag the caller reads right after the call returns.
     unsafe extern "C" fn jit_call(vm: *mut Vm, slot: i64, argc: i64, arg0: i64, arg1: i64, ok: *mut i64) -> i64 {
         let depth = CALL_DEPTH.with(|d| { let n = d.get() + 1; d.set(n); n });
         struct Guard;
@@ -214,10 +243,10 @@ mod arm64 {
         }
     }
 
-    /// `x[i]` from compiled code (`jitOpVecGet`, `src/neant/jit/arm64.nt`): `vp` is a pointer into
+    /// `x[i]` from compiled code (`jitOpVecGet` / `jitxOpVecGet`): `vp` is a pointer into
     /// the `vecbuf` side table `try_run`/`try_run_raw` populated at entry, live for the whole
     /// compiled call. All `Arc`/COW handling stays here in Rust rather than being inlined as
-    /// hand-rolled AArch64 pointer arithmetic — see README "Stage 2" for why. Bounds-checked; out
+    /// hand-rolled pointer arithmetic — see README "Stage 2" for why. Bounds-checked; out
     /// of range, or (shouldn't happen given the entry guard, but checked anyway) not actually
     /// `Ints`, both deopt like any other guarded point in a compiled function.
     unsafe extern "C" fn jit_vec_get(vp: *mut Value, idx: i64, ok: *mut i64) -> i64 {
@@ -246,7 +275,7 @@ mod arm64 {
     pub(crate) fn already_compiling() -> bool { COMPILING.with(|c| c.get() > 0) }
 
     pub fn compile(code: &Arc<FnCode>, vm: &mut Vm) -> Option<super::Compiled> {
-        let f = vm.get("jitCompile")?;
+        let f = vm.get(CODEGEN.0)?;
         // neant has no way to take a Rust function's address itself — hand it over explicitly, the
         // same way the old Rust encoder used to compute `jit_call`'s address inline.
         let trampolines = Value::List(Arc::new(vec![
@@ -290,6 +319,13 @@ mod arm64 {
             if mem as isize == -1 { return None; }
             std::ptr::copy_nonoverlapping(bytes.as_ptr(), mem as *mut u8, bytes.len());
             if mprotect(mem, len, PROT_READ | PROT_EXEC) != 0 { munmap(mem, len); return None; }
+            // Freshly written bytes have to be visible to instruction fetch before anything jumps
+            // into them. On AArch64 the data and instruction caches are not coherent, so that is a
+            // real operation. On x86-64 they are coherent — the architecture guarantees a store
+            // followed (here) by an `mprotect` is seen by a later fetch — so there is nothing to
+            // do at all, which is why this is a `cfg` on the call rather than a call to a helper
+            // that would be empty on one target: there is no operation to skip.
+            #[cfg(target_arch = "aarch64")]
             __clear_cache(mem as *mut std::ffi::c_char, (mem as *mut u8).add(len) as *mut std::ffi::c_char);
             let entry: unsafe extern "C" fn(*mut i64, *mut i64, *mut Vm) -> i64 = std::mem::transmute(mem);
             Some(super::Compiled { mem: mem as *mut u8, len, arity, nlocals, vec_slots, entry })
@@ -416,7 +452,7 @@ mod arm64 {
 
     pub fn compile_trace(trace: &crate::trace::Trace, vm: &mut Vm) -> Option<CompiledTrace> {
         use crate::trace::TraceTy;
-        let f = vm.get("jitCompileTrace")?;
+        let f = vm.get(CODEGEN.1)?;
         let (kinds, args, tys, ips) = trace.to_neant_input();
         let input = Value::List(Arc::new(vec![
             crate::value::ints(kinds), crate::value::ints(args), crate::value::ints(tys), crate::value::ints(ips),
@@ -483,6 +519,13 @@ mod arm64 {
             if mem as isize == -1 { return None; }
             std::ptr::copy_nonoverlapping(bytes.as_ptr(), mem as *mut u8, bytes.len());
             if mprotect(mem, len, PROT_READ | PROT_EXEC) != 0 { munmap(mem, len); return None; }
+            // Freshly written bytes have to be visible to instruction fetch before anything jumps
+            // into them. On AArch64 the data and instruction caches are not coherent, so that is a
+            // real operation. On x86-64 they are coherent — the architecture guarantees a store
+            // followed (here) by an `mprotect` is seen by a later fetch — so there is nothing to
+            // do at all, which is why this is a `cfg` on the call rather than a call to a helper
+            // that would be empty on one target: there is no operation to skip.
+            #[cfg(target_arch = "aarch64")]
             __clear_cache(mem as *mut std::ffi::c_char, (mem as *mut u8).add(len) as *mut std::ffi::c_char);
             let entry_fn: unsafe extern "C" fn(*mut i64, *mut i64) = std::mem::transmute(mem);
             Some(CompiledTrace { mem: mem as *mut u8, len, touched, real_upto, callees, entry, stack_base, exits, entry_fn })
@@ -490,36 +533,33 @@ mod arm64 {
     }
 }
 
-#[cfg(target_arch = "aarch64")]
-pub(crate) use arm64::already_compiling;
-#[cfg(target_arch = "aarch64")]
-pub use arm64::{compile as compile_arm64, compile_trace as compile_trace_arm64, Compiled, CompiledTrace};
+/// Everything above is per-architecture only in its codegen function and its cache flush, so both
+/// backends export the same names from the same module.
+#[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
+pub(crate) use native::already_compiling;
+#[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
+pub use native::{compile, compile_trace, Compiled, CompiledTrace};
 
 /// What `CompiledTrace::run` came back with — see its doc comment.
 pub enum TraceRun { Bailed(usize), TypeMismatch, StaleCallee }
 
-#[cfg(target_arch = "aarch64")]
-pub fn compile(code: &Arc<FnCode>, vm: &mut Vm) -> Option<Compiled> { compile_arm64(code, vm) }
-#[cfg(target_arch = "aarch64")]
-pub fn compile_trace(trace: &crate::trace::Trace, vm: &mut Vm) -> Option<CompiledTrace> {
-    compile_trace_arm64(trace, vm)
-}
-
-#[cfg(not(target_arch = "aarch64"))]
+// Any other target has no backend at all: uninhabited stand-ins, so the call sites in
+// src/value.rs and src/vm.rs keep compiling and every one of them takes the interpreter's path.
+#[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
 pub(crate) fn already_compiling() -> bool { false }
-#[cfg(not(target_arch = "aarch64"))]
+#[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
 pub struct Compiled(std::convert::Infallible);
-#[cfg(not(target_arch = "aarch64"))]
+#[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
 impl Compiled {
     pub fn try_run(&self, _loc: &[Value], _vm: &mut Vm) -> Option<Value> { match self.0 {} }
 }
-#[cfg(not(target_arch = "aarch64"))]
+#[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
 pub fn compile(_code: &Arc<FnCode>, _vm: &mut Vm) -> Option<Compiled> { None }
-#[cfg(not(target_arch = "aarch64"))]
+#[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
 pub struct CompiledTrace(std::convert::Infallible);
-#[cfg(not(target_arch = "aarch64"))]
+#[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
 impl CompiledTrace {
     pub fn run(&self, _loc: &mut [Value], _st: &mut Vec<Value>, _vm: &Vm) -> TraceRun { match self.0 {} }
 }
-#[cfg(not(target_arch = "aarch64"))]
+#[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
 pub fn compile_trace(_trace: &crate::trace::Trace, _vm: &mut Vm) -> Option<CompiledTrace> { None }

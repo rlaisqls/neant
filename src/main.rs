@@ -52,10 +52,12 @@ fn main() {
     }
 }
 
-const BOOT_FILES: [&str; 11] = [
+/// Both JIT backends are in the image: `src/jit.rs` picks the one its target architecture needs
+/// (`CODEGEN`), and the other's globals simply never get called.
+const BOOT_FILES: [&str; 12] = [
     "src/neant/stdlib/prelude.nt", "src/neant/core/lex.nt", "src/neant/core/parse.nt", "src/neant/core/compile.nt",
     "src/neant/stdlib/table.nt", "src/neant/stdlib/json.nt", "src/neant/stdlib/encode.nt", "src/neant/stdlib/regex.nt",
-    "src/neant/stdlib/test.nt", "src/neant/crypto/crypto.nt", "src/neant/jit/arm64.nt",
+    "src/neant/stdlib/test.nt", "src/neant/crypto/crypto.nt", "src/neant/jit/arm64.nt", "src/neant/jit/x86.nt",
 ];
 const BOOT_IMAGE_PATH: &str = "src/neant/image.nb";
 /// The whole front end and standard library as bytecode, compiled by itself: prelude, lexer, parser,

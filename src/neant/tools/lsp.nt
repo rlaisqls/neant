@@ -1,0 +1,402 @@
+// neant language server (LSP), in neant.  Not part of the boot image — running the file starts it:
+//
+//   ./target/release/neant src/neant/tools/lsp.nt            # LSP over stdin/stdout
+//   ./target/release/neant src/neant/tools/lsp.nt 127.0.0.1:5007   # the same server over TCP
+//
+// editors/README.md has the editor side.  Supported: initialize, initialized, shutdown, exit,
+// textDocument/{didOpen,didChange,didClose,publishDiagnostics,formatting,documentSymbol,hover,
+// completion}.  Document sync is full (capability 1): a didChange carries the whole buffer.
+//
+// Diagnostics are the point of a language server whose front end is already in the image: the
+// buffer goes through nlex and then nparse inside @[..], and a signalled error becomes one
+// diagnostic on the line its message names (src/neant/core/parse.nt appends " at line N").
+// Formatting is nfmt (src/neant/tools/fmt.nt).  Symbols are the top-level `name:` assignments in
+// the token stream.  Hover and completion cover those plus the names in the running image.
+//
+// FRAMING.  `read1 n` (src/prims.rs) is `hrecv` for stdin — up to n bytes, empty at EOF — so the
+// stdio server reads incrementally and answers each request as it arrives, which is what a live
+// editor needs.  lspServe[] and lspServeTcp[addr] therefore run the same loop (lspLoop) over
+// different byte sources; the TCP one serves one connection at a time, which is what an editor
+// opens.  Replies go out through `write1`, the byte-exact stdout write, so the Content-Length
+// counts are the truth — `print` would append a newline and write0 truncates on every call.
+//
+// Loading the file with lspNoStart: 1 already assigned gives the handlers without a server.
+
+@[load; "src/neant/tools/fmt.nt"; {[e] 0}]
+
+lspDocs: ()!()          // uri (as a symbol) -> buffer text
+lspRoot: ""             // the workspace root from initialize, so the image's sources can be found
+lspNamesCache: ()
+lspExit: 0
+lspOutBuf: ""
+
+// the Rust builtins (src/prims.rs PRIMS): the only names no .nt file defines, so the only ones
+// that have to be written down.  Every one is checked against the running image before it is
+// offered, so an entry that stops existing disappears instead of lying.
+lspPRIMS: ("exp";"log";"sin";"cos";"tan";"atan";"rand";"rseed";"urand";"badd";"band";"bor";"bxor";"shl";"shr";"bnot")
+lspPRIMS,: ("key";"value";"group";"isnull";"now";"fbits";"show";"print";"signal";"exit";"read0";"write0")
+lspPRIMS,: ("hopen";"hclose";"hsend";"hrecv";"hlisten";"accept";"shared";"sget";"sset";"each";"over";"scan")
+lspPRIMS,: ("exec";"elast";"spawn";"join";"supd";"args")
+// control words the parser handles itself, so they are not globals and cannot be probed for
+lspKEYWORDS: ("if";"while";"do";"break";"select";"by";"from";"where")
+// where the image's own sources live, for the names they define.  Tried as given and under the
+// workspace root, so the server finds them whatever directory an editor started it in.
+lspSOURCES: ("src/neant/stdlib/prelude.nt";"src/neant/stdlib/table.nt";"src/neant/stdlib/json.nt";"src/neant/stdlib/encode.nt")
+lspSOURCES,: ("src/neant/stdlib/regex.nt";"src/neant/stdlib/test.nt";"src/neant/core/lex.nt";"src/neant/core/parse.nt")
+lspSOURCES,: ("src/neant/core/compile.nt";"src/neant/crypto/crypto.nt";"src/neant/jit/arm64.nt";"src/neant/tools/fmt.nt")
+
+// ---- small helpers
+lspStr: {$[`char=type x; ,x; x]}                       // a one-character string lexes as a char atom
+lspD1: {[k;v] (,k)!,v}                                 // a one-key dict whose value may be a dict
+// A missing key reads back as ::, and :: as a *function argument* builds a projection instead of
+// calling (README, json.nt's jnull) — so absence travels as `nil and only becomes a JSON null in
+// lspRespond, where it sits inside a list literal rather than an argument.
+lspNil: `nil
+lspGet: {[d;k] $[`dict=type d; $[`null=type d[k]; lspNil; d[k]]; lspNil]}
+lspSplit: {[s] vs["\n"; lspStr s]}
+lspInt: {[s] @[{[x] `int$lspStr x}; s; {0}]}
+lspIsCmt: {[l] l: trim lspStr l; $[(count l)<2; 0; "//"~2#l]}
+
+// a global of the running image, read by hand-built bytecode (loadg of one const) rather than by
+// running source: nothing here can execute whatever a name happens to spell
+lspGread: {[nm] exec (,1; ,0; ,(`g; nm); ,0)}
+lspDefined: {[nm] @[{[n] lspGread n; 1b}; nm; {0b}]}
+
+// ---- positions.  LSP counts characters in UTF-16 code units, which is what we advertise.
+lspU16Len: {[s] s: lspStr s; $[0=count s; 0; sum 1+65535<`code$s]}
+lspU16Idx: {[line;ch]
+  line: lspStr line
+  i: 0; u: 0
+  while[$[i<count line; u<ch; 0]; u+: $[65535<`code$line[i]; 2; 1]; i+:1]
+  i}
+lspRange: {[l1;c1;l2;c2] `start`end!(`line`character!(l1;c1); `line`character!(l2;c2))}
+lspLineRange: {[l;s] lspRange[l; 0; l; lspU16Len s]}
+
+// the identifier under a character index, or "" — the cursor just past a word counts as in it
+lspWordAt: {[line;i]
+  line: lspStr line
+  n: count line
+  wc: alnum,"_."
+  if[not i<n; i: n-1]
+  if[$[i<0; 1; not line[i] in wc]; i: i-1]
+  if[$[i<0; 1; not line[i] in wc]; :""]
+  a: i; while[$[a>0; line[a-1] in wc; 0]; a-:1]
+  b: i; while[$[(b+1)<n; line[b+1] in wc; 0]; b+:1]
+  line[a+til 1+b-a]}
+// just the identifier characters before a character index — what the user has typed so far
+lspPrefixAt: {[line;i]
+  line: lspStr line
+  wc: alnum,"_."
+  if[i>count line; i: count line]
+  a: i; while[$[a>0; line[a-1] in wc; 0]; a-:1]
+  $[a<i; line[a+til i-a]; ""]}
+
+// ---- the front end, as a service
+lspToks: {[src] @[{[s] t: nlex s; (t; plines)}; src; {()}]}
+
+// every top-level `name:` assignment, as (name; 0-based line; 1 when the value opens with {)
+lspDefs: {[src]
+  r: lspToks src
+  if[0=count r; :()]
+  t: r[0]; ln: r[1]
+  n: count t; i: 0; d: 0; st: 1; out: ()
+  while[i<n
+    k: t[i]
+    isp: k[0]=`punct
+    if[isp
+      if[k[1] in "([{"; d+:1]
+      if[k[1] in ")]}"; d-:1]
+      if[d<0; d: 0]]                 // an unbalanced closer must not hide the definitions after it
+    if[st & (d=0) & k[0]=`name
+      if[$[(i+1)<n; $[(t[i+1])[0]=`punct; (t[i+1])[1]=":"; 0]; 0]
+        isfn: $[(i+2)<n; $[(t[i+2])[0]=`punct; (t[i+2])[1]="{"; 0]; 0]
+        out,: ,(k[1]; (ln[i])-1; isfn)]]
+    st: $[isp; k[1]=";"; 0]
+    i+:1]
+  out}
+
+// a signalled front-end error, split into (message; 1-based line).  parse.nt and lex.nt both end
+// their messages with " at line N", and nparse appends the outermost one last.
+lspErrPos: {[m]
+  m: lspStr m
+  p: m ss " at line "
+  if[0=count p; :(m; 1)]
+  i: (last p)+9
+  (m[til last p]; lspInt m[i+til (count m)-i])}
+
+// nlex then nparse, inside @[..]: one diagnostic, or none
+lspDiags: {[src]
+  r: @[{[s] nlex s; nparse s; `ok}; src; {x}]
+  if[r~`ok; :()]
+  ep: lspErrPos r
+  l: (ep[1])-1
+  if[l<0; l: 0]
+  ls: lspSplit src
+  if[not l<count ls; l: (count ls)-1]
+  ,`range`severity`source`message!(lspLineRange[l; ls[l]]; 1; "neant"; ep[0])}
+
+// ---- the names an editor can complete or hover: this buffer's, then the image's.
+// The image has no way to enumerate its globals — there is no `key `.` and no builtin for it — so
+// the candidates are the top-level definitions of the sources listed above plus lspPRIMS, and each
+// candidate is then *confirmed against the running image* with lspGread before it is offered.  So
+// the list is the image's, filtered from a superset, rather than a hardcoded answer.
+lspRead: {[p] @[{[f] "\n" sv read0 f}; p; {""}]}
+lspGlobals: {[]
+  if[count lspNamesCache; :lspNamesCache]
+  cand: lspPRIMS
+  i: 0
+  while[i<count lspSOURCES
+    p: lspSOURCES[i]
+    s: lspRead p
+    if[(0=count s) & count lspRoot; s: lspRead lspRoot,"/",p]
+    cand,: {x[0]} each lspDefs s
+    i+:1]
+  cand: distinct cand
+  out: (); i: 0
+  while[i<count cand
+    g: cand[i]
+    nm: `$g
+    if[lspDefined nm
+      v: lspGread nm
+      t: type v
+      out,: ,(g; $[t=`fn; 3; 6]; $[g in lspPRIMS; "Rust builtin"; t=`fn; lspStr string v; string t])]
+    i+:1]
+  i: 0
+  while[i<count lspKEYWORDS; out,: ,(lspKEYWORDS[i]; 14; "control word"); i+:1]
+  lspNamesCache:: out
+  out}
+
+// the comment block written directly above a definition, as its documentation
+lspDocAbove: {[ls;d]
+  out: (); i: d-1
+  while[$[i<0; 0; lspIsCmt ls[i]]; out: (,trim 2_trim lspStr ls[i]),out; i-:1]
+  "\n" sv out}
+
+lspDescribe: {[w;txt]
+  ls: lspSplit txt
+  ds: lspDefs txt
+  d: -1; i: 0
+  while[i<count ds; if[w~ds[i][0]; d: ds[i][1]]; i+:1]
+  if[not d<0
+    doc: lspDocAbove[ls;d]
+    :"```neant\n",(trim lspStr ls[d]),"\n```\n\n",$[count doc; doc,"\n\n"; ""],"defined in this file, line ",string d+1]
+  gs: lspGlobals[]
+  i: 0
+  while[i<count gs
+    g: gs[i]
+    if[w~g[0]; :"```neant\n",w," : ",(g[2]),"\n```\n\n",$[w in lspPRIMS; "a Rust builtin"; w in lspKEYWORDS; "a control word the parser handles"; "in the neant image"]]
+    i+:1]
+  ""}
+
+// ---- JSON-RPC
+lspRespond: {[id;result] `jsonrpc`id`result!("2.0"; $[id~lspNil; null; id]; $[result~lspNil; null; result])}
+lspErrorMsg: {[id;code;msg] `jsonrpc`id`error!("2.0"; id; `code`message!(code; msg))}
+lspNotify: {[method;params] `jsonrpc`method`params!("2.0"; method; params)}
+lspFrame: {[obj] body: jj obj; "Content-Length: ",(string count `byte$body),"\r\n\r\n",body}
+
+// ---- documents
+lspUri: {[ps] lspGet[lspGet[ps;`textDocument];`uri]}
+lspKey: {[uri] $[`sym=type uri; `; `$lspStr uri]}
+lspDoc: {[uri] u: lspKey uri; $[u in key lspDocs; lspDocs u; ""]}
+lspPut: {[uri;txt] lspDocs[lspKey uri]: txt; 0}
+lspDiagMsg: {[uri;txt] lspNotify["textDocument/publishDiagnostics"; `uri`diagnostics!(uri; lspDiags txt)]}
+
+lspDidOpen: {[ps]
+  td: lspGet[ps;`textDocument]
+  uri: lspGet[td;`uri]; txt: lspGet[td;`text]
+  if[txt~lspNil; txt: ""]
+  lspPut[uri;txt]
+  ,lspDiagMsg[uri;txt]}
+lspDidChange: {[ps]
+  uri: lspUri ps
+  cs: lspGet[ps;`contentChanges]
+  txt: lspDoc uri
+  if[count cs; txt: lspGet[last cs; `text]]
+  if[txt~lspNil; txt: ""]
+  lspPut[uri;txt]
+  ,lspDiagMsg[uri;txt]}
+lspDidClose: {[ps]
+  uri: lspUri ps
+  lspPut[uri;""]
+  ,lspNotify["textDocument/publishDiagnostics"; `uri`diagnostics!(uri; ())]}
+
+// ---- requests
+lspCaps: {[]
+  c: `positionEncoding`textDocumentSync`documentFormattingProvider`documentSymbolProvider`hoverProvider`completionProvider!("utf-16"; 1; 1b; 1b; 1b; lspD1[`resolveProvider; 0b])
+  `capabilities`serverInfo!(c; `name`version!("neant-lsp"; "0.1"))}
+
+// one edit replacing the whole buffer, or no edits when nfmt changed nothing
+lspFormat: {[ps]
+  if[not lspDefined `nfmt; :()]
+  uri: lspUri ps
+  txt: lspDoc uri
+  out: nfmt txt
+  if[out~txt; :()]
+  ,`range`newText!(lspRange[0; 0; count lspSplit txt; 0]; out)}
+
+lspDocSyms: {[ps]
+  txt: lspDoc lspUri ps
+  ls: lspSplit txt
+  ds: lspDefs txt
+  out: (); i: 0
+  while[i<count ds
+    d: ds[i]
+    r: lspLineRange[d[1]; $[(d[1])<count ls; ls[d[1]]; ""]]
+    out,: ,`name`kind`range`selectionRange!(d[0]; $[d[2]; 12; 13]; r; r)
+    i+:1]
+  out}
+
+lspHover: {[ps]
+  txt: lspDoc lspUri ps
+  pos: lspGet[ps;`position]
+  l: lspGet[pos;`line]; ch: lspGet[pos;`character]
+  ls: lspSplit txt
+  if[l~lspNil; :lspNil]
+  if[ch~lspNil; ch: 0]
+  if[not l<count ls; :lspNil]
+  line: lspStr ls[l]
+  w: lspWordAt[line; lspU16Idx[line;ch]]
+  if[0=count w; :lspNil]
+  doc: lspDescribe[w;txt]
+  if[0=count doc; :lspNil]
+  lspD1[`contents; `kind`value!("markdown"; doc)]}
+
+// Items are filtered by what the cursor has already typed, and a filtered reply is marked
+// incomplete so the client asks again as the word grows.
+lspComplete: {[ps]
+  txt: lspDoc lspUri ps
+  pos: lspGet[ps;`position]
+  l: lspGet[pos;`line]; ch: lspGet[pos;`character]
+  ls: lspSplit txt
+  pre: ""
+  if[not l~lspNil; if[l<count ls; if[not ch~lspNil; pre: lspPrefixAt[ls[l]; lspU16Idx[ls[l];ch]]]]]
+  ds: lspDefs txt
+  out: (); seen: (); i: 0
+  while[i<count ds
+    d: ds[i]
+    if[lspHasPre[d[0];pre]; out,: ,`label`kind`detail!(d[0]; $[d[2]; 3; 6]; "this file, line ",string 1+d[1])]
+    seen,: ,d[0]
+    i+:1]
+  gs: lspGlobals[]; i: 0
+  while[i<count gs
+    g: gs[i]
+    if[(not g[0] in seen) & lspHasPre[g[0];pre]; out,: ,`label`kind`detail!(g[0]; g[1]; g[2])]
+    i+:1]
+  `isIncomplete`items!($[0=count pre; 0b; 1b]; out)}
+lspHasPre: {[label;pre] n: count pre; $[0=n; 1; (count label)<n; 0; pre~n#lspStr label]}
+
+// ---- routing.  Returns the messages to send back, in order.
+lspRoute: {[id;meth;ps]
+  if[meth~"initialize"; lspRoot:: lspInitRoot ps; lspNamesCache:: (); :,lspRespond[id; lspCaps[]]]
+  if[meth~"initialized"; :()]
+  if[meth~"shutdown"; :,lspRespond[id; lspNil]]
+  if[meth~"exit"; lspExit:: 1; :()]
+  if[meth~"textDocument/didOpen"; :lspDidOpen ps]
+  if[meth~"textDocument/didChange"; :lspDidChange ps]
+  if[meth~"textDocument/didClose"; :lspDidClose ps]
+  if[meth~"textDocument/formatting"; :,lspRespond[id; lspFormat ps]]
+  if[meth~"textDocument/documentSymbol"; :,lspRespond[id; lspDocSyms ps]]
+  if[meth~"textDocument/hover"; :,lspRespond[id; lspHover ps]]
+  if[meth~"textDocument/completion"; :,lspRespond[id; lspComplete ps]]
+  $[id~lspNil; (); ,lspErrorMsg[id; -32601; "unhandled method: ",meth]]}
+
+// rootUri is a file:// URI; rootPath is a plain path.  Either is only a place to look for sources.
+lspInitRoot: {[ps]
+  u: lspGet[ps;`rootUri]
+  if[u~lspNil; u: lspGet[ps;`rootPath]]
+  if[u~lspNil; :""]
+  u: lspStr u
+  $[(7<count u) & "file://"~7#u; 7_u; u]}
+
+lspDispatch: {[body]
+  m: @[jk; body; {`bad}]
+  if[m~`bad; :()]
+  meth: lspGet[m;`method]
+  if[meth~lspNil; :()]                      // a response to something we asked: nothing to do
+  r: @[{[a] lspRoute[a[0]; a[1]; a[2]]}; (lspGet[m;`id]; lspStr meth; lspGet[m;`params]); {`err}]
+  $[r~`err; (); r]}
+
+// ---- stdin/stdout.  lspFrames is kept for a whole stream handed over at once (a scripted session
+// that pipes every frame in and closes): read0 0 hands back lines, so the CRs are gone and a body
+// has the next frame's header glued to it, but rejoining with "\n" gives back the stream minus its
+// CRs, and since the CRs only ever sat at the ends of header lines, and JSON escapes a newline
+// inside a string, Content-Length is still exact over what is left.
+lspBlank: {[b;i]
+  n: count b; j: i
+  while[(j+1)<n
+    if[(b[j]=10) & b[j+1]=10; :j]
+    j+:1]
+  -1}
+lspFrames: {[ls]
+  bs: `byte$"\n" sv ls
+  bi: `int$bs
+  n: count bi; i: 0; out: ()
+  while[i<n
+    e: lspBlank[bi;i]
+    if[e<0; :out]
+    len: lspLenOf `char$bs[i+til e-i]
+    st: e+2
+    if[len<0; i: st]
+    if[not len<0
+      if[(st+len)>n; :out]
+      out,: ,`char$bs[st+til len]
+      i: st+len]]
+  out}
+
+lspWrite: {[s] write1 s; 0}
+
+// One loop over any byte source: rd[] reads the next chunk (empty at EOF), wr[frame] writes one
+// reply.  Both servers are this with a different pair, so the framing lives in exactly one place.
+lspLoop: {[rd;wr]
+  buf: `byte$""
+  while[1
+    r: lspTakeFrame buf
+    if[0=count r
+      ch: rd[]
+      if[0=count ch; :0]
+      buf,: ch]
+    if[count r
+      buf: r[1]
+      ms: lspDispatch r[0]
+      j: 0
+      while[j<count ms; wr lspFrame ms[j]; j+:1]
+      if[lspExit; :0]]]
+  0}
+
+lspServe: {[] lspLoop[{[] read1 65536}; lspWrite]}
+
+// ---- TCP.  hrecv/hsend are byte-exact, so this is the framing the spec actually describes.
+lspHdrEnd: {[buf]
+  b: `int$buf; n: count b; i: 0
+  while[(i+3)<n
+    if[(b[i]=13) & (b[i+1]=10) & (b[i+2]=13) & b[i+3]=10; :i]
+    i+:1]
+  -1}
+// split on "\n" and trim, so this reads a header block whether or not its CRs survived
+lspLenOf: {[head]
+  ls: vs["\n"; lspStr head]; i: 0; n: -1
+  while[i<count ls
+    l: trim lspStr ls[i]
+    if[not (count l)<15; if[(15#lower l)~"content-length:"; n: lspInt trim 15_l]]
+    i+:1]
+  n}
+// (body; the bytes after it), or () when the buffer does not hold a whole frame yet
+lspTakeFrame: {[buf]
+  h: lspHdrEnd buf
+  if[h<0; :()]
+  len: lspLenOf `char$buf[til h]
+  if[len<0; :()]
+  if[(count buf)<(h+4)+len; :()]
+  (`char$buf[(h+4)+til len]; (h+4+len)_buf)}
+
+lspServeTcp: {[addr]
+  l: hlisten addr
+  c: accept l
+  lspLoop[{[c] hrecv[c; 65536]}[c]; {[c;f] hsend[c; f]}[c]]
+  hclose c; hclose l; 0}
+
+// Running this file starts the server; an argument is a TCP address to listen on instead.  Set
+// lspNoStart: 1 before loading it to get the handlers without a server (what tests do).  The
+// result is assigned, not left as the file's value, so nothing of ours lands on stdout.
+lspArgs: @[{[x] args}; 0; {()}]
+lspDone: $[@[{[x] lspNoStart}; 0; {0}]; 0; count lspArgs; lspServeTcp lspStr first lspArgs; lspServe[]]
