@@ -283,7 +283,7 @@ mod arm64 {
             if depth < 0 || depth as usize > MAX_DEPTH { return None; }
             if pending_call_slot.is_some() && !matches!(op, Op::Call(1) | Op::Call(2)) { return None; }
             match *op {
-                // `if`/`while`/`do` push a `Null` as their statement value (boot/compile.nt's
+                // `if`/`while`/`do` push a `Null` as their statement value (src/neant/core/compile.nt's
                 // `pushNull`), always immediately discarded by the `Pop` that follows every
                 // statement in a block. Nothing is ever read back from it, so it's safe to compile
                 // as long as that pairing holds — skip emitting anything for the push itself, and

@@ -536,7 +536,7 @@ pub fn amend_path(x: &mut Value, idx: &[Value], v: Value) -> R<()> {
 }
 /// `x[i]:v` in place. Vector index amends each; a missing dict key appends.
 /// `x[i]: v` for a typed vector written through an int vector with values of its own type — the shape
-/// `acc[i+til n] +: ...` that the field arithmetic in boot/crypto.nt is built out of. Writes in place
+/// `acc[i+til n] +: ...` that the field arithmetic in src/neant/crypto/crypto.nt is built out of. Writes in place
 /// instead of boxing every index and value and recursing once per element. Returns false (no writes yet)
 /// whenever anything does not line up, so the general path below still defines the semantics — including
 /// the partial mutation it performs when an index is out of range.
@@ -727,7 +727,7 @@ pub static PRIMS: &[PrimDef] = &[
     p!("$", Some(string), Some(cast)),
 ];
 /// Only what needs Rust: IO, dict internals, transcendental math, and the VM-dispatched keywords.
-/// Everything expressible with the verbs lives in boot/prelude.nt (sum avg count first in mod vs upper ...).
+/// Everything expressible with the verbs lives in src/neant/stdlib/prelude.nt (sum avg count first in mod vs upper ...).
 pub static BUILTINS: &[PrimDef] = &[
     p!("exp", Some(exp), None), p!("log", Some(log), None), p!("sin", Some(sin), None), p!("cos", Some(cos), None), p!("tan", Some(tan), None), p!("atan", Some(atan), None),
     p!("rand", Some(rand1), Some(rand2)), p!("rseed", Some(rseed), None), p!("urand", Some(urand), None),

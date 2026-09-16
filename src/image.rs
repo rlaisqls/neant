@@ -1,5 +1,5 @@
 //! Boot image: bytecode data (see "bytecode as data" in prims.rs) as a flat tagged binary.
-//! `neant --build-boot` writes boot/boot.nb with the neant compiler; main.rs embeds it with include_bytes!.
+//! `neant --build-boot` writes src/neant/image.nb with the neant compiler; main.rs embeds it with include_bytes!.
 use crate::value::*;
 use std::sync::Arc;
 use Value::*;

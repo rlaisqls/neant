@@ -1,5 +1,5 @@
-// Ed25519 signature verification (RFC 8032) in neant, on the 2^255-19 field in boot/crypto.nt.
-// Not part of the boot image — load it with  load "boot/ed25519.nt"
+// Ed25519 signature verification (RFC 8032) in neant, on the 2^255-19 field in src/neant/crypto/crypto.nt.
+// Not part of the boot image — load it with  load "src/neant/crypto/ed25519.nt"
 //
 // Verification only: there is no signing here, and nothing is constant-time — every input is public.
 // The check is the cofactorless one, [S]B - [k]A encoded and compared with R, plus S < L. That is

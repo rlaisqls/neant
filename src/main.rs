@@ -9,8 +9,8 @@
 //!     {x*y}[3;4]        // lambda, implicit args x y z
 //!     $[1<2;`yes;`no]   // cond
 //!
-//! Source never reaches Rust: boot/{lex,parse,compile}.nt lex, parse and compile it, and they
-//! themselves run on this VM, loaded from the bytecode image in boot/boot.nb.
+//! Source never reaches Rust: src/neant/core/{lex,parse,compile}.nt lex, parse and compile it, and
+//! they themselves run on this VM, loaded from the bytecode image in src/neant/image.nb.
 mod image;
 mod jit;
 mod prims;
@@ -30,7 +30,7 @@ fn main() {
     let argv: Vec<String> = std::env::args().collect();
     let read = |path: &str| std::fs::read_to_string(path).unwrap_or_else(|e| { eprintln!("{path}: {e}"); std::process::exit(2) });
     let mut vm = boot_vm();
-    if argv.get(1).map(String::as_str) == Some("--build-boot") {   // recompile boot/*.nt with the image's own compiler
+    if argv.get(1).map(String::as_str) == Some("--build-boot") {   // recompile src/neant/{core,stdlib} with the image's own compiler
         let bytes = build_boot_image(&mut vm, &read).unwrap_or_else(|e| { eprintln!("'{}", e.0); std::process::exit(1) });
         std::fs::write(BOOT_IMAGE_PATH, &bytes).unwrap_or_else(|e| { eprintln!("{BOOT_IMAGE_PATH}: {e}"); std::process::exit(2) });
         println!("wrote {BOOT_IMAGE_PATH} ({} bytes); rebuild to embed it", bytes.len());
@@ -51,12 +51,15 @@ fn main() {
     }
 }
 
-const BOOT_FILES: [&str; 7] = ["boot/prelude.nt", "boot/lex.nt", "boot/parse.nt", "boot/compile.nt", "boot/table.nt", "boot/json.nt", "boot/crypto.nt"];
-const BOOT_IMAGE_PATH: &str = "boot/boot.nb";
+const BOOT_FILES: [&str; 7] = [
+    "src/neant/stdlib/prelude.nt", "src/neant/core/lex.nt", "src/neant/core/parse.nt", "src/neant/core/compile.nt",
+    "src/neant/stdlib/table.nt", "src/neant/stdlib/json.nt", "src/neant/crypto/crypto.nt",
+];
+const BOOT_IMAGE_PATH: &str = "src/neant/image.nb";
 /// The whole front end and standard library as bytecode, compiled by itself: prelude, lexer, parser,
 /// compiler, tables, JSON, crypto. This is the only way into the language — there is no Rust front end,
 /// so a broken image can only be rebuilt by a binary carrying a working one (`--build-boot`, or git).
-const BOOT_IMAGE: &[u8] = include_bytes!("../boot/boot.nb");
+const BOOT_IMAGE: &[u8] = include_bytes!("neant/image.nb");
 
 /// A VM with the embedded boot image loaded — the only way to run neant code.
 fn boot_vm() -> vm::Vm {
@@ -65,7 +68,7 @@ fn boot_vm() -> vm::Vm {
     if let Err(e) = img { eprintln!("boot image: '{}  (rebuild it with a binary that still has a working one)", e.0); std::process::exit(2); }
     vm
 }
-/// Compile boot/*.nt with the compiler already in `vm` and serialize the units. Self-hosted: the image
+/// Compile src/neant/{core,stdlib,crypto} with the compiler already in `vm` and serialize the units. Self-hosted: the image
 /// that comes out was produced by the image that went in, so a compiler change needs two rebuilds to settle.
 fn build_boot_image(vm: &mut vm::Vm, read: &dyn Fn(&str) -> String) -> value::R<Vec<u8>> {
     let ncompile = vm.get("ncompile").ok_or_else(|| value::NError("ncompile: no boot image loaded".into()))?;
@@ -107,7 +110,7 @@ mod tests {
             ("d:`a`b!1 2;d`b", "2"), ("d:`a`b!1 2;d`b`a", "2 1"), ("key `a`b!1 2", "`a`b"), ("value `a`b!1 2", "1 2"),
             ("avg 1 2 3 4", "2.5"), ("sum 1 2 3", "6"), ("7 mod 3", "1"), ("7 div 2", "3"), ("max 3 1 2", "3"),
             ("1 2 3 in 2 3 4", "011b"), ("5 within 1 10", "1b"), ("1 2 3 within 2 3", "011b"), ("1=1 1 0", "110b"), ("(1=1 0)&1=0 1", "00b"),
-            // group, each over dicts, tables (boot/table.nt)
+            // group, each over dicts, tables (src/neant/stdlib/table.nt)
             ("=1 2 1 3 1", "1 2 3!(0 2 4;,1;,3)"), ("{x*2} each `a`b!1 2", "`a`b!2 4"), ("\"\" ~ \"abc\"[()]", "1b"),
             ("t:tbl[`a`b;(1 2 3;10 20 30)];t`b", "10 20 30"), ("t:tbl[`a`b;(1 2 3;10 20 30)];row[t;1]", "`a`b!2 20"), ("t:tbl[`a`b;(1 2 3;10 20 30)];tcount t", "3"),
             ("t:tbl[`a`b;(1 2 3;10 20 30)];tsel[t;t[`a]>1]", "`a`b!(2 3;20 30)"), ("t:tbl[`a`b;(3 1 2;10 20 30)];tsort[t;`a]`b", "20 30 10"),
@@ -154,21 +157,21 @@ mod tests {
             ("\"hello\" like \"h*o\"", "1b"), ("\"hello\" like \"h?l*\"", "1b"), ("\"hello\" like \"x*\"", "0b"), ("\"hello.nt\" like \"*.nt\"", "1b"),
             ("rseed 7; count 5 rand 10", "5"), ("rseed 7; all (5 rand 10) < 10", "1b"), ("rseed 7; x: 3 rand 10; rseed 7; x ~ 3 rand 10", "1b"), ("rseed 1; @rand 1.0", "`float"), ("rseed 1; (rand `a`b) in `a`b", "1b"),
             ("sin 0", "0f"), ("cos 0", "1f"), ("atan 1", "0.7853981633974483"),
-            // asof join, JSON (boot/json.nt)
+            // asof join, JSON (src/neant/stdlib/json.nt)
             ("t:tbl[`s`t`v;(`a`b`a;1 5 9;10 20 30)];q:tbl[`s`t`p;(`a`a`b;0 8 4;1 2 3)];aj[`s`t;t;q]`p", "1 3 2"), ("t:tbl[`t`v;(1 5 9;10 20 30)];q:tbl[`t`p;(0 8;1 2)];aj[`t;t;q]`p", "1 1 2"),
             ("jk \"{\\\"a\\\": [1, 2.5, \\\"s\\\"], \\\"b\\\": true, \\\"c\\\": null}\"", "`a`b`c!((1f;2.5;\"s\");1b;::)"), ("jk \"[1,2,3]\"", "1 2 3"), ("jk \"[]\"", "()"), ("jk \"{}\"", "()!()"), ("jk \" -1.5e2 \"", "-150f"),
             ("count jk \"\\\"a\\\\nb\\\"\"", "3"), ("jk \"\\\"\\\\u00e9\\\"\"", "\"é\""), ("jk \"{\\\"a\\\":{\\\"b\\\":[{\\\"c\\\":1}]}}\"", ",`a!(,`b!((,`c!,1)))"),
             ("jj `a`b`c!(1 2;\"x\";null)", "\"{\"a\": [1, 2], \"b\": \"x\", \"c\": null}\""), ("jj (1b;0b;null;1.5;`s;4.0)", "\"[true, false, null, 1.5, \"s\", 4]\""), ("jj \"q\\\"\\\\\"", "\"\"q\\\"\\\\\"\""),
             ("jk jj `a`b`c!(1 2;\"x\";null)", "`a`b`c!(1 2;\"x\";::)"), ("jj tbl[`a`b;(1 2;`x`y)]", "\"{\"a\": [1, 2], \"b\": [\"x\", \"y\"]}\""),
             ("jk \"[1,\"", "'json: unexpected end at 3"), ("jk \"[1 2]\"", "'json: expected , or ] at 4"), ("jk \"tru\"", "'json: bad literal at 0"), ("jk \"{\\\"a\\\":1,}\"", "'json: expected key at 7"), ("jj {x}", "'json: cannot serialize a function"),
-            // bytes, bit verbs, SHA-256 (boot/crypto.nt)
+            // bytes, bit verbs, SHA-256 (src/neant/crypto/crypto.nt)
             ("0x0aff", "0x0aff"), ("type 0x0a", "`byte"), ("0x0aff[1]", "0xff"), ("x: 0x; x,: 0x01; x,: 0x0203; x", "0x010203"), ("`int$0x0aff", "10 255"), ("`byte$255 256 65", "0xff0041"),
             ("`byte$\"hé\"", "0x68c3a9"), ("`char$0x68c3a9", "\"hé\""), ("hex 0x0aff", "\"0aff\""), ("unhex \"0aff\"", "0x0aff"), ("0x0a+1", "11"),
             ("0x0aff bxor 0xff00", "0xf5ff"), ("0x0f band 0x3c", "0x0c"), ("bnot 0x0f", "0xf0"), ("12 bxor 10", "6"), ("255 shl 8", "65280"), ("-1 shr 60", "15"), ("1 2 3 shl 1 2 3", "2 8 24"), ("rotr32[1;1]", "2147483648"),
             ("hex sha256 0x", "\"e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855\""),
             ("hex sha256 `byte$\"abc\"", "\"ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad\""),
             ("hex sha256 `byte$\"abcdbcdecdefdefgefghfghighijhijkijkljklmklmnlmnomnopnopq\"", "\"248d6a61d20638b8e5c026930c3e6039a33ce45964ff2167f6ecedd419db06c1\""),
-            // ChaCha20, HMAC/HKDF, Poly1305, AEAD, X25519 (boot/crypto.nt): RFC 8439 / 4231 / 5869 / 7748 vectors
+            // ChaCha20, HMAC/HKDF, Poly1305, AEAD, X25519 (src/neant/crypto/crypto.nt): RFC 8439 / 4231 / 5869 / 7748 vectors
             ("k: `byte$til 32; hex chachaBlock[k;1;0x000000090000004a00000000]", "\"10f1e7e4d13b5915500fdd1fa32071c4c7d1f4c733c068030422aa9ac3d46c4ed2826446079faa0914c2d705d98b02a2b5129cd1de164eb9cbd083e8a2503c4e\""),
             ("k: `byte$til 32; hex 16#chacha20[k;1;0x000000000000004a00000000;`byte$\"Ladies and Gentlemen of the class of '99: If I could offer you only one tip for the future, sunscreen would be it.\"]", "\"6e2e359a2568f98041ba0728dd0d6981\""),
             ("k: `byte$til 32; d: `byte$\"round trip\"; `char$chacha20[k;7;12#0x01;chacha20[k;7;12#0x01;d]]", "\"round trip\""),
@@ -435,14 +438,14 @@ mod conc {
     }
 }
 
-/// boot/tls.nt is a loadable module, not part of the image: key schedule and record layer,
+/// src/neant/crypto/tls.nt is a loadable module, not part of the image: key schedule and record layer,
 /// checked offline against RFC 8448. The handshake itself needs a server — see the README.
 #[cfg(test)]
 mod tls {
     use super::*;
     fn tls_vm() -> vm::Vm {
         let mut v = boot_vm();
-        v.eval(&std::fs::read_to_string("boot/tls.nt").unwrap()).unwrap();
+        v.eval(&std::fs::read_to_string("src/neant/crypto/tls.nt").unwrap()).unwrap();
         v
     }
     #[test]
@@ -545,7 +548,7 @@ mod tls {
     }
 }
 
-/// boot/http.nt is a loadable module, not part of the image: request parsing and response writing
+/// src/neant/net/http.nt is a loadable module, not part of the image: request parsing and response writing
 /// over hlisten/accept, one spawned worker per connection (httpServe).
 #[cfg(test)]
 mod http {
@@ -557,7 +560,7 @@ mod http {
     #[test]
     fn serves_get_and_post_over_real_sockets() {
         let mut v = boot_vm();
-        v.eval(&std::fs::read_to_string("boot/http.nt").unwrap()).unwrap();
+        v.eval(&std::fs::read_to_string("src/neant/net/http.nt").unwrap()).unwrap();
         // src/prims.rs has no way to ask a listener its bound port — bind a probe in Rust to grab
         // a free one, drop it, and point neant's hlisten at that same port (a small, accepted
         // TOCTOU race, same trick as the accept-workers test above).
@@ -589,14 +592,14 @@ mod http {
     }
 }
 
-/// boot/ed25519.nt is a loadable module, not part of the image: SHA-512 on raw 64-bit words, and
-/// Ed25519 verification on boot/crypto.nt's 2^255-19 field. FIPS 180-4 and RFC 8032 vectors.
+/// src/neant/crypto/ed25519.nt is a loadable module, not part of the image: SHA-512 on raw 64-bit words, and
+/// Ed25519 verification on src/neant/crypto/crypto.nt's 2^255-19 field. FIPS 180-4 and RFC 8032 vectors.
 #[cfg(test)]
 mod ed25519 {
     use super::*;
     fn ed_vm() -> vm::Vm {
         let mut v = boot_vm();
-        v.eval(&std::fs::read_to_string("boot/ed25519.nt").unwrap()).unwrap();
+        v.eval(&std::fs::read_to_string("src/neant/crypto/ed25519.nt").unwrap()).unwrap();
         v
     }
     /// `badd` is what makes this possible: a word may be any bit pattern, including the one `+` reads as 0N.
@@ -754,7 +757,7 @@ mod boot {
             assert_eq!(super::tests::ev(&mut v, src), *want, "gen2 source: {src}");
         }
         assert!(rebuild.as_millis() < 3000, "self-rebuild took {rebuild:?}");
-        eprintln!("self-hosted rebuild of boot/*.nt: {rebuild:?}");
+        eprintln!("self-hosted rebuild of src/neant/{{core,stdlib,crypto}}: {rebuild:?}");
     }
 
     /// Lexer and parser errors name the stage and the line. These messages are the front end's only
@@ -786,14 +789,15 @@ mod boot_image {
         assert_eq!(image::load(b"").unwrap_err().0, "image: empty");
     }
     /// The image must be a fixpoint: compiling the current boot sources with it reproduces it exactly.
-    /// This fails both when boot/*.nt has moved ahead of boot/boot.nb and when a compiler change has only
-    /// been rebuilt once — run `cargo run --release -- --build-boot` (twice, after a compiler change) and rebuild.
+    /// This fails both when the sources under src/neant/{core,stdlib} have moved ahead of
+    /// src/neant/image.nb and when a compiler change has only been rebuilt once — run
+    /// `cargo run --release -- --build-boot` (twice, after a compiler change) and rebuild.
     #[test]
     fn embedded_boot_image_is_current() {
         let read = |p: &str| std::fs::read_to_string(p).unwrap();
         let mut vm = boot_vm();
         let fresh = build_boot_image(&mut vm, &read).unwrap();
-        assert!(fresh == BOOT_IMAGE, "boot/boot.nb is stale ({} vs {} bytes): run `cargo run --release -- --build-boot` and rebuild", BOOT_IMAGE.len(), fresh.len());
+        assert!(fresh == BOOT_IMAGE, "src/neant/image.nb is stale ({} vs {} bytes): run `cargo run --release -- --build-boot` and rebuild", BOOT_IMAGE.len(), fresh.len());
     }
 }
 

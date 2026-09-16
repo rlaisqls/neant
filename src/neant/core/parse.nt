@@ -1,4 +1,4 @@
-// neant parser, in neant. Consumes nlex tokens (boot/lex.nt) and produces the AST the compiler walks.
+// neant parser, in neant. Consumes nlex tokens (src/neant/core/lex.nt) and produces the AST the compiler walks.
 // Nodes are (`kind; ...) lists, identifiers are symbols:
 //   (`const;v) (`name;`x) (`verb;"+") (`advb;"/";f) (`mo;f;x) (`dy;f;x;y) (`app;f;x) (`call;f;args) (`list;items)
 //   (`assign;`x;e) (`gassign;`x;e) (`iassign;`x;idxs;e) (`return;e) (`fn;params;body) (`if;c;body) (`while;c;body)
@@ -115,7 +115,7 @@ pargs: {[]
       :out]
     if[not isPt[t;";"] | isPt[t;"]"]; signal "parse: missing ]"]]}
 
-// ---- select cols by keys from t where conds  ->  qsel[t; where-fn; by-dict; col-dict]  (boot/table.nt)
+// ---- select cols by keys from t where conds  ->  qsel[t; where-fn; by-dict; col-dict]  (src/neant/stdlib/table.nt)
 selectForm: {[]
   cols: $[kw[0;"by"] | kw[0;"from"]; (); selList[]]
   by: (); if[kw[0;"by"]; pi::pi+1; by: selList[]]

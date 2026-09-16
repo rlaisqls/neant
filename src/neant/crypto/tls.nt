@@ -1,6 +1,6 @@
-// TLS 1.3 client (RFC 8446) in neant, on boot/crypto.nt: x25519 key exchange,
+// TLS 1.3 client (RFC 8446) in neant, on src/neant/crypto/crypto.nt: x25519 key exchange,
 // TLS_CHACHA20_POLY1305_SHA256, no resumption, no client certificate.
-// Not part of the boot image — load it with  load "boot/tls.nt"
+// Not part of the boot image — load it with  load "src/neant/crypto/tls.nt"
 //
 // !! The server certificate is read off the wire and NOT verified: no X.509 parsing, no signature
 // !! check, no hostname match, no trust store. That is confidentiality against someone recording

@@ -1,5 +1,5 @@
 //! Stack VM. Adverbs live here because they call back into user functions.
-//! There is no front end here: source becomes bytecode in boot/{lex,parse,compile}.nt, which run on this VM.
+//! There is no front end here: source becomes bytecode in src/neant/core/{lex,parse,compile}.nt, which run on this VM.
 use crate::prims::{amend_path, fold_fast, index_at, load_unit, scan_fast, BUILTINS};
 use crate::value::*;
 use std::collections::HashMap;
@@ -83,7 +83,7 @@ impl Vm {
         match c { Int(s) => *s as usize, Symbol(n) => self.slot(n) as usize, _ => unreachable!() }
     }
 
-    /// Run source through the self-hosted front end: `nrun` from the boot image (boot/compile.nt).
+    /// Run source through the self-hosted front end: `nrun` from the boot image (src/neant/core/compile.nt).
     /// Value of the last statement; a trailing assignment yields Null so the REPL stays quiet.
     pub fn eval(&mut self, src: &str) -> R<Value> {
         let f = self.get("nrun").ok_or_else(|| NError("nrun: no boot image loaded".into()))?;

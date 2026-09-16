@@ -1,6 +1,6 @@
 // JSON, in neant.  jk "text" -> value, jj value -> text.
 // objects <-> dicts, arrays <-> lists (typed vectors when homogeneous), strings <-> chars, true/false <-> 1b/0b, null <-> ::
-// Parser state is two globals like boot/parse.nt: js (the text) and jp (position), updated with ::.
+// Parser state is two globals like src/neant/core/parse.nt: js (the text) and jp (position), updated with ::.
 jpeek: {[] $[jp<#js; js[jp]; "\0"]}
 jws: {[] while[$[jp<#js; js[jp] in ws; 0]; jp::jp+1]}
 jfail: {[m] signal "json: ",m," at ",string jp}

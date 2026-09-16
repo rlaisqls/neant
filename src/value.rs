@@ -24,7 +24,7 @@ pub enum Op {
 
 impl Op {
     /// Bytecode-as-data form: (opcode; arg). This numbering is the loader's contract with
-    /// boot/compile.nt's OPS table — the compiler emits these ints, `load_unit` turns them back into ops.
+    /// src/neant/core/compile.nt's OPS table — the compiler emits these ints, `load_unit` turns them back into ops.
     pub fn decode(o: i64, a: i64) -> R<Op> {
         let u = a as u32;
         Ok(match o {

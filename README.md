@@ -34,14 +34,14 @@ cargo run --release -- file.nt          # run a file
 cargo test --release
 ```
 
-After editing `boot/*.nt`: `cargo run --release -- --build-boot`, then rebuild — `cargo test` fails
-until the embedded `boot/boot.nb` matches the sources again. A change to the *compiler* needs the cycle
-twice: the first pass compiles the new compiler with the old one, the second is the fixpoint the test
-checks for.
+After editing `src/neant/{core,stdlib,crypto}/*.nt`: `cargo run --release -- --build-boot`, then
+rebuild — `cargo test` fails until the embedded `src/neant/image.nb` matches the sources again. A
+change to the *compiler* needs the cycle twice: the first pass compiles the new compiler with the
+old one, the second is the fixpoint the test checks for.
 
-The image is the only front end, so it is also the only seed. A `boot/boot.nb` that cannot compile
-`boot/*.nt` can only be rebuilt by a binary that still carries a working one — the last good build, or
-the copy in git.
+The image is the only front end, so it is also the only seed. A `src/neant/image.nb` that cannot
+compile its own sources can only be rebuilt by a binary that still carries a working one — the last
+good build, or the copy in git.
 
 ## The language
 
@@ -74,7 +74,7 @@ f: {n: 10; {x+n}}; (f 0) 5         // closures capture enclosing locals by value
 
 ### Standard library
 
-Written in neant, in `boot/prelude.nt`:
+Written in neant, in `src/neant/stdlib/prelude.nt`:
 
 | Group | Functions |
 |---|---|
@@ -123,11 +123,11 @@ different OS threads, and both need to resolve the same handle. That lock is hel
 lookup, never across the actual blocking read/write/accept (each clones the underlying file
 descriptor and blocks on the clone) — otherwise one worker still waiting on a slow client would
 stall every other socket in the process, exactly the concurrency this is for. No TLS server side yet
-— `boot/tls.nt`'s handshake code is still client-only.
+— `src/neant/crypto/tls.nt`'s handshake code is still client-only.
 
 ## Tables
 
-`boot/table.nt`, in neant — a table is a dict of columns.
+`src/neant/stdlib/table.nt`, in neant — a table is a dict of columns.
 
 ```
 t: tbl[`name`dept`pay; (`ann`bob`cy; `eng`ops`eng; 120 80 100)]
@@ -154,7 +154,7 @@ kt: xkey[`id;t]; kt 3        // keyed table: key rows -> remaining columns; kt[(
 
 ## JSON
 
-`boot/json.nt`: `jk` parses (objects are dicts, null is `::`), `jj` serializes.
+`src/neant/stdlib/json.nt`: `jk` parses (objects are dicts, null is `::`), `jj` serializes.
 
 ```
 jk "{\"a\": [1, 2]}"         // ,`a!(1 2)
@@ -163,12 +163,12 @@ jj `a`b!(1 2;"x")            // "{"a": [1, 2], "b": "x"}"
 
 ## HTTP
 
-`boot/http.nt` (loadable, not in the boot image): `httpRecv`/`httpSend` parse a request and write a
+`src/neant/net/http.nt` (loadable, not in the boot image): `httpRecv`/`httpSend` parse a request and write a
 response over an `hopen`/`accept` handle; `httpServe` wraps the accept-loop-plus-`spawn` pattern shown earlier (`hlisten`/`accept`, "Rust
 builtins" above) into one call.
 
 ```
-load "boot/http.nt"
+load "src/neant/net/http.nt"
 l: hlisten "0.0.0.0:8080"
 httpServe[l; {[req] (200; "OK"; (`$"content-type")!(,"text/plain"); "you asked for ",req[`path])}]
 ```
@@ -177,7 +177,7 @@ httpServe[l; {[req] (200; "OK"; (`$"content-type")!(,"text/plain"); "you asked f
 one with `` `$"content-length" ``, not a literal `` `content-length `` — a hyphen in a *literal*
 symbol token is the `-` verb, not part of the name; casting a string with `` `$ `` has no such
 limit). A handler returns `(status; reason; headers; body)`. No chunked transfer-encoding, no
-keep-alive (`hclose` after every response), no URL/query decoding, no HTTPS yet — `boot/tls.nt` is
+keep-alive (`hclose` after every response), no URL/query decoding, no HTTPS yet — `src/neant/crypto/tls.nt` is
 still client-only.
 
 ## Bytes and crypto
@@ -190,17 +190,17 @@ still client-only.
 key bxor data                // the bit verbs on two byte operands give bytes
 ```
 
-`boot/crypto.nt` is pure neant on those: `sha256 hmac hkdfExtract hkdfExpand chacha20 poly1305
+`src/neant/crypto/crypto.nt` is pure neant on those: `sha256 hmac hkdfExtract hkdfExpand chacha20 poly1305
 aeadEncrypt aeadDecrypt x25519`, all checked against the RFC vectors (SHA-256 ~0.12ms/block,
 ChaCha20-Poly1305 ~16ms per 10KB, X25519 ~42ms). 32-bit words live in ints masked after each sum;
 the 2^255-19 and 2^130-5 fields use 22- and 26-bit limbs so products stay exact in an int, and
 carries run as vector passes.
 
-`boot/ed25519.nt` (loadable, not in the boot image) adds **SHA-512 and Ed25519 verification** on top
+`src/neant/crypto/ed25519.nt` (loadable, not in the boot image) adds **SHA-512 and Ed25519 verification** on top
 of that field — RFC 8032 vectors, ~68ms per signature:
 
 ```
-load "boot/ed25519.nt"
+load "src/neant/crypto/ed25519.nt"
 ed25519Verify[pub; msg; sig]       // 32-byte key, 64-byte signature -> 1b / 0b
 hex sha512 `byte$"abc"
 ```
@@ -270,21 +270,27 @@ Lexer, parser, compiler and VM in Rust.
 ### Stage 1 (done)
 
 lex/parse/compile rewritten in neant and running on that VM, PyPy-style; the Rust VM and primitives
-stay as the runtime. The Rust front end has been deleted — `src/` is `{vm, prims, value, image, main}.rs`,
-and **source never reaches Rust**.
+stay as the runtime. The Rust front end has been deleted — `src/` is `{vm, prims, value, image, jit,
+main}.rs` plus `src/neant/` (the self-hosted sources, below, and the compiled image), and **source
+never reaches Rust**.
 
-- `boot/lex.nt` — the lexer.
-- `boot/parse.nt` — the parser. Nodes are ``(`kind; ...)`` lists with identifiers as symbols.
-- `boot/compile.nt` — the compiler. It emits bytecode as data: a unit is
+- `src/neant/core/lex.nt` — the lexer.
+- `src/neant/core/parse.nt` — the parser. Nodes are ``(`kind; ...)`` lists with identifiers as symbols.
+- `src/neant/core/compile.nt` — the compiler. It emits bytecode as data: a unit is
   `(opcodes; args; consts; lines)`, where `lines[i]` is the source line op `i` came from (0 for
   synthetic ops). Consts are tagged ``(`k;v)`` ``(`g;`name)`` ``(`p;"+")`` ``(`a;"/";f)`` ``(`f;code)``.
   `exec` loads and runs it.
 - `nrun src` is the whole pipeline; `load "f.nt"` is `nrun` over a file. The REPL and the file runner
   are both one `nrun` call.
 
-`--build-boot` compiles `boot/*.nt` **with the compiler already in the image** and serializes the
-bytecode into `boot/boot.nb` (`src/image.rs`), embedded in the binary by `include_bytes!`. Rust is the
+`--build-boot` compiles `src/neant/{core,stdlib,crypto}/*.nt` **with the compiler already in the image** and serializes the
+bytecode into `src/neant/image.nb` (`src/image.rs`), embedded in the binary by `include_bytes!`. Rust is the
 VM plus the primitives, and nothing else.
+
+`src/neant/` is grouped by what a file is for, not by whether it ends up in the image — `core/`
+(lex/parse/compile, above) and `stdlib/` (prelude/table/json) do; `crypto/` is split between what's
+in it (`crypto.nt`) and what's loaded on demand (`ed25519.nt`, `tls.nt` — see their own sections);
+`net/` (`http.nt`) is loadable only. `load "f.nt"` doesn't care which directory a file is under.
 
 ### Stage 2 (started): a baseline JIT for integer loops and calls
 
@@ -348,8 +354,8 @@ There is no external oracle left, so the front end is pinned by fixpoints and by
   parse and compile the corpora to byte-identical output and still run every language case. A compiler
   that does not reproduce its own output when rebuilt by itself fails here — this is what the Rust
   oracle used to catch.
-- **The image is a fixpoint.** Compiling the current `boot/*.nt` with the embedded image reproduces
-  that image exactly. Catches both a stale `boot.nb` and a compiler change rebuilt only once.
+- **The image is a fixpoint.** Compiling the current sources with the embedded image reproduces
+  that image exactly. Catches both a stale `image.nb` and a compiler change rebuilt only once.
 - **The language cases.** ~250 source/result pairs — semantics, error messages, error line numbers and
   call stacks — every one through `nrun`.
 - **Front-end errors.** Lexer and parser messages and their line numbers, asserted literally.
@@ -377,8 +383,8 @@ consistently is no longer caught by construction — it is caught only if a lang
   The general path boxes every index and element into a `Value`, indexes one at a time, then re-detects
   the type in `pack` — the shape `acc[i+til 12] +: a[i]*b` that the field arithmetic is built out of.
 
-Together: the self-hosted rebuild of `boot/*.nt` takes ~185ms (was ~324ms), and a `while` iteration
-costs 26ns. On the crypto in `boot/crypto.nt`, per 64KB: SHA-256 284ms → 119ms, ChaCha20 115 → 68,
+Together: the self-hosted rebuild of the sources takes ~185ms (was ~324ms), and a `while` iteration
+costs 26ns. On the crypto in `src/neant/crypto/crypto.nt`, per 64KB: SHA-256 284ms → 119ms, ChaCha20 115 → 68,
 Poly1305 61 → 34, the AEAD 198 → 103; X25519 76ms → 42, and a TLS 1.3 handshake against OpenSSL
 169ms → 97ms. Allocation went from ~34% of samples to under 1%; what is left is the dispatch loop
 itself and `Value` clone/drop.
@@ -402,7 +408,7 @@ too. That random goes out in the clear, xorshift64 is linear and invertible, and
 enough to solve for the state and roll back to the key — a passive break, no certificate needed. Key
 material now comes from `urand`, and `rand` keeps the reproducibility its tests want.
 
-Ed25519 is in (`boot/ed25519.nt`), which took one runtime primitive — `badd` — and no language
+Ed25519 is in (`src/neant/crypto/ed25519.nt`), which took one runtime primitive — `badd` — and no language
 change. The remaining signature work is RSA-PSS and ECDSA P-256, which real certificates actually use;
 both need a general modular reduction (Montgomery or Barrett) rather than the special-prime folding
 the 2^255-19 field gets away with. RSA *verification* stays cheap because the exponent is 65537.

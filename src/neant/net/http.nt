@@ -1,7 +1,7 @@
-// HTTP/1.1 over hlisten/accept, in neant. load "boot/http.nt" — not part of the boot image.
+// HTTP/1.1 over hlisten/accept, in neant. load "src/neant/net/http.nt" — not part of the boot image.
 //
 // Scope: no chunked transfer-encoding, no keep-alive/pipelining (a connection is closed after one
-// response), no URL/query-string decoding, no multipart, no HTTPS (would compose with boot/tls.nt
+// response), no URL/query-string decoding, no multipart, no HTTPS (would compose with src/neant/crypto/tls.nt
 // once that has a server handshake, which it doesn't). A request with no Content-Length is treated
 // as having an empty body.
 
