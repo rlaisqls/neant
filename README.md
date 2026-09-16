@@ -413,11 +413,10 @@ bytecode `ip` the other direction would have gone to — and an unconditional `J
 at all, since the ops it skipped simply never ran. So an `if` or a `$[..]` inside the loop costs
 nothing until the day its condition actually flips.
 
-Scope: `while` only (a `do[n;..]` header is reached with its counter still live on the operand
-stack, and recording only starts on an empty one), `Push`/`LoadL`/`StoreL`/`Dyad`/`Pop`/`Jmpf`/`Jmp`
-in the body, and calls to plain lambdas held by globals (below). Anything else aborts the
-recording, and that header is never tried again — the same rejected-once-stays-rejected default
-the whole-function JIT already uses. Recording is pure observation: it can't change what a
+Scope: `while` and `do[n;..]` loops (the latter below), `Push`/`LoadL`/`StoreL`/`Dyad`/`Pop`/
+`Jmpf`/`Jmp`/`Loop` in the body, and calls to plain lambdas held by globals (below). Anything else
+aborts the recording, and that header is never tried again — the same rejected-once-stays-rejected
+default the whole-function JIT already uses. Recording is pure observation: it can't change what a
 program computes, only whether some of it gets to run faster.
 
 What a trace buys over the method JIT is types. The whole-function JIT has to *prove* every op is
@@ -437,31 +436,58 @@ position means which local, and one side deciding is what guarantees they do. En
 one of them (a plain non-null int, or a float, matching what was recorded); anything else, or more
 locals than a register file holds, and the loop just runs interpreted.
 
-Every exit is a **bail**: the guard's stub writes the locals back and hands over the `ip` to resume
-interpreting at, and `Vm::run_ops` splices them into its own frame and carries on, indistinguishable
-from having interpreted the whole time. That's why a guard is only legal where the trace holds no
-operand of its own — the interpreter resumes with the operand stack it entered the trace with, the
-empty one. The exception is the one deopt that can fire *mid*-iteration: two ordinary ints wrapping
-to exactly the null sentinel (`0W+1`), which the interpreter would start propagating as a null from
-there on and compiled code would not. Unlike the method JIT's version of that deopt, which just
-re-runs the whole call, there are already-committed writes from earlier iterations here. So the loop
-stores its written locals to the buffer once at the top of each iteration, and that deopt just
-abandons the registers — a half-finished iteration — and resumes at the loop header, where the
-buffer still says what the iteration started with. One store per written local per iteration is all
-that is left of the body's memory traffic, and the only way to remove even that is to hand the
-interpreter the live operand stack at the failing op rather than rewinding to the header.
+Every exit is a **bail that hands the interpreter its operand stack**. A guard's stub writes the
+locals back, then whatever the trace's own virtual stack holds at that point into the same buffer
+past the locals, and hands back an *index* into an exits table `jitCompileTrace` returns alongside
+the code — one `(resume ip; stack tags)` per exit. `CompiledTrace::run` (src/jit.rs) rebuilds those
+values by tag and `Vm::run_ops` pushes them and resumes at that `ip`, indistinguishable from having
+interpreted the whole time. So a guard is legal anywhere, not only where the stack is empty: a
+`Jmpf` inside an expression hands back that expression's operands; the one deopt that fires
+*mid*-iteration — two ordinary ints wrapping to exactly the null sentinel (`0W+1`), which the
+interpreter would start propagating as a null and compiled code would not — resumes at the op
+*after* the colliding one (`Dyad` steps record it) with the null result on top, which is exactly
+the `Int` the interpreter would have produced, and the interpreter propagates it from there. Before
+this, that deopt *rewound*: it threw the half-finished iteration away and resumed at the loop
+header from the values the iteration started with, which is why the loop had to store every
+written local to the buffer once at the top of each iteration. Now only a trace that still contains
+a rewind (a branch inside an inlined callee, below) stores at the top of an iteration; one that
+doesn't has **no memory operation in its body at all**.
 
-A `Bool` local is refused outright rather than traced: locals round-trip through a buffer of raw
-64-bit words, so `b: i<n` would come back an `Int`, and `type`/`show`/`string` can all see the
-difference. On the operand stack a comparison result is fine — nothing there survives the trace.
+Tags are the reason a `Bool` is its own type on the virtual stack: a comparison result handed back
+has to come back a `Value::Bool` — `type` sees the difference, and so does `&`/`|`, whose result is
+a bool exactly when both operands are (`1b&0b`, not `2&1b`), a rule codegen reproduces and the
+recorder's observed result type double-checks. In registers a bool is a 0/1 like any int. A `Bool`
+*local* is still refused: locals round-trip through the buffer as raw words of their slot's one
+type, so `b: i<n` would come back an `Int`.
 
-Measured: **~102x** on a 5M-iteration loop (`jit_tests::manual_trace_perf_measurement`), against a
-`do`-loop baseline — the same body written in the one loop form no trace is ever started on, which
-is what an interpreted baseline has to be now that a single call to a `while` loop is no longer one.
-(That baseline change is also why `manual_perf_measurement` still reports the same ~58x for the
-whole-function JIT: what it measures didn't change, only how it gets something interpreted to
-measure against. The same loop now runs faster traced than method-compiled, for the register reason
-above — the older tier is the one with a buffer in its inner loop.)
+Measured: **~168x** on a 5M-iteration loop (`jit_tests::manual_trace_perf_measurement`), 5.3ms
+traced against 894ms for the same loop with `- -` spliced in — the untraceable twin every
+differential test uses, which is now the only interpreted baseline there is (see `do` below; the
+`do`-loop baseline the earlier numbers were against ran the same body in 544ms, so the ratio moved
+for both reasons). The gain from the removed store is the traced number itself: 5.6ms before,
+5.3ms after, ~5%, on a body of two loads, three dyads and two stores. The same baseline change is
+why `manual_perf_measurement` now reports ~95x for the whole-function JIT rather than ~58x: its
+1.9ms didn't move, the baseline did. The same loop runs faster traced than method-compiled, for
+the register reason above — the older tier is the one with a buffer in its inner loop.
+
+**`do[n;..]` loops.** A `do` header is the `Op::Loop` that tests and decrements its counter, and it
+is reached with that counter live on the operand stack — which is what kept `do` from tracing.
+Now the operand stack at the header is part of the trace: `Vm::run_ops` starts a recording (and
+enters a compiled trace) when the stack holds only plain non-null ints (`Trace::entry`), and those
+are loop-carried values — on the virtual stack from step 0, back in the same registers at the back
+edge, handed back at every exit like anything else on it. `Op::Loop` is a step of its own: on the
+edge the recording took (counter positive) a guard that bails to the loop's exit `t` with the
+counter popped if it is ever `<= 0` — which *is* the interpreter's other edge, stack and all — and a
+decrement in place. A `do` nested inside the traced loop records unrolled, its exit edge a guard in
+the other direction that bails to the `Loop` op itself, counter still on the stack; a `while`
+inside a `do` traces with the outer counter under it the whole time; `do` inside `do` traces the
+inner loop with two counters on its entry stack. An `Op::Loop` inside an inlined callee is
+rejected, not rewound — its bail would be into the callee's bytecode, and unlike a callee's branch
+it mutates the stack — and a counter that isn't a plain int (`do[1b;..]`, `do[2.0;..]` are legal —
+`int_of` takes both) is refused at the entry check or, nested, by its tag at codegen. Measured:
+**~118x** on a 5M-iteration `do` loop (`jit_tests::manual_trace_do_perf_measurement`), 6.2ms
+against 738ms for its `- -` twin — one compare-branch-decrement longer per iteration than the
+`while` form, which shows.
 
 **Calls are inlined, not called.** The recorder lives on the `Vm`, not in one `run_ops` frame, so
 when the loop body does `Op::Call` on a plain lambda it simply follows the interpreter into the
@@ -489,26 +515,30 @@ times, after which it stays interpreted (`FnCode::retrace`, src/value.rs) — re
 at the REPL between runs is ordinary; a loop whose callee changes on every run is not worth a
 compile each time. **A branch inside a callee** can't bail the way one in the loop's own frame
 does: the `ip` it would resume at is in the callee's bytecode, and the interpreter is not in that
-frame. Those are `GuardRewind`s — they exit through the same stub the int-null deopt uses, throwing
-the half-finished iteration away and resuming the interpreter at the loop header from the values
-the buffer says the iteration started with, sound for the same reason that deopt is. If a callee's
-condition flips for good, every later iteration enters the trace, rewinds, and is interpreted;
-measured, that costs nothing over interpreting alone (496ms vs 510ms for 2M such iterations), so
-there is no cliff to fall off. Everything that is *not* a plain lambda in a global — a closure, a
+frame. Those are `GuardRewind`s — the one kind of exit left that does not hand off: it throws the
+half-finished iteration away and resumes the interpreter at the loop header from the values the
+buffer says the iteration started with (locals *and* entry stack, stored there at the top of every
+iteration by a trace that contains one), sound because nothing in the traceable subset can be
+observed from outside the loop. An int-null collision inside a callee rewinds the same way, for the
+same reason. If a callee's condition flips for good, every later iteration enters the trace,
+rewinds, and is interpreted; measured, that costs nothing over interpreting alone (496ms vs 510ms
+for 2M such iterations), so there is no cliff to fall off. Everything that is *not* a plain lambda in a global — a closure, a
 primitive, a projection (an arity mismatch is one), a vector being indexed, a callee that reads a
 global, a `Ret` out of the loop's own frame — fails the recording and leaves the loop interpreted,
 never miscompiled: a `Call` that didn't become an inlined frame arrives at the recorder without
 one having `returned`, and that is the whole check.
 
 Measured: **~200x** on a 5M-iteration loop calling `{x*2}` (`jit_tests::manual_trace_call_perf_measurement`)
-— 5.6ms traced against 1.13s for the same loop with `- -` spliced in, which pays a real
+— 5.65ms traced against 1.14s for the same loop with `- -` spliced in, which pays a real
 `Op::Call` → `call_code` → `execute` per iteration; the traced loop runs at the same speed as the
-one with no call in it at all (5.7ms, `manual_trace_perf_measurement`, ~100x), which is what
-inlining should mean.
+one with no call in it at all (5.3ms, `manual_trace_perf_measurement`), which is what inlining
+should mean.
 
-What's next here, in rough order: `do[n;..]`, which needs the header's live counter handled rather
-than avoided; a deopt that hands back the operand stack instead of rewinding, which would take the
-last store out of the loop; and int/float promotion inside a trace, so `1.0*i` compiles.
+What's next here, in rough order: int/float promotion inside a trace, so `1.0*i` compiles; a
+branch that flips for good — in the loop's own frame or a callee's — currently bails on every
+iteration and runs the rest of it interpreted (no cliff, but no gain either), and recording the
+other direction from the exit as a side trace would recover it; and a rewind-free exit for a
+callee's branch, which needs the interpreter to be able to resume inside a frame it never entered.
 
 ### What the tests check
 
@@ -525,10 +555,14 @@ There is no external oracle left, so the front end is pinned by fixpoints and by
 - **Front-end errors.** Lexer and parser messages and their line numbers, asserted literally.
 - **The JIT against the interpreter.** Every compiled path is checked by running the same loop twice
   — once so it tiers up, once in a form that provably never can (a spliced-in `- -`, an identity the
-  compilability check rejects; or a `do` loop, which no trace is started on) — and requiring the two
-  to agree. That covers the guards and deopts too: a branch that flips after the trace was recorded,
-  an `0W+1` wrapping to the null sentinel mid-loop, an out-of-range index, a second live reference to
-  an amended vector. For inlined calls: every shape that inlines (two arguments, in order; nested;
+  compilability check rejects) — and requiring the two to agree. That covers the guards and deopts
+  too: a branch that flips after the trace was recorded, an `0W+1` wrapping to the null sentinel
+  mid-loop (with one value on the stack under it, with two, with a bool under it, inside a `do`
+  body with the counter under it), a bool handed back at a guard that has to still be a bool, an
+  out-of-range index, a second live reference to an amended vector. For `do` loops: the plain
+  loop, every nesting with `while` and with itself (including an inner loop too long to unroll),
+  an `if` in the body, an inlined call in the body, a callee branch that rewinds with the counter
+  on the stack, and the shapes that must refuse (a `do` inside a callee; a bool or float counter). For inlined calls: every shape that inlines (two arguments, in order; nested;
   float; a scratch local; an early return; a callee branch that flips; two call sites), a global
   reassigned between runs (the result has to follow the new definition, through the re-record
   budget and past it), and every shape that must refuse (closure, primitive, projection, arity
@@ -570,8 +604,8 @@ caller's `LoadG`, so the bytecode carries positions but no names.
 
 ### Next
 
-For the JIT, the next steps are in "Stage 2b" above: `do[n;..]` headers, and a deopt that hands
-back the live operand stack instead of rewinding to the header.
+For the JIT, the next steps are in "Stage 2b" above: int/float promotion inside a trace, and
+side traces for a branch that flips for good.
 
 A register-style calling convention was tried and reverted — it measured slower, and the profile
 said frame setup is ~5% while `Value` clone/drop and small-list allocation are ~35%. The allocation
