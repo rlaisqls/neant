@@ -123,36 +123,39 @@ impl Vm {
             let ip_before_op = ip as u32;
             let was_recording = self.recorder.is_some();
             // A backward `Jmp` is a loop header being reached again — both `while` (jumps back to
-            // its own condition check) and `do` (jumps back to its body after decrementing) emit
-            // this shape; `Op::Loop`'s own target is always *forward* (the loop's exit), never a
-            // header, so it's not checked here. Only meaningful with a real `FnCode` to key the
-            // per-header counter on (see `execute`'s doc comment). An empty stack at this point is
-            // what distinguishes `while` (traceable — see src/trace.rs's module doc comment) from
-            // `do` (its counter is still live here, so it's silently left untraced this pass).
+            // its own condition check) and `do` (jumps back to the `Op::Loop` that decrements its
+            // counter) emit this shape; `Op::Loop`'s own target is always *forward* (the loop's
+            // exit), never a header, so it's not checked here. Only meaningful with a real `FnCode`
+            // to key the per-header counter on (see `execute`'s doc comment). What the operand
+            // stack holds at this point — nothing for a `while`, its counter for a `do`, the
+            // counters of enclosing `do` loops for either — is part of the trace (`entry_tags`;
+            // see src/trace.rs's module doc comment): it has to be plain ints, or this pass of the
+            // loop is silently left interpreted.
             if !was_recording {
                 if let Op::Jmp(t) = op {
                     if (t as usize) < ip {
                         if let Some(code) = code {
                             match code.loop_action(t) {
                                 // Already compiled: run it instead of interpreting this iteration.
-                                // The empty-stack check is the same one recording required — the
-                                // trace bails back to a bytecode ip carrying nothing of its own,
-                                // so the stack it resumes on has to be the one it started from.
-                                // A refusal falls through to the ordinary `Op::Jmp` below: a
-                                // type mismatch is the same "just don't use the compiled version
-                                // this time" fallback as everywhere else in the JIT; a callee
-                                // global that has been reassigned since the trace was recorded
-                                // is for good, so that trace is retired and the loop counted
-                                // afresh (`FnCode::retrace`).
-                                LoopAction::Run(trace) if st.is_empty() => match trace.run(loc, self) {
+                                // `run` checks the stack against what the trace was recorded on,
+                                // and on a bail leaves `st` holding what the interpreter would have
+                                // had at `bail_ip`. A refusal falls through to the ordinary
+                                // `Op::Jmp` below: a type mismatch is the same "just don't use the
+                                // compiled version this time" fallback as everywhere else in the
+                                // JIT; a callee global that has been reassigned since the trace
+                                // was recorded is for good, so that trace is retired and the loop
+                                // counted afresh (`FnCode::retrace`).
+                                LoopAction::Run(trace) => match trace.run(loc, &mut st, self) {
                                     crate::jit::TraceRun::Bailed(bail_ip) => { ip = bail_ip; *ipc = ip; continue; }
                                     crate::jit::TraceRun::TypeMismatch => {}
                                     crate::jit::TraceRun::StaleCallee => code.retrace(t),
                                 },
-                                LoopAction::StartRecording if st.is_empty() => {
-                                    self.recorder = Some(crate::trace::Recorder::start(t, loc.len() as u32, code.clone()));
+                                LoopAction::StartRecording => {
+                                    if let Some(entry) = crate::trace::TraceTy::entry_tags(&st) {
+                                        self.recorder = Some(crate::trace::Recorder::start(t, loc.len() as u32, code.clone(), entry));
+                                    }
                                 }
-                                _ => {}
+                                LoopAction::None => {}
                             }
                         }
                     }

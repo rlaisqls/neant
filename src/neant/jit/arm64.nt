@@ -451,40 +451,57 @@ jitCompile: {[input;trampolines]
   (,/jitLE each asm; vecSlots)}
 
 
-// ==== tracing JIT (src/trace.rs): compile one recorded `while`-loop iteration ====
+// ==== tracing JIT (src/trace.rs): compile one recorded loop iteration ====
 //
-// jitCompileTrace[input] -> (Bytes; Ints; Ints) or null (not compilable).
+// jitCompileTrace[input] -> (Bytes; Ints; Ints; Int; List) or null (not compilable).
 //   result = (machine code; the locals this trace touches, in buffer order; their types, 0=int
-//   1=float). The slot list is *decided here* and read back by src/jit.rs rather than recomputed
-//   there — the buffer's layout has to mean the same thing on both sides of the boundary, and one
-//   side computing it and the other believing it is the only way to guarantee that.
-// input = (kinds:Ints; args:Ints; tys:Ints; consts:List; header:Int; realUpto:Int) —
-//   Trace::to_neant_input (src/trace.rs) plus the loop header's own bytecode ip, which is where a
-//   mid-iteration deopt resumes interpreting, and the slot count of the loop's own frame: a slot at
-//   or past it belongs to an inlined callee (see "Calls are inlined" in src/trace.rs) and is never
-//   loaded from or stored to the buffer — it has no value before the loop and none anyone wants
-//   after it.
+//   1=float; the buffer position the operand-stack area starts at; the exits table). The slot list
+//   and the stack area's position are *decided here* and read back by src/jit.rs rather than
+//   recomputed there — the buffer's layout has to mean the same thing on both sides of the
+//   boundary, and one side computing it and the other believing it is the only way to guarantee
+//   that. The exits table is one `(resume ip; stack tags)` per exit, indexed by the number the
+//   compiled code hands back through x1: the bytecode ip the interpreter resumes at, and what it
+//   finds in the stack area of the buffer to push before it does, bottom first (tag codes below).
+// input = (kinds:Ints; args:Ints; tys:Ints; ips:Ints; consts:List; header:Int; realUpto:Int;
+//   entry:Ints) — Trace::to_neant_input (src/trace.rs) plus the loop header's own bytecode ip
+//   (where a rewind resumes interpreting), the slot count of the loop's own frame (a slot at or
+//   past it belongs to an inlined callee — see "Calls are inlined" in src/trace.rs — and is never
+//   loaded from or stored to the buffer: it has no value before the loop and none anyone wants
+//   after it), and the tags of the operand stack the recording started on (a `do` counter, or the
+//   counters of enclosing `do` loops — see "The operand stack is part of the trace", src/trace.rs).
 // kinds: 0=Push 1=PushNull 2=LoadL 3=StoreL 4=Dyad 5=Pop 6=Guard(taken) 7=Guard(not taken)
-//   8=GuardRewind(taken) 9=GuardRewind(not taken) 10=FramePush(nargs) 11=FrameEnd.
-// tys: 0=int 1=float (per-step; for Dyad this is the *result* type, not necessarily the operand
-// type — comparisons narrow float operands to an int/bool result, so jitTrDyad below derives the
-// operand type from its own tracked stack, then double-checks it against this as a sanity check).
+//   8=GuardRewind(taken) 9=GuardRewind(not taken) 10=FramePush(nargs) 11=FrameEnd
+//   12=Loop(continued; arg = the loop's exit ip) 13=Loop(exited; arg = the Loop op's own ip).
+// tys: 0=int 1=float 2=bool (per-step; for Dyad this is the *result* type, not necessarily the
+//   operand type — comparisons narrow their operands to a bool result, so jitTrDyad below derives
+//   the operand type from its own tracked stack, then double-checks the result against this).
+//   The same codes tag the exits table, plus 3=null for a `PushNull` placeholder (`if`/`while`/
+//   `do`'s statement value) that is live at an exit — it never had a register worth reading.
+// ips: a Dyad's resume ip — the op after it, where the interpreter picks up if that op's result
+//   wraps to the int-null sentinel (below).
 //
 // **Locals live in registers for the whole loop**, one each, and the buffer x0 (`jitTrBUF`) points
 // at is only how they get in and out: n words, indexed by *position* in the touched-slot list, not
-// by raw slot number. The body itself never touches memory. What does is one store per *written*
-// local at the top of every iteration — the iteration-start values, kept there for the one deopt
-// that can fire mid-iteration (an int-null collision) to resume the loop header from. Every other
-// exit is a guard, which is a legal bytecode position in its own right, so those write the locals
-// back as they stand and resume there. Layout:
+// by raw slot number, then the stack area — one word per live operand-stack value, bottom first.
+// The body itself touches no memory at all. **Every exit hands the interpreter its live operand
+// stack**: a guard, an `Op::Loop` edge or an int-null collision all name a bytecode ip that is a
+// legal place to resume interpreting *given the right stack*, so each exit writes the locals back
+// as they stand, then whatever the trace's virtual stack holds at that point (its tags are that
+// exit's entry in the exits table), and the interpreter pushes those and carries on. The one exit
+// that can't is a **rewind** — a branch, or an int-null collision, inside an inlined callee, whose
+// resume ip is in the callee's bytecode where the interpreter no longer is. That one throws the
+// half-finished iteration away and resumes the loop header from the values the iteration started
+// with, so a trace that contains one stores its written locals and its entry stack to the buffer
+// once at the top of every iteration; a trace with none does not, and its body has no memory ops
+// in it whatsoever. Layout:
 //
-//   int-null sentinel -> x17, then buf -> the local registers    <- entry, once
-//   one store per written local: this iteration's starting point <- loopStart, the back edge's target
+//   int-null sentinel -> x17, buf -> the local registers, stack area -> x9.. <- entry, once
+//   [rewinds only] the written locals and the entry stack -> buf        <- loopStart, the back edge's target
 //   the recorded body, guards branching out to their stubs
 //   b loopStart
-//   one 2-word stub per guard: bail ip -> x15, b writeback
-//   the int-null stub: header ip -> x15, b tail   (skipping the writeback: the buffer already
-//                                                  holds what this iteration started with)
+//   one stub per exit: its index -> x15, its live stack -> the stack area, b writeback
+//   [rewinds only] the rewind stub: its index -> x15, b tail   (over the writeback: the buffer
+//                                  already holds what this iteration started with)
 //   writeback: the local registers -> buf
 //   tail: *x1 = x15; ret
 //
@@ -493,36 +510,46 @@ jitCompile: {[input;trampolines]
 // frame is FramePush, StoreL+Pop per argument, its body, FrameEnd, all on this same operand
 // stack), so nothing here can clobber a caller-saved one and there is nothing to restore. x9..x14 (`jitSTACK`) are the int operand stack, d16..d21 (`jitFSTACK`) the
 // float one, x2..x8/x16 (`jitTrLOCALS`) and d0..d7 (`jitTrFLOCALS`) the locals, x15 (`jitSCRATCH`)
-// the exit ip and constant-loading scratch, x17 the int-null sentinel. x16/x17 are the linker's
+// the exit index and constant-loading scratch, x17 the int-null sentinel. x16/x17 are the linker's
 // IP0/IP1, free here precisely because this code never makes a call or crosses a PLT; x18 is left
 // alone (it is the platform register on some ABIs).
 //
 // `tstack` (in the state dict below) is the trace's own virtual operand stack, but unlike the
-// whole-function JIT's single `depth` counter, it's a list of `` `int``/`` `float `` tags — the
-// int and float stacks grow independently, so codegen needs to know, at each point, how many of
-// *each* type are already live to find the next free physical register (`jitTrPos`) — the same
-// problem a real per-value type this JIT never had to solve until a trace could hold either kind
-// of value on the same notional stack.
+// whole-function JIT's single `depth` counter, it's a list of `` `int``/`` `float``/`` `bool``/
+// `` `null `` tags — the int and float stacks grow independently, so codegen needs to know, at
+// each point, how many of *each* file are already live to find the next free physical register
+// (`jitTrPos`) — the same problem a real per-value type this JIT never had to solve until a trace
+// could hold either kind of value on the same notional stack. A bool lives in the int file as a
+// 0/1 and is tagged apart only so an exit hands it back as the `Bool` the interpreter would have
+// had (`TraceTy`, src/trace.rs); a null placeholder takes an int-file position it never writes.
 
 jitTrNIREG: 17
+jitTrCondLE: 13
 // One register per local, handed out in first-seen order. Caps the trace at this many locals of
 // each kind — a loop body with more just doesn't get traced, the same way one nested deeper than
 // `jitMAXDEPTH` doesn't. (More would mean saving and restoring callee-saved registers on entry and
 // on every exit, which is real work in the bail-often case, to buy a case that doesn't come up.)
 jitTrLOCALS: 2 3 4 5 6 7 8 16
 jitTrFLOCALS: 0 1 2 3 4 5 6 7
-// Mirrors MAX_TOUCHED (src/jit.rs), which sizes the buffer. Never the binding limit — the two
-// register files above already cap it lower — but the buffer is Rust's, so Rust's number is the
-// one that has to be respected.
+// Mirrors MAX_TOUCHED (src/jit.rs), which sizes the locals part of the buffer. Never the binding
+// limit — the two register files above already cap it lower — but the buffer is Rust's, so Rust's
+// number is the one that has to be respected. The stack area past it is bounded by `jitMAXDEPTH`
+// per file, which src/jit.rs mirrors as MAX_STACK and checks against every exit's tags.
 jitTrMAXTOUCHED: 16
+
+jitTrTag: {[t] $[t=1;`float; t=2;`bool; t=3;`null; `int]}
+jitTrTagCode: {[s] $[s=`float;1; s=`bool;2; s=`null;3; 0]}
+jitTrTagCodes: {[tags] $[0=count tags; (); `int$ jitTrTagCode each tags]}
+// Tag lists compare by element; `~` would tell an empty symbol list from `()`, which is not a
+// difference this cares about.
+jitTrSameTags: {[a;b] $[not (count a)=count b; 0b; 0=count a; 1b; (0+/a=b)=count a]}
 
 // (slots; tys; stored) — every local the trace reads or writes, in first-seen order (the buffer
 // layout), each one's observed type, and the *positions* (not slot numbers) of the ones it writes,
-// which are the only ones worth storing at the top of an iteration or writing back at an exit. Null
-// if a slot was ever observed as two different types across the trace: a silent mismatch there
-// would give one local two buffer positions, each written back independently with whichever ran
-// last winning — a real correctness bug, not a safe "just don't compile" fallback like everything
-// else here, so it's checked.
+// which are the only ones worth writing back at an exit. Null if a slot was ever observed as two
+// different types across the trace: a silent mismatch there would give one local two buffer
+// positions, each written back independently with whichever ran last winning — a real correctness
+// bug, not a safe "just don't compile" fallback like everything else here, so it's checked.
 jitTraceTouched: {[kinds;args;tys;realUpto]
   slots: (); stys: (); stored: ()
   i: 0
@@ -561,10 +588,10 @@ jitTrLocalRegs: {[stys]
     p: p+1]
   regs}
 
-// The local registers -> the buffer, for the positions in `which`. Emitted twice: at the top of
-// every iteration over the written locals (so the int-null stub can leave the buffer alone and
-// have it already say what the iteration started with), and once on the guard exit path, where it
-// is what makes the locals visible to the interpreter again.
+// The local registers -> the buffer, for the positions in `which`. Emitted on the exit path,
+// where it is what makes the locals visible to the interpreter again — and, only when the trace
+// has a rewind in it, at the top of every iteration too, so the rewind stub can leave the buffer
+// alone and have it already say what the iteration started with.
 jitTrStoreLocals: {[asm;which;stys;lregs]
   i: 0
   while[i<count which
@@ -588,14 +615,69 @@ jitTrLoadLocals: {[asm;slots;stys;lregs;realUpto]
     p: p+1]
   asm}
 
-// how many `ty`-tagged entries are already on `tstack` — also the next free physical register
-// offset for a new push of that type, and (minus 1, minus 2) the top/second-from-top of that same
-// type once at least two are live. The empty case is a real branch, not a fold over an empty
-// vector: `()=`int` is a length error, not an empty mask.
+// how many entries of `ty`'s register file are already on `tstack` — also the next free physical
+// register offset for a new push of that file, and (minus 1, minus 2) the top/second-from-top of
+// that same file once at least two are live. Everything that isn't a float is in the int file (a
+// bool is a 0/1 there; a null placeholder holds a position it never writes). The empty case is a
+// real branch, not a fold over an empty vector: `()=`int` is a length error, not an empty mask.
 jitTrPos: {[tstack;ty]
   $[0=count tstack; 0
   ; ty=`float; 0+/tstack=`float
   ; 0+/not tstack=`float]}
+
+// The operand stack <-> the buffer's stack area, one word per live value, bottom first: value j
+// goes to word `stackBase+j`, from the physical register its file and its position among that
+// file's values below it put it in — the same numbering jitTrPos gives a push. A null placeholder
+// is skipped: nothing was ever written to its register, and its tag alone tells the interpreter
+// what to push (`TraceTy::Null`, src/trace.rs). Emitted per exit over that exit's own live stack,
+// and once on entry (and at loopStart, when there is a rewind) over the entry stack.
+jitTrStoreStack: {[asm;tags;stackBase]
+  j: 0
+  while[j<count tags
+    t: tags[j]
+    reg: jitTrPos[j#tags;t]
+    $[t=`null; asm
+    ; t=`float; asm: asm,jitFStrImm[jitFSTACK+reg; jitTrBUF; (stackBase+j)*8]
+    ; asm: asm,jitStrImm[jitSTACK+reg; jitTrBUF; (stackBase+j)*8]]
+    j: j+1]
+  asm}
+jitTrLoadStack: {[asm;tags;stackBase]
+  j: 0
+  while[j<count tags
+    t: tags[j]
+    reg: jitTrPos[j#tags;t]
+    $[t=`null; asm
+    ; t=`float; asm: asm,jitFLdrImm[jitFSTACK+reg; jitTrBUF; (stackBase+j)*8]
+    ; asm: asm,jitLdrImm[jitSTACK+reg; jitTrBUF; (stackBase+j)*8]]
+    j: j+1]
+  asm}
+
+// The branch a guard leaves the loop on — the condition under which the recorded direction is
+// *not* the one being taken this time. 0=CBZ 1=CBNZ (a `Jmpf` whose condition flipped) 2=B.EQ
+// (an int result equal to the null sentinel, after a CMP) 3=B.LE 4=B.GT (a `do` counter that is
+// not / is positive, after a CMP against 0). Each is one word with an imm19 offset, patched in
+// once the stubs have been placed (jitCompileTrace).
+jitTrBranch: {[kind;reg;delta]
+  $[kind=0; jitCbz[reg;delta]
+  ; kind=1; jitCbnz[reg;delta]
+  ; kind=2; jitBcond[jitCondEQ;delta]
+  ; kind=3; jitBcond[jitTrCondLE;delta]
+  ; jitBcond[jitCondGT;delta]]}
+
+// A new exit: the ip to resume interpreting at and the stack the interpreter finds when it does.
+// Its index is what the compiled code hands back, and what the branch fixup names.
+jitTrExit: {[st;resumeIp;tags] st[`exits]: (st[`exits]),enlist (resumeIp; tags); st}
+// ...and the guard word that leaves through it: a placeholder now, `jitTrBranch` once its stub's
+// position is known.
+jitTrGuardWord: {[st;exitIdx;branchKind;reg]
+  st[`fixups]: (st[`fixups]),enlist ((count st[`asm]); exitIdx; branchKind; reg)
+  st[`asm]: (st[`asm]),0
+  st}
+// The same, leaving through the one rewind stub instead (see the section comment).
+jitTrRewindWord: {[st;branchKind;reg]
+  st[`rewFixups]: (st[`rewFixups]),enlist ((count st[`asm]); branchKind; reg)
+  st[`asm]: (st[`asm]),0
+  st}
 
 jitTrPush: {[st;consts;a;ty]
   tstack: st[`tstack]
@@ -604,8 +686,9 @@ jitTrPush: {[st;consts;a;ty]
   c: consts[a]
   isFloat: ty=`float
   // The observed type has to be the constant's own — anything else means the recorder and this
-  // walk disagree about the same step, which is never worth guessing through.
-  if[not $[isFloat; (`float)=type c; (`int)=type c]; :null]
+  // walk disagree about the same step, which is never worth guessing through. A bool constant
+  // (`if[1b;..]`) is left to the interpreter: nothing real pushes one in a loop.
+  if[not $[isFloat; (`float)=type c; ty=`int; (`int)=type c; 0b]; :null]
   // 0N would be an int null, which the interpreter propagates through arithmetic and this backend
   // does not — same rejection jitOpPush makes for the same reason. (0n needs no such check: the
   // float null is a NaN, and NaN propagates identically in hardware.)
@@ -620,8 +703,11 @@ jitTrPush: {[st;consts;a;ty]
 
 // `if`/`while`/`do`'s own statement-value convention (see jitOpPush's comment) — a true no-op,
 // but still needs a placeholder tag so the `Pop` that always immediately follows has something to
-// drop, and so the registers of anything pushed in between keep their numbering.
-jitTrPushNull: {[st] st[`tstack]: (st[`tstack]),`int; st}
+// drop, and so the registers of anything pushed in between keep their numbering. Tagged `` `null``
+// rather than `` `int`` so that if one is ever live at an exit (nothing the compiler emits does
+// that, but it isn't this code's place to rely on it) the interpreter gets a `Null` back, not the
+// contents of a register nothing ever wrote.
+jitTrPushNull: {[st] st[`tstack]: (st[`tstack]),`null; st}
 
 // A register move, not a load: the local is already in one (see this section's header comment).
 jitTrLoadL: {[st;slots;lregs;a;ty]
@@ -640,7 +726,7 @@ jitTrLoadL: {[st;slots;lregs;a;ty]
 
 // Doesn't pop — same as the interpreter's own `Op::StoreL`, which only peeks the top (see
 // jitOpStoreL's comment). The local's register is the only live copy of it from here until the
-// next exit or the top of the next iteration; the buffer is stale in between, deliberately.
+// next exit; the buffer is stale in between, deliberately.
 jitTrStoreL: {[st;slots;lregs;a;ty]
   tstack: st[`tstack]
   n: count tstack
@@ -684,24 +770,31 @@ jitTrDyadIArith: {[asm;x;y;dst;kind]
   ; kind=3; (asm,jitCmpR[x;y]),jitCsel[dst;x;y;jitCondLT]
   ; (asm,jitCmpR[x;y]),jitCsel[dst;x;y;jitCondGT]]}
 
-// Both operands must already be the *same* tracked type — no implicit int/float promotion this
-// pass (deferred, same as the whole-function JIT's own float extension would need to decide the
-// same question) — a mismatch just rejects the whole trace, same fail-closed default as everywhere
-// else here. A comparison's result is always `` `int `` (a bool, 0/1) regardless of the operands'
-// type; arithmetic's result stays the operands' own type.
-jitTrDyad: {[st;consts;a;ty]
+// Both operands must be in the same register file — no implicit int/float promotion this pass
+// (deferred, same as the whole-function JIT's own float extension would need to decide the same
+// question) — a mismatch just rejects the whole trace, same fail-closed default as everywhere
+// else here. A bool operand is a 0/1 in the int file, and the interpreter computes with it as
+// exactly that (`1b+2` is 3, `1b<2` is `1b`, `2&1b` is 1); only the result's *type* has rules of
+// its own — a comparison's is always a bool, `&`/`|`'s is a bool exactly when both operands are
+// (`1b&0b` is `0b`, `2&1b` is `1`), and `+ - *`'s is an int — which is what the tag below
+// reproduces. The recorder saw the real result's type, and disagreeing with it here rejects the
+// trace rather than guessing. `rip` is the ip of the op after this one — see the null check at
+// the end.
+jitTrDyad: {[st;consts;a;ty;rip]
   tstack: st[`tstack]
   n: count tstack
   if[n<2; :null]
-  opTy: tstack[n-1]
-  if[not opTy=(tstack[n-2]); :null]
+  opTy: tstack[n-1]; opTy2: tstack[n-2]
+  if[not (opTy in `int`bool`float) & (opTy2 in `int`bool`float); :null]
+  isFloat: opTy=`float
+  if[not isFloat=(opTy2=`float); :null]
   p: consts[a]
   kind: jitDyadKind string p
   if[isnull kind; :null]
   isCmp: kind>4
-  resultTy: $[isCmp; `int; opTy]
+  bothBool: (opTy=`bool)&(opTy2=`bool)
+  resultTy: $[isCmp; `bool; isFloat; `float; bothBool & ((kind=3)|(kind=4)); `bool; `int]
   if[not resultTy=ty; :null]
-  isFloat: opTy=`float
   base: $[isFloat; jitFSTACK; jitSTACK]
   x: base+((jitTrPos[tstack;opTy])-1)
   y: base+((jitTrPos[tstack;opTy])-2)
@@ -711,61 +804,86 @@ jitTrDyad: {[st;consts;a;ty]
        ; isCmp; jitTrDyadICmp[st[`asm];x;y;dst;kind]
        ; isFloat; jitTrDyadFArith[st[`asm];x;y;dst;kind]
        ; jitTrDyadIArith[st[`asm];x;y;dst;kind]]
-  // Two ordinary ints wrapping to exactly the null sentinel by coincidence (`0W+1`): the
-  // interpreter would start propagating a null from here on and this backend would keep doing
-  // plain wrapping arithmetic, so the two diverge from this point. Deopt instead — and unlike the
-  // whole-function JIT's deopt, which just re-runs the call, this one is mid-loop, with earlier
-  // iterations' writes already committed. So it abandons the local registers (which hold a
-  // half-finished iteration) and resumes the interpreter at the loop header, where the buffer
-  // still says what this iteration started with (jitCompileTrace below). Only `+ - *` can do it:
-  // `&`/`|` pick one of their operands, both already non-null, and a comparison yields 0 or 1.
-  if[(not isFloat) & (kind<3)
-    ; asm: asm,jitCmpR[dst;jitTrNIREG]
-      st[`niFixups]: (st[`niFixups]),count asm
-      asm: asm,0]
   st[`asm]: asm
   st[`tstack]: newTstack,resultTy
+  // Two ordinary ints wrapping to exactly the null sentinel by coincidence (`0W+1`): the
+  // interpreter would start propagating a null from here on and this backend would keep doing
+  // plain wrapping arithmetic, so the two diverge from this point. Exit instead — to the op after
+  // this one, with the stack as it stands: the null result on top is exactly the `Int` the
+  // interpreter would have produced (`int_dyad`, src/vm.rs, wraps the same way), and it takes
+  // over the propagating from there. Inside an inlined callee that ip is in another frame's
+  // bytecode, so the collision rewinds the iteration instead, like a callee's branch does. Only
+  // `+ - *` can do it: `&`/`|` pick one of their operands, both already non-null, and a
+  // comparison yields 0 or 1.
+  if[(not isFloat) & (kind<3)
+    ; st[`asm]: (st[`asm]),jitCmpR[dst;jitTrNIREG]
+      inFrame: 0<count st[`frames]
+      if[inFrame; st: jitTrRewindWord[st;2;0]]
+      if[not inFrame
+        ; st: jitTrExit[st;rip;st[`tstack]]
+          st: jitTrGuardWord[st; (count st[`exits])-1; 2; 0]]]
   st}
 
 // The recorded direction of a branch this trace took: `taken` (this `Jmpf` jumped, i.e. the
 // condition was false) needs the condition to *still* be false on replay (bail via `CBNZ` if not);
 // `not taken` needs it to still be true (bail via `CBZ` if not). Each guard gets its own stub
-// (fixed 2 words: load the bail `ip` constant, branch to the one shared epilogue) rather than
-// inlining the load — keeps every `CBZ`/`CBNZ`'s branch distance small and uniform instead of
-// depending on how big each bail `ip` constant happens to be.
+// (load the exit index, store the live stack, branch to the one shared writeback) rather than
+// inlining any of that — keeps every `CBZ`/`CBNZ`'s branch distance small instead of depending on
+// how much each exit has to store.
 //
-// The virtual stack must be empty once the condition is popped. A bail hands control back to the
-// interpreter at a bytecode ip with whatever operand stack it already had — which is the empty one
-// it had when it entered the trace — so a guard is only a legal exit at a point where the trace
-// isn't holding any operand of its own. (Every `Jmpf` a `while` header or a statement-level `if`
-// emits is such a point; one inside an expression isn't, and rejects the trace.)
+// Whatever is under the condition is handed to the interpreter along with the bail ip, so a
+// guard is a legal exit anywhere: a `while` header's or a statement-level `if`'s `Jmpf` with an
+// enclosing `do` loop's counter under it, or one inside an expression with that expression's
+// operands under it. The condition itself has to be an int or a bool — `Jmpf` accepts anything
+// truthy, but a float or a null there is not a shape this pass compiles.
 jitTrGuard: {[st;taken;bailIp]
   tstack: st[`tstack]
-  if[not 1=count tstack; :null]
-  if[not (tstack[0])=`int; :null]
-  if[not bailIp<65536; :null]   // a bail ip past one MOVZ's reach: don't compile (see the stub)
+  n: count tstack
+  if[n<1; :null]
+  if[not (tstack[n-1]) in `int`bool; :null]
   reg: jitSTACK+((jitTrPos[tstack;`int])-1)
-  bails: (st[`bails]),bailIp
-  st[`bails]: bails
-  st[`fixups]: (st[`fixups]),enlist ((count st[`asm]); (count bails)-1; reg; taken)
-  st[`asm]: (st[`asm]),$[taken; jitCbnz[reg;0]; jitCbz[reg;0]]
-  st[`tstack]: ()
+  rest: (n-1)#tstack
+  st: jitTrExit[st;bailIp;rest]
+  st: jitTrGuardWord[st; (count st[`exits])-1; $[taken;1;0]; reg]
+  st[`tstack]: rest
   st}
 
 // A guard inside an inlined callee. Same test, different exit: the `ip` it would resume at is in
-// the callee's bytecode, and the interpreter is not in that frame — so it goes where the int-null
-// deopt goes, back to the loop header with the iteration thrown away (the stub jitTrDyad's check
-// also branches to; see jitCompileTrace). No empty-stack requirement either, for the same reason:
-// nothing on the trace's stack survives a rewind, so nothing has to be accounted for.
+// the callee's bytecode, and the interpreter is not in that frame — so it goes to the rewind
+// stub, back to the loop header with the iteration thrown away (the stub jitTrDyad's in-callee
+// null check also branches to; see jitCompileTrace). Nothing on the trace's stack survives a
+// rewind, so nothing has to be accounted for.
 jitTrGuardRewind: {[st;taken]
+  tstack: st[`tstack]
+  n: count tstack
+  if[n<1; :null]
+  if[not (tstack[n-1]) in `int`bool; :null]
+  reg: jitSTACK+((jitTrPos[tstack;`int])-1)
+  st: jitTrRewindWord[st; $[taken;1;0]; reg]
+  st[`tstack]: (n-1)#tstack
+  st}
+
+// `do[n;..]`'s `Op::Loop` (only ever in the loop's own frame — the recorder rejects one in a
+// callee), as the edge this pass took. The counter is the top of the stack and must be a plain
+// int (the interpreter also takes a bool or a whole float there, via `int_of`; the recorder
+// checks). Continued: the counter was positive — bail to the loop's exit `t` with the counter
+// popped if it is `<= 0` now (that *is* the interpreter's other edge, stack and all), else
+// decrement it in place. Exited (a `do` nested inside the traced loop, unrolled — the traced
+// loop's own header exiting ends the recording): the counter was `<= 0` — bail to the `Loop` op
+// itself, counter still on the stack, if it is positive now, and let the interpreter take it
+// from there; else pop it.
+jitTrLoop: {[st;exited;bailIp]
   tstack: st[`tstack]
   n: count tstack
   if[n<1; :null]
   if[not (tstack[n-1])=`int; :null]
   reg: jitSTACK+((jitTrPos[tstack;`int])-1)
-  st[`rewFixups]: (st[`rewFixups]),enlist ((count st[`asm]); reg; taken)
-  st[`asm]: (st[`asm]),$[taken; jitCbnz[reg;0]; jitCbz[reg;0]]
-  st[`tstack]: (n-1)#tstack
+  rest: (n-1)#tstack
+  st[`asm]: (st[`asm]),jitCmpImm[reg;0]
+  st: jitTrExit[st;bailIp;$[exited;tstack;rest]]
+  st: jitTrGuardWord[st; (count st[`exits])-1; $[exited;4;3]; reg]
+  if[exited; st[`tstack]: rest]
+  if[not exited; st[`asm]: (st[`asm]),jitSubImm[reg;reg;1]]
   st}
 
 // An inlined callee's frame opens with its `nargs` arguments as the top of the stack (the callee
@@ -795,7 +913,7 @@ jitTrFrameEnd: {[st]
   src: file+((jitTrPos[tstack;ty])-1)
   dst: file+jitTrPos[kept;ty]
   asm: st[`asm]
-  if[not src=dst
+  if[(not src=dst) & (not ty=`null)
     ; $[ty=`float; asm: asm,jitFMovD[dst;src]; asm: asm,jitMovR[dst;src]]]
   st[`asm]: asm
   st[`tstack]: kept,ty
@@ -803,9 +921,10 @@ jitTrFrameEnd: {[st]
   st}
 
 jitCompileTrace: {[input]
-  kinds: input[0]; args: input[1]; tys: input[2]; consts: input[3]; header: input[4]; realUpto: input[5]
+  kinds: input[0]; args: input[1]; tys: input[2]; ips: input[3]; consts: input[4]
+  header: input[5]; realUpto: input[6]
+  entry: $[0=count input[7]; (); jitTrTag each input[7]]
   n: count kinds
-  if[not header<65536; :null]   // the rewind stub's own resume ip, loaded by one MOVZ
   touched: jitTraceTouched[kinds;args;tys;realUpto]
   if[isnull touched; :null]
   slots: touched[0]; stys: touched[1]; stored: touched[2]
@@ -813,24 +932,22 @@ jitCompileTrace: {[input]
   if[not nslots<jitTrMAXTOUCHED; :null]
   lregs: jitTrLocalRegs stys
   if[isnull lregs; :null]   // out of local registers
+  // The stack area starts right after the locals; src/jit.rs reads this back rather than assuming it.
+  stackBase: nslots
 
-  // x17 = the int-null sentinel, compared against after every int add/sub/mul exactly as the
-  // whole-function JIT's x20 is (jitOpDyad). Loaded once, above the loop, with the locals.
-  asm: jitLoadConst[();jitTrNIREG;0N]
-  asm: jitTrLoadLocals[asm;slots;stys;lregs;realUpto]
-  loopStart: count asm
-  asm: jitTrStoreLocals[asm;stored;stys;lregs]
-
-  st: `asm`tstack`fixups`bails`niFixups`rewFixups`frames!(asm; (); (); (); (); (); ())
+  // The body is assembled on its own first: whether the top of the iteration has to store
+  // anything (only if the body turns out to contain a rewind) is known only once it has been
+  // walked, and everything it branches to is placed after it anyway.
+  st: `asm`tstack`fixups`exits`rewFixups`frames!((); entry; (); (); (); ())
   i: 0
   while[i<n
     kind: kinds[i]; a: args[i]
-    ty: $[(tys[i])=1; `float; `int]
+    ty: jitTrTag tys[i]
     $[kind=0; st: jitTrPush[st;consts;a;ty]
     ; kind=1; st: jitTrPushNull st
     ; kind=2; st: jitTrLoadL[st;slots;lregs;a;ty]
     ; kind=3; st: jitTrStoreL[st;slots;lregs;a;ty]
-    ; kind=4; st: jitTrDyad[st;consts;a;ty]
+    ; kind=4; st: jitTrDyad[st;consts;a;ty;ips[i]]
     ; kind=5; st: jitTrPop st
     ; kind=6; st: jitTrGuard[st;1b;a]
     ; kind=7; st: jitTrGuard[st;0b;a]
@@ -838,67 +955,90 @@ jitCompileTrace: {[input]
     ; kind=9; st: jitTrGuardRewind[st;0b]
     ; kind=10; st: jitTrFramePush[st;a]
     ; kind=11; st: jitTrFrameEnd st
+    ; kind=12; st: jitTrLoop[st;0b;a]
+    ; kind=13; st: jitTrLoop[st;1b;a]
     ; st: null]
     if[isnull st; :null]
     i: i+1]
 
-  // The recording started, and now ends, at the back edge — where the interpreter's own operand
-  // stack was empty (src/vm.rs checks exactly that before it will start one), so the trace can't
-  // be holding a value of its own here either.
-  if[not 0=count st[`tstack]; :null]
+  // The recording started, and now ends, at the back edge — so the trace's stack has to be the
+  // one it entered on (the entry stack, value for value: a `do` counter decremented in place is
+  // still the same position and type), for the loop-carried registers to line up.
+  if[not jitTrSameTags[st[`tstack];entry]; :null]
   if[not 0=count st[`frames]; :null]   // every inlined frame closed (the recorder guarantees it; checked anyway)
-  bails: st[`bails]
-  numGuards: count bails
-  // No guard means no way out: the emitted back edge would spin forever. Can't happen for a real
-  // `while` (its condition's `Jmpf` is always in the trace), but it isn't the generated code's
-  // place to rely on that.
-  if[numGuards<1; :null]
+  exits: st[`exits]
+  hasRewind: 0<count st[`rewFixups]
+  // The rewind exit is the last entry in the table: the header, entered with the entry stack.
+  if[hasRewind; exits: exits,enlist (header; entry)]
+  numExits: count exits
+  // No exit means no way out: the emitted back edge would spin forever. Can't happen for a real
+  // loop (a `while`'s condition guard or a `do`'s counter test is always in the trace), but it
+  // isn't the generated code's place to rely on that.
+  if[numExits<1; :null]
 
-  asm: st[`asm]
+  // x17 = the int-null sentinel, compared against after every int add/sub/mul exactly as the
+  // whole-function JIT's x20 is (jitOpDyad). Loaded once, above the loop, with the locals and
+  // the entry stack.
+  asm: jitLoadConst[();jitTrNIREG;0N]
+  asm: jitTrLoadLocals[asm;slots;stys;lregs;realUpto]
+  asm: jitTrLoadStack[asm;entry;stackBase]
+  loopStart: count asm
+  // Only a rewind needs the iteration's starting point kept anywhere; without one the loop body
+  // has no memory operation in it at all (see the section comment).
+  if[hasRewind
+    ; asm: jitTrStoreLocals[asm;stored;stys;lregs]
+      asm: jitTrStoreStack[asm;entry;stackBase]]
+  bodyAt: count asm
+  asm: asm,st[`asm]
   asm: asm,jitB[loopStart-(count asm)]
 
-  stubAt: count asm
-  niStubAt: stubAt+(2*numGuards)
-  writebackAt: niStubAt+2
+  // Place the stubs before emitting them: each is its index load, one store per live stack value
+  // (none for the rewind stub, which skips the writeback too) and a branch, so their positions
+  // — and the writeback's and the tail's — follow from the exits table alone.
+  starts: ()
+  pos: count asm
+  ei: 0
+  while[ei<numExits
+    starts: starts,pos
+    isRew: hasRewind & (ei=(numExits-1))
+    pos: pos+$[isRew; 2; 2+count (exits[ei])[1]]
+    ei: ei+1]
+  writebackAt: pos
   tailAt: writebackAt+(count stored)   // one store per written local, so: one word each
 
-  gi: 0
-  while[gi<numGuards
-    asm: asm,jitMovz[jitSCRATCH; bails[gi]; 0]
-    asm: asm,jitB[writebackAt-(count asm)]
-    gi: gi+1]
-
-  // The rewind stub — the int-null deopt's and every callee-side guard's exit. Straight to the
-  // tail, over the writeback: the buffer already holds this iteration's starting values (stored
-  // at loopStart) and the registers hold a half-finished iteration, which is exactly the state
-  // this exit exists to discard.
-  asm: asm,jitMovz[jitSCRATCH; header; 0]
-  asm: asm,jitB[tailAt-(count asm)]
+  ei: 0
+  while[ei<numExits
+    e: exits[ei]
+    isRew: hasRewind & (ei=(numExits-1))
+    asm: asm,jitMovz[jitSCRATCH; ei; 0]
+    if[not isRew
+      ; asm: jitTrStoreStack[asm;e[1];stackBase]
+        asm: asm,jitB[writebackAt-(count asm)]]
+    // The rewind stub: straight to the tail, over the writeback — the buffer already holds this
+    // iteration's starting values (stored at loopStart) and the registers hold a half-finished
+    // iteration, which is exactly the state this exit exists to discard.
+    if[isRew; asm: asm,jitB[tailAt-(count asm)]]
+    ei: ei+1]
+  if[not writebackAt=count asm; :null]   // the placement above and what was emitted disagree: never trust the branches then
 
   asm: jitTrStoreLocals[asm;stored;stys;lregs]
-  asm: asm,jitStrImm[jitSCRATCH; jitTrOUT; 0]   // *outBailIp = whichever stub got here
+  asm: asm,jitStrImm[jitSCRATCH; jitTrOUT; 0]   // *out = the index of whichever exit got here
   asm: asm,jitRet[]
 
   fixups: st[`fixups]
   fi: 0
   while[fi<count fixups
     e: fixups[fi]
-    word: e[0]; stubIdx: e[1]; reg: e[2]; taken: e[3]
-    delta: (stubAt+(2*stubIdx))-word
-    asm[word]: $[taken; jitCbnz[reg;delta]; jitCbz[reg;delta]]
-    fi: fi+1]
-  nfix: st[`niFixups]
-  fi: 0
-  while[fi<count nfix
-    word: nfix[fi]
-    asm[word]: jitBcond[jitCondEQ; niStubAt-word]
+    word: bodyAt+e[0]; exitIdx: e[1]; bk: e[2]; reg: e[3]
+    asm[word]: jitTrBranch[bk;reg;(starts[exitIdx])-word]
     fi: fi+1]
   rfix: st[`rewFixups]
+  rewAt: starts[numExits-1]
   fi: 0
   while[fi<count rfix
     e: rfix[fi]
-    word: e[0]; reg: e[1]; taken: e[2]
-    asm[word]: $[taken; jitCbnz[reg;niStubAt-word]; jitCbz[reg;niStubAt-word]]
+    word: bodyAt+e[0]; bk: e[1]; reg: e[2]
+    asm[word]: jitTrBranch[bk;reg;rewAt-word]
     fi: fi+1]
 
-  (,/jitLE each asm; `int$slots; `int$stys)}
+  (,/jitLE each asm; `int$slots; `int$stys; stackBase; {(x[0]; jitTrTagCodes x[1])} each exits)}
