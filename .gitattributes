@@ -1,0 +1,12 @@
+# GitHub has no neant. Its linguist reads .nt as N-Triples, a `data` language, so the self-hosted
+# front end and standard library are today neither counted nor highlighted; q is the family this
+# language is in (src/neant/*.nt, README "The language") and its grammar is close enough to read by.
+*.nt linguist-language=q
+
+# the boot image is compiled bytecode, not source — linguist skips it as binary either way, but
+# saying so keeps `git diff` from trying to render 760KB of it
+src/neant/image.nb binary linguist-generated=true
+
+# tree-sitter output: grammar.js and queries/ are the sources it is generated from. Left alone it
+# is 175KB of C, the largest single language in the repository.
+editors/tree-sitter-neant/src/** linguist-generated=true
