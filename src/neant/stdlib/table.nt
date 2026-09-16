@@ -3,6 +3,7 @@
 //   t`age                      column          tsel[t; t[`age]>30]       rows where
 //   row[t;0]                   row as a dict   tsort[t;`age]             rows ordered by a column
 //   tby[t;`dept;`pay;sum]      aggregate       tshow t                   aligned grid
+//   meta t  tcols t  xcol  xcols  tcsv  wcsv  rcsv  fby  tupd  tdel  tdistinct  tinsert   see the sections below
 tbl: {[names;cols] names!cols}
 tcount: {#first value x}
 row: {[t;i] (key t)!{x[y]}[;i] each value t}
@@ -55,10 +56,82 @@ uj: {[t;u]
 ungroup: {[t]
   cols: value t; isl: {`list=@x} each cols; n: count each first cols[&isl]
   (key t)! {[n;c;l] $[l; raze c; c[&n]]}[n]'[cols;isl]}
-// csv: types is one char per column: I int, F float, S symbol, anything else keeps the string
-rcsv: {[types;sep;path]
-  ls: read0 path; hdr: `$sep vs first ls; cols: flip sep vs/: 1_ls
-  hdr! {[t;c] $[t="I"; `int$c; t="F"; `float$c; t="S"; `$c; c]}'[types;cols]}
+// ---- schema.  meta t -> a `c`t table: column name and its type as @ gives it (`ints `syms `chars ... `list for a general list)
+//   tcols t                  column names          xcol[`pay`dept!`p`d; t]  rename (a dict old!new, or a symbol list for the first n)
+//   xcols[`pay; t]           those columns first, the rest keep their order
+meta: {[t] tbl[`c`t; (key t; type each value t)]}
+tcols: {key x}
+tcolsub: {[t;ks] ks!t ks}
+xcol: {[names;t] ks: key t
+  ks: $[`dict=@names; {[names;k] $[k in key names; names k; k]}[names] each ks; (enl names), (count enl names) _ ks]
+  ks!value t}
+xcols: {[names;t] tcolsub[t; (enl names), (key t) except enl names]}
+
+// ---- csv.  tcsv t -> text: a header line then one line per row, "\n"-separated; a cell is quoted with "" (inner quotes
+// doubled) only when it holds , " or a newline.  wcsv[path;t] writes it.  rcsv["SSI";",";src] reads it back: src is a path,
+// or the CSV text itself when it holds a newline or names no readable file.  types is one char per column: I int, F float,
+// S symbol, anything else keeps the string; an I/F cell that does not parse (e.g. "0N", "") becomes null.
+csvcell: {[v] s: $[`char=@v; ,v; `chars=@v; v; string v]; $[any s in ",\"\n"; "\"",(ssr[s;"\"";"\"\""]),"\""; s]}
+tcsv: {[t] cells: {csvcell each x} each value t
+  ls: {[cells;i] "," sv {x[y]}[;i] each cells}[cells] each til tcount t
+  hdr: "," sv string each key t
+  $[count ls; hdr,"\n","\n" sv ls; hdr]}
+wcsv: {[path;t] write0[path; tcsv t]}
+// CSV text -> rows of cells, one pass, no recursion; \r is dropped outside quotes; a one-char cell is a char atom, as in a literal
+csvatom: {$[1=count x; first x; x]}
+csvrows: {[sep;s]
+  rws: (); cur: (); cell: ""; q: 0b; i: 0; n: count s
+  while[i<n; c: s[i]; i+:1; inq: q
+    if[inq & not c="\""; cell,: c]
+    if[inq & c="\""; q: 0b; if[$[i<n; s[i]="\""; 0b]; cell,: c; q: 1b; i+:1]]
+    if[not inq
+      if[c="\""; q: 1b]
+      if[c=sep; cur,: enlist csvatom cell; cell: ""]
+      if[c="\n"; if[(count cell) | count cur; cur,: enlist csvatom cell; rws,: enlist cur]; cell: ""; cur: ()]
+      if[not c in "\"\n\r",sep; cell,: c]]]
+  if[(count cell) | count cur; cur,: enlist csvatom cell; rws,: enlist cur]
+  rws}
+rcell: {[t;c] $[t="I"; `int$c; t="F"; `float$c; t="S"; `$c; c]}
+rnull: {[t;e] $[t="I"; 0N; t="F"; 0n; `]}
+// a column of one-char cells is a chars vector, so cast per cell; a vector cast that fails falls back to per cell with nulls
+rcol: {[t;c] $[0=count c; c; `chars=@c; rcell[t] each c; @[rcell[t]; c; {[t;c;e] {[t;x] @[rcell[t]; x; rnull[t]]}[t] each c}[t;c]]]}
+rcsv: {[types;sep;src]
+  ls: $[any src in "\n"; `text; @[read0; src; {[e] `text}]]
+  rws: csvrows[first sep; $[`text~ls; src; "\n" sv ls]]
+  if[0=count rws; :()!()]
+  hn: first rws; hdr: $[`chars=@hn; sym each hn; `$hn]; body: 1 _ rws
+  cols: {[body;j] {x[y]}[;j] each body}[body] each til count hdr
+  hdr! rcol'[types;cols]}
+
+// ---- fby[f;col;bycol;t]: f over col within each bycol group, as a vector aligned with the rows
+//   tsel[t; t[`pay] > fby[avg;`pay;`dept;t]]       paid above their department's average
+fby: {[f;col;bycol;t] if[0=tcount t; :()]
+  g: value group krows[t;bycol]; v: t col
+  a: {[f;v;i] f v[i]}[f;v] each g
+  p: raze g; k: raze {[i;j] (count j)#i}'[til count g; g]
+  (a k)[iasc p]}
+
+// ---- update, delete, distinct, insert
+//   tupd[t;mask;cols]   rows where mask is 1b (every row for ()) take the values in cols: name -> vector, atom, or a unary fn
+//                       of the masked rows; a new name adds a column, other rows nullof the value
+//                       tupd[t; t[`dept]=`ops; (,`pay)!enlist {x[`pay]+5}]      tupd[t; (); (,`n)!enlist 0]
+//   tdel[t;mask]        the rows where mask is 0b;  tdel[t;`col] or a symbol list drops columns
+//   tdistinct t         distinct rows, first occurrence kept
+//   tinsert[t;row]      append one row: a dict, or a list in column order
+tatoms: `bool`int`float`char`sym`date`time`null
+tupd: {[t;mask;cols] n: tcount t; idx: $[0=count mask; til n; where mask]; sub: rows[t;idx]; ks: key cols
+  full: (count idx)=n; i: 0
+  while[i<count ks; k: ks[i]; v: cols k; i+:1
+    if[`fn=@v; v: v sub]
+    if[(@v) in tatoms; v: (count idx)#v]
+    c: $[k in key t; t k; n#nullof v]
+    if[full; c: v]
+    if[not full; c[idx]: v]
+    t[k]: c]
+  t}
+tdel: {[t;m] $[(@m) in `sym`syms; tcolsub[t; (key t) except enl m]; rows[t; where not m]]}
+tdistinct: {[t] $[0=tcount t; t; rows[t; asc first each value group flip value t]]}
+tinsert: {[t;r] vals: $[`dict=@r; r key t; r]; (key t)!{[c;v] $[(`list=@c) | `chars=@v; c,enlist v; c,v]}'[value t; vals]}
 
 // ---- keyed tables: a dict from key values (rows of the key columns) to the remaining columns as a table;
 // kt[key] yields the matching row.  xkey[`id;t]  kt[3]  unkey kt

@@ -1,0 +1,158 @@
+// regular expressions, in neant. Pattern first, subject second; a match is (start;length).
+//   rxTest["\\d+";"ab12"]                 1b                 rx["\\d+";"ab12"]            2 2   (start;length), () if none
+//   rxAll["a";"banana"]                  (1 1;3 1;5 1)      rxAll["x*";"axb"]           (0 0;1 1;2 0;3 0)   an empty match steps one char
+//   rxCaps["(\\w+)@(\\w+)";"to bob@ex"]   ("bob@ex";"bob";"ex")   element 0 the whole match, then groups 1..n ("" if a group did not take part)
+//   rxSub["(\\w+)@(\\w+)";"$2:$1";"bob@ex"]  "ex:bob"        $0..$9 in the replacement are groups, $$ is a $
+//   rxSplit[", *";"a, b,c"]              ("a";"b";"c")
+// Syntax: literals . \. \\ \n \t \r \d \D \w \W \s \S (any other \c is c); [abc] [a-z0-9_] [^...] with \d \w \s (and \D \W \S) inside;
+// ^ $; (...) capturing, (?:...) not; |; * + ? {n} {n,} {n,m}, lazy *? +? ?? {n,m}?. Case-sensitive; . does not match \n; no backreferences or lookaround.
+// Malformed patterns signal "regex: unbalanced (" / "unbalanced )" / "unbalanced [" / "nothing to repeat" / "bad {}" / "bad range".
+//
+// The pattern is parsed once into (`kind; ...) nodes: (`chr;c) (`any;0) (`cls;neg;chars;notchars) (`bol;0) (`eol;0) (`seq;items) (`alt;branches)
+// (`grp;n;e) (`run;atom;lo;hi;greedy) (`rep;e;lo;hi;greedy) — `run is a quantifier over one character, `rep over anything else — and
+// compiled to a program of (`chr..) (`split;a;b) (`jmp;d) (`save;i) (`ifprog;i;d) (`run;..) (`match;0) with relative jumps, run by a
+// backtracking machine with an explicit stack (rxRun): recursion would hit the depth limit long before 10k chars. A `run counts the
+// maximal run of matching characters with one vector op, then tries the lengths from the longest (greedy) or shortest (lazy) down,
+// one stack entry for the whole range. A star over something that matched nothing stops looping (`ifprog), so (a*)* terminates.
+// Parser state is globals like src/neant/stdlib/json.nt: rp (pattern) ri (position) rng (groups so far) rcb (first loop slot) rns (loop slots).
+rxDIG: "0123456789"
+rxWRD: "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_"
+rxSPC: " \t\r\n",`char$12 11
+rfail: {[m] signal "regex: ",m}
+rpeek: {[] $[ri<#rp; rp[ri]; "\0"]}
+rnext: {[] c: rp[ri]; ri::ri+1; c}
+rcnext: {[] if[not ri<#rp; rfail "unbalanced ["]; rnext[]}
+// an escaped letter, in or out of a class: (`c;char) (`set;chars) (`nset;chars)
+rsh: {[e] $[e="d"; (`set; rxDIG); e="w"; (`set; rxWRD); e="s"; (`set; rxSPC); e="D"; (`nset; rxDIG); e="W"; (`nset; rxWRD); e="S"; (`nset; rxSPC)
+  e="n"; (`c; "\n"); e="t"; (`c; "\t"); e="r"; (`c; "\r"); (`c; e)]}
+resc: {[] if[not ri<#rp; rfail "trailing \\"]; it: rsh rnext[]; $[it[0]=`c; (`chr; it[1]); (`cls; it[0]=`nset; it[1]; ())]}
+rclass: {[] neg: 0; inc: ""; excs: (); fst: 1
+  if[rpeek[]="^"; neg: 1; ri::ri+1]
+  while[1
+    c: rcnext[]
+    if[(c="]") & not fst; :(`cls; neg; inc; excs)]
+    fst: 0
+    it: $[c="\\"; rsh rcnext[]; (`c; c)]
+    isr: (it[0]=`c) & (rpeek[]="-") & $[(ri+1)<#rp; not rp[ri+1]="]"; 0]
+    if[isr; ri::ri+1; c2: rcnext[]; hi: $[c2="\\"; rsh rcnext[]; (`c; c2)]
+      if[not hi[0]=`c; rfail "bad range"]
+      lo: `code$it[1]; h: `code$hi[1]; if[h<lo; rfail "bad range"]
+      inc,: `char$lo+til 1+h-lo]
+    if[not isr; $[it[0]=`nset; excs,: ,it[1]; inc,: it[1]]]]}
+rgroup: {[]
+  nc: (rpeek[]="?") & $[(ri+1)<#rp; rp[ri+1]=":"; 0]
+  if[nc; ri::ri+2]
+  idx: 0; if[not nc; rng::rng+1; idx: rng]
+  e: ralt[]
+  if[not rpeek[]=")"; rfail "unbalanced ("]
+  ri::ri+1
+  $[nc; e; (`grp; idx; e)]}
+rlbrace: {[] if[$[ri<#rp; rp[ri] in rxDIG; 0]; rfail "nothing to repeat"]; (`chr; "{")}
+ratom: {[] c: rnext[]
+  $[c="("; rgroup[]; c="["; rclass[]; c="."; (`any; 0); c="^"; (`bol; 0); c="$"; (`eol; 0); c="\\"; resc[]
+    c in "*+?"; rfail "nothing to repeat"; c="{"; rlbrace[]; (`chr; c)]}
+rnum: {[] st: ri; while[rpeek[] in rxDIG; ri::ri+1]; `int$rp[st+til ri-st]}
+// {n} {n,} {n,m} -> (lo;hi), or () when the { is a literal (no digit after it)
+rbrace: {[]
+  if[not $[(ri+1)<#rp; rp[ri+1] in rxDIG; 0]; :()]
+  ri::ri+1; lo: rnum[]; hi: lo
+  c: rpeek[]; ri::ri+1
+  if[c=","; hi: $[rpeek[] in rxDIG; rnum[]; 0W]; c: rpeek[]; ri::ri+1]
+  if[not c="}"; rfail "bad {}"]
+  if[hi<lo; rfail "bad {}"]
+  (lo; hi)}
+rquant: {[] a: ratom[]
+  while[1
+    c: rpeek[]
+    q: $[c="*"; 0 0W; c="+"; 1 0W; c="?"; 0 1; c="{"; rbrace[]; ()]
+    if[0=#q; :a]
+    if[a[0] in `run`rep; rfail "nothing to repeat"]
+    if[not c="{"; ri::ri+1]
+    g: 1; if[rpeek[]="?"; g: 0; ri::ri+1]
+    a: $[a[0] in `chr`any`cls; (`run; a; q[0]; q[1]; g); (`rep; a; q[0]; q[1]; g)]]}
+rseq: {[] items: (); while[(ri<#rp) & not rpeek[] in "|)"; items,: ,rquant[]]; (`seq; items)}
+ralt: {[] bs: ,rseq[]; while[rpeek[]="|"; ri::ri+1; bs,: ,rseq[]]; $[1=#bs; bs[0]; (`alt; bs)]}
+rxStr: {$[`char=@x; ,x; x]}
+rxParse: {[p] rp::rxStr p; ri::0; rng::0; e: ralt[]; if[ri<#rp; rfail "unbalanced )"]; e}
+
+// ---- compile: node -> list of instructions, jumps relative to the jumping instruction
+rc: {[e] k: e[0]
+  $[k in `chr`any`cls`bol`eol`run; ,e
+    k=`seq; $[0=#e[1]; (); (,/) rc each e[1]]
+    k=`alt; rcalt e[1]
+    k=`grp; (,(`save; 2*e[1])), (rc e[2]), ,(`save; 1+2*e[1])
+    rcrep e]}
+rcalt: {[bs] code: rc last bs; i: (#bs)-2
+  while[not i<0; c: rc bs[i]; code: (,(`split; 1; 2+#c)), c, (,(`jmp; 1+#code)), code; i-: 1]
+  code}
+// lo copies, then either nested optionals (finite hi) or a guarded loop (hi=0W)
+rcrep: {[e] c: rc e[1]; lo: e[2]; hi: e[3]; g: e[4]
+  code: (); do[lo; code,: c]
+  if[hi<0W; opt: (); do[hi-lo; opt: (,$[g; (`split; 1; 1+(#c)+#opt); (`split; 1+(#c)+#opt; 1)]), c, opt]; code,: opt]
+  if[hi=0W; k: rcb+rns; rns::rns+1
+    body: (,(`save; k)), c, ,(`ifprog; k; -(2+#c))
+    code,: (,$[g; (`split; 1; 1+#body); (`split; 1+#body; 1)]), body]
+  code}
+// compiled pattern: (program; state size; groups; anchored at ^)
+rxc: {[p] e: rxParse p; rcb::2*1+rng; rns::0; prog: (rc e), ,(`match; 0); (prog; rcb+rns; rng; `bol=(prog[0])[0])}
+
+// ---- match. x is one char or a string; the class test is vectorized so a `run costs one pass
+rxCls: {[ins; x] v: x in ins[2]; ex: ins[3]; i: 0; while[i<#ex; v: v | not x in ex[i]; i+: 1]; $[ins[1]; not v; v]}
+rxAtom: {[a; x] $[a[0]=`chr; x=a[1]; a[0]=`any; not x="\n"; rxCls[a; x]]}
+// run the program on s from st: (start; end; state) or (). State is the capture positions (2 per group, -1 unset) then the loop slots.
+// The stack holds (`b; pc; pos; state) alternatives and (`r; pc; base; state; len; step; left) ranges of run lengths still to try.
+rxRun: {[c; s; st]
+  prog: c[0]; n: #s; caps: c[1]#-1; stk: (); sp: 0; pc: 0; pos: st
+  while[1
+    ins: prog[pc]; k: ins[0]; ok: 1b
+    if[k in `chr`any`cls
+      ok: $[not pos<n; 0b; k=`chr; s[pos]=ins[1]; k=`any; not s[pos]="\n"; rxCls[ins; s[pos]]]
+      pos+: ok; pc+: 1]
+    if[k=`run
+      hi: ins[3] & n-pos; cnt: $[hi=0; 0; rxAtom[ins[1]; s[pos+til hi]]?0b]; lo: ins[2]; ok: not cnt<lo
+      if[ok
+        if[cnt>lo; e: $[ins[4]; (`r; pc+1; pos; caps; cnt-1; -1; (cnt-1)-lo); (`r; pc+1; pos; caps; lo+1; 1; (cnt-1)-lo)]
+          if[sp<#stk; stk[sp]: e]; if[not sp<#stk; stk,: ,e]; sp+: 1]
+        pos+: $[ins[4]; cnt; lo]; pc+: 1]]
+    if[k=`split; e: (`b; pc+ins[2]; pos; caps); if[sp<#stk; stk[sp]: e]; if[not sp<#stk; stk,: ,e]; sp+: 1; pc+: ins[1]]
+    if[k=`jmp; pc+: ins[1]]
+    if[k=`save; caps[ins[1]]: pos; pc+: 1]
+    if[k=`ifprog; pc+: $[pos=caps[ins[1]]; 1; ins[2]]]
+    if[k=`bol; ok: pos=0; pc+: 1]
+    if[k=`eol; ok: pos=n; pc+: 1]
+    if[k=`match; :(st; pos; caps)]
+    if[not ok
+      if[sp=0; :()]
+      sp-: 1; e: stk[sp]; pc: e[1]; pos: e[2]; caps: e[3]
+      if[e[0]=`r; pos+: e[4]; if[e[6]>0; stk[sp]: (`r; e[1]; e[2]; e[3]; e[4]+e[5]; e[5]; e[6]-1); sp+: 1]]]]}
+// first match starting at or after st
+rxExec: {[c; s; st] n: #s
+  while[not st>n; r: rxRun[c; s; st]; if[#r; :r]; if[c[3]; :()]; st+: 1]
+  ()}
+rxCapsOf: {[r] caps: r[2]; caps[0]: r[0]; caps[1]: r[1]; caps}
+rxGrp: {[s; caps; g] a: caps[2*g]; b: caps[1+2*g]; $[(a<0) | b<0; ""; s[a+til b-a]]}
+// replacement template: $0..$9 -> group text ("" if absent), $$ -> $
+rxExpand: {[r; s; caps; ng] out: ""; i: 0; n: #r
+  while[i<n; c: r[i]; i+: 1
+    if[(c="$") & i<n; d: r[i]
+      if[d in rxDIG; g: rxDIG?d; c: $[g>ng; ""; rxGrp[s; caps; g]]; i+: 1]
+      if[d="$"; i+: 1]]
+    out,: c]
+  out}
+
+// ---- API
+rxTest: {[p; s] 0<#rxExec[rxc p; rxStr s; 0]}
+rx: {[p; s] r: rxExec[rxc p; rxStr s; 0]; $[#r; (r[0]; r[1]-r[0]); ()]}
+rxAll: {[p; s] c: rxc p; s: rxStr s; n: #s; pos: 0; out: ()
+  while[not pos>n; r: rxExec[c; s; pos]; if[0=#r; :out]; out,: ,(r[0]; r[1]-r[0]); pos: $[r[1]>r[0]; r[1]; r[1]+1]]
+  out}
+rxCaps: {[p; s] c: rxc p; s: rxStr s; r: rxExec[c; s; 0]; $[0=#r; (); rxGrp[s; rxCapsOf r] each til 1+c[2]]}
+rxSub: {[p; r; s] c: rxc p; s: rxStr s; r: rxStr r; n: #s; pos: 0; prev: 0; out: ""
+  while[not pos>n; m: rxExec[c; s; pos]; if[0=#m; :out, s[prev+til n-prev]]
+    out,: s[prev+til m[0]-prev]; out,: rxExpand[r; s; rxCapsOf m; c[2]]; prev: m[1]
+    pos: $[m[1]>m[0]; m[1]; m[1]+1]]
+  out, s[prev+til n-prev]}
+rxSplit: {[p; s] s: rxStr s; ms: rxAll[p; s]; prev: 0; out: (); i: 0
+  while[i<#ms; m: ms[i]; out,: ,s[prev+til m[0]-prev]; prev: m[0]+m[1]; i+: 1]
+  out,: ,s[prev+til (#s)-prev]
+  out}

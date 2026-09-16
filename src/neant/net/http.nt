@@ -1,7 +1,7 @@
 // HTTP/1.1 over hlisten/accept, in neant. load "src/neant/net/http.nt" — not part of the boot image.
 //
 // Scope: no chunked transfer-encoding, no keep-alive/pipelining (a connection is closed after one
-// response), no URL/query-string decoding, no multipart, no HTTPS (would compose with src/neant/crypto/tls.nt
+// response), no multipart, no HTTPS (would compose with src/neant/crypto/tls.nt
 // once that has a server handshake, which it doesn't). A request with no Content-Length is treated
 // as having an empty body.
 
@@ -11,7 +11,9 @@ httpHdr: {[line]
   (`$lower line[til i]; trim line[(i+1)+til (count line)-(i+1)])}
 
 /// Blocks for one full request on connection h: reads until the header/body boundary, then reads
-// exactly Content-Length more if present. `path`/`method`/`version` are strings; `headers` is a
+// exactly Content-Length more if present. `path`/`method`/`version` are strings; `path` is the
+// percent-decoded path without its query string, which is `query`, a dict of strings keyed by symbol
+// (src/neant/stdlib/encode.nt's qparse; `target` is the raw request-target as sent); `headers` is a
 // dict keyed by lowercased symbol; `body` is a string (raw bytes decoded as chars).
 httpRecv: {[h]
   buf: ""; pos: ()
@@ -34,7 +36,8 @@ httpRecv: {[h]
     c: hrecv[h; len-count body]
     if[0=count c; signal "http: connection closed before body"]
     body,: `char$c]
-  `method`path`version`headers`body ! (rl 0; rl 1; rl 2; hdrs; $[0=len;"";len#body])}
+  q: (rl 1)?"?"
+  `method`target`path`query`version`headers`body ! (rl 0; rl 1; urldec q#rl 1; qparse (q+1)_rl 1; rl 2; hdrs; $[0=len;"";len#body])}
 
 /// Writes a response: status (int), reason (string), headers (dict, any key type stringifies),
 // body (string or bytes — sent as-is after the headers).

@@ -52,9 +52,10 @@ fn main() {
     }
 }
 
-const BOOT_FILES: [&str; 8] = [
+const BOOT_FILES: [&str; 11] = [
     "src/neant/stdlib/prelude.nt", "src/neant/core/lex.nt", "src/neant/core/parse.nt", "src/neant/core/compile.nt",
-    "src/neant/stdlib/table.nt", "src/neant/stdlib/json.nt", "src/neant/crypto/crypto.nt", "src/neant/jit/arm64.nt",
+    "src/neant/stdlib/table.nt", "src/neant/stdlib/json.nt", "src/neant/stdlib/encode.nt", "src/neant/stdlib/regex.nt",
+    "src/neant/stdlib/test.nt", "src/neant/crypto/crypto.nt", "src/neant/jit/arm64.nt",
 ];
 const BOOT_IMAGE_PATH: &str = "src/neant/image.nb";
 /// The whole front end and standard library as bytecode, compiled by itself: prelude, lexer, parser,
@@ -240,6 +241,19 @@ mod tests {
             v.restore(&base);
             assert_eq!(ev(&mut v, src), *want, "source: {src}");
         }
+    }
+
+    /// Every tests/*.nt through tests/run.nt, the same path the file runner takes (cwd is the crate root under
+    /// cargo test). run.nt's `exit` would end this whole process, so ntExit: 0b makes it fall through and the
+    /// failure count is simply the file's value — smaller than reading a global back, and it is what run.nt returns anyway.
+    #[test]
+    fn nt_tests() {
+        let mut v = boot_vm();
+        v.set("args", value::list(vec![]));
+        v.eval("ntExit: 0b").unwrap();
+        let src = std::fs::read_to_string("tests/run.nt").unwrap();
+        let failures = v.eval(&src).unwrap_or_else(|e| panic!("tests/run.nt: '{}", e.0));
+        assert_eq!(failures.fmt(), "0", "tests/run.nt reported failures (names are in the captured output above)");
     }
 
     #[test]

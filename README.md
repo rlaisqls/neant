@@ -79,11 +79,31 @@ Written in neant, in `src/neant/stdlib/prelude.nt`:
 | Group | Functions |
 |---|---|
 | Aggregate | `sum avg min max med var dev count any all` |
+| Statistics | `wsum wavg cov cor svar sdev zscore quantile percentile mode` |
 | Math | `sqrt floor ceiling round signum neg mod div xexp` |
 | Lists | `til first last reverse raze sort asc desc distinct where rank rotate cut sublist except inter union cross` |
+| Collections | `sortOn maxBy minBy freq groupBy takeWhile dropWhile partition zip flatten` |
 | Running, windowed | `sums prds maxs mins deltas ratios prev next differ msum mavg mmax mmin ema xbar bin` |
-| Strings | `string sym vs sv ss upper lower trim ltrim rtrim ssr like fmt hex unhex` |
+| Iteration | `prior converge converges iterate iterates` |
+| Strings | `string sym vs sv ss upper lower trim ltrim rtrim ssr like hex unhex` — regexes: [below](#regular-expressions) |
+| Formatting | `tostr lpad rpad lpad0 fixed commas fmt` |
+| Dates, times | `today dow ymd isleap dim mkdate addMonths mstart mend ystart wstart iso isot isodt pdate ptime pdt dfmt dparse httpDate` |
 | Tests | `type not in within` |
+
+```
+prior[-;1 5 20]                    // 1 4 15      f over adjacent pairs, first kept (deltas is prior[-])
+converge[{_x%2};100]               // 0           apply until the value stops changing; converges keeps the steps
+iterate[3;{x*2};1]                 // 8           n times; iterates gives 1 2 4 8
+2 vs 13   256 vs 1000   0x00 vs 258  // 1 1 0 1   3 232   0x0000000000000102   base decomposition, msd first
+24 60 60 sv 1 2 3   2 sv 101b      // 3723   5     and back (an int left argument picks the numeric vs/sv)
+fmt["%s has %d items (%5.1f%%)"; ("bob";3;42.25)]   // "bob has 3 items ( 42.3%)"   %s %d %f, - width .prec, %% ; bare % is %s
+fixed[2;3.14159]   commas 1234567   lpad[6;42]      // "3.14"   "1,234,567"   "    42"
+quantile[0.5;3 1 2]   cor[1 2 3;2 4 6]   mode 1 2 2  // 2f   1f   2       R type-7 interpolation; svar/sdev are the n-1 forms
+sortOn[count;("aa";"b")]   freq "abca"   groupBy[{x mod 2};til 5]   // ("b";"aa")   "abc"!2 1 1   0 1!(0 2 4;1 3)
+dow 2026.09.16   mkdate[2026;9;16]   addMonths[1;2026.01.31]    // 2 (Mon=0)   2026.09.16   2026.02.28 (clamped)
+iso d   isodt[d;t]   pdt "2026-09-16T12:30:00.250Z"          // "2026-09-16"   "...T12:30:00.250Z"   (date;time)
+dfmt["%a, %d %b %Y %H:%M:%S GMT"; d; t]   dparse["%Y/%m/%d";"2026/9/6"]   // httpDate[d;t] is that format; codes Y m d H M S b a j y
+```
 
 ### Rust builtins
 
@@ -139,10 +159,12 @@ tshow tsort[t;`pay]          // aligned grid
 | Group | Functions |
 |---|---|
 | Build, show | `tbl row rows tcount tappend tshow` |
-| Query | `tsel tsort tby xasc xdesc ungroup` |
+| Schema | `meta tcols xcol xcols` |
+| Query | `tsel tsort tby fby xasc xdesc ungroup` |
+| Update | `tupd tdel tdistinct tinsert` |
 | Joins | `lj ij uj aj` |
 | Keyed | `xkey unkey` |
-| CSV | `rcsv["SSI";",";"file.csv"]` |
+| CSV | `tcsv wcsv rcsv` |
 
 ```
 select total: sum pay, n: count pay by dept from t where pay>90
@@ -150,6 +172,18 @@ select total: sum pay, n: count pay by dept from t where pay>90
 t[1]  t[0 2]                 // rows by position; t[where t[`pay]>90]
 kt: xkey[`id;t]; kt 3        // keyed table: key rows -> remaining columns; kt[(1;2)] for a multi-column key
 (1 2;3 4)?3 4                // ? on a general list finds a whole row (1); so does `in`
+meta t                       // `c`t table: column name and type (`syms `ints ... `list for a general-list column)
+tcols t                      // `name`dept`pay
+xcol[`pay`dept!`p`d; t]      // rename by dict old!new;  xcol[`a`b; t] renames the first two columns
+xcols[`pay; t]               // those columns first, the rest keep their order
+tcsv t                       // "name,dept,pay\nann,eng,120\n..." — a cell holding , " or a newline is "" quoted
+wcsv["t.csv"; t]             // write0 that text;  rcsv["SSI";",";"t.csv"] reads it back — or pass the CSV text itself
+fby[avg;`pay;`dept;t]        // per-row: avg pay of the row's dept, aligned with t;  tsel[t; t[`pay]>fby[avg;`pay;`dept;t]]
+tupd[t; t[`dept]=`ops; (,`pay)!enlist {x[`pay]+5}]   // update masked rows: name -> vector, atom, or unary fn of the masked rows
+tupd[t; (); (,`n)!enlist 0]  // () means every row; a new name adds a column, other rows filled with nullof
+tdel[t; t[`pay]<90]          // the rows where the mask is 0b;  tdel[t;`note] or tdel[t;`a`b] drops columns
+tdistinct t                  // distinct rows, first occurrence kept
+tinsert[t; (`dan;`ops;90)]   // append one row: a list in column order, or a dict `name`dept`pay!(...)
 ```
 
 ## JSON
@@ -159,6 +193,47 @@ kt: xkey[`id;t]; kt 3        // keyed table: key rows -> remaining columns; kt[(
 ```
 jk "{\"a\": [1, 2]}"         // ,`a!(1 2)
 jj `a`b!(1 2;"x")            // "{"a": [1, 2], "b": "x"}"
+```
+
+## Regular expressions
+
+`src/neant/stdlib/regex.nt`: a backtracking engine in neant — pattern first, a match is `(start;length)`.
+Literals `. \d \w \s` (and their negations) `[a-z] [^...] ^ $ ( ) (?: ) |` and `* + ? {n} {n,m}` with the lazy
+`*? +? ??` forms; case-sensitive, no backreferences or lookaround.
+
+```
+rxTest["\\d+";"ab12"]                  // 1b           rx["\\d+";"ab12"] -> 2 2 (start;length), () if none
+rxAll["a";"banana"]                     // (1 1;3 1;5 1)
+rxCaps["(\\w+)@(\\w+)";"to bob@ex"]     // ("bob@ex";"bob";"ex")   whole match, then the groups
+rxSub["(\\w+)@(\\w+)";"$2:$1";"bob@ex"] // "ex:bob"     $0..$9 are groups, $$ a literal $
+rxSplit[", *";"a, b,c"]                 // ("a";"b";"c")
+```
+
+The pattern is compiled once to a small program run by a machine with an explicit backtrack stack, and a
+quantifier over one character (`[a-z]*`) counts the run with a vector op and tries the lengths from there — so
+neither a long subject nor a long run recurses, and `(a*)*` terminates. A malformed pattern signals `regex: ...`.
+
+## Tests in neant
+
+`src/neant/stdlib/test.nt` is a small harness — `tok[name;cond]` `teq[name;got;want]` `terr[name;f]`
+`terrLike[name;f;prefix]` `tsection` `treport[]` — and `tests/*.nt` are the stdlib tests written with it:
+
+```
+./target/release/neant tests/run.nt      # loads every tests/*.nt by name, prints "N passed, M failed", exits with M
+```
+
+`cargo test` runs the same file (`nt_tests`, src/main.rs), so a stdlib change is tested where it lives: add a
+`teq` line to the matching `tests/*.nt` rather than a case in Rust.
+
+## Encodings
+
+`src/neant/stdlib/encode.nt`: base64 and percent-encoding on the byte vectors `` `byte$ `` gives, and query strings.
+
+```
+b64 `byte$"foobar"           // "Zm9vYmFy"    unb64 "Zm9vYmFy" -> 0x666f6f626172;  b64url/unb64url are the - _ unpadded form JWTs use
+urlenc "a b/é"               // "a%20b%2F%C3%A9"   RFC 3986: unreserved chars pass, every other UTF-8 byte is %XX
+urldec "a%20b+c"             // "a b c"       + reads as a space, like a form
+qparse "a=1&b=x+y"           // `a`b!("1";"x y")     qbuild inverts it
 ```
 
 ## HTTP
@@ -173,11 +248,13 @@ l: hlisten "0.0.0.0:8080"
 httpServe[l; {[req] (200; "OK"; (`$"content-type")!(,"text/plain"); "you asked for ",req[`path])}]
 ```
 
-`req` is `` `method`path`version`headers`body!(...) ``, headers keyed by lowercased symbol (build
+`req` is `` `method`target`path`query`version`headers`body!(...) `` — `path` percent-decoded with the
+query string split off into `query`, a dict of strings keyed by symbol (`target` is the raw request-target);
+headers keyed by lowercased symbol (build
 one with `` `$"content-length" ``, not a literal `` `content-length `` — a hyphen in a *literal*
 symbol token is the `-` verb, not part of the name; casting a string with `` `$ `` has no such
 limit). A handler returns `(status; reason; headers; body)`. No chunked transfer-encoding, no
-keep-alive (`hclose` after every response), no URL/query decoding, no HTTPS yet — `src/neant/crypto/tls.nt` is
+keep-alive (`hclose` after every response), no HTTPS yet — `src/neant/crypto/tls.nt` is
 still client-only.
 
 ## Bytes and crypto
@@ -288,7 +365,7 @@ bytecode into `src/neant/image.nb` (`src/image.rs`), embedded in the binary by `
 VM plus the primitives, and nothing else.
 
 `src/neant/` is grouped by what a file is for, not by whether it ends up in the image — `core/`
-(lex/parse/compile, above) and `stdlib/` (prelude/table/json) do; `crypto/` is split between what's
+(lex/parse/compile, above) and `stdlib/` (prelude/table/json/encode/regex/test) do; `crypto/` is split between what's
 in it (`crypto.nt`) and what's loaded on demand (`ed25519.nt`, `tls.nt` — see their own sections);
 `net/` (`http.nt`) is loadable only. `load "f.nt"` doesn't care which directory a file is under.
 
