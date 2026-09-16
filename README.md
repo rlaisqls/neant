@@ -293,6 +293,26 @@ extended coordinates with the complete addition law, and Shamir's trick does bot
 of 253 doublings. Scalars reduce mod L one bit at a time. Verification only: no signing, and nothing
 is constant-time, which is what a verifier's all-public inputs allow.
 
+`src/neant/crypto/der.nt` and `src/neant/crypto/x509.nt` (loadable, not in the boot image) read
+**ASN.1 DER and X.509 certificates** — parsing only, no signature check and no chain building:
+
+```
+load "src/neant/crypto/der.nt"; load "src/neant/crypto/x509.nt"
+c: x509Parse (pemLoad "tests/data/chain-google.pem")[0]
+c`subject                          // "CN=www.google.com"          RFC 2253, as OpenSSL prints it
+c`san                              // ("www.google.com")
+hex sha256 c`tbs                   // the bytes the signature is over, as they arrived
+(c`spki)`n                         // for `rsa: the modulus, big-endian, sign octet stripped
+```
+
+A parsed DER element carries the raw span it was cut from, because verifying a certificate hashes
+the *original* encoding of tbsCertificate and a re-serialisation would not do. The reader is strict
+on purpose — indefinite lengths, non-minimal lengths and tags, padded INTEGERs and OIDs, a BIT
+STRING whose unused bits are set, a DEFAULT that DER should have omitted, and trailing bytes after
+the top-level element all signal rather than being guessed at. `x509Parse` returns one dict, its
+keys documented at the top of x509.nt; an unrecognised *critical* extension is reported in
+`` `critUnknown `` rather than dropped, since silently ignoring one is how a verifier gets fooled.
+
 ## Errors
 
 Lexer and parser errors carry the line. A runtime error points at the line that actually failed and

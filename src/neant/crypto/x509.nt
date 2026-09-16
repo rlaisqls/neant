@@ -1,0 +1,425 @@
+// X.509 certificate parsing (RFC 5280) in neant, on src/neant/crypto/der.nt.
+// Not part of the boot image — load it with  load "src/neant/crypto/der.nt"  then this file.
+//
+// Parsing only: nothing here verifies a signature, builds a chain, matches a hostname or consults a
+// trust store. It hands a verifier the pieces, and the dict below is what that verifier codes to.
+//
+//   x509Parse[der] -> a dict with exactly these keys
+//
+//   `ver          int              1, 2 or 3
+//   `tbs          bytes            tbsCertificate as it appeared on the wire, tag and length
+//                                  included — this is what the signature is over, so hash *this*
+//                                  and never a re-encoding
+//   `serial       bytes            the serialNumber INTEGER's content octets, two's complement
+//                                  big-endian exactly as encoded (a leading 0x00 is kept)
+//   `sigAlg       symbol           `rsaPkcs1Sha1 `rsaPkcs1Sha256 `rsaPkcs1Sha384 `rsaPkcs1Sha512
+//                                  `rsaPssSha256 `rsaPssSha384 `rsaPssSha512
+//                                  `ecdsaSha256 `ecdsaSha384 `ecdsaSha512 `ed25519
+//                                  `unknown — nothing here recognised it; `sigAlgOid still says
+//                                  which OID it was, and a verifier must refuse it
+//   `sigAlgOid    string           the dotted OID, always, named or not
+//   `sigParams    dict             RSASSA-PSS only: `hash`mgfHash`saltLen!(`sha256;`sha256;32).
+//                                  ()!() for every other algorithm
+//   `sig          bytes            the signatureValue BIT STRING's octets
+//   `issuer       string           RFC 2253, most specific first — the same text as
+//                                  `openssl x509 -noout -issuer -nameopt RFC2253`
+//   `issuerCanon  string           the form to *compare* on (see below)
+//   `subject      string           RFC 2253
+//   `subjectCanon string           chain building matches one certificate's `issuerCanon against
+//                                  another's `subjectCanon, byte for byte
+//   `notBefore    (date;time)      the language's own values, UTC
+//   `notAfter     (date;time)
+//   `spki         dict             the public key, by algorithm:
+//                                    `alg`n`e!(`rsa; nBytes; eBytes)     big-endian magnitudes,
+//                                        sign octet stripped — what an RSA verifier takes
+//                                    `alg`curve`oid`point!(`ec;`p256;"1.2.840.10045.3.1.7";bytes)
+//                                        `curve is `p256 `p384 `p521 or `unknown; `point is the
+//                                        uncompressed/compressed SEC 1 encoding, unexamined
+//                                    `alg`pub!(`ed25519; bytes)
+//                                    `alg`oid`bits!(`unknown; dotted; bytes)
+//   `spkiRaw      bytes            the whole SubjectPublicKeyInfo DER — what a key id hashes
+//   `san          list of strings  the dNSName entries of subjectAltName, in order. () if absent
+//   `eku          list of strings  extendedKeyUsage as dotted OIDs. () if absent
+//   `isCa         1b/0b            basicConstraints cA; 0b when the extension is absent
+//   `pathLen      int              basicConstraints pathLenConstraint, 0N when absent
+//   `keyUsage     symbols          `digitalSignature `nonRepudiation `keyEncipherment
+//                                  `dataEncipherment `keyAgreement `keyCertSign `cRLSign
+//                                  `encipherOnly `decipherOnly. () when the extension is absent —
+//                                  which RFC 5280 reads as "no restriction", not "nothing allowed"
+//   `critUnknown  list of strings  the dotted OIDs of critical extensions this parser does not
+//                                  model. MUST be empty for a certificate to be accepted (RFC 5280
+//                                  4.2): silently ignoring a critical extension is how a verifier
+//                                  gets fooled, so it is reported rather than dropped
+//
+// `issuerCanon / `subjectCanon: RDNs in encoding order, the attributes inside one RDN sorted (a SET
+// is unordered, so two encodings of one name differ only in that order), each written as
+// dottedOid=value with the value lowercased and runs of whitespace collapsed to one space — RFC
+// 5280 7.1's caseIgnoreMatch without the Unicode folding. Equality of these strings is a match.
+//
+// Not modelled, deliberately: any extension other than basicConstraints, keyUsage, subjectAltName
+// and extendedKeyUsage (an unrecognised *critical* one lands in `critUnknown; a non-critical one
+// is dropped, as RFC 5280 4.2 allows); issuerUniqueID and subjectUniqueID (skipped over, not
+// returned); the non-dNSName GeneralName choices in a SAN — iPAddress, rfc822Name, URI,
+// directoryName; the interior of an EC point or of a PSS/ECDSA signature. A DirectoryString that
+// is none of UTF8String, PrintableString, T61String or IA5String is not decoded — it appears in a
+// name as #hex of its DER, which is what RFC 2253 2.4 says to do with a value it cannot print.
+
+// () , enlist "s" flattens a one-element list of strings back into a char vector, so every such
+// list is grown through this instead.
+x509Cons: {[l;s] $[0=count l; enlist s; l,enlist s]}
+
+// ---- names
+// AttributeType short names: RFC 2253 2.3 plus the few more OpenSSL's -nameopt RFC2253 prints.
+X509ATTROIDS: ("2.5.4.3";"2.5.4.6";"2.5.4.7";"2.5.4.8";"2.5.4.10";"2.5.4.11";"2.5.4.9")
+X509ATTROIDS,: ("0.9.2342.19200300.100.1.25";"0.9.2342.19200300.100.1.1";"1.2.840.113549.1.9.1")
+X509ATTROIDS,: ("2.5.4.5";"2.5.4.4";"2.5.4.42";"2.5.4.15")
+X509ATTRNAMES: ("CN";"C";"L";"ST";"O";"OU";"STREET";"DC";"UID";"emailAddress")
+X509ATTRNAMES,: ("serialNumber";"SN";"GN";"businessCategory")
+
+// RFC 2253 2.4: , + " \ < > ; anywhere, and # or a space at the front or a space at the back, are
+// backslash-escaped; a control character goes out as \XX, which is what OpenSSL does too.
+X509DNESC: ",+\"\\<>;"
+x509DnEsc: {[s]
+  out: ""; i: 0; n: count s
+  while[i<n
+    c: s[i]
+    edge: $[i=0; c in " #"; $[i=n-1; c=" "; 0b]]
+    v: `code$c
+    out,: $[edge | c in X509DNESC; ("\\";c); v<32; "\\",hexu[(v div 16; v mod 16)]; c]
+    i+:1]
+  out}
+// an AttributeValue that is not one of the string types der.nt models is dumped as #hex of its
+// whole TLV — RFC 2253 2.4's hexstring form, and OpenSSL's DUMP_UNKNOWN.
+x509Str: {[nd] (`univ=nd`cls) & nd[`tag] in DERSTRTAGS}
+x509DnVal: {[nd] $[x509Str nd; x509DnEsc derStr nd; "#",upper hex nd`raw]}
+// leading and trailing whitespace dropped, internal runs collapsed to one space
+x509Ws: {[s]
+  if[0=count s; :""]
+  t: {$[x in "\t\r\n"; " "; x]} each s
+  out: ""; i: 0
+  while[i<count t
+    c: t[i]
+    if[$[c=" "; $[0=count out; 0b; not " "=out[(count out)-1]]; 1b]; out,: c]
+    i+:1]
+  trim out}
+x509DnCanon: {[nd] $[x509Str nd; x509Ws lower derStr nd; "#",hex nd`raw]}
+
+// Name ::= RDNSequence ::= SEQUENCE OF SET SIZE (1..MAX) OF SEQUENCE { type OID, value ANY }
+// -> (the RFC 2253 string; the canonical string the header describes)
+x509Name: {[nd]
+  derWant[nd;DERSEQ;1b]
+  rdns: derKids nd
+  pr: ""; cn: ""
+  i: 0
+  while[i<count rdns
+    r: rdns[i]
+    derWant[r;DERSET;1b]
+    ats: derKids r
+    if[0=count ats; signal "x509: an RDN must hold at least one attribute"]
+    ps: (); cs: ()
+    j: 0
+    while[j<count ats
+      a: ats[j]
+      derWant[a;DERSEQ;1b]
+      kv: derKids a
+      if[not 2=count kv; signal "x509: an AttributeTypeAndValue is a type and a value"]
+      o: derOid kv[0]
+      k: X509ATTROIDS?o
+      ps: x509Cons[ps; ($[k<count X509ATTROIDS; X509ATTRNAMES[k]; o]),"=",x509DnVal kv[1]]
+      cs: x509Cons[cs; o,"=",x509DnCanon kv[1]]
+      j+:1]
+    p1: "+" sv ps
+    pr: $[0=count pr; p1; p1,",",pr]                  // RFC 2253 prints RDNs most specific first
+    c1: "+" sv asc cs                                      // a SET is unordered: sort to compare
+    cn: $[0=count cn; c1; cn,",",c1]
+    i+:1]
+  (pr;cn)}
+
+// ---- algorithm identifiers
+// AlgorithmIdentifier ::= SEQUENCE { algorithm OID, parameters ANY DEFINED BY algorithm OPTIONAL }
+// -> (dotted OID; a 0- or 1-element list holding the parameter node), so absence is representable.
+x509Alg: {[nd]
+  derWant[nd;DERSEQ;1b]
+  k: derKids nd
+  if[0=count k; signal "x509: an empty AlgorithmIdentifier"]
+  if[2<count k; signal "x509: an AlgorithmIdentifier is an OID and at most one parameter"]
+  (derOid k[0]; $[1<count k; enlist k[1]; ()])}
+
+X509SIGOIDS: ("1.2.840.113549.1.1.5";"1.2.840.113549.1.1.11";"1.2.840.113549.1.1.12")
+X509SIGOIDS,: ("1.2.840.113549.1.1.13";"1.2.840.10045.4.3.2";"1.2.840.10045.4.3.3")
+X509SIGOIDS,: ("1.2.840.10045.4.3.4";"1.3.101.112")
+X509SIGSYMS: `rsaPkcs1Sha1`rsaPkcs1Sha256`rsaPkcs1Sha384`rsaPkcs1Sha512
+X509SIGSYMS,: `ecdsaSha256`ecdsaSha384`ecdsaSha512`ed25519
+X509RSAV15: `rsaPkcs1Sha1`rsaPkcs1Sha256`rsaPkcs1Sha384`rsaPkcs1Sha512
+X509HASHOIDS: ("1.3.14.3.2.26";"2.16.840.1.101.3.4.2.1";"2.16.840.1.101.3.4.2.2")
+X509HASHOIDS,: ("2.16.840.1.101.3.4.2.3")
+X509HASHSYMS: `sha1`sha256`sha384`sha512
+// a hash AlgorithmIdentifier: RFC 4055 lets the NULL parameter be present or absent, nothing else
+x509Hash: {[a]
+  if[1<count a[1]; signal "x509: a hash algorithm takes at most a NULL parameter"]
+  if[1=count a[1]; derNull (a[1])[0]]
+  i: X509HASHOIDS?a[0]
+  $[i<count X509HASHOIDS; X509HASHSYMS[i]; `unknown]}
+
+// RSASSA-PSS-params (RFC 4055 3.1). The hash is in the parameters, so `rsaPssSha256 can only be
+// said after reading them; DER omits a field equal to its DEFAULT, so an absent field is SHA-1 /
+// MGF1-SHA-1 / salt 20 / trailer 1. Only the shape a verifier here could check — MGF1 over the same
+// hash, salt equal to the hash length — gets a name; anything else stays `unknown and is refused.
+x509Pss: {[a]
+  if[not 1=count a[1]; signal "x509: RSASSA-PSS needs parameters"]
+  p: (a[1])[0]
+  derWant[p;DERSEQ;1b]
+  ps: derKids p
+  h: `sha1; mg: `sha1; sl: 20
+  i: 0; lt: -1
+  while[i<count ps
+    f: ps[i]
+    if[not `ctx=f`cls; signal "x509: RSASSA-PSS parameters are context-tagged"]
+    if[not f`cons; signal "x509: an RSASSA-PSS parameter must be constructed (EXPLICIT)"]
+    fk: derKids f
+    if[not 1=count fk; signal "x509: an RSASSA-PSS parameter holds one value"]
+    tg: f`tag
+    if[not tg>lt; signal "x509: RSASSA-PSS parameters repeat or are out of order"]
+    lt: tg
+    if[tg=0; h: x509Hash x509Alg fk[0]]
+    if[tg=1
+      mgf: x509Alg fk[0]
+      if[not (mgf[0]) ~ "1.2.840.113549.1.1.8"; signal "x509: RSASSA-PSS masking must be MGF1"]
+      if[not 1=count mgf[1]; signal "x509: MGF1 needs a hash parameter"]
+      mg: x509Hash x509Alg (mgf[1])[0]]
+    if[tg=2; sl: derIntVal fk[0]; if[sl<0; signal "x509: a negative RSASSA-PSS salt length"]]
+    if[tg=3; if[not 1=derIntVal fk[0]; signal "x509: RSASSA-PSS trailerField must be 1"]]
+    if[tg>3; signal "x509: unknown RSASSA-PSS parameter"]
+    i+:1]
+  nm: `unknown
+  if[(h ~ mg) & sl = $[h=`sha256;32; h=`sha384;48; h=`sha512;64; -1]
+    nm: $[h=`sha256;`rsaPssSha256; h=`sha384;`rsaPssSha384; `rsaPssSha512]]
+  (nm; `hash`mgfHash`saltLen!(h;mg;sl))}
+
+// -> (symbol; parameter dict). RFC 4055: a PKCS#1 v1.5 algorithm carries NULL parameters; RFC 5758:
+// an ECDSA one carries none at all. Both are enforced — a verifier that shrugged at the difference
+// would let an attacker restate the algorithm.
+x509SigAlg: {[a]
+  o: a[0]
+  k: X509SIGOIDS?o
+  if[k<count X509SIGOIDS
+    nm: X509SIGSYMS[k]
+    if[nm in X509RSAV15
+      if[not 1=count a[1]; signal "x509: ",o," must carry NULL parameters"]
+      derNull (a[1])[0]]
+    if[not nm in X509RSAV15; if[0<count a[1]; signal "x509: ",o," must not carry parameters"]]
+    :(nm; ()!())]
+  if[o ~ "1.2.840.113549.1.1.10"; :x509Pss a]
+  (`unknown; ()!())}
+
+// ---- the public key
+X509CURVEOIDS: ("1.2.840.10045.3.1.7";"1.3.132.0.34";"1.3.132.0.35")
+X509CURVESYMS: `p256`p384`p521
+// a positive INTEGER as its big-endian magnitude: the leading 0x00 that keeps DER's two's
+// complement positive is dropped, which is the form the RSA verifier wants.
+x509Mag: {[nd]
+  b: derInt nd
+  if[127<`int$b[0]; signal "x509: a negative RSA key value"]
+  if[(1<count b) & 0=`int$b[0]; b: 1_b]
+  if[0=`int$b[0]; signal "x509: a zero RSA key value"]
+  b}
+// SubjectPublicKeyInfo ::= SEQUENCE { algorithm AlgorithmIdentifier, subjectPublicKey BIT STRING }
+x509Spki: {[nd]
+  derWant[nd;DERSEQ;1b]
+  k: derKids nd
+  if[not 2=count k; signal "x509: a SubjectPublicKeyInfo is an algorithm and a key"]
+  a: x509Alg k[0]
+  b: derBits k[1]
+  o: a[0]
+  if[o ~ "1.2.840.113549.1.1.1"
+    if[not 1=count a[1]; signal "x509: rsaEncryption must carry NULL parameters"]
+    derNull (a[1])[0]
+    r: derParse b                                  // the key is a DER RSAPublicKey inside the bits
+    derWant[r;DERSEQ;1b]
+    rk: derKids r
+    if[not 2=count rk; signal "x509: an RSAPublicKey is a modulus and an exponent"]
+    :`alg`n`e!(`rsa; x509Mag rk[0]; x509Mag rk[1])]
+  if[o ~ "1.2.840.10045.2.1"
+    if[not 1=count a[1]; signal "x509: id-ecPublicKey must name a curve"]
+    c: derOid (a[1])[0]
+    i: X509CURVEOIDS?c
+    if[0=count b; signal "x509: an empty EC point"]
+    :`alg`curve`oid`point!(`ec; $[i<count X509CURVEOIDS; X509CURVESYMS[i]; `unknown]; c; b)]
+  if[o ~ "1.3.101.112"
+    if[0<count a[1]; signal "x509: id-Ed25519 must not carry parameters"]
+    if[not 32=count b; signal "x509: an Ed25519 key is 32 octets"]
+    :`alg`pub!(`ed25519; b)]
+  `alg`oid`bits!(`unknown; o; b)}
+
+// ---- the extensions this parser models
+// BasicConstraints ::= SEQUENCE { cA BOOLEAN DEFAULT FALSE, pathLenConstraint INTEGER OPTIONAL }
+x509Bc: {[nd]
+  derWant[nd;DERSEQ;1b]
+  k: derKids nd
+  ca: 0b; pl: 0N; i: 0
+  if[i<count k
+    if[(`univ=k[i][`cls]) & DERBOOL=k[i][`tag]
+      ca: derBool k[i]
+      if[not ca; signal "x509: a cA of FALSE must be omitted in DER"]
+      i+:1]]
+  if[i<count k
+    pl: derIntVal k[i]
+    if[pl<0; signal "x509: a negative pathLenConstraint"]
+    if[not ca; signal "x509: a pathLenConstraint without cA"]
+    i+:1]
+  if[i<count k; signal "x509: trailing fields in BasicConstraints"]
+  (ca;pl)}
+
+X509KUNAMES: `digitalSignature`nonRepudiation`keyEncipherment`dataEncipherment`keyAgreement
+X509KUNAMES,: `keyCertSign`cRLSign`encipherOnly`decipherOnly
+// KeyUsage ::= BIT STRING, bit 0 the most significant bit of the first octet
+x509Ku: {[nd]
+  r: derBitStr nd
+  b: r[1]
+  n: (8*count b)-r[0]
+  if[0=n; signal "x509: an empty KeyUsage"]
+  if[n>9; signal "x509: KeyUsage has more bits than RFC 5280 defines"]
+  out: (); i: 0
+  while[i<n
+    if[0 < (`int$b[i div 8]) band 1 shl 7-i mod 8; out,: X509KUNAMES[i]]
+    i+:1]
+  out}
+
+// SubjectAltName ::= GeneralNames ::= SEQUENCE SIZE (1..MAX) OF GeneralName.  dNSName is
+// [2] IMPLICIT IA5String; the other choices are skipped — hostname matching is not this file's job,
+// and a verifier that wants iPAddress can walk the nodes itself.
+x509San: {[nd]
+  derWant[nd;DERSEQ;1b]
+  k: derKids nd
+  if[0=count k; signal "x509: an empty SubjectAltName"]
+  out: (); i: 0
+  while[i<count k
+    g: k[i]
+    if[not `ctx=g`cls; signal "x509: a GeneralName must be context-tagged"]
+    if[(2=g`tag) & not g`cons
+      w: `int$g`v
+      if[0=count w; signal "x509: an empty dNSName"]
+      if[any 127<w; signal "x509: a dNSName that is not ASCII"]
+      out: x509Cons[out; `char$g`v]]
+    i+:1]
+  out}
+
+// ExtKeyUsageSyntax ::= SEQUENCE SIZE (1..MAX) OF KeyPurposeId, reported as dotted OIDs
+x509Eku: {[nd]
+  derWant[nd;DERSEQ;1b]
+  k: derKids nd
+  if[0=count k; signal "x509: an empty ExtKeyUsage"]
+  out: (); i: 0
+  while[i<count k; out: x509Cons[out; derOid k[i]]; i+:1]
+  out}
+
+X509EXTBC: "2.5.29.19"; X509EXTKU: "2.5.29.15"; X509EXTSAN: "2.5.29.17"; X509EXTEKU: "2.5.29.37"
+
+// ---- the certificate
+// Certificate ::= SEQUENCE { tbsCertificate, signatureAlgorithm, signatureValue BIT STRING }
+x509Parse: {[der]
+  top: derParse der
+  derWant[top;DERSEQ;1b]
+  ks: derKids top
+  if[not 3=count ks; signal "x509: a Certificate is a tbsCertificate, an algorithm and a signature"]
+  tbs: ks[0]
+  derWant[tbs;DERSEQ;1b]
+  oa: x509Alg ks[1]
+  sa: x509SigAlg oa
+  sig: derBits ks[2]
+  if[0=count sig; signal "x509: an empty signature"]
+
+  t: derKids tbs
+  n: count t
+  ver: 1; i: 0
+  if[0<n
+    if[(`ctx=t[0][`cls]) & 0=t[0][`tag]
+      if[not t[0][`cons]; signal "x509: the version tag must be constructed (EXPLICIT)"]
+      vk: derKids t[0]
+      if[not 1=count vk; signal "x509: the version tag holds one INTEGER"]
+      ver: 1+derIntVal vk[0]
+      if[not ver in 2 3; signal "x509: a version tag may only say v2 or v3, not v",string ver]
+      i: 1]]
+  if[n<i+6; signal "x509: tbsCertificate is missing fields"]
+  // RFC 5280 4.1.1.2: the two AlgorithmIdentifiers must be the same, down to the encoding
+  if[not (t[i+1][`raw]) ~ ks[1][`raw]
+    signal "x509: signatureAlgorithm does not match the one inside tbsCertificate"]
+  serial: derInt t[i]
+  issuer: x509Name t[i+2]
+  vld: derKids t[i+3]
+  if[not 2=count vld; signal "x509: Validity is a notBefore and a notAfter"]
+  subject: x509Name t[i+4]
+  spki: t[i+5]
+
+  j: i+6
+  // [1] issuerUniqueID and [2] subjectUniqueID are IMPLICIT BIT STRINGs: skipped over, not returned
+  if[j<n; if[(`ctx=t[j][`cls]) & 1=t[j][`tag]; j+:1]]
+  if[j<n; if[(`ctx=t[j][`cls]) & 2=t[j][`tag]; j+:1]]
+  isCa: 0b; pathLen: 0N; ku: (); san: (); eku: (); cru: ()
+  if[j<n
+    e: t[j]
+    if[not (`ctx=e`cls) & 3=e`tag; signal "x509: an unexpected field at the end of tbsCertificate"]
+    if[not e`cons; signal "x509: the extensions tag must be constructed (EXPLICIT)"]
+    ek: derKids e
+    if[not 1=count ek; signal "x509: the extensions tag holds one SEQUENCE"]
+    if[not ver=3; signal "x509: extensions require version 3"]
+    derWant[ek[0];DERSEQ;1b]
+    es: derKids ek[0]
+    if[0=count es; signal "x509: an empty Extensions sequence"]
+    seen: ()!(); m: 0
+    while[m<count es
+      x: es[m]
+      derWant[x;DERSEQ;1b]
+      f: derKids x
+      if[not (count f) in 2 3; signal "x509: an Extension is an OID, a flag and an OCTET STRING"]
+      o: derOid f[0]
+      // RFC 5280 4.2: at most one instance of any extension
+      if[0<count seen; if[(`$o) in key seen; signal "x509: a duplicate extension, ",o]]
+      seen[`$o]: 1
+      crit: 0b
+      if[3=count f
+        crit: derBool f[1]
+        if[not crit; signal "x509: a critical flag of FALSE must be omitted in DER"]]
+      ev: derParse derOct f[(count f)-1]       // derParse: the octets must be all of its DER
+      known: 1b
+      if[o ~ X509EXTBC; bc: x509Bc ev; isCa: bc[0]; pathLen: bc[1]]
+      if[o ~ X509EXTKU; ku: x509Ku ev]
+      if[o ~ X509EXTSAN; san: x509San ev]
+      if[o ~ X509EXTEKU; eku: x509Eku ev]
+      if[not o in (X509EXTBC;X509EXTKU;X509EXTSAN;X509EXTEKU); known: 0b]
+      if[crit & not known; cru: x509Cons[cru;o]]
+      m+:1]
+    j+:1]
+  if[j<n; signal "x509: trailing fields in tbsCertificate"]
+
+  k1: `ver`tbs`serial`sigAlg`sigAlgOid`sigParams`sig
+  v1: (ver; tbs`raw; serial; sa[0]; oa[0]; sa[1]; sig)
+  k2: `issuer`issuerCanon`subject`subjectCanon`notBefore`notAfter
+  v2: (issuer[0]; issuer[1]; subject[0]; subject[1]; derTime vld[0]; derTime vld[1])
+  k3: `spki`spkiRaw`san`eku`isCa`pathLen`keyUsage`critUnknown
+  v3: (x509Spki spki; spki`raw; san; eku; isCa; pathLen; ku; cru)
+  ((k1,k2),k3)!(v1,v2),v3}
+
+// ---- PEM
+// text -> the DER of every CERTIFICATE block in it. Anything outside the BEGIN/END lines is
+// ignored, which is what lets `openssl s_client -showcerts` output be handed over unedited.
+X509PEMBEGIN: "-----BEGIN CERTIFICATE-----"
+X509PEMEND: "-----END CERTIFICATE-----"
+pemDecode: {[text]
+  ls: "\n" vs text
+  out: (); body: ""; open: 0; i: 0
+  while[i<count ls
+    l: trim ls[i] except "\r"
+    if[l ~ X509PEMBEGIN
+      if[open; signal "pem: a BEGIN CERTIFICATE inside a block"]
+      open: 1; body: ""]
+    if[l ~ X509PEMEND
+      if[not open; signal "pem: an END CERTIFICATE with no BEGIN"]
+      out: $[0=count out; enlist unb64 body; out,enlist unb64 body]
+      open: 0]
+    if[open & not l ~ X509PEMBEGIN; body,: l]
+    i+:1]
+  if[open; signal "pem: a BEGIN CERTIFICATE with no END"]
+  out}
+// a file of PEM blocks -> their DER, for a trust store or an `openssl s_client -showcerts` capture
+pemLoad: {[path] pemDecode "\n" sv read0 path}
