@@ -117,7 +117,7 @@ Only what needs the host; everything expressible with the verbs lives in the pre
 | Dicts | `key value group` |
 | Values | `isnull now` |
 | Output | `show print signal exit repr` — `repr x` is the text `show` would print, the one thing `$` cannot give (`$` casts elementwise); `tests/lang.nt` pins display forms with it |
-| Files | `read0 write0` |
+| Files | `read0 write0` — plus `read1 n` / `write1 x`, `hrecv`/`hsend` for stdin/stdout: exactly n bytes in, exactly these bytes out, for a byte-counted protocol on the standard streams (`src/neant/tools/lsp.nt`) |
 | Sockets | `hopen hclose hsend hrecv hlisten accept` |
 | Concurrency | `spawn join shared sget sset supd` — see [Concurrency](#concurrency) |
 | Adverb keywords | `each over scan` |
@@ -228,6 +228,67 @@ src/main.rs — and `tests/jit.nt` and `tests/crypto.nt` are the JIT and crypto 
 asserting on them, so it is run by hand (`./target/release/neant tests/bench.nt`). `cargo test` runs the whole set twice: once directly (`nt_tests`) and once against the
 front end rebuilt by itself (`front_end_reproduces_itself`), both in src/main.rs. So a language or stdlib
 change is tested where it lives: add a `teq` line to the matching `tests/*.nt` rather than a case in Rust.
+
+## Tooling
+
+A formatter and a language server, both in neant, both loadable rather than in the boot image. They
+do not reimplement anything: the front end is already a library — `nlex`, `nparse` and `ncompile`
+are ordinary globals — so the formatter tokenises with the lexer's own dispatch and the server's
+diagnostics are the compiler's own errors.
+
+### The formatter
+
+`src/neant/tools/fmt.nt`: `nfmt[src]` returns the formatted text, `nfmtFile[path]` rewrites a file
+and returns `1b` if it changed.
+
+```
+load "src/neant/tools/fmt.nt"
+nfmt "f: {[a]\nb:   a+1  \nb}"        // "f: {[a]\n  b:   a+1\n  b}"
+nfmtFile "src/neant/stdlib/json.nt"   // 0b — already formatted
+```
+
+Whitespace here is load-bearing — `1 -2` is a vector and `1 - 2` is subtraction, `f ,x` parses as
+`f , x`, a newline ends a statement, a name followed by a verb is that verb's left argument — so a
+formatter that reflows breaks code. This one never moves a token across a line, never adds or
+removes a line, and touches only five things: trailing whitespace; indentation, two spaces per
+open bracket, skipping the lines of a `;`-broken argument list, which the author aligned by hand;
+whitespace after `( [ {`; whitespace before `) ] } ;`; and a run of spaces after `;` collapsed to
+one. Everything else is copied byte for byte, aligned definitions and aligned trailing comments
+included. `src/neant/tools/fmt.nt`'s header comment is the exact list.
+
+Meaning-preservation is mechanical rather than argued. `nparse` reads nothing but the token list
+and the line each token starts on, so identical tokens and identical lines are an identical AST —
+and every rewritten line is re-lexed and reverted to the original unless `nlex` gives back exactly
+what it gave before. `tests/fmt.nt` runs that check over **every `.nt` file in the repository**,
+compares the compiled bytecode as well, and requires `nfmt nfmt s` to equal `nfmt s`. Over the
+whole repository it changes 3 lines, which is the house style being what the rules say.
+
+### The language server
+
+`src/neant/tools/lsp.nt`: running the file starts an LSP server.
+
+```
+./target/release/neant src/neant/tools/lsp.nt                  # over stdin/stdout
+./target/release/neant src/neant/tools/lsp.nt 127.0.0.1:5007   # over TCP — what an editor wants
+```
+
+`initialize`, `initialized`, `shutdown`, `exit`, `textDocument/`{`didOpen`, `didChange` (full sync),
+`didClose`, `publishDiagnostics`, `formatting`, `documentSymbol`, `hover`, `completion`}, and the
+capabilities it advertises are exactly those. Diagnostics are the point: the buffer goes through
+`nlex` then `nparse` inside `@[..]` and a signalled error becomes one diagnostic on the line its
+message names, so what an editor underlines is what the compiler would have said. Formatting is
+`nfmt`. Symbols are the top-level `name:` assignments. Hover and completion cover those plus the
+names in the running image — there is no way to enumerate the globals, so the candidates come from
+the boot sources plus a written-down list of the Rust builtins, and each one is *confirmed against
+the image* with a `loadg` of one const before it is offered.
+
+Both transports run the same loop over different byte sources: `lspServe[]` on stdin/stdout, which
+is what an editor launches by default, and `lspServeTcp[addr]` on a socket. Framing needs reads and
+writes that are byte-exact and incremental — `read0 0` reads stdin to EOF and splits lines, `print`
+appends a newline, `write0 "/dev/stdout"` truncates on every call — so stdio needed two primitives
+that genuinely have to be in the host: `read1 n` and `write1 x`, `hrecv`/`hsend` for the standard
+streams. editors/README.md has the configuration for neovim, eglot and VS Code, and covers the
+tree-sitter grammar and vim syntax file next to it.
 
 ## Encodings
 

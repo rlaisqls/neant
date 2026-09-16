@@ -10,6 +10,7 @@ load "tests/table2.nt"
 load "tests/regex.nt"
 load "tests/jit.nt"
 load "tests/crypto.nt"
+load "tests/fmt.nt"
 ntFailures: treport[]
 // exit ends the whole process, so the cargo test (nt_tests in src/main.rs) sets ntExit: 0b and reads the count as this file's value
 if[@[{[x] ntExit};0;{1b}]; exit ntFailures]

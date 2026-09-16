@@ -1,0 +1,149 @@
+// tests for src/neant/tools/fmt.nt (loadable, not in the boot image); loaded by tests/run.nt
+load "src/neant/tools/fmt.nt"
+tsection "fmt"
+
+// ---- the five normalisations, one at a time
+teq["fmt trailing spaces"; nfmt "a: 1   "; "a: 1"]
+teq["fmt trailing tab"; nfmt "a: 1\t"; "a: 1"]
+teq["fmt blank line of spaces"; nfmt "a: 1\n   \nb: 2"; "a: 1\n\nb: 2"]
+teq["fmt indent body"; nfmt "f: {[a]\nb: 1\nb}"; "f: {[a]\n  b: 1\n  b}"]
+teq["fmt indent nested"; nfmt "f: {[a]\nif[a\nb: 1]\n0}"; "f: {[a]\n  if[a\n    b: 1]\n  0}"]
+teq["fmt indent closer line"; nfmt "f: {[a]\na\n}"; "f: {[a]\n  a\n}"]
+teq["fmt indent top level"; nfmt "  a: 1\n   b: 2"; "a: 1\nb: 2"]
+teq["fmt after opener"; nfmt "f[ 1; 2]"; "f[1; 2]"]
+teq["fmt after brace"; nfmt "{ x+1}"; "{x+1}"]
+teq["fmt after paren"; nfmt "( 1;2)"; "(1;2)"]
+teq["fmt before closer"; nfmt "f[1;2 ]"; "f[1;2]"]
+teq["fmt before semi"; nfmt "f[1 ;2]"; "f[1;2]"]
+teq["fmt after semi collapses"; nfmt "f[1;   2]"; "f[1; 2]"]
+teq["fmt after semi keeps none"; nfmt "f[1;2]"; "f[1;2]"]
+teq["fmt after semi keeps one"; nfmt "f[1; 2]"; "f[1; 2]"]
+
+// ---- what it must leave alone
+teq["fmt keeps aligned defs"; nfmt "wu8:   1\nwu16:  2"; "wu8:   1\nwu16:  2"]
+teq["fmt keeps comment column"; nfmt "a: 1        // note"; "a: 1        // note"]
+teq["fmt keeps comment column after semi"; nfmt "a: 1;        // note"; "a: 1;        // note"]
+teq["fmt keeps glued minus"; nfmt "x: 1 -2"; "x: 1 -2"]
+teq["fmt keeps spaced minus"; nfmt "x: 1 - 2"; "x: 1 - 2"]
+teq["fmt keeps a date vector"; nfmt "d: 2026.01.01 2026.01.03"; "d: 2026.01.01 2026.01.03"]
+teq["fmt keeps string contents"; nfmt "s: \"a [ 1 ;  2 ]\""; "s: \"a [ 1 ;  2 ]\""]
+teq["fmt keeps a multi-line string"; nfmt "s: \"ab\n   cd\"   "; "s: \"ab\n   cd\"   "]
+teq["fmt keeps a leading-; continuation"; nfmt "$[a; 1\n     ; b; 2\n       ; 3]"; "$[a; 1\n     ; b; 2\n       ; 3]"]
+teq["fmt keeps a trailing-; continuation"; nfmt "r: $[a; 1;\n       b; 2]"; "r: $[a; 1;\n       b; 2]"]
+teq["fmt untokenisable source"; nfmt "s: \"unterminated  "; "s: \"unterminated  "]
+teq["fmt empty"; nfmt ""; ""]
+
+// ---- the whole corpus.  There is no directory listing builtin, so the files are named (as in
+// tests/run.nt); a new .nt file in the repo belongs in this list.
+fmtFiles: ()
+fmtFiles,: ,"src/neant/core/compile.nt"
+fmtFiles,: ,"src/neant/core/lex.nt"
+fmtFiles,: ,"src/neant/core/parse.nt"
+fmtFiles,: ,"src/neant/crypto/crypto.nt"
+fmtFiles,: ,"src/neant/crypto/ed25519.nt"
+fmtFiles,: ,"src/neant/crypto/tls.nt"
+fmtFiles,: ,"src/neant/jit/arm64.nt"
+fmtFiles,: ,"src/neant/net/http.nt"
+fmtFiles,: ,"src/neant/stdlib/encode.nt"
+fmtFiles,: ,"src/neant/stdlib/json.nt"
+fmtFiles,: ,"src/neant/stdlib/prelude.nt"
+fmtFiles,: ,"src/neant/stdlib/regex.nt"
+fmtFiles,: ,"src/neant/stdlib/table.nt"
+fmtFiles,: ,"src/neant/stdlib/test.nt"
+fmtFiles,: ,"src/neant/tools/fmt.nt"
+fmtFiles,: ,"src/neant/tools/lsp.nt"
+fmtFiles,: ,"tests/fmt.nt"
+fmtFiles,: ,"tests/json.nt"
+fmtFiles,: ,"tests/prelude.nt"
+fmtFiles,: ,"tests/regex.nt"
+fmtFiles,: ,"tests/run.nt"
+fmtFiles,: ,"tests/stdlib2.nt"
+fmtFiles,: ,"tests/table2.nt"
+fmtFiles,: ,"tests/table.nt"
+
+fmtSrc: {[p] "\n" sv read0 p}
+// the token stream with the line each token starts on — everything nparse reads, so equal here
+// means an identical AST for a source the formatter has rewritten
+fmtTok: {[s] t: nlex s; (t; plines)}
+fmtLineCount: {[s] 1 + sum s="\n"}
+
+{[p]
+  src: fmtSrc p
+  out: nfmt src
+  teq["fmt tokens ",p; fmtTok out; fmtTok src]
+  teq["fmt lines ",p; fmtLineCount out; fmtLineCount src]
+  teq["fmt bytecode ",p; ncompile out; ncompile src]
+  teq["fmt idempotent ",p; nfmt out; out]} each fmtFiles
+
+// nfmtFile rewrites a file once and then leaves it alone.  It writes outside the repo: there is
+// no delete builtin, so a scratch file under tests/ would never be cleaned up again.
+fmtTmp: "/tmp/neant-fmt-test.nt"
+write0[fmtTmp; "f: {[a]\nb:   a+1  \nb}\n"]
+tok["fmtFile reports a change"; nfmtFile fmtTmp]
+teq["fmtFile wrote the formatted text"; fmtSrc fmtTmp; "f: {[a]\n  b:   a+1\n  b}"]
+tok["fmtFile is a no-op the second time"; not nfmtFile fmtTmp]
+
+// ---- the language server, whose formatting request is nfmt.  lspNoStart keeps loading it from
+// starting a server on this process's stdin.
+tsection "lsp"
+lspNoStart: 1
+load "src/neant/tools/lsp.nt"
+
+lspFrameOf: {[body] "Content-Length: ",(string count `byte$body),"\r\n\r\n",body}
+// what read0 0 would hand back for a stream of frames: lines, CRs eaten, no newline after a body
+lspAsLines: {[bodies] vs["\n"; ssr[(,/) lspFrameOf each bodies; "\r"; ""]]}
+
+teq["lsp frames one message"; lspFrames lspAsLines enlist "{\"a\": 1}"; ,"{\"a\": 1}"]
+teq["lsp frames two messages"; lspFrames lspAsLines ("{\"a\": 1}";"{\"b\": 2}"); ("{\"a\": 1}";"{\"b\": 2}")]
+teq["lsp frames a utf-8 body"; lspFrames lspAsLines enlist "{\"a\": \"é\"}"; ,"{\"a\": \"é\"}"]
+teq["lsp frames nothing"; lspFrames enlist ""; ()]
+teq["lsp frame header counts bytes"; lspFrame `a!"é"; "Content-Length: 11\r\n\r\n{\"a\": \"é\"}"]
+
+// the byte-exact TCP reader agrees with the line-based stdin one
+lspBuf: `byte$(,/) lspFrameOf each ("{\"a\": 1}";"{\"b\": 2}")
+teq["lsp tcp frame 1"; (lspTakeFrame lspBuf)[0]; "{\"a\": 1}"]
+teq["lsp tcp frame 2"; (lspTakeFrame (lspTakeFrame lspBuf)[1])[0]; "{\"b\": 2}"]
+teq["lsp tcp partial frame"; lspTakeFrame 12#lspBuf; ()]
+
+teq["lsp defs"; lspDefs "a: 1\nf: {[x] y: 2; x}\n  g: 3"; ((,"a";0;0); (,"f";1;1b); (,"g";2;0))]
+teq["lsp defs skip an index assign"; lspDefs "a: 1\na[0]: 2"; ,(,"a";0;0)]
+teq["lsp defs survive an unbalanced closer"; {x[0]} each lspDefs "c: )\nd: 4"; (,"c";,"d")]
+teq["lsp no diagnostic"; lspDiags "a: 1\nb: 2"; ()]
+teq["lsp diagnostic line"; (first lspDiags "a: 1\nb: 2\nc: )\nd: 4")[`range][`start][`line]; 2]
+teq["lsp diagnostic message"; (first lspDiags "a: 1\nc: )")[`message]; "parse: empty assignment"]
+teq["lsp lex diagnostic"; (first lspDiags "a: 1\nb: \"oops")[`message]; "lex: unterminated string"]
+teq["lsp word at"; lspWordAt["d: sums 1"; 4]; "sums"]
+teq["lsp word just past a word"; lspWordAt["d: sums"; 7]; "sums"]
+teq["lsp prefix at"; lspPrefixAt["d: sum"; 6]; "sum"]
+
+// a whole session through lspDispatch, the way lspServe and lspServeTcp both drive it
+teq["lsp initialize result"; (first lspDispatch "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\",\"params\":{}}")[`result][`capabilities][`textDocumentSync]; 1]
+teq["lsp a notification answers nothing"; lspDispatch "{\"jsonrpc\":\"2.0\",\"method\":\"initialized\",\"params\":{}}"; ()]
+lspOpen: "{\"jsonrpc\":\"2.0\",\"method\":\"textDocument/didOpen\",\"params\":{\"textDocument\":{\"uri\":\"file:///t.nt\",\"text\":\"a: 1\\nb:  2\\nc: )\"}}}"
+lspPub: first lspDispatch lspOpen
+teq["lsp didOpen publishes"; lspPub[`method]; "textDocument/publishDiagnostics"]
+teq["lsp published line"; (first lspPub[`params][`diagnostics])[`range][`start][`line]; 2]
+lspFmtReq: "{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"textDocument/formatting\",\"params\":{\"textDocument\":{\"uri\":\"file:///t.nt\"}}}"
+teq["lsp formatting edit"; (first (first lspDispatch lspFmtReq)[`result])[`newText]; "a: 1\nb:  2\nc:)"]
+lspSymReq: "{\"jsonrpc\":\"2.0\",\"id\":3,\"method\":\"textDocument/documentSymbol\",\"params\":{\"textDocument\":{\"uri\":\"file:///t.nt\"}}}"
+teq["lsp symbols"; {x[`name]} each (first lspDispatch lspSymReq)[`result]; (,"a";,"b";,"c")]
+lspHovReq: "{\"jsonrpc\":\"2.0\",\"id\":4,\"method\":\"textDocument/hover\",\"params\":{\"textDocument\":{\"uri\":\"file:///t.nt\"},\"position\":{\"line\":0,\"character\":0}}}"
+teq["lsp hover"; (first lspDispatch lspHovReq)[`result][`contents][`value]; "```neant\na: 1\n```\n\ndefined in this file, line 1"]
+tok["lsp shutdown result is null"; `null=type (first lspDispatch "{\"jsonrpc\":\"2.0\",\"id\":9,\"method\":\"shutdown\"}")[`result]]
+teq["lsp unknown request errors"; (first lspDispatch "{\"jsonrpc\":\"2.0\",\"id\":8,\"method\":\"nope\"}")[`error][`code]; -32601]
+teq["lsp unknown notification is ignored"; lspDispatch "{\"jsonrpc\":\"2.0\",\"method\":\"nope\"}"; ()]
+teq["lsp junk is ignored"; lspDispatch "not json"; ()]
+
+// the completion list is the running image's, not a written-down one: every name it offers can be
+// read back out of the image, and the ones only Rust defines are in it
+lspItems: (first lspDispatch "{\"jsonrpc\":\"2.0\",\"id\":5,\"method\":\"textDocument/completion\",\"params\":{\"textDocument\":{\"uri\":\"file:///t.nt\"},\"position\":{\"line\":0,\"character\":0}}}")[`result][`items]
+lspLabels: {x[`label]} each lspItems
+tok["lsp completion has the prelude"; "sums" in lspLabels]
+tok["lsp completion has a Rust builtin"; "hopen" in lspLabels]
+tok["lsp completion has a control word"; "while" in lspLabels]
+tok["lsp completion has this buffer"; (enlist "b") in lspLabels]
+tok["lsp completion offers only names the image really has"; all {[g] $[g[0] in lspKEYWORDS; 1b; lspDefined `$g[0]]} each lspGlobals[]]
+lspPre: {x[`label]} each (first lspDispatch "{\"jsonrpc\":\"2.0\",\"id\":6,\"method\":\"textDocument/completion\",\"params\":{\"textDocument\":{\"uri\":\"file:///t.nt\"},\"position\":{\"line\":1,\"character\":1}}}")[`result][`items]
+tok["lsp completion filters by prefix"; all {[l] "b"~first l} each lspPre]
+tok["lsp completion prefix keeps the matches"; (enlist "b") in lspPre]
+tok["lsp completion prefix keeps image matches"; "badd" in lspPre]

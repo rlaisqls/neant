@@ -357,6 +357,16 @@ fn cast(t: Value, x: Value) -> R<Value> {
 fn text(x: &Value) -> String { to_chars(x).into_iter().collect() }
 fn lines(s: String) -> Value { list(s.lines().map(|l| chars(l.chars().collect())).collect()) }
 /// `read0 "path"` -> list of lines; `read0 0` reads stdin.
+/// `hrecv` for stdin: up to n bytes, as Bytes, empty at EOF. `read0 0` reads stdin to EOF and
+/// splits it into lines, which cannot do the incremental framed reads a protocol speaking over
+/// stdin needs (`lspServe`, src/neant/tools/lsp.nt) — that is the whole of why this exists.
+fn read1(x: Value) -> R<Value> {
+    let n = int_of(&x)?.max(0) as usize;
+    let mut buf = vec![0u8; n];
+    let got = std::io::Read::read(&mut std::io::stdin(), &mut buf).map_err(|e| NError(format!("read1: {e}")))?;
+    buf.truncate(got);
+    Ok(bytes(buf))
+}
 fn read0(x: Value) -> R<Value> {
     if let Int(0) = x {
         let mut s = String::new();
@@ -478,6 +488,16 @@ fn write0(path: Value, x: Value) -> R<Value> {
     let p = text(&path);
     let body = match &x { List(items) => items.iter().map(text).collect::<Vec<_>>().join("\n") + "\n", _ => text(&x) };
     std::fs::write(&p, body).map_err(|e| NError(format!("{p}: {e}")))?;
+    Ok(Null)
+}
+/// `hsend` for stdout: the bytes exactly as given, no trailing newline, flushed. `print` appends a
+/// newline and `write0 "/dev/stdout"` truncates on every call (so incremental writes overwrite each
+/// other), neither of which a byte-counted protocol on stdout can use — see `read1`.
+fn write1(x: Value) -> R<Value> {
+    use std::io::Write;
+    let b: Vec<u8> = match &x { Bytes(v) => v.to_vec(), _ => text(&x).into_bytes() };
+    let mut o = std::io::stdout().lock();
+    let _ = o.write_all(&b); let _ = o.flush();
     Ok(Null)
 }
 /// stdout without panicking on a closed pipe (`neant f.nt | head`)
@@ -747,7 +767,7 @@ pub static BUILTINS: &[PrimDef] = &[
     p!("key", Some(key), None), p!("value", Some(value), None), p!("group", Some(group), None),
     p!("isnull", Some(isnull), None), p!("now", Some(now), None), p!("fbits", Some(fbits), None),
     p!("show", Some(show), None), p!("repr", Some(repr), None), p!("print", Some(print), None), p!("signal", Some(signal), None), p!("exit", Some(exit), None),
-    p!("read0", Some(read0), None), p!("write0", None, Some(write0)),
+    p!("read0", Some(read0), None), p!("read1", Some(read1), None), p!("write0", None, Some(write0)), p!("write1", Some(write1), None),
     p!("hopen", Some(hopen), None), p!("hclose", Some(hclose), None), p!("hsend", None, Some(hsend)), p!("hrecv", None, Some(hrecv)),
     p!("hlisten", Some(hlisten), None), p!("accept", Some(accept), None),
     p!("shared", Some(shared), None), p!("sget", Some(sget), None), p!("sset", None, Some(sset)),
