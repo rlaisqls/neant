@@ -545,6 +545,50 @@ mod tls {
     }
 }
 
+/// boot/http.nt is a loadable module, not part of the image: request parsing and response writing
+/// over hlisten/accept, one spawned worker per connection (httpServe).
+#[cfg(test)]
+mod http {
+    use super::*;
+    use std::io::{Read, Write};
+
+    /// httpServe run against real client sockets (not neant's own hopen), the most direct way to
+    /// check request parsing and response formatting against literal bytes on the wire.
+    #[test]
+    fn serves_get_and_post_over_real_sockets() {
+        let mut v = boot_vm();
+        v.eval(&std::fs::read_to_string("boot/http.nt").unwrap()).unwrap();
+        // src/prims.rs has no way to ask a listener its bound port — bind a probe in Rust to grab
+        // a free one, drop it, and point neant's hlisten at that same port (a small, accepted
+        // TOCTOU race, same trick as the accept-workers test above).
+        let probe = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = probe.local_addr().unwrap().port();
+        drop(probe);
+        v.eval(&format!("l: hlisten \"127.0.0.1:{port}\"")).unwrap();
+        v.eval(
+            "handler: {[req] (200;\"OK\";(`$\"content-type\")!(,\"text/plain\"); \
+             \"method=\",req[`method],\" path=\",req[`path],\" body=\",req[`body])}",
+        ).unwrap();
+        std::thread::spawn(move || v.eval("httpServe[l;handler]").unwrap());
+        std::thread::sleep(std::time::Duration::from_millis(100));
+
+        let mut c = std::net::TcpStream::connect(("127.0.0.1", port)).unwrap();
+        c.write_all(b"GET /hello HTTP/1.1\r\nHost: h\r\n\r\n").unwrap();
+        let mut resp = String::new();
+        c.read_to_string(&mut resp).unwrap();
+        assert!(resp.starts_with("HTTP/1.1 200 OK\r\n"), "{resp:?}");
+        assert!(resp.contains("content-type: text/plain\r\n"), "{resp:?}");
+        assert!(resp.ends_with("method=GET path=/hello body="), "{resp:?}");
+
+        let mut c = std::net::TcpStream::connect(("127.0.0.1", port)).unwrap();
+        let body = "hi there";
+        c.write_all(format!("POST /echo HTTP/1.1\r\nHost: h\r\nContent-Length: {}\r\n\r\n{body}", body.len()).as_bytes()).unwrap();
+        let mut resp = String::new();
+        c.read_to_string(&mut resp).unwrap();
+        assert!(resp.ends_with("method=POST path=/echo body=hi there"), "{resp:?}");
+    }
+}
+
 /// boot/ed25519.nt is a loadable module, not part of the image: SHA-512 on raw 64-bit words, and
 /// Ed25519 verification on boot/crypto.nt's 2^255-19 field. FIPS 180-4 and RFC 8032 vectors.
 #[cfg(test)]

@@ -1,0 +1,52 @@
+// HTTP/1.1 over hlisten/accept, in neant. load "boot/http.nt" — not part of the boot image.
+//
+// Scope: no chunked transfer-encoding, no keep-alive/pipelining (a connection is closed after one
+// response), no URL/query-string decoding, no multipart, no HTTPS (would compose with boot/tls.nt
+// once that has a server handshake, which it doesn't). A request with no Content-Length is treated
+// as having an empty body.
+
+// one header line "Name: value" -> (`name (lowercased, as a symbol); trimmed value)
+httpHdr: {[line]
+  i: first line ss ":"
+  (`$lower line[til i]; trim line[(i+1)+til (count line)-(i+1)])}
+
+/// Blocks for one full request on connection h: reads until the header/body boundary, then reads
+// exactly Content-Length more if present. `path`/`method`/`version` are strings; `headers` is a
+// dict keyed by lowercased symbol; `body` is a string (raw bytes decoded as chars).
+httpRecv: {[h]
+  buf: ""; pos: ()
+  while[0=count pos
+    c: hrecv[h;4096]
+    if[0=count c; signal "http: connection closed before headers"]
+    buf,: `char$c
+    pos: buf ss "\r\n\r\n"]
+  i: first pos
+  head: buf[til i]
+  rest: buf[(i+4)+til (count buf)-(i+4)]
+  lines: vs["\r\n";head]
+  rl: vs[" ";lines[0]]
+  hp: httpHdr each 1_lines
+  hdrs: (first each hp) ! (last each hp)
+  clKey: `$"content-length"
+  len: $[clKey in key hdrs; `int$hdrs clKey; 0]
+  body: rest
+  while[(count body)<len
+    c: hrecv[h; len-count body]
+    if[0=count c; signal "http: connection closed before body"]
+    body,: `char$c]
+  `method`path`version`headers`body ! (rl 0; rl 1; rl 2; hdrs; $[0=len;"";len#body])}
+
+/// Writes a response: status (int), reason (string), headers (dict, any key type stringifies),
+// body (string or bytes — sent as-is after the headers).
+httpSend: {[h;status;reason;headers;body]
+  hl: {x,": ",y}'[string each key headers; string each value headers]
+  statusLine: "HTTP/1.1 ",(string status)," ",reason
+  head: sv["\r\n"; (enlist statusLine),hl,(enlist "")]
+  hsend[h; head,"\r\n",body]}
+
+/// `httpServe[l;handler]`: accepts forever, one spawned worker per connection. `handler` is
+// `req -> (status;reason;headers;body)`, called with `httpRecv`'s dict.
+httpServe: {[l;handler]
+  while[1
+    c: accept l
+    spawn {r: handler httpRecv c; httpSend[c;r[0];r[1];r[2];r[3]]; hclose c}]}

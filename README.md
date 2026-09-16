@@ -161,6 +161,25 @@ jk "{\"a\": [1, 2]}"         // ,`a!(1 2)
 jj `a`b!(1 2;"x")            // "{"a": [1, 2], "b": "x"}"
 ```
 
+## HTTP
+
+`boot/http.nt` (loadable, not in the boot image): `httpRecv`/`httpSend` parse a request and write a
+response over an `hopen`/`accept` handle; `httpServe` wraps the accept-loop-plus-`spawn` pattern shown earlier (`hlisten`/`accept`, "Rust
+builtins" above) into one call.
+
+```
+load "boot/http.nt"
+l: hlisten "0.0.0.0:8080"
+httpServe[l; {[req] (200; "OK"; (`$"content-type")!(,"text/plain"); "you asked for ",req[`path])}]
+```
+
+`req` is `` `method`path`version`headers`body!(...) ``, headers keyed by lowercased symbol (build
+one with `` `$"content-length" ``, not a literal `` `content-length `` — a hyphen in a *literal*
+symbol token is the `-` verb, not part of the name; casting a string with `` `$ `` has no such
+limit). A handler returns `(status; reason; headers; body)`. No chunked transfer-encoding, no
+keep-alive (`hclose` after every response), no URL/query decoding, no HTTPS yet — `boot/tls.nt` is
+still client-only.
+
 ## Bytes and crypto
 
 ```
