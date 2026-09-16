@@ -1425,6 +1425,290 @@ mod ed25519 {
     }
 }
 
+/// src/neant/crypto/{der,x509}.nt are loadable modules, not part of the image: ASN.1 DER and X.509
+/// certificate parsing — the half of certificate verification that establishes what a certificate
+/// *says*, with no signature check, no chain building and no hostname match anywhere in it.
+///
+/// Every expected value below was read off `openssl x509 -text -noout` (OpenSSL 3.6.2) for the same
+/// fixture, and each fixture under tests/data/ carries the command that generated it in its own
+/// header. The hand-written DER vectors are X.690's own encodings, small enough to read by eye.
+#[cfg(test)]
+mod x509 {
+    use super::*;
+    fn x509_vm() -> vm::Vm {
+        let mut v = boot_vm();
+        for f in ["src/neant/crypto/der.nt", "src/neant/crypto/x509.nt"] {
+            v.eval(&std::fs::read_to_string(f).unwrap()).unwrap_or_else(|e| panic!("{f}: '{}", e.0));
+        }
+        v
+    }
+    /// `d "hex"` parses one complete element; anything left over is already an error.
+    const D: &str = "d: {derParse unhex x}; ";
+
+    /// Every universal type a certificate uses, decoded from its own encoding.
+    #[test]
+    fn der_decodes_every_type_a_certificate_uses() {
+        let mut v = x509_vm();
+        for (src, want) in [
+            // INTEGER is two's complement, so the sign is in the top bit of the first octet
+            ("derIntVal d \"020100\"", "0"), ("derIntVal d \"02017f\"", "127"),
+            ("derIntVal d \"02020080\"", "128"), ("derIntVal d \"0201ff\"", "-1"),
+            ("derIntVal d \"020180\"", "-128"),
+            ("hex derInt d \"0202ff00\"", "\"ff00\""),          // -256 needs two octets: minimal
+            ("derBool d \"0101ff\"", "1b"), ("derBool d \"010100\"", "0b"),
+            ("(derNull d \"0500\") ~ 0x", "1b"),
+            ("hex derOct d \"0403010203\"", "\"010203\""),
+            // the first octet packs two arcs as 40*a+b; { 2 999 3 } is X.690 8.19's own example
+            ("derOid d \"06092a864886f70d01010b\"", "\"1.2.840.113549.1.1.11\""),
+            ("derOid d \"0603883703\"", "\"2.999.3\""),
+            ("derOidSym derOid d \"06092a864886f70d01010b\"", "`sha256WithRsa"),
+            ("derOidSym derOid d \"0603883703\"", "`unknown"),
+            ("derBitStr d \"030304f0f0\"", "(4;0xf0f0)"),       // 4 unused bits, all of them zero
+            ("hex derBits d \"0303001234\"", "\"1234\""),
+            ("derStr d \"130461626364\"", "\"abcd\""),          // PrintableString
+            ("derStr d \"0c04c3a9c3a8\"", "\"\u{e9}\u{e8}\""),  // UTF8String, decoded as UTF-8
+            ("derStr d \"140241e9\"", "\"A\u{e9}\""),           // T61String, decoded as latin-1
+            ("derTime d \"170d3236303130313032303330345a\"", "(2026.01.01;02:03:04.000)"),
+            ("derTime d \"180f32303236303130313030303030305a\"", "(2026.01.01;00:00:00.000)"),
+            // RFC 5280 4.1.2.5.1: a two-digit year is 1950..2049, so 49 and 50 land a century apart
+            ("(derTime d \"170d3439303130313030303030305a\")[0]", "2049.01.01"),
+            ("(derTime d \"170d3530303130313030303030305a\")[0]", "1950.01.01"),
+            // structure: long-form length, the high-tag-number form, and a constructed element's kids
+            ("n: d (\"3081c8\"),raze 200#enlist \"00\"; (n[`tag];n[`hlen];n[`len])", "16 3 200"),
+            ("h: d \"5f1f0100\"; (h[`cls];h[`tag];h[`cons])", "(`app;31;0b)"),
+            ("count derKids d \"3006020101020102\"", "2"),
+            ("count derKids d \"3100\"", "0"),
+            // the span a node carries is the bytes it came from, not a re-encoding
+            ("hex (derKids d \"3006020101020102\")[1][`raw]", "\"020102\""),
+        ] {
+            assert_eq!(tests::ev(&mut v, &format!("{D}{src}")), want, "source: {src}");
+        }
+    }
+
+    /// Everything that must not parse. A DER reader that shrugs at any of these hands a verifier an
+    /// encoding whose meaning two implementations can disagree about, which is the whole attack.
+    #[test]
+    fn der_refuses_every_encoding_der_forbids() {
+        let mut v = x509_vm();
+        for (what, src, msg) in [
+            ("indefinite length", "d \"308005000000\"", "indefinite length is not DER"),
+            ("trailing bytes", "d \"050000\"", "trailing bytes after the top-level element"),
+            ("non-minimal length", "d \"3081050500\"", "non-minimal length"),
+            ("length past the end", "d \"30050500\"", "length runs past the end of the input"),
+            ("truncated header", "d \"05\"", "input ends inside an element"),
+            ("length wider than an int", "d \"3085010000000500\"", "length does not fit an int"),
+            ("non-minimal tag", "d \"5f800100\"", "non-minimal tag"),
+            ("padded positive INTEGER", "derInt d \"0202007f\"", "non-minimal INTEGER"),
+            ("padded negative INTEGER", "derInt d \"0202ffff\"", "non-minimal INTEGER"),
+            ("empty INTEGER", "derInt d \"0200\"", "empty INTEGER"),
+            ("INTEGER wider than an i64", "derIntVal d \"0209010000000000000000\"",
+             "INTEGER too large for an int"),
+            ("BOOLEAN that is not 0x00/0xff", "derBool d \"010101\"",
+             "BOOLEAN must be 0x00 or 0xff in DER"),
+            ("two-octet BOOLEAN", "derBool d \"0102ffff\"", "BOOLEAN must be one octet"),
+            ("NULL with content", "derNull d \"050100\"", "NULL with content"),
+            ("padded OID subidentifier", "derOid d \"06032a8001\"",
+             "non-minimal OBJECT IDENTIFIER subidentifier"),
+            ("OID cut mid-subidentifier", "derOid d \"06022a86\"",
+             "OBJECT IDENTIFIER ends inside a subidentifier"),
+            ("empty OID", "derOid d \"0600\"", "empty OBJECT IDENTIFIER"),
+            ("BIT STRING with set unused bits", "derBitStr d \"030304f0f1\"",
+             "BIT STRING trailing bits are not zero"),
+            ("BIT STRING claiming 8 unused", "derBitStr d \"03020800\"",
+             "BIT STRING unused-bit count out of range"),
+            ("empty BIT STRING with unused bits", "derBitStr d \"030101\"",
+             "BIT STRING has no octets but claims unused bits"),
+            ("partial-octet key", "derBits d \"030304f0f0\"",
+             "BIT STRING is not a whole number of octets"),
+            ("PrintableString with @", "derStr d \"130140\"",
+             "PrintableString has a character outside its set"),
+            ("IA5String above ASCII", "derStr d \"160180\"", "IA5String is not ASCII"),
+            ("constructed string", "derStr d \"3300\"", "a DER string must be primitive"),
+            ("UTCTime without seconds", "derTime d \"170b3236303130313030303030\"",
+             "UTCTime must be 13 characters"),
+            ("UTCTime without Z", "derTime d \"170d323630313031303030303030ff\"",
+             "UTCTime must end in Z"),
+            ("month 13", "derTime d \"170d3236313330313030303030305a\"",
+             "month out of range in UTCTime"),
+            ("30 February", "derTime d \"170d3236303233303030303030305a\"",
+             "day out of range in UTCTime"),
+            ("second 60", "derTime d \"170d3236303130313030303036305a\"",
+             "second out of range in UTCTime"),
+            ("primitive SEQUENCE", "derWant[d \"1000\";16;1b]", "SEQUENCE must be constructed"),
+            ("kids of a primitive", "derKids d \"0500\"",
+             "expected a constructed element, got a primitive one"),
+        ] {
+            assert_eq!(tests::ev(&mut v, &format!("{D}{src}")), format!("'der: {msg}"), "{what}");
+        }
+    }
+
+    /// The self-signed RSA fixture, field by field. Its key is regenerated by the command in its
+    /// header, so nothing here depends on the modulus' value — only on its size and on the fields
+    /// the command itself fixes.
+    #[test]
+    fn self_signed_rsa_matches_openssl() {
+        let mut v = x509_vm();
+        v.eval("c: x509Parse (pemLoad \"tests/data/selfsigned-rsa.pem\")[0]").unwrap();
+        for (src, want) in [
+            ("c`ver", "3"),
+            ("hex c`serial", "\"0102030405060708\""),            // openssl: serial=0102030405060708
+            ("c`sigAlg", "`rsaPkcs1Sha256"),                     // Signature Algorithm: sha256WithRSA
+            ("c`sigAlgOid", "\"1.2.840.113549.1.1.11\""),
+            ("c`sigParams", "()!()"),                            // PKCS#1 v1.5 has no parameters
+            // openssl x509 -noout -subject -issuer -nameopt RFC2253, verbatim
+            ("c`subject", "\"CN=selfsigned.neant.test,OU=crypto,O=neant,L=San Francisco,\
+ST=California,C=US\""),
+            ("(c`issuer) ~ c`subject", "1b"),
+            ("(c`issuerCanon) ~ c`subjectCanon", "1b"),            // self-signed: it is its own issuer
+            ("c`subjectCanon", "\"2.5.4.6=us,2.5.4.8=california,2.5.4.7=san francisco,\
+2.5.4.10=neant,2.5.4.11=crypto,2.5.4.3=selfsigned.neant.test\""),
+            ("c`notBefore", "(2026.01.01;00:00:00.000)"),        // Not Before: Jan  1 00:00:00 2026
+            ("c`notAfter", "(2036.01.01;00:00:00.000)"),         // Not After : Jan  1 00:00:00 2036
+            ("(c`spki)`alg", "`rsa"),
+            ("count (c`spki)`n", "256"),                         // Public-Key: (2048 bit)
+            ("hex (c`spki)`e", "\"010001\""),                    // Exponent: 65537 (0x10001)
+            ("0=`int$((c`spki)`n)[0]", "0b"),                    // the sign octet is stripped
+            ("c`san", "(\"selfsigned.neant.test\";\"alt.neant.test\")"),   // the IP: entry is skipped
+            ("c`eku", "(\"1.3.6.1.5.5.7.3.1\";\"1.3.6.1.5.5.7.3.2\")"),    // serverAuth, clientAuth
+            ("(c`isCa; c`pathLen)", "(1b;2)"),                   // CA:TRUE, pathlen:2
+            ("c`keyUsage", "`digitalSignature`keyCertSign`cRLSign"),
+            ("c`critUnknown", "()"),                             // both critical ones are modelled
+            ("count c`sig", "256"),
+            // `tbs is the span, not a re-encoding: it is exactly the bytes at offset 4 of the file
+            ("der: (pemLoad \"tests/data/selfsigned-rsa.pem\")[0]; (c`tbs) ~ der[4+til count c`tbs]",
+             "1b"),
+        ] {
+            assert_eq!(tests::ev(&mut v, src), want, "source: {src}");
+        }
+    }
+
+    /// The EC and RSASSA-PSS fixtures: the two spki shapes and the two signature-algorithm shapes
+    /// the RSA fixture cannot reach. PSS names its hash in the parameters, not in the OID.
+    #[test]
+    fn ec_and_pss_certificates_match_openssl() {
+        let mut v = x509_vm();
+        v.eval("e: x509Parse (pemLoad \"tests/data/selfsigned-ec.pem\")[0]").unwrap();
+        v.eval("p: x509Parse (pemLoad \"tests/data/selfsigned-pss.pem\")[0]").unwrap();
+        for (src, want) in [
+            ("`int$(e`serial)[0]", "42"),                             // openssl: serial=2A
+            ("e`sigAlg", "`ecdsaSha256"),                        // ecdsa-with-SHA256
+            ("e`sigAlgOid", "\"1.2.840.10045.4.3.2\""),
+            ("e`subject", "\"CN=ec.neant.test,O=neant,C=US\""),
+            ("(e`spki)`alg", "`ec"),
+            ("(e`spki)`curve", "`p256"),                         // NIST CURVE: P-256
+            ("(e`spki)`oid", "\"1.2.840.10045.3.1.7\""),         // ASN1 OID: prime256v1
+            ("count (e`spki)`point", "65"),                      // 0x04 and two 32-octet coordinates
+            ("e`san", "(\"ec.neant.test\")"),
+            // CA:FALSE is the DEFAULT, so DER encodes BasicConstraints as an empty SEQUENCE
+            ("(e`isCa; e`pathLen)", "(0b;0N)"),
+            ("e`keyUsage", ",`digitalSignature"),
+            ("`int$(p`serial)[0]", "123"),                            // openssl: serial=7B
+            ("p`sigAlg", "`rsaPssSha256"),                       // Signature Algorithm: rsassaPss
+            ("p`sigAlgOid", "\"1.2.840.113549.1.1.10\""),
+            // Hash Algorithm: sha256 / Mask Algorithm: mgf1 with sha256 / Salt Length: 0x20
+            ("p`sigParams", "`hash`mgfHash`saltLen!(`sha256;`sha256;32)"),
+            ("(p`spki)`alg", "`rsa"),
+            ("p`keyUsage", "()"),                                // no keyUsage extension at all
+        ] {
+            assert_eq!(tests::ev(&mut v, src), want, "source: {src}");
+        }
+    }
+
+    /// A chain exactly as a server sends one. The point of `issuerCanon`/`subjectCanon` is here:
+    /// chain building matches one certificate's issuer against another's subject, and it must be a
+    /// comparison on a canonical form, not on the printable text.
+    #[test]
+    fn real_chain_parses_and_links() {
+        let mut v = x509_vm();
+        v.eval("cs: x509Parse each pemLoad \"tests/data/chain-google.pem\"").unwrap();
+        for (src, want) in [
+            ("count cs", "3"),                                   // leaf, intermediate, root
+            ("(cs[0])`subject", "\"CN=www.google.com\""),
+            ("(cs[0])`issuer", "\"CN=WE2,O=Google Trust Services,C=US\""),
+            ("hex (cs[0])`serial", "\"465ba8f43add48190abbcabc0878c127\""),
+            ("(cs[0])`notBefore", "(2026.09.04;08:06:59.000)"),  // Not Before: Sep 4 08:06:59 2026
+            ("(cs[0])`notAfter", "(2026.11.27;08:06:58.000)"),
+            ("(cs[0])`sigAlg", "`ecdsaSha256"),
+            ("((cs[0])`spki)`curve", "`p256"),
+            ("(cs[0])`san", "(\"www.google.com\")"),
+            ("((cs[0])`isCa; (cs[0])`pathLen)", "(0b;0N)"),
+            ("(cs[1])`subject", "\"CN=WE2,O=Google Trust Services,C=US\""),
+            ("(cs[1])`sigAlg", "`ecdsaSha384"),
+            ("((cs[1])`isCa; (cs[1])`pathLen)", "(1b;0)"),       // CA:TRUE, pathlen:0
+            ("(cs[2])`subject", "\"CN=GTS Root R4,O=Google Trust Services LLC,C=US\""),
+            ("(cs[2])`issuer", "\"CN=GlobalSign Root CA,OU=Root CA,O=GlobalSign nv-sa,C=BE\""),
+            ("(cs[2])`sigAlg", "`rsaPkcs1Sha256"),               // an EC key cross-signed by RSA
+            ("((cs[2])`spki)`curve", "`p384"),
+            ("((cs[2])`isCa; (cs[2])`pathLen)", "(1b;0N)"),      // CA:TRUE with no pathlen
+            ("{x`critUnknown} each cs", "(();();())"),           // nothing critical is unmodelled
+            ("(cs[0])[`issuerCanon] ~ (cs[1])`subjectCanon", "1b"),
+            ("(cs[1])[`issuerCanon] ~ (cs[2])`subjectCanon", "1b"),
+            ("(cs[0])[`issuerCanon] ~ (cs[2])`subjectCanon", "0b"),
+            // the hashes a verifier will actually sign-check, over the spans the parser kept:
+            //   python3 -c 'import base64,hashlib,re,sys; ...' -- or equivalently
+            //   openssl asn1parse -in <one cert> -strparse 4 -noout -out - | sha256sum
+            ("hex sha256 (cs[0])`tbs",
+             "\"68d4a9fb5c3da2814f42d61dd2558273479b5f75fd8ae13d7f9e715c3eae7306\""),
+            ("hex sha256 (cs[1])`tbs",
+             "\"c3210337a3f77559f6371588cdc4894e3d084bb79f4c283f9320b7bd8cf16474\""),
+            ("hex sha256 (cs[2])`tbs",
+             "\"6e62a0efd60a04d93f2f864b54442717a666c038c8c70546af6319e4f46a2f73\""),
+        ] {
+            assert_eq!(tests::ev(&mut v, src), want, "source: {src}");
+        }
+    }
+
+    /// RFC 5280 4.2: a critical extension a verifier does not understand means the certificate must
+    /// be rejected. Dropping it silently is a way a verifier gets fooled, so it is reported instead.
+    #[test]
+    fn a_critical_extension_nobody_models_is_reported() {
+        let mut v = x509_vm();
+        v.eval("c: x509Parse (pemLoad \"tests/data/critical-unknown-ext.pem\")[0]").unwrap();
+        assert_eq!(tests::ev(&mut v, "c`critUnknown"), "(\"1.3.6.1.4.1.99999.1\")");
+        assert_eq!(tests::ev(&mut v, "c`subject"), "\"CN=critical.neant.test\"");
+        assert_eq!(tests::ev(&mut v, "hex c`serial"), "\"1234\"");
+    }
+
+    /// tests/data/malformed.pem, block by block, in the order tests/data/malformed.py writes them.
+    /// The last one is the interesting one: two AlgorithmIdentifiers of the same length that say
+    /// different things, which only RFC 5280 4.1.1.2's equality check catches.
+    #[test]
+    fn malformed_certificates_signal() {
+        let mut v = x509_vm();
+        v.eval("ds: pemLoad \"tests/data/malformed.pem\"").unwrap();
+        assert_eq!(tests::ev(&mut v, "count ds"), "5");
+        for (i, msg) in [
+            (0, "'der: length runs past the end of the input"),
+            (1, "'der: non-minimal length"),
+            (2, "'der: indefinite length is not DER"),
+            (3, "'der: trailing bytes after the top-level element"),
+            (4, "'x509: signatureAlgorithm does not match the one inside tbsCertificate"),
+        ] {
+            assert_eq!(tests::ev(&mut v, &format!("x509Parse ds[{i}]")), msg, "block {i}");
+        }
+    }
+
+    /// pemDecode ignores everything outside the BEGIN/END lines — which is what lets an
+    /// `openssl s_client -showcerts` capture be handed over unedited — and refuses a broken wrapper.
+    #[test]
+    fn pem_decoding_is_strict_about_its_wrapper() {
+        let mut v = x509_vm();
+        let one = "-----BEGIN CERTIFICATE-----\\nBQA=\\n-----END CERTIFICATE-----";
+        for (src, want) in [
+            (format!("hex (pemDecode \"junk\\n{one}\\ntrailing junk\")[0]"), "\"0500\"".to_string()),
+            (format!("count pemDecode \"{one}\\n{one}\""), "2".to_string()),
+            ("count pemDecode \"nothing here\"".to_string(), "0".to_string()),
+            (format!("pemDecode \"{one}\\n-----BEGIN CERTIFICATE-----\""),
+             "'pem: a BEGIN CERTIFICATE with no END".to_string()),
+            ("pemDecode \"-----END CERTIFICATE-----\"".to_string(),
+             "'pem: an END CERTIFICATE with no BEGIN".to_string()),
+            (format!("count pemLoad \"tests/data/chain-google.pem\""), "3".to_string()),
+        ] {
+            assert_eq!(tests::ev(&mut v, &src), want, "source: {src}");
+        }
+    }
+}
+
 #[cfg(test)]
 mod boot {
     use super::*;
