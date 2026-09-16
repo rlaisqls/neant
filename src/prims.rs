@@ -81,6 +81,7 @@ fn join(mut x: Value, y: Value) -> R<Value> {
 }
 fn take(n: Value, x: Value) -> R<Value> {
     let n = int_of(&n)?; let s = x.seq(); let len = s.len() as i64;
+    if n == 0 { return Ok(pack(vec![])); }   // 0 from anything, even empty, is just empty — no cycling needed
     if len == 0 { return err("take from empty"); }
     let idx: Vec<i64> = if n >= 0 { (0..n).map(|i| i % len).collect() } else { (n..0).map(|i| (len + i) % len).collect() };
     Ok(pack(idx.into_iter().map(|i| s[i as usize].clone()).collect()))
