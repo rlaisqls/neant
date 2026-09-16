@@ -1,0 +1,181 @@
+// Arbitrary-precision unsigned integers in neant — the general modular arithmetic that signature
+// schemes on real certificates need, where crypto.nt's 2^255-19 and 2^130-5 get away with folding a
+// special prime. Not part of the boot image — load it with  load "src/neant/crypto/bignum.nt"
+//
+// The API boundary is a big-endian byte vector (`0x..`), because that is what X.509 INTEGERs and
+// the TLS wire hand you. Inside, a number is a list of ints holding 26-bit limbs, least significant
+// first, the same shape poly1305 uses in crypto.nt. Leading zero limbs are trimmed; zero is `,0`.
+//
+// Why 26 bits: a limb product is < 2^52, and bnMul forms one column of the schoolbook product with
+// a single vectorised `acc[i+til nb] +: a[i]*b` exactly as fmul does — a column takes min(na;nb) of
+// those products, so it stays under min(na;nb)*2^52 with no carries in between. An int is an i64,
+// so 1023 products still fit under 2^62 and leave bnMontMul's carry (< 2^33) room on top; bnMul
+// refuses anything wider. 1023 limbs is 26598 bits, five times an RSA-4096 modulus. Carries are not
+// propagated per product: bnCarry runs them as vector passes afterwards, fmul's trick again.
+//
+// Montgomery, not Barrett, for bnModExp: with e = 65537 a verification is 16 squarings and 2
+// multiplies, and REDC is n rounds of that same vectorised multiply-accumulate plus one scalar
+// carry, so a modmul is 2n vector ops and no division at all. Barrett would need two n-limb
+// multiplications per reduction *and* a mu = floor(b^2k / N) that only a general division can
+// produce. The division is written here anyway (bnDivMod, Knuth 4.3.1D) because R^2 mod N has to
+// come from somewhere and because bnMod should work for any modulus — but it runs twice per
+// exponentiation instead of eighteen times. REDC needs an odd modulus, so bnModExp signals on an
+// even one rather than returning a wrong answer.
+
+BNB:    26                          // limb width in bits
+BNM:    67108863                    // 2^26-1, the limb mask
+BNBASE: 67108864                    // 2^26
+BNHALF: 33554432                    // 2^25: bnDivMod normalises until v's top limb has this bit
+BNBIAS: 4503599627370496            // 2^52, a base multiple: keeps bnMontInv's subtraction positive
+BNZERO: ,0
+
+// ---- shape
+bnTrim: {[v] n: count v; while[(n>1) & 0 = v[n-1]; n: n-1]; n#v}
+bnPad:  {[v;n] $[n < count v; v; v, (n-count v)#0]}       // to at least n limbs; never truncates
+// carry pass over limbs that may hold anything up to ~2^59, e.g. straight out of bnMul's acc.
+// One pass moves each carry up one limb, so it repeats until nothing is left; the sum of the limbs
+// strictly drops whenever a carry is nonzero, which is why it terminates.
+bnCarry: {[v]
+  c: v shr BNB
+  while[0 < |/c
+    if[0 < last c; v,: 0; c,: 0]                          // a carry off the top needs a new limb
+    v: (v band BNM) + 0,-1_c
+    c: v shr BNB]
+  v}
+bnIsZero: {[v] (1 = count bnTrim v) & 0 = v[0]}
+// bit length; 0 for zero
+bnBits: {[v] v: bnTrim v; t: v[(count v)-1]; k: 0
+  while[t>0; t: t shr 1; k+:1]
+  (BNB * (count v)-1) + k}
+// -1 / 0 / 1, like ed25519's scGe: the highest limb they differ in decides
+bnCmp: {[a;b]
+  n: (count a)|count b
+  d: bnPad[a;n] - bnPad[b;n]
+  i: where not d=0
+  $[0 = count i; 0; 0 < d[last i]; 1; -1]}
+
+// ---- conversion. bytes are big-endian and limbs little-endian, so the byte list is reversed
+// first and laid out as one bit list least-significant-first, the way fdecode does it.
+bnFromBytes: {[b]
+  if[0 = count b; :BNZERO]
+  m: 8 * count b
+  n: BNB * ceiling m % BNB
+  bits: (raze {(x shr til 8) band 1} each `int$ reverse b), (n-m)#0
+  bnTrim {+/x*2^til BNB} each BNB cut bits}
+// exactly k big-endian bytes, zero-padded on the left; signals when the value does not fit
+bnBytesN: {[v;k]
+  if[k < ceiling (bnBits v) % 8; signal "bn: value needs more than k bytes"]
+  if[k<1; :0x]                                            // only zero fits in no bytes at all
+  bits: (raze {(x shr til BNB) band 1} each v), (8*k)#0  // over-pad: `#` would cycle a short list
+  `byte$ reverse {+/x*2^til 8} each 8 cut (8*k)#bits}
+bnBytes: {[v] bnBytesN[v; ceiling (bnBits v) % 8]}        // minimal form; zero is 0x
+
+// ---- add, subtract, compare-free shifts
+bnAdd: {[a;b] n: 1 + (count a)|count b; bnTrim bnCarry bnPad[a;n] + bnPad[b;n]}
+// a-b, and a signal when that would go negative — callers here always know it does not.
+// The bias (2^26 at limb 0, 2^26-1 on every limb above it) is exactly 2^(26n), so every limb stays
+// non-negative while the value is a-b+2^(26n): the top limb comes out 1 iff a >= b.
+bnSub: {[a;b]
+  n: (count a)|count b
+  d: bnPad[a;n+1] - bnPad[b;n+1]
+  r: bnCarry d + ((BNBASE, (n-1)#BNM), 0)
+  if[not 1 = r[n]; signal "bn: subtraction would go negative"]
+  bnTrim n#r}
+bnShl: {[v;s] bnTrim bnCarry ((s div BNB)#0), v * 2^s mod BNB}
+bnShr: {[v;s]
+  w: (s div BNB) _ v
+  if[0 = count w; :BNZERO]
+  b: s mod BNB
+  if[b>0; w: (w shr b) bor BNM band (1_w,0) shl BNB-b]   // the limb above slides its low bits down
+  bnTrim w}
+
+// ---- multiply. One vector multiply-accumulate per limb of a, no carries until the end.
+bnMul: {[a;b]
+  na: count a; nb: count b
+  if[1023 < na&nb; signal "bn: operands too wide for an exact column sum"]
+  acc: (na+nb)#0
+  i: 0
+  while[i<na; acc[i+til nb]+: a[i]*b; i+:1]
+  bnTrim bnCarry acc}
+bnMulSmall: {[v;k] bnTrim bnCarry v*k}                    // k < 2^26, so every product is < 2^52
+
+// ---- divide: Knuth 4.3.1 algorithm D. bnDivMod[u;v] -> (quotient; remainder).
+// The estimated digit is corrected by comparing qhat*v against the working slice outright rather
+// than by the two-limb test — a handful of extra vector ops on a loop that normally runs zero
+// times, in exchange for a correction that cannot be subtly wrong.
+bnDivSmall: {[u;d]                                   // one-limb divisor: (r*2^26)+u[i] stays exact
+  n: count u; q: n#0; r: 0; i: n-1
+  while[not i<0; t: (r*BNBASE) + u[i]; q[i]: t div d; r: t mod d; i: i-1]
+  (bnTrim q; ,r)}
+bnDivMod: {[u0;v0]
+  u: bnTrim u0; v: bnTrim v0
+  if[bnIsZero v; signal "bn: divide by zero"]
+  if[0 > bnCmp[u;v]; :(BNZERO; u)]
+  n: count v
+  if[n=1; :bnDivSmall[u; v[0]]]
+  s: 0; t: v[n-1]
+  while[t < BNHALF; t: 2*t; s+:1]                        // normalise: v's top limb keeps bit 25 set
+  vn: bnPad[bnShl[v;s]; n]
+  nu: count u
+  un: bnPad[bnShl[u;s]; nu+1]
+  m: nu - n
+  q: (m+1)#0
+  j: m
+  while[not j<0
+    qh: ((un[j+n]*BNBASE) + un[(j+n)-1]) div vn[n-1]    // < 2^52 over >= 2^25: off by at most 2
+    if[qh > BNM; qh: BNM]
+    p: bnPad[bnMulSmall[vn;qh]; n+1]
+    sl: un[j+til n+1]
+    while[0 < bnCmp[p;sl]; qh: qh-1; p: bnPad[bnSub[p;vn]; n+1]]
+    q[j]: qh
+    un[j+til n+1]: bnPad[bnSub[sl;p]; n+1]
+    j: j-1]
+  (bnTrim q; bnShr[bnTrim n#un; s])}
+bnMod: {[u;v] (bnDivMod[u;v])[1]}
+
+// ---- Montgomery. R = 2^(26n) for an n-limb modulus; np = -N^-1 mod 2^26 by Hensel lifting, five
+// doublings from one correct bit (N is odd) to 32, of which 26 are kept. The bias keeps the
+// subtraction positive: 2^52 is a multiple of 2^26, so it does not change the result mod 2^26.
+bnMontInv: {[n0]
+  if[0 = n0 band 1; signal "bn: even modulus"]
+  x: 1
+  do[5; x: BNM band x * BNM band (BNBIAS+2) - n0*x]
+  BNBASE - x}
+// a*b*R^-1 mod N, for a,b < N. The product's low limbs are cleared one at a time: m makes limb i a
+// multiple of 2^26, and the one scalar carry out of it is the only carry the loop propagates —
+// every other limb grows unchecked (< 2^58.4 for a 2048-bit modulus) and is normalised at the end.
+bnMontMul: {[a;b;N;np]
+  n: count N
+  t: bnPad[bnMul[a;b]; (2*n)+1]
+  i: 0
+  while[i<n
+    m: BNM band t[i]*np
+    t[i+til n]+: m*N
+    t[i+1]+: t[i] shr BNB
+    i+:1]
+  r: bnCarry t[n+til n+1]
+  $[0 > bnCmp[r;N]; bnTrim r; bnTrim bnSub[r;N]]}     // < 2N, so one subtraction settles it
+// exponent bits most-significant-first with the leading zeros gone
+bnExpBits: {[e] k: bnBits e; $[k=0; (); reverse k # raze {(x shr til BNB) band 1} each e]}
+// base^exp mod N on limbs. N odd and > 1.
+bnModExpL: {[b;e;N]
+  n: count N
+  np: bnMontInv N[0]
+  r2: bnMod[((2*n)#0), 1; N]                          // R^2 mod N: the division's one job here
+  x: bnMontMul[bnMod[b;N]; r2; N; np]
+  acc: bnMontMul[,1; r2; N; np]                           // R mod N, which is 1 in Montgomery form
+  bits: bnExpBits e
+  i: 0; m: count bits
+  while[i<m
+    acc: bnMontMul[acc;acc;N;np]
+    if[bits[i]; acc: bnMontMul[acc;x;N;np]]
+    i+:1]
+  bnMontMul[acc; ,1; N; np]}                              // back out of Montgomery form
+// bnModExp[base;exp;mod] -> bytes. Everything big-endian; the result is minimal (no leading zeros),
+// so a caller wanting a fixed width pads it. An even or zero modulus signals: see the header.
+bnModExp: {[bb;eb;mb]
+  N: bnFromBytes mb
+  if[bnIsZero N; signal "bn: modulus is zero"]
+  if[0 = N[0] band 1; signal "bn: even modulus, Montgomery reduction needs an odd one"]
+  if[1 = bnBits N; :0x]                                   // mod 1 is 0 for every base
+  bnBytes bnModExpL[bnFromBytes bb; bnFromBytes eb; N]}

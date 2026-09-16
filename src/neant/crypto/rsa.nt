@@ -1,0 +1,100 @@
+// RSA signature verification (RFC 8017) in neant, on src/neant/crypto/bignum.nt and crypto.nt's
+// sha256. Not part of the boot image, and bignum.nt is not either, so load both:
+//   load "src/neant/crypto/bignum.nt"
+//   load "src/neant/crypto/rsa.nt"
+//
+//   rsaVerifyPkcs1[n; e; `sha256; digest; sig] -> 1b / 0b      RFC 8017 8.2.2
+//   rsaVerifyPss[n; e; digest; sig]            -> 1b / 0b      RFC 8017 8.1.2, MGF1-SHA256
+//
+// n, e and sig are big-endian byte vectors as they come off a certificate; digest is the hash of
+// the signed message, already computed (32 bytes for SHA-256). `hash` is a symbol so a second
+// hash can be added in rsaDigestInfo/rsaHashLen without any caller changing.
+//
+// Both verifiers are total: every malformed encoding returns 0b, because saying no is the whole job
+// and a signal would be an answer the caller has to remember to catch. Only a caller error — an
+// empty modulus or exponent — signals. Verification only: there is no signing here, and nothing is
+// constant-time, which is what a verifier's all-public inputs allow.
+
+// ---- the DigestInfo DER that RFC 8017 9.2 note 1 fixes for each hash, and the digest length that
+// goes with it. An unknown symbol gives () / 0, which every caller turns into 0b.
+rsaDigestInfo: {[h] $[h ~ `sha256; unhex "3031300d060960864801650304020105000420"; ()]}
+rsaHashLen:    {[h] $[h ~ `sha256; 32; 0]}
+
+// ---- RSAVP1 (RFC 8017 5.2.2) with every structural check the standard puts around it, failing
+// closed as () rather than signalling: a signature that is not exactly k octets, a modulus that is
+// even, too small or absurdly wide, an exponent outside 3 <= e < n, a representative >= n, or a
+// result too wide for emLen octets. Returns the encoded message as exactly emLen big-endian bytes.
+// The width cap is what keeps the verifier total: bnMul signals past 26598 bits, and a signal is
+// not an answer a certificate gets to force.
+rsaRecover: {[n;e;sig;emLen]
+  N: bnFromBytes n
+  E: bnFromBytes e
+  if[(bnBits N) < 2; :()]                                 // 0 and 1 are not moduli
+  if[16384 < bnBits N; :()]                               // bnMul signals past 26598 bits
+  if[0 = N[0] band 1; :()]                                // an even modulus is not an RSA modulus
+  if[0 > bnCmp[E; ,3]; :()]                               // RFC 8017 3.1: e is between 3 and n-1,
+  if[not 0 > bnCmp[E;N]; :()]                            // e=1 would make the signature the message
+  k: ceiling (bnBits N) % 8
+  if[not k = count sig; :()]
+  S: bnFromBytes sig
+  if[not 0 > bnCmp[S;N]; :()]
+  M: bnModExpL[S;E;N]
+  if[emLen < ceiling (bnBits M) % 8; :()]
+  bnBytesN[M;emLen]}
+// caller errors, told apart from a bad signature: an empty key is a bug at the call site
+rsaKeyCheck: {[n;e]
+  if[bnIsZero bnFromBytes n; signal "rsa: modulus is empty"]
+  if[bnIsZero bnFromBytes e; signal "rsa: exponent is empty"]}
+
+// ---- RSASSA-PKCS1-v1_5 (RFC 8017 8.2.2). The expected block is built whole and compared whole:
+//   EM = 0x00 0x01 0xFF...0xFF 0x00 DigestInfo
+// Looking for the digest *inside* the block is the Bleichenbacher '06 forgery — with a small
+// exponent an attacker can arrange a cube root whose top bytes happen to spell a valid header and
+// DigestInfo and whose tail is garbage a lazy parser never reads. Comparing all k bytes leaves
+// nowhere to put that garbage, and the length check below enforces the RFC's 8 padding bytes.
+rsaVerifyPkcs1: {[n;e;hash;digest;sig]
+  rsaKeyCheck[n;e]
+  di: rsaDigestInfo hash
+  if[0 = count di; :0b]                                   // a hash this build does not know
+  if[not (count digest) = rsaHashLen hash; :0b]
+  tLen: (count di) + count digest
+  k: ceiling (bnBits bnFromBytes n) % 8
+  if[k < 11 + tLen; :0b]                                  // 00 01 <8 or more FF> 00 DigestInfo
+  em: rsaRecover[n;e;sig;k]
+  if[0 = count em; :0b]
+  em ~ ((0x0001, (k-(3+tLen))#0xff), 0x00), di, digest}
+
+// ---- MGF1 (RFC 8017 B.2.1) on SHA-256: hash(seed | counter) blocks, counter a 4-byte big-endian
+// integer from 0, truncated to len bytes.
+rsaMgf1: {[seed;len]
+  t: 0x; c: 0
+  while[(count t) < len; t,: sha256 seed, `byte$ (c shr 24 16 8 0) band 255; c+:1]
+  t[til len]}
+
+// ---- RSASSA-PSS (RFC 8017 8.1.2), verification with EMSA-PSS-VERIFY (9.1.2), MGF1-SHA256 and the
+// salt length recovered from the encoding rather than agreed in advance.
+//   EM = maskedDB | H | 0xbc over emBits = modBits-1 bits, so when modBits is 1 mod 8 the EM is
+//   one byte shorter than the signature and the top 8*emLen-emBits bits of maskedDB must be zero.
+//   DB = 0x00..00 | 0x01 | salt after unmasking, and H' = SHA-256(8 zero bytes | mHash | salt).
+rsaVerifyPss: {[n;e;digest;sig]
+  rsaKeyCheck[n;e]
+  hLen: 32
+  if[not hLen = count digest; :0b]
+  emBits: (bnBits bnFromBytes n) - 1
+  emLen: ceiling emBits % 8
+  if[emLen < 2 + hLen; :0b]                               // no room for H, the 0x01 and the trailer
+  em: rsaRecover[n;e;sig;emLen]
+  if[0 = count em; :0b]
+  if[not 188 = `int$ em[emLen-1]; :0b]                    // 0xbc
+  dbLen: (emLen - hLen) - 1
+  H: em[dbLen + til hLen]
+  nbits: (8*emLen) - emBits                               // leading bits emBits forces to zero
+  if[0 < (`int$ em[0]) shr 8-nbits; :0b]
+  db: (em[til dbLen]) bxor rsaMgf1[H;dbLen]
+  db[0]: `byte$ (`int$ db[0]) band (2^8-nbits)-1          // the mask does not cover them either
+  nz: where 0 < `int$db
+  if[0 = count nz; :0b]                                   // all zero: no 0x01 separator
+  j: first nz
+  if[not 1 = `int$ db[j]; :0b]                           // the first non-zero byte is the separator
+  salt: db[(j+1) + til (dbLen-j)-1]
+  H ~ sha256 ((8#0x00), digest), salt}                    // M' = eight zero bytes | mHash | salt
