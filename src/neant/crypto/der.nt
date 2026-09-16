@@ -1,0 +1,216 @@
+// ASN.1 DER (X.690) reader in neant, over the byte vectors `byte$ and 0x give.
+// Not part of the boot image — load it with  load "src/neant/crypto/der.nt"
+//
+// A parsed element is a dict:
+//   `cls   `univ `app `ctx `priv   class, from the top two bits of the identifier octet
+//   `tag   int                     tag number (the high-tag-number form is decoded)
+//   `cons  1b constructed, 0b primitive
+//   `off   int                     index of the identifier octet in the buffer it was read from
+//   `hlen  int                     identifier + length octets
+//   `len   int                     content length
+//   `raw   bytes                   the whole TLV, byte for byte as it appeared
+//   `v     bytes                   the content octets
+// `raw is the point of carrying spans at all: verifying a certificate hashes the *original*
+// encoding of tbsCertificate, so every node hands back the bytes it was cut from instead of a
+// re-serialisation that would differ wherever the issuer was sloppier than this reader is strict.
+//
+// Strict, because a parser that accepts malformed input is how a verifier gets fooled. Signalled:
+// an indefinite length (legal BER, not DER), a non-minimal long-form length or tag, a length that
+// runs past the end of the input, trailing bytes after the top-level element, a non-minimal
+// INTEGER, a BIT STRING whose unused bits are not zero, a BOOLEAN that is not 0x00/0xff, a NULL
+// with content, an OBJECT IDENTIFIER with a padded subidentifier, a constructed string, and any
+// universal type read as something it is not.
+
+DERCLS: `univ`app`ctx`priv
+DERBOOL: 1; DERINT: 2; DERBITS: 3; DEROCT: 4; DERNULL: 5; DEROID: 6; DERUTF8: 12
+DERSEQ: 16; DERSET: 17; DERPRINT: 19; DERT61: 20; DERIA5: 22; DERUTC: 23; DERGEN: 24
+DERSTRTAGS: 12 19 20 22                      // UTF8String PrintableString T61String IA5String
+DERTAGS:  1 2 3 4 5 6 12 16 17 19 20 22 23 24
+DERNAMES: ("BOOLEAN";"INTEGER";"BIT STRING";"OCTET STRING";"NULL";"OBJECT IDENTIFIER";"UTF8String")
+DERNAMES,: ("SEQUENCE";"SET";"PrintableString";"T61String";"IA5String";"UTCTime";"GeneralizedTime")
+derTagName: {[t] i: DERTAGS?t; $[i<count DERTAGS; DERNAMES[i]; "universal tag ",string t]}
+
+// one content octet, or the error that says the input ran out in the middle of an element
+derByte: {[b;i] if[not i<count b; signal "der: input ends inside an element"]; `int$b[i]}
+
+// derTLV[b;i] -> the element whose identifier octet is b[i]. Definite lengths only.
+derTLV: {[b;i]
+  id: derByte[b;i]
+  j: i+1
+  t: id band 31
+  if[t=31                               // high-tag-number form: base 128, most significant first
+    t: 0; k: 0; more: 1
+    while[more
+      c: derByte[b;j]; j+:1
+      if[(k=0) & c=128; signal "der: non-minimal tag"]
+      if[k>8; signal "der: tag number too large"]
+      t: (128*t)+c band 127
+      more: 0<c band 128
+      k+:1]
+    if[t<31; signal "der: non-minimal tag"]]
+  l: derByte[b;j]; j+:1
+  if[l=128; signal "der: indefinite length is not DER"]
+  if[l>128                                   // long form: the low 7 bits count the length octets
+    nb: l-128
+    if[nb>4; signal "der: length does not fit an int"]
+    if[0=derByte[b;j]; signal "der: non-minimal length"]
+    ln: 0; k: 0
+    while[k<nb; ln: (256*ln)+derByte[b;j]; j+:1; k+:1]
+    if[ln<128; signal "der: non-minimal length"]
+    l: ln]
+  if[(count b)<l+j; signal "der: length runs past the end of the input"]
+  h: j-i; r: b[i+til h+l]
+  `cls`tag`cons`off`hlen`len`raw`v!(DERCLS[id shr 6];t;0<id band 32;i;h;l;r;b[j+til l])}
+
+// the whole buffer as exactly one element — nothing may follow it
+derParse: {[b]
+  nd: derTLV[b;0]
+  if[not (count b)=nd[`hlen]+nd[`len]; signal "der: trailing bytes after the top-level element"]
+  nd}
+
+// the children of a constructed element, in order. Their `off` is relative to the parent's content;
+// `raw` is absolute in the sense that matters — the same bytes, whatever buffer they were cut from.
+derKids: {[nd]
+  if[not nd`cons; signal "der: expected a constructed element, got a primitive one"]
+  b: nd`v; out: (); i: 0
+  while[i<count b
+    c: derTLV[b;i]
+    out,: enlist c
+    i+: c[`hlen]+c[`len]]
+  out}
+
+// every universal accessor goes through this: class, tag and the constructed bit all checked, so a
+// caller can never read one type's octets as another's.
+derWant: {[nd;t;cn]
+  if[not `univ=nd`cls; signal "der: expected ",(derTagName t),", got a ",(string nd`cls)," tag"]
+  if[not t=nd`tag; signal "der: expected ",(derTagName t),", got ",derTagName nd`tag]
+  if[not cn=nd`cons
+    signal "der: ",(derTagName t),$[cn;" must be constructed";" must be primitive"]]
+  nd`v}
+
+// INTEGER, as its two's-complement big-endian octets. X.690 8.3.2: the first nine bits may not be
+// all zero or all one, or a shorter encoding of the same value existed.
+derInt: {[nd]
+  b: derWant[nd;DERINT;0b]
+  if[0=count b; signal "der: empty INTEGER"]
+  if[1<count b
+    a: `int$b[0]; c: `int$b[1]
+    if[(a=0) & c<128; signal "der: non-minimal INTEGER"]
+    if[(a=255) & 127<c; signal "der: non-minimal INTEGER"]]
+  b}
+// the same as an i64 — for the small ones (version, pathLenConstraint) only; 7 octets so the sign
+// fold below cannot shift by 64.
+derIntVal: {[nd]
+  b: derInt nd
+  if[7<count b; signal "der: INTEGER too large for an int"]
+  n: 0 {(256*x)+y}/ `int$b
+  $[127<`int$b[0]; n-1 shl 8*count b; n]}
+
+// BIT STRING -> (unused bits in the last octet; the octets). DER (11.2) also requires those unused
+// bits to be zero, so two encodings of one bit string can never compare unequal.
+derBitStr: {[nd]
+  b: derWant[nd;DERBITS;0b]
+  if[0=count b; signal "der: empty BIT STRING"]
+  u: `int$b[0]
+  if[u>7; signal "der: BIT STRING unused-bit count out of range"]
+  if[(1=count b) & 0<u; signal "der: BIT STRING has no octets but claims unused bits"]
+  s: 1_b
+  if[0<u
+    m: (1 shl u)-1
+    if[0<m band `int$s[(count s)-1]; signal "der: BIT STRING trailing bits are not zero"]]
+  (u;s)}
+// the whole-octet case — a signature or a key, where a partial last octet would be nonsense
+derBits: {[nd]
+  r: derBitStr nd
+  if[0<r[0]; signal "der: BIT STRING is not a whole number of octets"]
+  r[1]}
+
+derOct: {[nd] derWant[nd;DEROCT;0b]}
+derNull: {[nd] b: derWant[nd;DERNULL;0b]; if[0<count b; signal "der: NULL with content"]; 0x}
+derBool: {[nd]
+  b: derWant[nd;DERBOOL;0b]
+  if[not 1=count b; signal "der: BOOLEAN must be one octet"]
+  v: `int$b[0]
+  if[not v in 0 255; signal "der: BOOLEAN must be 0x00 or 0xff in DER"]
+  v=255}
+
+// OBJECT IDENTIFIER -> the dotted string. Subidentifiers are base 128, high bit set on every octet
+// but the last; a leading 0x80 would be padding, which DER forbids. The first octet packs the first
+// two arcs as 40*a+b, and a is 0, 1 or 2 — which is what the 40/80 split below recovers.
+derOid: {[nd]
+  v: `int$derWant[nd;DEROID;0b]
+  n: count v
+  if[0=n; signal "der: empty OBJECT IDENTIFIER"]
+  if[127<v[n-1]; signal "der: OBJECT IDENTIFIER ends inside a subidentifier"]
+  arcs: (); acc: 0; k: 0; i: 0
+  while[i<n
+    c: v[i]
+    if[(k=0) & c=128; signal "der: non-minimal OBJECT IDENTIFIER subidentifier"]
+    if[k>8; signal "der: OBJECT IDENTIFIER subidentifier too large"]   // 9*7 = 63 bits, exact
+    acc: (128*acc)+c band 127
+    k+:1
+    if[c<128; arcs,: acc; acc: 0; k: 0]
+    i+:1]
+  f: arcs[0]
+  "." sv string each ($[f<40; 0,f; f<80; 1,f-40; 2,f-80]),1_arcs}
+
+// T61String is read as latin-1 and re-encoded as UTF-8 — `char$ decodes UTF-8, and a T61 octet
+// above 127 is not. Every other string type this reader models is ASCII or is already UTF-8.
+derLatin1: {[w] `byte$ raze {$[x<128; ,x; (192+x div 64; 128+x mod 64)]} each w}
+DERPRINTOK: `code$"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789 '()+,-./:=?"
+derStr: {[nd]
+  if[not `univ=nd`cls; signal "der: expected a string, got a ",(string nd`cls)," tag"]
+  if[nd`cons; signal "der: a DER string must be primitive"]
+  t: nd`tag
+  if[not t in DERSTRTAGS; signal "der: ",(derTagName t)," is not a string type this reader models"]
+  w: `int$nd`v
+  if[0<count w
+    if[(t=DERPRINT) & not all w in DERPRINTOK
+      signal "der: PrintableString has a character outside its set"]
+    if[(t=DERIA5) & any 127<w; signal "der: IA5String is not ASCII"]]
+  $[t=DERT61; `char$derLatin1 w; `char$nd`v]}
+
+// UTCTime is YYMMDDHHMMSSZ and GeneralizedTime YYYYMMDDHHMMSSZ. RFC 5280 4.1.2.5 allows nothing
+// else in a certificate: seconds are mandatory, the zone is Z, and there are no fractional seconds.
+// The two-digit year is 1950..2049 (4.1.2.5.1). -> (date; time), the language's own values.
+derTime: {[nd]
+  if[not `univ=nd`cls; signal "der: expected a time, got a ",(string nd`cls)," tag"]
+  if[nd`cons; signal "der: a DER time must be primitive"]
+  t: nd`tag
+  if[not t in DERUTC,DERGEN; signal "der: expected a time, got ",derTagName t]
+  s: `char$nd`v
+  n: $[t=DERUTC; 13; 15]
+  if[not n=count s; signal "der: ",(derTagName t)," must be ",(string n)," characters"]
+  if[not "Z"=s[n-1]; signal "der: ",(derTagName t)," must end in Z"]
+  g: "0123456789"?(n-1)#s
+  if[any g=10; signal "der: ",(derTagName t)," has a non-digit"]
+  y: 0
+  if[t=DERUTC; y: (10*g[0])+g[1]; y+: $[y<50; 2000; 1900]]
+  if[t=DERGEN; y: 0 {(10*x)+y}/ g[til 4]]
+  p: $[t=DERUTC; 2; 4]
+  mo: (10*g[p])+g[p+1]
+  dy: (10*g[p+2])+g[p+3]
+  hh: (10*g[p+4])+g[p+5]
+  mi: (10*g[p+6])+g[p+7]
+  sc: (10*g[p+8])+g[p+9]
+  if[not (mo>0) & mo<13; signal "der: month out of range in ",derTagName t]
+  if[not (dy>0) & dy<1+dim[y;mo]; signal "der: day out of range in ",derTagName t]
+  if[hh>23; signal "der: hour out of range in ",derTagName t]
+  if[mi>59; signal "der: minute out of range in ",derTagName t]
+  if[sc>59; signal "der: second out of range in ",derTagName t]
+  (mkdate[y;mo;dy]; `time$1000*(sc+(60*mi)+(3600*hh)))}
+
+// the OIDs this project names. derOidSym is only ever a convenience — the dotted string from derOid
+// is what x509.nt compares on, so an OID nobody here knows still parses and still reports itself.
+DEROIDS: ("1.2.840.113549.1.1.1";"1.2.840.113549.1.1.5";"1.2.840.113549.1.1.8")
+DEROIDS,: ("1.2.840.113549.1.1.10";"1.2.840.113549.1.1.11";"1.2.840.113549.1.1.12")
+DEROIDS,: ("1.2.840.113549.1.1.13";"1.2.840.10045.2.1";"1.2.840.10045.3.1.7")
+DEROIDS,: ("1.3.132.0.34";"1.3.132.0.35";"1.2.840.10045.4.3.2";"1.2.840.10045.4.3.3")
+DEROIDS,: ("1.2.840.10045.4.3.4";"1.3.101.112";"1.3.14.3.2.26";"2.16.840.1.101.3.4.2.1")
+DEROIDS,: ("2.16.840.1.101.3.4.2.2";"2.16.840.1.101.3.4.2.3";"2.5.29.15";"2.5.29.17")
+DEROIDS,: ("2.5.29.19";"2.5.29.37";"2.5.4.3";"2.5.4.6";"2.5.4.10")
+DEROIDSYMS: `rsaEncryption`sha1WithRsa`mgf1`rsaPss`sha256WithRsa`sha384WithRsa`sha512WithRsa
+DEROIDSYMS,: `ecPublicKey`prime256v1`secp384r1`secp521r1`ecdsaWithSha256`ecdsaWithSha384
+DEROIDSYMS,: `ecdsaWithSha512`ed25519`sha1`sha256`sha384`sha512`keyUsage`subjectAltName
+DEROIDSYMS,: `basicConstraints`extKeyUsage`commonName`countryName`organizationName
+derOidSym: {[o] i: DEROIDS?o; $[i<count DEROIDS; DEROIDSYMS[i]; `unknown]}
