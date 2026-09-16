@@ -81,6 +81,7 @@ jitLdpPost: {[rt1;rt2;rn;byteOff] (jitW 0xA8C00000) bor (((byteOff div 8) band 0
 // *either* side is NaN) — an easy mix-up since the mnemonics look interchangeable.
 jitFDyad: {[rd;rn;rm;op] (jitW 0x1E600800) bor (op shl 12) bor (rm shl 16) bor (rn shl 5) bor rd}
 jitFCmp: {[rn;rm] (jitW 0x1E602000) bor (rm shl 16) bor (rn shl 5)}
+jitFMovD: {[dd;dn] (jitW 0x1E604000) bor (dn shl 5) bor dd}     // Dd <- Dn
 jitFMovToF: {[dd;xn] (jitW 0x9E670000) bor (xn shl 5) bor dd}   // Dd <- Xn, raw bits
 jitFMovToX: {[xd;dn] (jitW 0x9E660000) bor (dn shl 5) bor xd}   // Xd <- Dn, raw bits
 jitFLdrImm: {[dt;rn;byteOff] (jitW 0xFD400000) bor ((byteOff div 8) shl 10) bor (rn shl 5) bor dt}
@@ -464,23 +465,31 @@ jitCompile: {[input;trampolines]
 // type — comparisons narrow float operands to an int/bool result, so jitTrDyad below derives the
 // operand type from its own tracked stack, then double-checks it against this as a sanity check).
 //
-// x0 (`jitTrBUF`) is a buffer of 2*n words: the first n are the locals, live in and out, indexed
-// by *position* in the touched-slot list, not by raw slot number. The second n are the rollback
-// snapshot, re-taken at the top of every iteration, that an int-null deopt restores from — see
-// jitTrSnapshot. Layout:
+// **Locals live in registers for the whole loop**, one each, and the buffer x0 (`jitTrBUF`) points
+// at is only how they get in and out: n words, indexed by *position* in the touched-slot list, not
+// by raw slot number. The body itself never touches memory. What does is one store per *written*
+// local at the top of every iteration — the iteration-start values, kept there for the one deopt
+// that can fire mid-iteration (an int-null collision) to resume the loop header from. Every other
+// exit is a guard, which is a legal bytecode position in its own right, so those write the locals
+// back as they stand and resume there. Layout:
 //
-//   load the int-null sentinel (once)     <- entry
-//   snapshot buf -> copy                  <- loopStart, and the back edge's target
+//   int-null sentinel -> x17, then buf -> the local registers    <- entry, once
+//   one store per written local: this iteration's starting point <- loopStart, the back edge's target
 //   the recorded body, guards branching out to their stubs
 //   b loopStart
-//   one 2-word stub per guard: bail ip -> x15, b epilogue
-//   the int-null stub: restore the snapshot, header ip -> x15, b epilogue
-//   epilogue: *x1 = x15; ret
+//   one 2-word stub per guard: bail ip -> x15, b writeback
+//   the int-null stub: header ip -> x15, b tail   (skipping the writeback: the buffer already
+//                                                  holds what this iteration started with)
+//   writeback: the local registers -> buf
+//   tail: *x1 = x15; ret
 //
 // There is no prologue/epilogue in the calling-convention sense and no callee-saved register:
-// Milestone 1 has no `Call` in scope, so nothing here can clobber x0/x1 and there is nothing to
-// restore. x9..x14 (`jitSTACK`) are the int operand stack, d16..d21 (`jitFSTACK`) the float one,
-// x15 (`jitSCRATCH`) the bail ip and the snapshot's shuttle register, x17 the int-null sentinel.
+// Milestone 1 has no `Call` in scope, so nothing here can clobber a caller-saved one and there is
+// nothing to restore. x9..x14 (`jitSTACK`) are the int operand stack, d16..d21 (`jitFSTACK`) the
+// float one, x2..x8/x16 (`jitTrLOCALS`) and d0..d7 (`jitTrFLOCALS`) the locals, x15 (`jitSCRATCH`)
+// the exit ip and constant-loading scratch, x17 the int-null sentinel. x16/x17 are the linker's
+// IP0/IP1, free here precisely because this code never makes a call or crosses a PLT; x18 is left
+// alone (it is the platform register on some ABIs).
 //
 // `tstack` (in the state dict below) is the trace's own virtual operand stack, but unlike the
 // whole-function JIT's single `depth` counter, it's a list of `` `int``/`` `float `` tags — the
@@ -490,16 +499,24 @@ jitCompile: {[input;trampolines]
 // of value on the same notional stack.
 
 jitTrNIREG: 17
-// Mirrors MAX_TOUCHED (src/jit.rs), which sizes the buffer at 2x this. A loop body touching more
-// locals than this just doesn't get traced.
+// One register per local, handed out in first-seen order. Caps the trace at this many locals of
+// each kind — a loop body with more just doesn't get traced, the same way one nested deeper than
+// `jitMAXDEPTH` doesn't. (More would mean saving and restoring callee-saved registers on entry and
+// on every exit, which is real work in the bail-often case, to buy a case that doesn't come up.)
+jitTrLOCALS: 2 3 4 5 6 7 8 16
+jitTrFLOCALS: 0 1 2 3 4 5 6 7
+// Mirrors MAX_TOUCHED (src/jit.rs), which sizes the buffer. Never the binding limit — the two
+// register files above already cap it lower — but the buffer is Rust's, so Rust's number is the
+// one that has to be respected.
 jitTrMAXTOUCHED: 16
 
 // (slots; tys; stored) — every local the trace reads or writes, in first-seen order (the buffer
 // layout), each one's observed type, and the *positions* (not slot numbers) of the ones it writes,
-// which are the only ones the rollback snapshot has to cover. Null if a slot was ever observed as
-// two different types across the trace: a silent mismatch there would give one local two buffer
-// positions, each written back independently with whichever ran last winning — a real correctness
-// bug, not a safe "just don't compile" fallback like everything else here, so it's checked.
+// which are the only ones worth storing at the top of an iteration or writing back at an exit. Null
+// if a slot was ever observed as two different types across the trace: a silent mismatch there
+// would give one local two buffer positions, each written back independently with whichever ran
+// last winning — a real correctness bug, not a safe "just don't compile" fallback like everything
+// else here, so it's checked.
 jitTraceTouched: {[kinds;args;tys]
   slots: (); stys: (); stored: ()
   i: 0
@@ -516,17 +533,48 @@ jitTraceTouched: {[kinds;args;tys]
     i: i+1]
   (slots;stys;stored)}
 
-// buf[0..n) <-> buf[n..2n): `back` 0b takes the snapshot (top of every iteration), 1b restores it
-// (the int-null stub). Raw 64-bit moves, so a float local's bits ride along unexamined.
-jitTrSnapshot: {[asm;stored;nslots;back]
-  si: 0
-  while[si<count stored
-    p: stored[si]
-    from: $[back; nslots+p; p]
-    to: $[back; p; nslots+p]
-    asm: asm,jitLdrImm[jitSCRATCH; jitTrBUF; from*8]
-    asm: asm,jitStrImm[jitSCRATCH; jitTrBUF; to*8]
-    si: si+1]
+// The register each local gets, by position: the int and float files are handed out independently,
+// in first-seen order. Null if either runs out (see jitTrLOCALS).
+jitTrLocalRegs: {[stys]
+  regs: ()
+  ni: 0; nf: 0
+  p: 0
+  while[p<count stys
+    isF: (stys[p])=1
+    if[isF
+      ; if[not nf<count jitTrFLOCALS; :null]
+        regs: regs,jitTrFLOCALS[nf]
+        nf: nf+1]
+    if[not isF
+      ; if[not ni<count jitTrLOCALS; :null]
+        regs: regs,jitTrLOCALS[ni]
+        ni: ni+1]
+    p: p+1]
+  regs}
+
+// The local registers -> the buffer, for the positions in `which`. Emitted twice: at the top of
+// every iteration over the written locals (so the int-null stub can leave the buffer alone and
+// have it already say what the iteration started with), and once on the guard exit path, where it
+// is what makes the locals visible to the interpreter again.
+jitTrStoreLocals: {[asm;which;stys;lregs]
+  i: 0
+  while[i<count which
+    p: which[i]
+    $[(stys[p])=1
+    ; asm: asm,jitFStrImm[lregs[p]; jitTrBUF; p*8]
+    ; asm: asm,jitStrImm[lregs[p]; jitTrBUF; p*8]]
+    i: i+1]
+  asm}
+
+// The buffer -> the local registers, once on entry. Every local, not just the written ones: a
+// read-only local is exactly the kind this loads for good and never stores back.
+jitTrLoadLocals: {[asm;stys;lregs]
+  p: 0
+  while[p<count stys
+    $[(stys[p])=1
+    ; asm: asm,jitFLdrImm[lregs[p]; jitTrBUF; p*8]
+    ; asm: asm,jitLdrImm[lregs[p]; jitTrBUF; p*8]]
+    p: p+1]
   asm}
 
 // how many `ty`-tagged entries are already on `tstack` — also the next free physical register
@@ -564,7 +612,8 @@ jitTrPush: {[st;consts;a;ty]
 // drop, and so the registers of anything pushed in between keep their numbering.
 jitTrPushNull: {[st] st[`tstack]: (st[`tstack]),`int; st}
 
-jitTrLoadL: {[st;slots;a;ty]
+// A register move, not a load: the local is already in one (see this section's header comment).
+jitTrLoadL: {[st;slots;lregs;a;ty]
   tstack: st[`tstack]
   reg: jitTrPos[tstack;ty]
   if[not reg<jitMAXDEPTH; :null]
@@ -572,16 +621,16 @@ jitTrLoadL: {[st;slots;a;ty]
   if[pos=count slots; :null]
   asm: st[`asm]
   $[ty=`float
-  ; asm: asm,jitFLdrImm[jitFSTACK+reg; jitTrBUF; pos*8]
-  ; asm: asm,jitLdrImm[jitSTACK+reg; jitTrBUF; pos*8]]
+  ; asm: asm,jitFMovD[jitFSTACK+reg; lregs[pos]]
+  ; asm: asm,jitMovR[jitSTACK+reg; lregs[pos]]]
   st[`asm]: asm
   st[`tstack]: tstack,ty
   st}
 
 // Doesn't pop — same as the interpreter's own `Op::StoreL`, which only peeks the top (see
-// jitOpStoreL's comment) — and the buffer is the trace's only copy of a local's value (nothing
-// caches it in a register across ops), so this write is immediately the new ground truth.
-jitTrStoreL: {[st;slots;a;ty]
+// jitOpStoreL's comment). The local's register is the only live copy of it from here until the
+// next exit or the top of the next iteration; the buffer is stale in between, deliberately.
+jitTrStoreL: {[st;slots;lregs;a;ty]
   tstack: st[`tstack]
   n: count tstack
   if[n<1; :null]
@@ -591,8 +640,8 @@ jitTrStoreL: {[st;slots;a;ty]
   if[pos=count slots; :null]
   asm: st[`asm]
   $[ty=`float
-  ; asm: asm,jitFStrImm[jitFSTACK+reg; jitTrBUF; pos*8]
-  ; asm: asm,jitStrImm[jitSTACK+reg; jitTrBUF; pos*8]]
+  ; asm: asm,jitFMovD[lregs[pos]; jitFSTACK+reg]
+  ; asm: asm,jitMovR[lregs[pos]; jitSTACK+reg]]
   st[`asm]: asm
   st}
 
@@ -654,10 +703,11 @@ jitTrDyad: {[st;consts;a;ty]
   // Two ordinary ints wrapping to exactly the null sentinel by coincidence (`0W+1`): the
   // interpreter would start propagating a null from here on and this backend would keep doing
   // plain wrapping arithmetic, so the two diverge from this point. Deopt instead — and unlike the
-  // whole-function JIT's deopt, which just re-runs the call, this one is mid-loop, so it rolls the
-  // iteration back to the snapshot and hands the header back as the resume point (jitCompileTrace
-  // below). Only `+ - *` can do it: `&`/`|` pick one of their operands, both already non-null, and
-  // a comparison yields 0 or 1.
+  // whole-function JIT's deopt, which just re-runs the call, this one is mid-loop, with earlier
+  // iterations' writes already committed. So it abandons the local registers (which hold a
+  // half-finished iteration) and resumes the interpreter at the loop header, where the buffer
+  // still says what this iteration started with (jitCompileTrace below). Only `+ - *` can do it:
+  // `&`/`|` pick one of their operands, both already non-null, and a comparison yields 0 or 1.
   if[(not isFloat) & (kind<3)
     ; asm: asm,jitCmpR[dst;jitTrNIREG]
       st[`niFixups]: (st[`niFixups]),count asm
@@ -700,12 +750,15 @@ jitCompileTrace: {[input]
   slots: touched[0]; stys: touched[1]; stored: touched[2]
   nslots: count slots
   if[not nslots<jitTrMAXTOUCHED; :null]
+  lregs: jitTrLocalRegs stys
+  if[isnull lregs; :null]   // out of local registers
 
   // x17 = the int-null sentinel, compared against after every int add/sub/mul exactly as the
-  // whole-function JIT's x20 is (jitOpDyad). Loaded once, above the loop.
+  // whole-function JIT's x20 is (jitOpDyad). Loaded once, above the loop, with the locals.
   asm: jitLoadConst[();jitTrNIREG;0N]
+  asm: jitTrLoadLocals[asm;stys;lregs]
   loopStart: count asm
-  asm: jitTrSnapshot[asm;stored;nslots;0b]
+  asm: jitTrStoreLocals[asm;stored;stys;lregs]
 
   st: `asm`tstack`fixups`bails`niFixups!(asm; (); (); (); ())
   i: 0
@@ -714,8 +767,8 @@ jitCompileTrace: {[input]
     ty: $[(tys[i])=1; `float; `int]
     $[kind=0; st: jitTrPush[st;consts;a;ty]
     ; kind=1; st: jitTrPushNull st
-    ; kind=2; st: jitTrLoadL[st;slots;a;ty]
-    ; kind=3; st: jitTrStoreL[st;slots;a;ty]
+    ; kind=2; st: jitTrLoadL[st;slots;lregs;a;ty]
+    ; kind=3; st: jitTrStoreL[st;slots;lregs;a;ty]
     ; kind=4; st: jitTrDyad[st;consts;a;ty]
     ; kind=5; st: jitTrPop st
     ; kind=6; st: jitTrGuard[st;1b;a]
@@ -740,18 +793,22 @@ jitCompileTrace: {[input]
 
   stubAt: count asm
   niStubAt: stubAt+(2*numGuards)
-  epilogueAt: niStubAt+(2+(2*count stored))
+  writebackAt: niStubAt+2
+  tailAt: writebackAt+(count stored)   // one store per written local, so: one word each
 
   gi: 0
   while[gi<numGuards
     asm: asm,jitMovz[jitSCRATCH; bails[gi]; 0]
-    asm: asm,jitB[epilogueAt-(count asm)]
+    asm: asm,jitB[writebackAt-(count asm)]
     gi: gi+1]
 
-  asm: jitTrSnapshot[asm;stored;nslots;1b]
+  // Straight to the tail, over the writeback: the buffer already holds this iteration's starting
+  // values (stored at loopStart) and the registers hold a half-finished iteration, which is
+  // exactly the state this deopt exists to discard.
   asm: asm,jitMovz[jitSCRATCH; header; 0]
-  asm: asm,jitB[epilogueAt-(count asm)]
+  asm: asm,jitB[tailAt-(count asm)]
 
+  asm: jitTrStoreLocals[asm;stored;stys;lregs]
   asm: asm,jitStrImm[jitSCRATCH; jitTrOUT; 0]   // *outBailIp = whichever stub got here
   asm: asm,jitRet[]
 

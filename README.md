@@ -427,40 +427,46 @@ per-value type tracked at codegen time (`tstack`) rather than a single depth cou
 floats are `FMINNM`/`FMAXNM`, not `FMIN`/`FMAX`: Rust's `f64::min`/`max` propagate the non-NaN side,
 and the plain forms don't.
 
-Locals live in a buffer the compiled code is handed (`CompiledTrace`, `src/jit.rs`), indexed by
-position in a layout `jitCompileTrace` decides and `src/jit.rs` reads back out of its result rather
-than recomputing — both halves have to agree about what position means which local, and one side
-deciding is what guarantees they do. Entry guards every one of them (a plain non-null int, or a
-float, matching what was recorded); anything else and the loop just runs interpreted this time.
+**Every local gets a register for the whole loop**, one each from two independent files (x2..x8/x16
+for ints, d0..d7 for floats), so the loop body does no memory traffic at all — which is where the
+tracing tier pulls ahead of the whole-function one, whose locals stay in the interpreter's own
+frame and are loaded and stored on every access. A buffer (`CompiledTrace`, `src/jit.rs`) is only
+how they get in and out, indexed by position in a layout `jitCompileTrace` decides and `src/jit.rs`
+reads back out of its result rather than recomputing — both halves have to agree about what
+position means which local, and one side deciding is what guarantees they do. Entry guards every
+one of them (a plain non-null int, or a float, matching what was recorded); anything else, or more
+locals than a register file holds, and the loop just runs interpreted.
 
-Every exit is a **bail**: the guard's stub hands back the `ip` to resume interpreting at, and
-`Vm::run_ops` splices the locals back in and carries on, indistinguishable from having interpreted
-the whole time. That's why a guard is only legal where the trace holds no operand of its own — the
-interpreter resumes with the operand stack it entered the trace with, the empty one. The exception
-is the one deopt that can fire *mid*-iteration: two ordinary ints wrapping to exactly the null
-sentinel (`0W+1`), which the interpreter would start propagating as a null from there on and
-compiled code would not. Unlike the method JIT's version of that deopt, which just re-runs the whole
-call, there are already-committed writes from earlier iterations here — so the compiled code keeps a
-rollback copy of every local it writes, re-taken at the top of each iteration, and that deopt
-restores it and resumes at the loop header. It costs two memory ops per written local per iteration,
-which is most of the gap below.
+Every exit is a **bail**: the guard's stub writes the locals back and hands over the `ip` to resume
+interpreting at, and `Vm::run_ops` splices them into its own frame and carries on, indistinguishable
+from having interpreted the whole time. That's why a guard is only legal where the trace holds no
+operand of its own — the interpreter resumes with the operand stack it entered the trace with, the
+empty one. The exception is the one deopt that can fire *mid*-iteration: two ordinary ints wrapping
+to exactly the null sentinel (`0W+1`), which the interpreter would start propagating as a null from
+there on and compiled code would not. Unlike the method JIT's version of that deopt, which just
+re-runs the whole call, there are already-committed writes from earlier iterations here. So the loop
+stores its written locals to the buffer once at the top of each iteration, and that deopt just
+abandons the registers — a half-finished iteration — and resumes at the loop header, where the
+buffer still says what the iteration started with. One store per written local per iteration is all
+that is left of the body's memory traffic, and the only way to remove even that is to hand the
+interpreter the live operand stack at the failing op rather than rewinding to the header.
 
 A `Bool` local is refused outright rather than traced: locals round-trip through a buffer of raw
 64-bit words, so `b: i<n` would come back an `Int`, and `type`/`show`/`string` can all see the
 difference. On the operand stack a comparison result is fine — nothing there survives the trace.
 
-Measured: **~53x** on a 5M-iteration loop (`jit_tests::manual_trace_perf_measurement`), against a
+Measured: **~102x** on a 5M-iteration loop (`jit_tests::manual_trace_perf_measurement`), against a
 `do`-loop baseline — the same body written in the one loop form no trace is ever started on, which
 is what an interpreted baseline has to be now that a single call to a `while` loop is no longer one.
 (That baseline change is also why `manual_perf_measurement` still reports the same ~58x for the
 whole-function JIT: what it measures didn't change, only how it gets something interpreted to
-measure against.)
+measure against. The same loop now runs faster traced than method-compiled, for the register reason
+above — the older tier is the one with a buffer in its inner loop.)
 
-What's next here, in rough order: keeping locals in registers across an iteration instead of in the
-buffer — which removes both the loads and stores in the body *and* the rollback copy, since the
-buffer would then already hold the iteration-start values; calls, so a trace can cross a function
-boundary the method JIT would have to compile whole; and `do[n;..]`, which needs the header's live
-counter handled rather than avoided.
+What's next here, in rough order: calls, so a trace can cross a function boundary the method JIT
+would have to compile whole; `do[n;..]`, which needs the header's live counter handled rather than
+avoided; and a deopt that hands back the operand stack instead of rewinding, which would take the
+last store out of the loop.
 
 ### What the tests check
 

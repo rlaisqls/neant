@@ -567,6 +567,25 @@ mod jit_tests {
         assert_eq!(got.fmt(), "1111b");
     }
 
+    /// Each local a trace touches gets a register of its own for the whole loop, handed out from
+    /// two independent files (`jitTrLOCALS`/`jitTrFLOCALS`, src/neant/jit/arm64.nt) — so a loop
+    /// mixing both kinds is the case that would catch the two allocations colliding, and one with
+    /// more locals than either file holds is the case that has to give up cleanly rather than
+    /// index past the end of it. `f` has 12 int locals against a file of 8; `g` fills the float
+    /// file exactly.
+    #[test]
+    fn traced_loop_allocates_a_register_per_local() {
+        let mut v = boot_vm();
+        let got = v.eval(
+            "h: {[k] x:0.0; y:1.0; n:0; i:0; while[i<k; x: x+0.25; y: y*1.5; n: n+i; i: i+1]; (x;y;n)}; \
+             hSlow: {[k] x:0.0; y:1.0; n:0; i:0; while[i<k; x: x+(- - 0.25); y: y*1.5; n: n+i; i: i+1]; (x;y;n)}; \
+             f: {[k] a:0;b:0;c:0;d:0;e:0;g:0;m:0;p:0;q:0;r:0; i:0; while[i<k; a: a+1; b: b+2; c: c+3; d: d+4; e: e+5; g: g+6; m: m+7; p: p+8; q: q+9; r: r+10; i: i+1]; a+b+c+d+e+g+m+p+q+r}; \
+             fSlow: {[k] a:0;b:0;c:0;d:0;e:0;g:0;m:0;p:0;q:0;r:0; i:0; while[i<k; a: a+(- - 1); b: b+2; c: c+3; d: d+4; e: e+5; g: g+6; m: m+7; p: p+8; q: q+9; r: r+10; i: i+1]; a+b+c+d+e+g+m+p+q+r}; \
+             ({[k] (h k)~hSlow k} each 63 64 65 200), {[k] (f k)~fSlow k} each 63 64 65 200",
+        ).unwrap();
+        assert_eq!(got.fmt(), "11111111b");
+    }
+
     /// Everything above stays correct whether or not a single trace is ever compiled — the
     /// interpreter is always the fallback — so one test has to actually notice that the loop ran
     /// natively. A single call can't reach the whole-function JIT (that needs 64 *calls*), so the

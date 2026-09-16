@@ -314,11 +314,10 @@ mod arm64 {
         /// same kind of guard `try_run`'s entry check already makes for the method-JIT) — same
         /// fallback as everywhere else here: just don't use the compiled version this time.
         pub fn run(&self, loc: &mut [Value]) -> Option<usize> {
-            // Twice `MAX_TOUCHED`: the second half is the rollback copy the compiled code re-takes
-            // at the top of every iteration, so that the one deopt it can hit mid-iteration (an
-            // int-null collision) can put the locals back the way the header saw them and resume
-            // there. Nothing outside the compiled code ever reads it.
-            let mut buf = [0i64; 2 * MAX_TOUCHED];
+            // Only how the locals get in and out: the compiled code keeps them in registers for
+            // the whole loop and touches this again just once per iteration, to leave behind the
+            // values the iteration started with for its one mid-iteration deopt to resume from.
+            let mut buf = [0i64; MAX_TOUCHED];
             for (i, (slot, ty)) in self.touched.iter().enumerate() {
                 buf[i] = match (ty, loc.get(*slot)?) {
                     // A null int is rejected, not passed through: the interpreter propagates it
