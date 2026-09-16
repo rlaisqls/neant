@@ -26,6 +26,11 @@ fn int_dyad(name: &str, a: i64, b: i64) -> Option<Value> {
 /// The value `n` down from the top of a stack, for peeking at a callee before popping it.
 fn f_at(st: &[Value], n: usize) -> &Value { &st[st.len() - 1 - n] }
 
+/// How deep interpreted calls may nest — see `call_code`'s guard for the calibration. Shared with
+/// the JIT's `jit_call` (src/jit.rs), whose compiled-to-compiled chain sits *on top of* whatever
+/// interpreted depth it was entered from and so has to count against the same budget.
+pub(crate) const MAX_DEPTH: usize = 1000;
+
 /// One call-stack frame of an error: the function's name (None when it is not a plain global call) and
 /// the source line it was on. A frame is named by its *caller*, which knows the global it loaded to call it.
 type Frame = (Option<Arc<str>>, u32);
@@ -62,6 +67,8 @@ impl Vm {
     /// trampoline (src/jit.rs) uses to resolve a compiled call site's callee, the same lookup
     /// `Op::LoadG` does in `run_ops` below.
     pub(crate) fn global_at(&self, slot: usize) -> Option<Value> { self.vals.get(slot).cloned().flatten() }
+    /// The current interpreted call depth (`call_code`), for `jit_call`'s combined depth guard.
+    pub(crate) fn depth(&self) -> usize { self.depth }
     /// All global values, for save/restore around test cases (slots only grow, so a snapshot stays valid).
     #[allow(dead_code)]
     pub fn snapshot(&self) -> Vec<Option<Value>> { self.vals.clone() }
@@ -277,7 +284,7 @@ impl Vm {
         // the smallest stack this can run on, not just the main thread's — a `spawn`ed thread
         // (src/prims.rs) defaults to a 2MiB OS stack. 1800 levels of plain recursion overflows one;
         // this leaves real margin. src/jit.rs's `MAX_CALL_DEPTH` mirrors this for the same reason.
-        if self.depth > 1000 { return err("stack: recursion too deep"); }
+        if self.depth > MAX_DEPTH { return err("stack: recursion too deep"); }
         let nargs = args.len();
         let mut loc = args; loc.resize(code.nlocals.max(arity), Null); loc.extend_from_slice(caps);
         self.depth += 1;

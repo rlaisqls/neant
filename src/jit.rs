@@ -175,6 +175,15 @@ mod arm64 {
     /// compiled frame from 112 to 192 bytes for the callee-saved saves and the spill area: with
     /// this guard lifted, `{[x] $[x<1; 0; 1+h[x-1]]}` on a 2MiB thread now overflows between 1800
     /// and 1900 levels (2000–2100 before), so 500 still leaves a >3x margin and stays.
+    ///
+    /// That margin is for the chain *alone*. A chain is entered from some interpreted depth and
+    /// sits on top of it — and when the chain deopts at this limit, the interpreter takes one more
+    /// level and the next call starts a fresh 500-deep chain, so near the interpreter's own limit
+    /// the stack holds ~1000 interpreted frames *plus* a full chain. That sum is what actually
+    /// overflowed a 2MiB thread once both tiers had grown a little (the register-locals frame here,
+    /// the trace tier's `run_ops` changes there — each fine alone). So `jit_call` also charges the
+    /// chain against the interpreter's budget (`vm::MAX_DEPTH`): the total never exceeds what 1000
+    /// interpreted levels already fit, and a compiled level is the lighter of the two.
     const MAX_CALL_DEPTH: u32 = 500;
 
     /// The one fixed trampoline every compiled call site reaches via `blr` (see the module doc
@@ -189,8 +198,8 @@ mod arm64 {
         impl Drop for Guard { fn drop(&mut self) { CALL_DEPTH.with(|d| d.set(d.get() - 1)); } }
         let _guard = Guard;
         let fail = |ok: *mut i64| unsafe { *ok = 0; 0 };
-        if depth > MAX_CALL_DEPTH { return fail(ok); }
         let vm = unsafe { &mut *vm };
+        if depth > MAX_CALL_DEPTH || vm.depth() + depth as usize > crate::vm::MAX_DEPTH { return fail(ok); }
         let Some(f) = vm.global_at(slot as usize) else { return fail(ok) };
         let (code, caps): (&Arc<FnCode>, &[Value]) = match &f {
             Value::Lambda(c) => (c, &[]),
