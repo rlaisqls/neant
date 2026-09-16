@@ -281,13 +281,21 @@ mod jit_tests {
         assert_eq!(got.fmt(), ",332833500"); // one distinct value across 100 calls
     }
 
+    /// `f`'s own cold run stopped being an interpreted baseline once the tracing JIT landed — a
+    /// single call is enough for it to take the loop over partway through. `fDo` is the same body
+    /// as a `do` loop, which no trace is ever started on (its counter is live on the operand stack
+    /// at the backward jump, and `run_ops` only starts recording on an empty one, src/vm.rs), so
+    /// it stays interpreted however many iterations it runs. It does marginally *less* work per
+    /// iteration than `f` — no `i<k` compare — so if anything this understates the ratio, which
+    /// is the right direction for a baseline to be wrong in.
     #[test]
     #[ignore]
     fn manual_perf_measurement() {
         let mut v = boot_vm();
         v.eval("f: {[k] n:0; i:0; while[i<k; n: n+i*i; i: i+1]; n}").unwrap();
+        v.eval("fDo: {[k] n:0; i:0; do[k; n: n+i*i; i: i+1]; n}").unwrap();
         let t0 = std::time::Instant::now();
-        v.eval("f 1000000").unwrap();
+        v.eval("fDo 1000000").unwrap();
         let cold = t0.elapsed();
         for _ in 0..70 { v.eval("f 10").unwrap(); } // cross the tier-up threshold
         let t1 = std::time::Instant::now();
@@ -457,6 +465,139 @@ mod jit_tests {
             tests::ev(&mut v, "orig: 1 2 3; also: orig; r: f[orig;3]; (r; orig; also)"),
             "(2;1 2 3;1 2 3)",
         );
+    }
+
+    /// A `while` loop goes hot *inside a single call* — the tracing JIT counts backward jumps per
+    /// loop header, not calls per function (`FnCode::loop_action`, src/value.rs) — so one `f 1000`
+    /// crosses the threshold partway through and runs the rest of its iterations natively.
+    /// `fSlow` is the same loop with two monadic negations (`- -`, an identity) spliced in purely
+    /// to keep it permanently untraceable (`Op::Monad` is outside Milestone 1's scope,
+    /// src/trace.rs), so it stays interpreted and is the oracle. The sizes straddle the threshold
+    /// in both directions: below it nothing is ever recorded, just above it the trace is compiled
+    /// and immediately has only a few iterations left to run, well above it almost the whole loop
+    /// is native.
+    #[test]
+    fn traced_loop_and_interpreted_agree() {
+        let mut v = boot_vm();
+        let got = v.eval(
+            "f: {[k] n:0; i:0; while[i<k; n: n+i*i; i: i+1]; n}; \
+             fSlow: {[k] n:0; i:0; while[i<k; n: n+(- - i*i); i: i+1]; n}; \
+             {[k] (f k)=fSlow k} each 0 1 63 64 65 66 200 1000",
+        ).unwrap();
+        assert_eq!(got.fmt(), "11111111b");
+    }
+
+    /// Every branch the recorded iteration took is a guard fixed to *that* direction, so a
+    /// condition that flips later is the case where compiled code has to hand control back
+    /// mid-loop and let the interpreter take the other edge — here on the iteration after the
+    /// 100th, long after the trace was recorded on the 64th. `g` also stores to `n` *before* its
+    /// guard, which is what makes it a test of the bail handing back current locals rather than
+    /// the ones the iteration started with.
+    #[test]
+    fn traced_loop_guards_bail_when_a_branch_flips() {
+        let mut v = boot_vm();
+        let got = v.eval(
+            "f: {[k] n:0; i:0; while[i<k; n: $[i<100; n+2; n+1]; i: i+1]; n}; \
+             fSlow: {[k] n:0; i:0; while[i<k; n: $[i<100; n+(- - 2); n+(- - 1)]; i: i+1]; n}; \
+             g: {[k] n:0; i:0; while[i<k; n: n+1; if[n>100; n: n+10]; i: i+1]; n}; \
+             gSlow: {[k] n:0; i:0; while[i<k; n: n+(- - 1); if[n>100; n: n+10]; i: i+1]; n}; \
+             ({[k] (f k)=fSlow k} each 99 100 101 300), {[k] (g k)=gSlow k} each 99 100 101 300",
+        ).unwrap();
+        assert_eq!(got.fmt(), "11111111b");
+    }
+
+    /// Floats run on a second operand stack of their own (`jitFSTACK`, d16..d21) with its own
+    /// encoders, and a trace is the only part of this JIT that sees them at all — the whole-
+    /// function JIT rejects anything non-int outright. `&` is in here specifically because it
+    /// compiles to FMINNM, not FMIN (see `jitFDyad`'s comment for why that distinction is real).
+    #[test]
+    fn traced_float_loop_and_interpreted_agree() {
+        let mut v = boot_vm();
+        let got = v.eval(
+            "f: {[k] s:0.0; i:0; while[i<k; s: (s+0.5)&1000.0; i: i+1]; s}; \
+             fSlow: {[k] s:0.0; i:0; while[i<k; s: (s+(- - 0.5))&1000.0; i: i+1]; s}; \
+             {[k] (f k)=fSlow k} each 63 64 65 200 5000",
+        ).unwrap();
+        assert_eq!(got.fmt(), "11111b");
+    }
+
+    /// `0W+1` wraps to exactly the int-null sentinel — the same case
+    /// `deopts_on_null_collision_instead_of_diverging` covers for the whole-function JIT, but a
+    /// trace can only hit it *mid-loop*, with earlier iterations' writes already committed. So
+    /// this is the one deopt that has to undo something: it restores the snapshot the compiled
+    /// code re-takes at the top of every iteration and resumes at the loop header
+    /// (`jitCompileTrace`, src/neant/jit/arm64.nt). Starting at `0W-200` is what puts the
+    /// collision ~200 iterations in — well after the trace was recorded and compiled, which
+    /// starting at `0W` would not (`n` would already be null by then, and a null local is refused
+    /// at the recorder).
+    #[test]
+    fn traced_loop_deopts_on_null_collision_instead_of_diverging() {
+        let mut v = boot_vm();
+        let got = v.eval(
+            "f: {[k] n: 0W-200; i:0; while[i<k; n: n+1; i+:1]; n}; \
+             fSlow: {[k] n: 0W-200; i:0; while[i<k; n: n+(- - 1); i+:1]; n}; \
+             ({[k] (f k)~fSlow k} each 100 199 200 201 1000), (,(f 1000)~0N)",
+        ).unwrap();
+        assert_eq!(got.fmt(), "111111b");
+    }
+
+    /// A trace's locals round-trip through a buffer of raw 64-bit words, so the type they are
+    /// rebuilt as on the way out is the type they have afterwards. A `Bool` local rebuilt as an
+    /// `Int` would be a silent, observable change (`type`, `show`, `string` all see it), so the
+    /// recorder refuses to trace a loop that stores one at all (`TraceTy::of_local`,
+    /// src/trace.rs) — this is what would catch that check going missing.
+    #[test]
+    fn a_bool_local_is_still_a_bool_after_a_traced_loop() {
+        let mut v = boot_vm();
+        assert_eq!(tests::ev(&mut v, "{[k] i:0; b: 0b; while[i<k; b: i<100; i: i+1]; (type b; b)} 200"), "(`bool;0b)");
+    }
+
+    /// The inner loop is the one that goes hot (its header is reached `k*3` times), and recording
+    /// the *outer* one fails on the inner loop's own backward jump — a `Jmp` that isn't this
+    /// trace's header ends the recording without closing it (src/trace.rs). Both loops writing
+    /// the same local is what would catch a trace that wrote its locals back at the wrong moment.
+    #[test]
+    fn traced_nested_loop_and_interpreted_agree() {
+        let mut v = boot_vm();
+        let got = v.eval(
+            "f: {[k] n:0; i:0; while[i<k; j:0; while[j<3; n: n+i; j: j+1]; i: i+1]; n}; \
+             fSlow: {[k] n:0; i:0; while[i<k; j:0; while[j<3; n: n+(- - i); j: j+1]; i: i+1]; n}; \
+             {[k] (f k)=fSlow k} each 10 64 100 500",
+        ).unwrap();
+        assert_eq!(got.fmt(), "1111b");
+    }
+
+    /// Everything above stays correct whether or not a single trace is ever compiled — the
+    /// interpreter is always the fallback — so one test has to actually notice that the loop ran
+    /// natively. A single call can't reach the whole-function JIT (that needs 64 *calls*), so the
+    /// tracing JIT is the only thing that can make this finish in the time asserted: 20M
+    /// iterations interpret in ~700ms here and trace in ~40ms.
+    #[test]
+    #[cfg(target_arch = "aarch64")]
+    fn a_hot_loop_really_is_traced() {
+        let mut v = boot_vm();
+        let t = std::time::Instant::now();
+        let r = v.eval("{[k] n:0; i:0; while[i<k; n: n+i; i: i+1]; n} 20000000").unwrap();
+        assert_eq!(r.fmt(), "199999990000000");
+        assert!(t.elapsed().as_millis() < 250, "took {:?}", t.elapsed());
+    }
+
+    /// One call each — the whole-function JIT never enters into it (that needs 64) — against the
+    /// same `do`-loop baseline `manual_perf_measurement` above uses, and for the same reason.
+    #[test]
+    #[ignore]
+    fn manual_trace_perf_measurement() {
+        let mut v = boot_vm();
+        v.eval("f: {[k] n:0; i:0; while[i<k; n: n+i*i; i: i+1]; n}").unwrap();
+        v.eval("fDo: {[k] n:0; i:0; do[k; n: n+i*i; i: i+1]; n}").unwrap();
+        let t0 = std::time::Instant::now();
+        let slow = v.eval("fDo 5000000").unwrap();
+        let interpreted = t0.elapsed();
+        let t1 = std::time::Instant::now();
+        let fast = v.eval("f 5000000").unwrap();
+        let traced = t1.elapsed();
+        assert_eq!(slow.fmt(), fast.fmt());
+        println!("interpreted {interpreted:?}  traced {traced:?}  ratio {:.1}x", interpreted.as_secs_f64() / traced.as_secs_f64());
     }
 
     #[test]

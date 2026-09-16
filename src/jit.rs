@@ -289,8 +289,10 @@ mod arm64 {
     pub struct CompiledTrace {
         mem: *mut u8,
         len: usize,
-        /// Every local this trace reads or writes, in the fixed order codegen assigned them a
-        /// buffer slot in — `run()` marshals exactly these, in this order, both in and out.
+        /// Every local this trace reads or writes, in the order codegen laid them out in the
+        /// buffer — `run()` marshals exactly these, in this order, both in and out. Taken from
+        /// `jitCompileTrace`'s own result rather than recomputed here: the layout has to mean the
+        /// same thing on both sides, and one side deciding it is what guarantees that.
         touched: Vec<(usize, crate::trace::TraceTy)>,
         entry: unsafe extern "C" fn(*mut i64, *mut i64),
     }
@@ -300,7 +302,9 @@ mod arm64 {
         fn drop(&mut self) { unsafe { munmap(self.mem as *mut std::ffi::c_void, self.len); } }
     }
     /// Generous but fixed, same choice `MAX_SLOTS`/`MAX_VEC_SLOTS` already make: a loop body with
-    /// more than this many distinct locals live in it just doesn't get traced.
+    /// more than this many distinct locals live in it just doesn't get traced. Mirrored as
+    /// `jitTrMAXTOUCHED` (src/neant/jit/arm64.nt), which rejects the trace before emitting any
+    /// code that would index past the buffer.
     const MAX_TOUCHED: usize = 16;
 
     impl CompiledTrace {
@@ -310,11 +314,17 @@ mod arm64 {
         /// same kind of guard `try_run`'s entry check already makes for the method-JIT) — same
         /// fallback as everywhere else here: just don't use the compiled version this time.
         pub fn run(&self, loc: &mut [Value]) -> Option<usize> {
-            if self.touched.len() > MAX_TOUCHED { return None; }
-            let mut buf = [0i64; MAX_TOUCHED];
+            // Twice `MAX_TOUCHED`: the second half is the rollback copy the compiled code re-takes
+            // at the top of every iteration, so that the one deopt it can hit mid-iteration (an
+            // int-null collision) can put the locals back the way the header saw them and resume
+            // there. Nothing outside the compiled code ever reads it.
+            let mut buf = [0i64; 2 * MAX_TOUCHED];
             for (i, (slot, ty)) in self.touched.iter().enumerate() {
-                buf[i] = match (ty, &loc[*slot]) {
-                    (crate::trace::TraceTy::Int, Value::Int(n)) => *n,
+                buf[i] = match (ty, loc.get(*slot)?) {
+                    // A null int is rejected, not passed through: the interpreter propagates it
+                    // through arithmetic and compiled code does plain wrapping arithmetic — the
+                    // same entry guard `try_run` makes, for the same reason.
+                    (crate::trace::TraceTy::Int, Value::Int(n)) if *n != crate::value::NI => *n,
                     (crate::trace::TraceTy::Float, Value::Float(f)) => f.to_bits() as i64,
                     _ => return None,
                 };
@@ -332,21 +342,40 @@ mod arm64 {
     }
 
     pub fn compile_trace(trace: &crate::trace::Trace, consts: &[Value], vm: &mut Vm) -> Option<CompiledTrace> {
-        let touched = trace.touched_locals()?; // None: a slot's observed type conflicted across the trace
         let f = vm.get("jitCompileTrace")?;
         let (kinds, args, tys) = trace.to_neant_input();
         let input = Value::List(Arc::new(vec![
             crate::value::ints(kinds), crate::value::ints(args), crate::value::ints(tys),
-            crate::value::list(consts.to_vec()),
+            crate::value::list(consts.to_vec()), Value::Int(trace.header as i64),
         ]));
         // Same reentrancy guard `compile` above uses: `jitCompileTrace`'s own helpers are neant
         // functions too and could cross the JIT threshold while compiling themselves.
         COMPILING.with(|c| c.set(c.get() + 1));
         let result = vm.call(&f, vec![input]);
         COMPILING.with(|c| c.set(c.get() - 1));
-        let bytes = match result { Ok(Value::Bytes(b)) => b, other => { eprintln!("DEBUG jitCompileTrace result: {:?}", other); return None; } };
-        let touched = touched.into_iter().map(|(s, t)| (s as usize, t)).collect();
-        emit_trace(&bytes, touched)
+        // Success is `(bytes; slots; tys)` — the buffer layout rides along with the code that was
+        // built around it (see `CompiledTrace::touched`). Null (not compilable) or an error in the
+        // codegen itself both just mean this loop stays interpreted.
+        let Ok(Value::List(items)) = result else { return None };
+        if items.len() != 3 { return None; }
+        let Value::Bytes(bytes) = &items[0] else { return None };
+        let slots = int_vec(&items[1])?;
+        let tys = int_vec(&items[2])?;
+        if slots.len() != tys.len() || slots.len() > MAX_TOUCHED { return None; }
+        let touched = slots.iter().zip(&tys)
+            .map(|(&s, &t)| (s as usize, if t == 1 { crate::trace::TraceTy::Float } else { crate::trace::TraceTy::Int }))
+            .collect();
+        emit_trace(bytes, touched)
+    }
+
+    /// An `Ints` result as a `Vec<i64>`. A neant vector that happens to be empty comes back as an
+    /// empty general list, not an empty `Ints`, so that case is spelled out rather than rejected.
+    fn int_vec(v: &Value) -> Option<Vec<i64>> {
+        match v {
+            Value::Ints(xs) => Some(xs.to_vec()),
+            Value::List(xs) if xs.is_empty() => Some(Vec::new()),
+            _ => None,
+        }
     }
 
     fn emit_trace(bytes: &[u8], touched: Vec<(usize, crate::trace::TraceTy)>) -> Option<CompiledTrace> {

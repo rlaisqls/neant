@@ -271,7 +271,7 @@ Lexer, parser, compiler and VM in Rust.
 
 lex/parse/compile rewritten in neant and running on that VM, PyPy-style; the Rust VM and primitives
 stay as the runtime. The Rust front end has been deleted — `src/` is `{vm, prims, value, image, jit,
-main}.rs` plus `src/neant/` (the self-hosted sources, below, and the compiled image), and **source
+trace, main}.rs` plus `src/neant/` (the self-hosted sources, below, and the compiled image), and **source
 never reaches Rust**.
 
 - `src/neant/core/lex.nt` — the lexer.
@@ -396,6 +396,72 @@ trampolines bounds-check and deopt exactly like every other guarded point. Measu
 the cost this removes (interpreter dispatch, `Value` boxing per element) dominates over the one
 `bl` per access that's still there.
 
+
+### Stage 2b (started): a tracing JIT for hot loops
+
+The JIT above tiers up whole *functions*, after 64 calls. That misses the shape this language is
+most often written in: one call that loops a million times. So a second tier records **traces** —
+`src/trace.rs` (the recording side, in the VM's own dispatch loop) and `jitCompileTrace`
+(`src/neant/jit/arm64.nt`, the codegen, self-hosted the same way `jitCompile` is).
+
+A loop header is counted every time a backward `Jmp` reaches it (`FnCode::loop_action`,
+`src/value.rs`) — per header, not per function, so a loop goes hot inside a single call. At 64, the
+VM records the *next* iteration: every op it actually executes, in order, each tagged with the type
+it was actually observed to hold. That recording is one straight line with no control flow in it at
+all. Where the iteration branched, the trace keeps a **guard** — the direction taken, plus the
+bytecode `ip` the other direction would have gone to — and an unconditional `Jmp` leaves no trace
+at all, since the ops it skipped simply never ran. So an `if` or a `$[..]` inside the loop costs
+nothing until the day its condition actually flips.
+
+Scope for a first pass: `while` only (a `do[n;..]` header is reached with its counter still live on
+the operand stack, and recording only starts on an empty one), no calls, no early `Ret`, and
+`Push`/`LoadL`/`StoreL`/`Dyad`/`Pop`/`Jmpf`/`Jmp` in the body. Anything else aborts the recording,
+and that header is never tried again — the same rejected-once-stays-rejected default the
+whole-function JIT already uses. Recording is pure observation: it can't change what a program
+computes, only whether some of it gets to run faster.
+
+What a trace buys over the method JIT is types. The whole-function JIT has to *prove* every op is
+integer from the bytecode alone; a trace just writes down what the values were, so **floats compile
+too** — a second operand stack in `d16..d21` alongside the integer one in `x9..x14`, with the
+per-value type tracked at codegen time (`tstack`) rather than a single depth counter. `&` and `|` on
+floats are `FMINNM`/`FMAXNM`, not `FMIN`/`FMAX`: Rust's `f64::min`/`max` propagate the non-NaN side,
+and the plain forms don't.
+
+Locals live in a buffer the compiled code is handed (`CompiledTrace`, `src/jit.rs`), indexed by
+position in a layout `jitCompileTrace` decides and `src/jit.rs` reads back out of its result rather
+than recomputing — both halves have to agree about what position means which local, and one side
+deciding is what guarantees they do. Entry guards every one of them (a plain non-null int, or a
+float, matching what was recorded); anything else and the loop just runs interpreted this time.
+
+Every exit is a **bail**: the guard's stub hands back the `ip` to resume interpreting at, and
+`Vm::run_ops` splices the locals back in and carries on, indistinguishable from having interpreted
+the whole time. That's why a guard is only legal where the trace holds no operand of its own — the
+interpreter resumes with the operand stack it entered the trace with, the empty one. The exception
+is the one deopt that can fire *mid*-iteration: two ordinary ints wrapping to exactly the null
+sentinel (`0W+1`), which the interpreter would start propagating as a null from there on and
+compiled code would not. Unlike the method JIT's version of that deopt, which just re-runs the whole
+call, there are already-committed writes from earlier iterations here — so the compiled code keeps a
+rollback copy of every local it writes, re-taken at the top of each iteration, and that deopt
+restores it and resumes at the loop header. It costs two memory ops per written local per iteration,
+which is most of the gap below.
+
+A `Bool` local is refused outright rather than traced: locals round-trip through a buffer of raw
+64-bit words, so `b: i<n` would come back an `Int`, and `type`/`show`/`string` can all see the
+difference. On the operand stack a comparison result is fine — nothing there survives the trace.
+
+Measured: **~53x** on a 5M-iteration loop (`jit_tests::manual_trace_perf_measurement`), against a
+`do`-loop baseline — the same body written in the one loop form no trace is ever started on, which
+is what an interpreted baseline has to be now that a single call to a `while` loop is no longer one.
+(That baseline change is also why `manual_perf_measurement` still reports the same ~58x for the
+whole-function JIT: what it measures didn't change, only how it gets something interpreted to
+measure against.)
+
+What's next here, in rough order: keeping locals in registers across an iteration instead of in the
+buffer — which removes both the loads and stores in the body *and* the rollback copy, since the
+buffer would then already hold the iteration-start values; calls, so a trace can cross a function
+boundary the method JIT would have to compile whole; and `do[n;..]`, which needs the header's live
+counter handled rather than avoided.
+
 ### What the tests check
 
 There is no external oracle left, so the front end is pinned by fixpoints and by behaviour:
@@ -409,6 +475,13 @@ There is no external oracle left, so the front end is pinned by fixpoints and by
 - **The language cases.** ~250 source/result pairs — semantics, error messages, error line numbers and
   call stacks — every one through `nrun`.
 - **Front-end errors.** Lexer and parser messages and their line numbers, asserted literally.
+- **The JIT against the interpreter.** Every compiled path is checked by running the same loop twice
+  — once so it tiers up, once in a form that provably never can (a spliced-in `- -`, an identity the
+  compilability check rejects; or a `do` loop, which no trace is started on) — and requiring the two
+  to agree. That covers the guards and deopts too: a branch that flips after the trace was recorded,
+  an `0W+1` wrapping to the null sentinel mid-loop, an out-of-range index, a second live reference to
+  an amended vector. One test asserts a wall-clock bound instead, since everything else here would
+  still pass if the JIT silently stopped compiling anything at all.
 - RFC vectors for the crypto and the TLS key schedule; the record layer round-trips offline.
 
 What this gives up relative to the oracle: a bug that the compiler introduces *and* reproduces
@@ -443,6 +516,9 @@ Runtime errors carry a line table, which costs ~10% of compile throughput. A fra
 caller's `LoadG`, so the bytecode carries positions but no names.
 
 ### Next
+
+For the JIT, the next steps are in "Stage 2b" above: locals in registers across a traced iteration,
+then calls, then `do[n;..]`.
 
 A register-style calling convention was tried and reverted — it measured slower, and the profile
 said frame setup is ~5% while `Value` clone/drop and small-list allocation are ~35%. The allocation

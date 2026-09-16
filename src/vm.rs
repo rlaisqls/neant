@@ -94,7 +94,7 @@ impl Vm {
     /// If this frame failed inside a Call, the op before it loaded the callee — that names the frame below.
     /// `code`: `Some` when this frame belongs to an actual `FnCode` (a lambda/closure call,
     /// `Vm::call_code`) — the only case `Op::Jmp`/`Op::Loop` backward jumps can trigger the
-    /// tracing JIT's per-loop-header hotness counting (`FnCode::loop_hot`); `None` for top-level
+    /// tracing JIT's per-loop-header hotness counting (`FnCode::loop_action`); `None` for top-level
     /// unit execution (`Vm::exec`), which has no `FnCode` to key that counter on and isn't the
     /// tracing JIT's target anyway.
     fn execute(&mut self, code: Option<&Arc<FnCode>>, ops: &[Op], k: &[Value], lines: &[u32], loc: &mut Vec<Value>) -> R<Value> {
@@ -132,18 +132,18 @@ impl Vm {
                     if (t as usize) < ip {
                         if let Some(code) = code {
                             match code.loop_action(t) {
-                                LoopAction::Run(trace) => {
-                                    // Already compiled: run it instead of interpreting this
-                                    // iteration. A `None` here means the current locals don't
-                                    // match the types this trace assumed — same "just don't use
-                                    // the compiled version this time" fallback as everywhere else
-                                    // in the JIT; falls through to the ordinary `Op::Jmp` below.
+                                // Already compiled: run it instead of interpreting this iteration.
+                                // The empty-stack check is the same one recording required — the
+                                // trace bails back to a bytecode ip carrying nothing of its own,
+                                // so the stack it resumes on has to be the one it started from.
+                                // A `None` from `run` means the current locals don't match the
+                                // types this trace assumed — same "just don't use the compiled
+                                // version this time" fallback as everywhere else in the JIT; both
+                                // fall through to the ordinary `Op::Jmp` below.
+                                LoopAction::Run(trace) if st.is_empty() => {
                                     if let Some(bail_ip) = trace.run(loc) {
-                                        eprintln!("DEBUG trace run: header={t} bail_ip={bail_ip}");
                                         ip = bail_ip; *ipc = ip;
                                         continue;
-                                    } else {
-                                        eprintln!("DEBUG trace run: type mismatch, skipped");
                                     }
                                 }
                                 LoopAction::StartRecording if st.is_empty() => {
@@ -225,8 +225,8 @@ impl Vm {
                         let t = recorder.take().unwrap().finish();
                         if let Some(code) = code {
                             match crate::jit::compile_trace(&t, &code.consts, self) {
-                                Some(compiled) => { eprintln!("DEBUG trace compiled: header={} steps={}", t.header, t.steps.len()); code.set_trace_compiled(t.header, Arc::new(compiled)); }
-                                None => { eprintln!("DEBUG trace compile FAILED: header={} steps={}", t.header, t.steps.len()); code.set_trace_rejected(t.header); }
+                                Some(compiled) => code.set_trace_compiled(t.header, Arc::new(compiled)),
+                                None => code.set_trace_rejected(t.header),
                             }
                         }
                     } else if rec.failed() {
