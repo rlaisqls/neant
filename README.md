@@ -360,12 +360,38 @@ locals go on a fixed-size native stack buffer (`try_run_raw`, `src/jit.rs`) inst
 function's own int-typed registers) and real functions have nowhere near `MAX_SLOTS` (64) locals —
 between the two, a hot recursive call pays neither a lock nor an allocation.
 
-Measured on this machine: a tight scalar `while` loop is **~58x** faster compiled (cold/interpreted
-vs. warm — `cargo test --release jit_tests::manual_perf_measurement -- --ignored --nocapture`).
-Recursive calls (`fib`) are **~4x** (`jit_tests::manual_recursive_perf_measurement`) — smaller than
-the loop case since a call still costs more than a loop iteration even with the lock and the
-allocation gone (marshalling arguments, the depth guard, resolving the callee), just far less than
-before.
+**Locals live in registers.** That buffer (and `try_run`'s) is only how a call's locals get *in*.
+Every local a compiled function touches — params, scratch locals and captures alike, in first-seen
+bytecode order (`jitLocalSlots`, `src/neant/jit/arm64.nt`) — is assigned one register for the whole
+function, loaded from the buffer once in the prologue; `LoadL`/`StoreL` compile to register moves,
+and the values are never written back out. That's sound because `Compiled::run` reads only the
+returned value and the ok word, and neither entry point looks at the buffer again after the call, so
+a return or a deopt simply abandons the registers; and both entry paths marshal into the same layout
+and reach the same entry, so one prologue serves both. What makes this different from the tracing
+tier's version of the same idea ([Stage 2b](#stage-2b-started-a-tracing-jit-for-hot-loops)) is that a
+compiled function makes calls — `blr` to the `jit_call`/`jit_vec_get`/`jit_vec_set` trampolines — and
+its locals have to survive them. So the first six registers handed out are callee-saved (x23..x28),
+which the trampolines preserve for free at the cost of one `stp`/`ldp` per pair in the prologue/
+epilogue, paid once per call *of* the function and only for the pairs in use; the next five are
+caller-saved (x6..x8, x16, x17) and are spilled to the frame around every `blr`, the same way the live
+operand stack already was — a cost only a function with more than six locals *and* a call in it pays.
+A twelfth local and beyond simply stays in the buffer and is reached through x19 exactly as every
+local used to be, per slot, so no function is rejected for being too wide; its overflow locals just
+run the old way. A vector-classified slot (below) is a register too — its value is a pointer, a plain
+64-bit word only ever handed to the vector trampolines — so those keep their semantics unchanged.
+The frame grew from 112 to 192 bytes for the saves and the spill area, which moved where compiled
+recursion overflows a 2MiB thread stack from ~2000 levels to ~1800 (measured with the guard lifted);
+`MAX_CALL_DEPTH` stays at 500, still with a >3x margin.
+
+Measured on this machine: a tight scalar `while` loop is **~120x** faster compiled (cold/interpreted
+vs. warm — `cargo test --release jit_tests::manual_perf_measurement -- --ignored --nocapture`), up
+from ~60x when every `LoadL`/`StoreL` went through the buffer — the loop body now touches no memory
+at all, and this tier is back ahead of the tracing one on the same loop (whose body still stores its
+written locals once per iteration, see Stage 2b). Recursive calls (`fib`) are **~3.5x**
+(`jit_tests::manual_recursive_perf_measurement`), unchanged within noise by the register change —
+`fib` has a single local, and a call still costs far more than a loop iteration even with the lock
+and the allocation gone (marshalling arguments, the depth guard, resolving the callee), just far less
+than before.
 
 **Vector indexing inside a compiled loop.** `x[i]` and `x[i]:v` on an `Ints` **parameter or
 capture** (not a scratch local — nothing in the compilable subset can construct a fresh vector
@@ -391,10 +417,10 @@ memory-layout assumption this project has no reason to make. At entry, a classif
 capture value must be `Ints` (else, same as a non-int plain arg, the whole call just doesn't run
 compiled), a clone of it lives in a small side table (`vecbuf`, `try_run`/`try_run_raw`) for the
 duration of the call, and that slot's register holds a pointer into it instead of a plain int — the
-trampolines bounds-check and deopt exactly like every other guarded point. Measured: **~64x**
-(`jit_tests::manual_vector_perf_measurement`) — in the same range as the plain scalar loop, since
-the cost this removes (interpreter dispatch, `Value` boxing per element) dominates over the one
-`bl` per access that's still there.
+trampolines bounds-check and deopt exactly like every other guarded point. Measured: **~75x**
+(`jit_tests::manual_vector_perf_measurement`, unchanged within noise by the register change) — below the plain scalar loop's ~120x because every
+access is still a `blr` (plus the operand-stack spill around it), but the cost this removes
+(interpreter dispatch, `Value` boxing per element) still dominates that.
 
 
 ### Stage 2b (started): a tracing JIT for hot loops

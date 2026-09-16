@@ -467,6 +467,70 @@ mod jit_tests {
         );
     }
 
+    /// Every local of a compiled function lives in a register for the whole call (`jitLREGS`,
+    /// src/neant/jit/arm64.nt): the first six in callee-saved ones, the next five in caller-saved
+    /// ones spilled around every trampoline call, and any beyond that back in the interpreter's
+    /// buffer. `g` has fourteen locals, all live across its recursive call, so one of each class is
+    /// held across a `blr` here — a wrong pair in the prologue/epilogue saves, a caller-saved local
+    /// not spilled around the call, or one register handed to two slots would each change this
+    /// sum, while `fact`/`fib` above (one local) would still come out right. `gSlow` is the same
+    /// function kept interpreted by `- -` (see `manual_recursive_perf_measurement`) and is the
+    /// oracle; `distinct` over both proves all 100 compiled-or-not calls agree with it.
+    #[test]
+    fn many_locals_survive_a_recursive_call_in_every_register_class() {
+        let mut v = boot_vm();
+        let got = v.eval(
+            "g: {[x] if[x<1; :0]; a:x+1; b:x+2; c:x+3; d:x+4; e:x+5; f:x+6; h:x+7; k:x+8; m:x+9; p:x+10; q:x+11; r:x+12; s: g[x-1]; a+b+c+d+e+f+h+k+m+p+q+r+s}; \
+             gSlow: {[x] if[x<1; :0]; a:x+(- - 1); b:x+2; c:x+3; d:x+4; e:x+5; f:x+6; h:x+7; k:x+8; m:x+9; p:x+10; q:x+11; r:x+12; s: gSlow[x-1]; a+b+c+d+e+f+h+k+m+p+q+r+s}; \
+             r: (); i: 0; while[i<100; r,: g 10; i+:1]; r,: gSlow 10; \
+             distinct r",
+        ).unwrap();
+        assert_eq!(got.fmt(), ",1440"); // sum over x=1..10 of 12x+78
+    }
+
+    /// A vector param's slot holds a pointer into `vecbuf` (src/jit.rs) rather than an int, and it
+    /// gets a register like any other local — which one depends on first use in the bytecode. In
+    /// `f` (nine locals) the vector's first use comes after seven int locals, so its pointer sits in
+    /// a caller-saved register that has to be spilled around the very `jit_vec_get` call it is the
+    /// argument to; in `w` (fourteen locals, with a write as well as a read) it's past the last
+    /// register and stays in the buffer, reached through x19 as before. A pointer clobbered by the
+    /// trampoline, or an int local sharing its register, would fault or change the sum on the next
+    /// iteration. `n` (10) stays under the trace threshold so the whole-function JIT is what runs
+    /// these loops; the `- -` twins are the interpreted oracles.
+    #[test]
+    fn vector_param_and_many_int_locals_share_the_register_file_correctly() {
+        let mut v = boot_vm();
+        let got = v.eval(
+            "f: {[x;n] s:0; a:0; b:0; c:0; d:0; e:0; i:0; while[i<n; s: s+x[i]; a: a+1; b: b+i; c: c+2; d: d+3; e: e+s; i: i+1]; s+a+b+c+d+e}; \
+             fSlow: {[x;n] s:0; a:0; b:0; c:0; d:0; e:0; i:0; while[i<n; s: s+x[i]; a: a+(- - 1); b: b+i; c: c+2; d: d+3; e: e+s; i: i+1]; s+a+b+c+d+e}; \
+             w: {[x;n] s:0; a:0; b:0; c:0; d:0; e:0; g:0; h:0; k:0; m:0; p:0; i:0; while[i<n; x[i]: x[i]*2; s: s+x[i]; a: a+1; b: b+i; c: c+2; d: d+3; e: e+s; g: g+4; h: h+5; k: k+6; m: m+7; p: p+8; i: i+1]; s+a+b+c+d+e+g+h+k+m+p}; \
+             wSlow: {[x;n] s:0; a:0; b:0; c:0; d:0; e:0; g:0; h:0; k:0; m:0; p:0; i:0; while[i<n; x[i]: x[i]*2; s: s+x[i]; a: a+(- - 1); b: b+i; c: c+2; d: d+3; e: e+s; g: g+4; h: h+5; k: k+6; m: m+7; p: p+8; i: i+1]; s+a+b+c+d+e+g+h+k+m+p}; \
+             xs: 1 2 3 4 5 6 7 8 9 10; \
+             rf: (); rw: (); i: 0; while[i<100; rf,: f[xs;10]; rw,: w[xs;10]; i+:1]; rf,: fSlow[xs;10]; rw,: wSlow[xs;10]; \
+             (distinct rf; distinct rw; xs)",
+        ).unwrap();
+        // `xs` unchanged too: the in-loop write went to `w`'s own copy (see jit_vec_set).
+        assert_eq!(got.fmt(), "(,380;,955;1 2 3 4 5 6 7 8 9 10)");
+    }
+
+    /// Every differential test in this module stays green whether or not a function is ever
+    /// compiled — the interpreter is always the fallback, so a codegen that quietly returned `::`
+    /// for everything would pass all of them. One test has to notice that a hot function really ran
+    /// natively. A `do` loop, because no trace is ever started on one (see `manual_perf_measurement`),
+    /// leaving the whole-function JIT as the only thing that can make this finish in the time
+    /// asserted: 20M iterations interpret in ~2.3s here and run compiled in ~20ms.
+    #[test]
+    #[cfg(target_arch = "aarch64")]
+    fn a_hot_function_really_is_compiled() {
+        let mut v = boot_vm();
+        v.eval("f: {[k] n:0; i:0; do[k; n: n+i; i: i+1]; n}").unwrap();
+        for _ in 0..70 { v.eval("f 10").unwrap(); } // cross the tier-up threshold
+        let t = std::time::Instant::now();
+        let r = v.eval("f 20000000").unwrap();
+        assert_eq!(r.fmt(), "199999990000000");
+        assert!(t.elapsed().as_millis() < 250, "took {:?}", t.elapsed());
+    }
+
     /// A `while` loop goes hot *inside a single call* — the tracing JIT counts backward jumps per
     /// loop header, not calls per function (`FnCode::loop_action`, src/value.rs) — so one `f 1000`
     /// crosses the threshold partway through and runs the rest of its iterations natively.
