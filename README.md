@@ -223,7 +223,9 @@ neither a long subject nor a long run recurses, and `(a*)*` terminates. A malfor
 ```
 
 `tests/lang.nt` is the language itself — the 363 source/result pairs that used to be the `CASES` table in
-src/main.rs. `cargo test` runs the whole set twice: once directly (`nt_tests`) and once against the
+src/main.rs — and `tests/jit.nt` and `tests/crypto.nt` are the JIT and crypto suites that used to be Rust
+`#[test]` functions. `tests/bench.nt` is not loaded by `run.nt`: it measures the tiers rather than
+asserting on them, so it is run by hand (`./target/release/neant tests/bench.nt`). `cargo test` runs the whole set twice: once directly (`nt_tests`) and once against the
 front end rebuilt by itself (`front_end_reproduces_itself`), both in src/main.rs. So a language or stdlib
 change is tested where it lives: add a `teq` line to the matching `tests/*.nt` rather than a case in Rust.
 
@@ -606,9 +608,13 @@ There is no external oracle left, so the front end is pinned by fixpoints and by
   between runs. So does every way a shape can *refuse* to compile — a `do` inside a callee, a
   non-int counter, a closure or primitive or projection callee, an arity mismatch, a global read,
   deep recursion, too many locals — since what matters there is that it be rejected rather than
-  miscompiled. One test asserts a wall-clock bound instead, since everything else here would still
-  pass if the JIT silently stopped compiling anything at all.
-- RFC vectors for the crypto and the TLS key schedule; the record layer round-trips offline.
+  miscompiled. These are `tests/jit.nt`, in neant: a case is a source string and the text the REPL
+  prints for it, which needs no Rust. What stays in Rust is only what has to look at the host — the
+  two wall-clock bounds that catch the JIT silently compiling nothing at all, the `FnCode` flag that
+  says a function really was compiled, and the deopt cases that need two separate VMs so one provably
+  never tiers up. `tests/bench.nt` is the ratio measurement, run by hand.
+- RFC vectors for the crypto and the TLS key schedule (`tests/crypto.nt`); the record layer
+  round-trips offline.
 
 What this gives up relative to the oracle: a bug that the compiler introduces *and* reproduces
 consistently is no longer caught by construction — it is caught only if a language case exercises it.

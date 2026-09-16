@@ -1,0 +1,24 @@
+// SHA-512 and the Ed25519 group law against their published vectors — the ed_vm tests that used to
+// be in src/main.rs. ed25519.nt is loaded on demand (it is not in the boot image), exactly as a
+// script would load it.
+tsection "crypto"
+load "src/neant/crypto/ed25519.nt"
+ctev: {[s] @[{[s] repr nrun s}; s; {"'",x}]}
+
+// `badd` is what makes SHA-512 possible: a word may be any bit pattern, including the one `+` reads as 0N.
+teq["sha512 empty"; hex sha512 0x; "cf83e1357eefb8bdf1542850d66d8007d620e4050b5715dc83f4a921d36ce9ce47d0d13c5d85f2b0ff8318d2877eec2f63b931bd47417a81a538327af927da3e"]
+teq["sha512 abc"; hex sha512 `byte$"abc"; "ddaf35a193617abacc417349ae20413112e6fa4e89a97ea20a9eeee64b55d39a2192992a274fc1a836ba3c23a3feebbd454d4423643ce80e2a9ac94fa54ca49f"]
+// two blocks, and a length that forces a padding block of its own
+teq["sha512 two blocks"; hex sha512 `byte$"abcdefghbcdefghicdefghijdefghijkefghijklfghijklmghijklmnhijklmnoijklmnopjklmnopqklmnopqrlmnopqrsmnopqrstnopqrstu"; "8e959b75dae313da8cf4f72814fc143f8f7779c6eb9f7fa17299aeadb6889018501d289e4900f7e4331b99dec4b5433ac7d329eeb6dd26545e96e55b874be909"]
+teq["sha512 200 a"; hex sha512 `byte$ 200#"a"; "4b11459c33f52a22ee8236782714c150a3b2c60994e9acee17fe68947a3e6789f31e7668394592da7bef827cddca88c4e6f86e4df7ed1ae6cba71f3e98faee9f"]
+teq["badd vs + on the null bit pattern"; ctev "mn: 1 shl 63; (mn badd 1; mn + 1)"; "-0W 0N"]
+
+// the curve: encoding round-trips, the addition law, the identity, inverses, and scalar reduction
+teq["edEncode matches fencode"; (edEncode EDB) ~ fencode EDBY; 1b]
+teq["edDecode round-trips"; (edEncode edDecode edEncode EDB) ~ edEncode EDB; 1b]
+teq["add is double on equal points"; (edEncode edAdd[EDB;EDB]) ~ edEncode edDbl EDB; 1b]
+teq["zero is the identity"; (edEncode edAdd[EDZERO;EDB]) ~ edEncode EDB; 1b]
+teq["a point plus its negation is zero"; (edEncode edAdd[EDB;edNeg EDB]) ~ edEncode EDZERO; 1b]
+teq["scalar 2 is a double"; (edEncode edMul[253#scBits scFromBytes 0x02,31#0x00; EDB]) ~ edEncode edDbl EDB; 1b]
+teq["L reduces to zero"; scMod bitsBE unhex "1000000000000000000000000000000014def9dea2f79cd65812631a5cf5d3ed"; 12#0]
+teq["one reduces to one"; scMod bitsBE (31#0x00),0x01; 1,11#0]

@@ -1,0 +1,44 @@
+// The manual JIT benchmarks — the #[ignore]d manual_*_perf_measurement tests that used to be in
+// src/main.rs. tests/run.nt does NOT load this file (nothing here asserts a speed; the numbers depend
+// on the machine, which is why they were #[ignore]d): run it by hand.
+//   ./target/release/neant tests/bench.nt
+// The pairing is always the same — `f` is the shape a tier can take, `fSlow` is the same arithmetic
+// with `- -` spliced in so it provably cannot be taken, so the ratio is tier vs interpreter on one
+// machine at one moment. `now`time` is milliseconds, so the sizes are chosen to run long enough to
+// measure.
+btms: {[f] t0: now`time; f[]; `int$now[`time]-t0}
+bratio: {[name;cold;hot] print fmt["%-22s interpreted %5dms   tiered %5dms   ratio %.1fx"; (name; cold; hot; (0.0+cold)%1|hot)]}
+
+f: {[k] n:0; i:0; while[i<k; n: n+i*i; i: i+1]; n}
+fSlow: {[k] n:0; i:0; while[i<k; n: n+(- - i*i); i: i+1]; n}
+
+// the function tier: 70 small calls cross the 64-call threshold, then one big call is compiled
+cold: btms {fSlow 1000000}
+do[70; f 10]
+bratio["while loop"; cold; btms {f 1000000}]
+
+// the trace tier: no warm-up call needed, the loop tiers up from inside its own first run
+bratio["traced while loop"; btms {fSlow 5000000}; btms {f 5000000}]
+
+g: {[k] n:0; do[k; n: n+1]; n}
+gSlow: {[k] n:0; do[k; n: n+(- - 1)]; n}
+bratio["traced do loop"; btms {gSlow 5000000}; btms {g 5000000}]
+
+// a call inside a traced loop is inlined by the recorder, never called
+sq: {x*2}
+h: {[k] s:0; i:0; while[i<k; s: s+sq i; i: i+1]; s}
+hSlow: {[k] s:0; i:0; while[i<k; s: s+(- - sq i); i: i+1]; s}
+bratio["traced inlined call"; btms {hSlow 5000000}; btms {h 5000000}]
+
+// the function tier again, on calls rather than a loop: each side recurses into itself
+fib: {$[x<2;x;fib[x-1]+fib[x-2]]}
+fibSlow: {$[x<2;x;(- - fibSlow[x-1])+(- - fibSlow[x-2])]}
+do[70; fib 5]
+bratio["recursive calls"; btms {fibSlow 27}; btms {fib 27}]
+
+// x[i] on an int-vector parameter, the one non-scalar shape the function tier takes
+vf: {[x;yy;n] s:0; i:0; while[i<n; s: s+x[i]*yy[i]; i: i+1]; s}
+xs: til 1000000
+cold: btms {vf[xs;xs;1000000]}
+do[70; vf[1 2 3 4 5;1 2 3 4 5;5]]
+bratio["vector index"; cold; btms {vf[xs;xs;1000000]}]
