@@ -1,0 +1,1036 @@
+// x86-64 (System V) codegen for the baseline JIT, beside src/neant/jit/arm64.nt (src/jit.rs owns
+// memory/execution; see README "Stage 2" and its x86-64 subsection). Two entry points, named apart
+// from the AArch64 ones so both backends can be in the boot image at once and src/jit.rs picks the
+// one its target arch needs:
+//
+// jitCompileX86[input;trampolines] -> (Bytes; Ints) or null, exactly jitCompile's contract.
+// jitCompileTraceX86[input] -> (Bytes; Ints; Ints; Int; List) or null, exactly jitCompileTrace's.
+//
+// Nothing here runs at load time, so where this file sits in BOOT_FILES (src/main.rs) doesn't
+// matter: the arm64.nt helpers below are resolved when a compile actually happens.
+//
+// Everything that decides *whether* a function or a trace compiles is arm64.nt's and is called
+// from here rather than copied: jitClassifySlots, jitLocalSlots, jitDyadKind, jitTraceTouched,
+// jitTrPos, jitTrTag/jitTrTagCodes/jitTrSameTags, jitMAXDEPTH, jitTrMAXTOUCHED. The compilability
+// walk, the slot classification and the deopt/guard points are therefore the same code, not the
+// same code twice: the two backends accept and reject exactly the same inputs, and a change to the
+// subset can't drift between them. What is new here is the instruction encoders, the register
+// assignment, and how branches are resolved.
+//
+// ---- registers (System V AMD64): the roles arm64.nt documents, mapped onto this ABI.
+// Long-lived pointers must survive the `call`s a compiled function makes, so they go in
+// callee-saved registers (rbx, rbp, r12-r15 — the trampolines preserve them for free, exactly as
+// x19..x22 are preserved on AArch64); the operand stack is caller-saved and spilled around every
+// call, the way x9..x14 are.
+//
+//   role                     AArch64      x86-64            why
+//   loc (`buf`) pointer      x19          rbx               callee-saved: held across calls
+//   int-null sentinel        x20          rbp               callee-saved: ditto. Not a frame
+//                                                           pointer here — nothing unwinds
+//                                                           through this code, and the ABI only
+//                                                           asks that it be restored, which the
+//                                                           epilogue does.
+//   vm pointer               x21          r12               callee-saved
+//   ok-out pointer           x22          r13               callee-saved
+//   operand stack (6 deep)   x9..x14      rsi,rdi,r8..r11   caller-saved, spilled around a call.
+//                                                           Register numbers 6,7,8,9,10,11 are
+//                                                           consecutive, so `jitxSTACK+i` indexes
+//                                                           it the same way `jitSTACK+i` does.
+//   call scratch             x15          rax               holds the trampoline address for
+//                                                           `call rax`, then its return value
+//   post-call ok scratch     x15          rcx               reads the ok word back after a call
+//   locals in registers      x23..x28,    r14, r15          only two are left after the four
+//                            x6..x8,                        long-lived roles above, and both are
+//                            x16,x17                        callee-saved, so — unlike AArch64 —
+//                                                           there are no caller-saved local
+//                                                           registers and nothing to spill around
+//                                                           a call. A third local and beyond stays
+//                                                           in `buf` and is reached through rbx,
+//                                                           exactly as arm64.nt's overflow slots
+//                                                           are (jitxLocalToReg); no function is
+//                                                           rejected for being too wide, its extra
+//                                                           locals just run the old way.
+//   trace buffer / out ptr   x0, x1       rdi, rsi          the trace tier's two arguments, held
+//                                                           for its whole lifetime (see below)
+//
+// The six argument registers this ABI uses for a call (rdi, rsi, rdx, rcx, r8, r9) overlap the
+// operand stack, which AArch64's x0..x5 / x9..x14 split does not. So a call here spills *every*
+// live operand-stack register, not just the ones below the operands the call consumes, and then
+// loads the arguments it needs out of those spill slots — there is no order in which the register
+// moves alone are safe. It costs a handful of memory operations on a path that is already making
+// a call, and it removes the whole class of "an argument clobbered an operand that hadn't been
+// read yet" bug.
+//
+// ---- branches: fixed-width rel32, emitted once, patched once.
+// An x86 instruction is variable length, so how far a jump reaches depends on the size of what it
+// jumps over — and a displacement that fits in a byte would make the instruction shorter, which
+// could in turn change another jump's distance. Nothing here plays that game: **every** branch is
+// emitted in its rel32 form (`jmp` = E9 + rel32, `jcc` = 0F 8x + rel32), never the rel8 short
+// form, so an instruction's length is a function of its *form* alone and never of its operands'
+// values. That makes the standard two-pass resolution exact: pass one emits the instruction in
+// full with a zero displacement and records the byte offset of that 4-byte field (jitxPatch32's
+// callers); pass two subtracts and writes four bytes, moving nothing. The same choice is why every
+// memory operand uses a full disp32 and every constant the 10-byte `mov r64, imm64`.
+//
+// `asm` is therefore a list of plain byte values (ints 0..255) rather than arm64.nt's list of
+// 32-bit words, and `count asm` is a byte offset — which is what every fixup, every `ipByte` entry
+// and every stub position below is. The final `` `byte$asm `` is the Bytes value src/jit.rs maps.
+//
+// A hex literal in this language is a Bytes vector, not an int (see arm64.nt's jitW), so an opcode
+// byte is written `` `int$0x8b `` and a two-byte opcode `` `int$0x0faf `` — which is already the
+// two-element list these encoders want to append.
+
+jitxLOC: 3          // rbx
+jitxNI: 5           // rbp
+jitxVM: 12          // r12
+jitxOK: 13          // r13
+jitxSTACK: 6        // rsi, rdi, r8..r11 (consecutive register numbers 6..11)
+jitxSCRATCH: 0      // rax
+jitxOKTMP: 1        // rcx
+jitxSP: 4           // rsp
+jitxLREGS: 14 15    // both callee-saved, so no local is ever spilled around a call
+
+// Pushed in the prologue and popped in the epilogue, always all six even when a role's register
+// goes unused: a fixed, even count is what makes the 16-byte stack alignment below an argument
+// this file can state once instead of per compiled function.
+jitxSAVED: 3 5 12 13 14 15
+
+// Frame: 48 bytes of operand-stack spill (jitMAXDEPTH words) then the ok word a trampoline writes.
+// Sized to 72 rather than 64 for alignment: this code is entered with rsp ≡ 8 (mod 16) — the
+// `call` into it pushed a return address — the six pushes take 48 more, and System V wants
+// rsp ≡ 0 (mod 16) *at* a call instruction, so the frame has to be ≡ 8 (mod 16) itself.
+jitxSPILLBASE: 0
+jitxCALLOK: 48
+jitxFRAME: 72
+
+// Condition codes, as the low nibble of a jcc (0x80+cc), setcc (0x90+cc) or cmovcc (0x40+cc).
+jitxCcE: 4
+jitxCcNE: 5
+jitxCcA: 7          // unsigned above: CF=0 and ZF=0 — the ordered float compare, see jitxTrDyadFCmp
+jitxCcNP: 11        // not-parity: the float compare was ordered (neither operand a NaN)
+jitxCcL: 12
+jitxCcLE: 14
+jitxCcG: 15
+
+// ---- instruction encoders. Every one was cross-checked byte for byte against `nasm -f bin` output
+// for the same mnemonic and operands (tests/x86.nt asserts those bytes, and README "Stage 2"'s
+// x86-64 subsection says what that does and does not prove), and read back with
+// `llvm-objdump -D -b binary -m x86-64`.
+
+// REX prefix: W (64-bit operand), R (the ModRM reg field names r8..r15), B (its rm field does).
+jitxRex: {[w;reg;rm] (((jitW 0x40) bor ($[w;8;0])) bor ($[reg>7;4;0])) bor ($[rm>7;1;0])}
+// ModRM, register-direct (mod=11): reg and rm both name registers.
+jitxModRR: {[reg;rm] ((jitW 0xc0) bor ((reg band 7) shl 3)) bor (rm band 7)}
+// ModRM for [base+disp32] (mod=10) plus, when the rm field would otherwise mean "there is a SIB
+// byte here" (rm=100, i.e. rsp or r12), that SIB byte — 0x24 is scale=1, no index, base=rm.
+jitxMem: {[reg;base;disp]
+  m: ((jitW 0x80) bor ((reg band 7) shl 3)) bor (base band 7)
+  $[4=(base band 7); (m; jitW 0x24),jitxLE32 disp; (enlist m),jitxLE32 disp]}
+
+jitxLE32: {[v] (v band 255; (v shr 8) band 255; (v shr 16) band 255; (v shr 24) band 255)}
+jitxLE64: {[v] (jitxLE32 v),jitxLE32 (v shr 32)}
+
+// mov rd, imm64 — always the 10-byte form, whatever the value (see the header comment on widths).
+jitxMovRI: {[rd;v] ((jitxRex[1;0;rd]; (jitW 0xb8)+(rd band 7)),jitxLE64 v)}
+// mov rd, rs  (89 /r is `mov r/m64, r64`, so the *destination* is the rm field)
+jitxMovRR: {[rd;rs] (jitxRex[1;rs;rd]; jitW 0x89; jitxModRR[rs;rd])}
+// mov rd, [base+disp]  /  mov [base+disp], rs
+jitxLoad: {[rd;base;disp] (jitxRex[1;rd;base]; jitW 0x8b),jitxMem[rd;base;disp]}
+jitxStore: {[base;disp;rs] (jitxRex[1;rs;base]; jitW 0x89),jitxMem[rs;base;disp]}
+// The reg/reg ALU forms that take `op r/m64, r64`: destination in the rm field, like mov above.
+jitxAlu: {[op;rd;rs] (jitxRex[1;rs;rd]; op; jitxModRR[rs;rd])}
+jitxAddRR: {[rd;rs] jitxAlu[jitW 0x01;rd;rs]}
+jitxSubRR: {[rd;rs] jitxAlu[jitW 0x29;rd;rs]}
+jitxAndRR: {[rd;rs] jitxAlu[jitW 0x21;rd;rs]}
+// `or` and (below) `divsd`, `movq r64 <- xmm` are the siblings of encoders this backend does use,
+// kept and pinned byte for byte by tests/x86.nt but not reachable from the compilable subset: the
+// integer `&`/`|` verbs are min/max rather than bitwise (so `and` earns its place only in the float
+// equality sequence), and neither tier compiles a division.
+jitxOrRR: {[rd;rs] jitxAlu[jitW 0x09;rd;rs]}
+jitxCmpRR: {[rd;rs] jitxAlu[jitW 0x39;rd;rs]}
+jitxTestRR: {[rd;rs] jitxAlu[jitW 0x85;rd;rs]}
+// imul, unlike the above, is `imul r64, r/m64`: the destination is the *reg* field.
+jitxImulRR: {[rd;rs] (jitxRex[1;rd;rs]),(`int$0x0faf),jitxModRR[rd;rs]}
+// The /digit group-1 immediate forms: cmp rd, imm8 and sub rd, imm8 (sign-extended).
+jitxCmpRI8: {[rd;imm] (jitxRex[1;0;rd]; jitW 0x83; ((jitW 0xf8) bor (rd band 7)); imm band 255)}
+jitxSubRI8: {[rd;imm] (jitxRex[1;0;rd]; jitW 0x83; ((jitW 0xe8) bor (rd band 7)); imm band 255)}
+// sub/add rsp, imm32 — the frame, so imm32 whatever the size (jitxFRAME fits a byte today).
+jitxSubSP: {[imm] (jitxRex[1;0;jitxSP]; jitW 0x81; (jitW 0xe8) bor jitxSP),jitxLE32 imm}
+jitxAddSP: {[imm] (jitxRex[1;0;jitxSP]; jitW 0x81; (jitW 0xc0) bor jitxSP),jitxLE32 imm}
+// lea rd, [rsp+disp] — how a trampoline gets `&ok`, where AArch64 uses `add xd, sp, #imm`.
+jitxLeaSP: {[rd;disp] (jitxRex[1;rd;jitxSP]; jitW 0x8d),jitxMem[rd;jitxSP;disp]}
+// setcc r8: the low byte of rd. A REX prefix is needed (and only needed) from register 4 up —
+// without one, rm=4..7 would mean ah/ch/dh/bh instead of spl/bpl/sil/dil.
+jitxSetcc: {[cc;rd]
+  t: ((`int$0x0f),((jitW 0x90)+cc)),jitxModRR[0;rd]
+  $[rd>3; (enlist jitxRex[0;0;rd]),t; t]}
+// movzx rd, rs8 — what turns a setcc's byte into the plain 0/1 int the rest of the code expects.
+jitxMovzx: {[rd;rs] (jitxRex[1;rd;rs]),(`int$0x0fb6),jitxModRR[rd;rs]}
+// cmovcc rd, rs — destination in the reg field. Reads flags, writes none.
+jitxCmovcc: {[cc;rd;rs] (jitxRex[1;rd;rs]),((`int$0x0f),((jitW 0x40)+cc)),jitxModRR[rd;rs]}
+// jmp/jcc rel32, with the displacement left zero for jitxPatch32 (see the header comment).
+jitxJmp: {[] (jitW 0xe9),jitxLE32 0}
+jitxJcc: {[cc] ((`int$0x0f),((jitW 0x80)+cc)),jitxLE32 0}
+// call rd — no REX.W: a near call is 64-bit by default in long mode.
+jitxCallR: {[rd] $[rd>7; (jitxRex[0;0;rd]; jitW 0xff; (jitW 0xd0) bor (rd band 7)); (jitW 0xff; (jitW 0xd0) bor (rd band 7))]}
+jitxPush: {[rd] $[rd>7; (jitxRex[0;0;rd]; (jitW 0x50)+(rd band 7)); enlist (jitW 0x50)+(rd band 7)]}
+jitxPop: {[rd] $[rd>7; (jitxRex[0;0;rd]; (jitW 0x58)+(rd band 7)); enlist (jitW 0x58)+(rd band 7)]}
+jitxRet: {[] enlist jitW 0xc3}
+
+// ---- SSE2, for the float side of the tracing tier (the whole-function tier is integer-only, so
+// none of this is reachable from jitCompileX86). A trace records *observed* types, so as on
+// AArch64 there is no static-typing problem to solve here, just the ISA. REX is emitted only when
+// an operand is xmm8 or above — these are not 64-bit-operand instructions, so there is no REX.W.
+jitxSse2: {[pfx;op;reg;rm]
+  r: jitxRex[0;reg;rm]
+  body: ((enlist op),jitxModRR[reg;rm])
+  $[r=(jitW 0x40); (enlist pfx),(`int$0x0f),body; (pfx; r),(`int$0x0f),body]}
+jitxMovsdRR: {[xd;xs] jitxSse2[jitW 0xf2; jitW 0x10; xd; xs]}
+jitxAddsd: {[xd;xs] jitxSse2[jitW 0xf2; jitW 0x58; xd; xs]}
+jitxSubsd: {[xd;xs] jitxSse2[jitW 0xf2; jitW 0x5c; xd; xs]}
+jitxMulsd: {[xd;xs] jitxSse2[jitW 0xf2; jitW 0x59; xd; xs]}
+jitxDivsd: {[xd;xs] jitxSse2[jitW 0xf2; jitW 0x5e; xd; xs]}
+// ucomisd xa, xb sets ZF/CF/PF from xa against xb, and PF specifically when either is a NaN —
+// which is what makes jitxTrDyadFCmp's `seta`/`setnp` reproduce Rust's comparison semantics.
+jitxUcomisd: {[xa;xb] jitxSse2[jitW 0x66; jitW 0x2e; xa; xb]}
+// movsd xd, [base+disp] / movsd [base+disp], xs — 10 loads, 11 stores.
+jitxMovsdMem: {[op;reg;base;disp]
+  r: jitxRex[0;reg;base]
+  body: ((enlist op),jitxMem[reg;base;disp])
+  $[r=(jitW 0x40); ((jitW 0xf2)),(`int$0x0f),body; ((jitW 0xf2); r),(`int$0x0f),body]}
+jitxMovsdLoad: {[xd;base;disp] jitxMovsdMem[jitW 0x10;xd;base;disp]}
+jitxMovsdStore: {[base;disp;xs] jitxMovsdMem[jitW 0x11;xs;base;disp]}
+// movq between an xmm and a GPR, raw bits, both directions (AArch64's FMOV Dd,Xn / FMOV Xd,Dn):
+// 66 REX.W 0F 6E moves GPR -> xmm, 66 REX.W 0F 7E xmm -> GPR, the xmm in the reg field either way.
+jitxMovqXR: {[xd;rs] ((jitW 0x66); jitxRex[1;xd;rs]),(`int$0x0f6e),jitxModRR[xd;rs]}
+jitxMovqRX: {[rd;xs] ((jitW 0x66); jitxRex[1;xs;rd]),(`int$0x0f7e),jitxModRR[xs;rd]}
+
+// ---- the two-pass branch resolution. `off` is the byte offset of a 4-byte displacement field
+// inside an already-emitted instruction; an x86 relative displacement is measured from the end of
+// the instruction it belongs to, which is exactly off+4.
+jitxPatch32: {[asm;off;target]
+  b: jitxLE32 (target-(off+4))
+  asm[off]: b[0]
+  asm[off+1]: b[1]
+  asm[off+2]: b[2]
+  asm[off+3]: b[3]
+  asm}
+// A branch whose target is already known (a back edge, a stub's exit): same fixed-width form,
+// resolved on the spot instead of through a fixup list.
+jitxJmpTo: {[asm;target] jitxPatch32[asm,jitxJmp[]; (count asm)+1; target]}
+
+// ---- locals in registers (README "Stage 2"). Identical scheme to arm64.nt's, with a narrower
+// register window: `jitLocalSlots` (arm64.nt) hands out one register per slot the bytecode touches
+// as a local, in first-seen order, and everything past jitxLREGS stays in `buf` and is reached
+// through rbx per access. The prologue loads the register-resident ones once and nothing ever
+// writes them back — sound for the same reason it is there: `Compiled::run` (src/jit.rs) reads only
+// the returned value and the ok word, and neither entry point looks at `buf` again, so a return or
+// a deopt just abandons the registers.
+jitxLocalReg: {[st;a]
+  p: (st[`lslots])?a
+  $[p<count st[`lregs]; (st[`lregs])[p]; null]}
+jitxLocalToReg: {[st;asm;rd;a]
+  r: jitxLocalReg[st;a]
+  $[isnull r; asm,jitxLoad[rd;jitxLOC;a*8]; asm,jitxMovRR[rd;r]]}
+jitxRegToLocal: {[st;asm;a;rs]
+  r: jitxLocalReg[st;a]
+  $[isnull r; asm,jitxStore[jitxLOC;a*8;rs]; asm,jitxMovRR[r;rs]]}
+
+// Around a `call`: every live operand-stack register goes to the frame and comes back, because the
+// trampoline may clobber all of them and because this ABI's argument registers *are* four of them
+// (see the header comment). `n` here is the whole virtual depth on the way in — including the
+// operands the call is about to consume, which is how the argument setup reads them without
+// caring what register they were in. On the way back only the ones the call didn't consume are
+// restored; the result goes straight into the register the shortened stack leaves free.
+// The local registers need nothing either way: both are callee-saved.
+jitxSaveLive: {[asm;n]
+  i: 0
+  while[i<n; asm: asm,jitxStore[jitxSP; jitxSPILLBASE+(i*8); jitxSTACK+i]; i: i+1]
+  asm}
+jitxRestoreLive: {[asm;n]
+  i: 0
+  while[i<n; asm: asm,jitxLoad[jitxSTACK+i; jitxSP; jitxSPILLBASE+(i*8)]; i: i+1]
+  asm}
+
+// The six callee-saved registers, saved and restored unconditionally (see jitxSAVED).
+jitxEmitPrologue: {[asm]
+  i: 0
+  while[i<count jitxSAVED; asm: asm,jitxPush jitxSAVED[i]; i: i+1]
+  asm,jitxSubSP jitxFRAME}
+jitxEmitEpilogue: {[asm]
+  asm: asm,jitxAddSP jitxFRAME
+  i: count jitxSAVED
+  while[i>0; i: i-1; asm: asm,jitxPop jitxSAVED[i]]
+  asm,jitxRet[]}
+
+// The return value goes in rax and the ok word is set through r13; locals are not stored back
+// (see the locals-in-registers comment above).
+jitxEmitReturn: {[asm;valreg]
+  asm: asm,jitxMovRR[jitxSCRATCH;valreg]
+  asm: asm,jitxMovRI[jitxOKTMP;1]
+  asm: asm,jitxStore[jitxOK;0;jitxOKTMP]
+  jitxEmitEpilogue asm}
+jitxEmitDeopt: {[asm]
+  asm: asm,jitxMovRI[jitxOKTMP;0]
+  asm: asm,jitxStore[jitxOK;0;jitxOKTMP]
+  jitxEmitEpilogue asm}
+
+// State carried through the walk. Same fields as arm64.nt's jitNewState, with two differences the
+// encoding forces: a fixup is (displacement field offset; bytecode target) rather than (word
+// index; target; isCbz), and the deopt fixups are bare offsets. Both because the *instruction* is
+// already fully emitted by the time it goes on the list — on AArch64 the branch word could be
+// re-encoded from scratch at patch time, here only its rel32 field is written, so the opcode (and
+// the `test` that sets the flags a conditional branch reads) is chosen at emission time. The two
+// AArch64 deopt kinds collapse into one for the same reason: `cmp dst, rbp` and `test rcx, rcx`
+// both leave "deopt" as ZF=1, so both branches are a `jz` and neither needs to be told apart here.
+jitxNewState: {[asm;lslots;lregs]
+  `asm`depth`fixups`deoptFixups`depthAt`pending`lslots`lregs!(asm;0;();();()!();null;lslots;lregs)}
+
+// ---- per-op handlers, one per arm64.nt handler, same contract: take the state dict, return the
+// updated one, or null to reject the whole function.
+
+// The one check arm64.nt doesn't make, and why: the register above the operand-stack file is the
+// vm pointer here, not a scratch register. A push at the top of the file writes one register past
+// it, which on AArch64 lands in x15 (scratch, reloaded before every use, so writing it early is
+// harmless) and here would land on r12. The walk's own depth check catches the overflow at the
+// *next* op and rejects the whole function, so nothing wrong is ever executed either way — but a
+// backend shouldn't emit a store to a live pointer at all, so both stack-growing ops refuse the
+// seventh operand themselves. It cannot change which functions compile: a function whose last op
+// is a push has a complete expression on the stack, so it is at depth 1, not at the top of the
+// file, and any push not at the end is followed by an op that makes the same check.
+jitxOpPush: {[st;ip;opcodes;consts;a]
+  if[not (st[`depth])<jitMAXDEPTH; :null]
+  c: consts[a]
+  $[isnull c
+    ; $[not (opcodes[ip+1])=11; null   // Null is only ever immediately Pop'd — see jitOpPush
+        ; st[`asm]: st[`asm],(); st[`depth]: (st[`depth])+1; st]
+    ; not (`int)=type c
+    ; null
+    ; c=0N
+    ; null
+    ; st[`asm]: (st[`asm]),jitxMovRI[jitxSTACK+(st[`depth]); c]; st[`depth]: (st[`depth])+1; st]}
+
+jitxOpLoadL: {[st;a]
+  if[not (st[`depth])<jitMAXDEPTH; :null]
+  if[not a<4096; :null]
+  st[`asm]: jitxLocalToReg[st; st[`asm]; jitxSTACK+(st[`depth]); a]
+  st[`depth]: (st[`depth])+1
+  st}
+
+// Doesn't pop — same as the interpreter's own `Op::StoreL`, which only peeks the top.
+jitxOpStoreL: {[st;a]
+  if[(st[`depth])<1; :null]
+  if[not a<4096; :null]
+  st[`asm]: jitxRegToLocal[st; st[`asm]; a; jitxSTACK+((st[`depth])-1)]
+  st}
+
+jitxOpPop: {[st]
+  if[(st[`depth])<1; :null]
+  st[`depth]: (st[`depth])-1
+  st}
+
+jitxOpRet: {[st]
+  if[(st[`depth])<1; :null]
+  st[`asm]: jitxEmitReturn[st[`asm]; jitxSTACK+((st[`depth])-1)]
+  st}
+
+// `x` is the top of the stack and the dyad's *left* argument, `y` the one below it, and the result
+// has to end up in `y`'s register — the position the shortened stack leaves on top. That is what
+// makes subtraction the one case that needs a temporary: every other form either commutes
+// (`add`/`imul`), overwrites its destination from a flag test (`cmov`, `setcc`) or is a compare.
+// `+ - *` then check the result against the int-null sentinel in rbp and deopt on a match, exactly
+// as jitOpDyad does with x20.
+jitxOpDyad: {[st;consts;a]
+  if[(st[`depth])<2; :null]
+  p: consts[a]
+  kind: jitDyadKind string p
+  if[isnull kind; :null]
+  x: jitxSTACK+((st[`depth])-1)
+  y: jitxSTACK+((st[`depth])-2)
+  dst: y
+  asm: st[`asm]
+  df: st[`deoptFixups]
+  $[kind=0
+    ; asm: asm,jitxAddRR[dst;x]
+    ; kind=1
+    ; asm: ((asm,jitxMovRR[jitxSCRATCH;x]),jitxSubRR[jitxSCRATCH;y]),jitxMovRR[dst;jitxSCRATCH]
+    ; kind=2
+    ; asm: asm,jitxImulRR[dst;x]
+    ; kind=3
+    ; asm: (asm,jitxCmpRR[x;y]),jitxCmovcc[jitxCcL;dst;x]
+    ; kind=4
+    ; asm: (asm,jitxCmpRR[x;y]),jitxCmovcc[jitxCcG;dst;x]
+    ; kind=5
+    ; asm: ((asm,jitxCmpRR[x;y]),jitxSetcc[jitxCcL;dst]),jitxMovzx[dst;dst]
+    ; kind=6
+    ; asm: ((asm,jitxCmpRR[x;y]),jitxSetcc[jitxCcG;dst]),jitxMovzx[dst;dst]
+    ; asm: ((asm,jitxCmpRR[x;y]),jitxSetcc[jitxCcE;dst]),jitxMovzx[dst;dst]]
+  if[kind<3
+    ; asm: asm,jitxCmpRR[dst;jitxNI]
+      asm: asm,jitxJcc jitxCcE
+      df: df,(count asm)-4]
+  st[`asm]: asm
+  st[`deoptFixups]: df
+  st[`depth]: (st[`depth])-1
+  st}
+
+jitxOpJmp: {[st;t]
+  st[`depthAt;t]: st[`depth]
+  st[`asm]: (st[`asm]),jitxJmp[]
+  st[`fixups]: (st[`fixups]),enlist ((count st[`asm])-4;t)
+  st}
+
+// `Jmpf` jumps when the condition is false, i.e. when the register is zero: `test`+`jz`, the pair
+// AArch64 spells CBZ.
+jitxOpJmpf: {[st;t]
+  if[(st[`depth])<1; :null]
+  r: jitxSTACK+((st[`depth])-1)
+  st[`depth]: (st[`depth])-1
+  st[`depthAt;t]: st[`depth]
+  st[`asm]: ((st[`asm]),jitxTestRR[r;r]),jitxJcc jitxCcE
+  st[`fixups]: (st[`fixups]),enlist ((count st[`asm])-4;t)
+  st}
+
+// do[n;..]: n>0 -> decrement in place and fall through (depth unchanged); else pop and jump to the
+// exit (depth-1 — the one thing the naive linear scan can't see, so it's recorded in depthAt).
+// One branch rather than AArch64's B.GT-over-a-B: x86 has the `jle` this wants directly.
+jitxOpLoop: {[st;t]
+  if[(st[`depth])<1; :null]
+  r: jitxSTACK+((st[`depth])-1)
+  asm: st[`asm]
+  asm: asm,jitxCmpRI8[r;0]
+  asm: asm,jitxJcc jitxCcLE
+  st[`depthAt;t]: (st[`depth])-1
+  st[`fixups]: (st[`fixups]),enlist ((count asm)-4;t)
+  st[`asm]: asm,jitxSubRI8[r;1]
+  st}
+
+// jit_call(vm; slot; argc; arg0; arg1; &ok) -> rdi, rsi, rdx, rcx, r8, r9, result in rax, and the
+// ok word read back through rcx right after. The arguments come out of the spill slots rather
+// than out of the operand-stack registers (see jitxSaveLive).
+jitxOpCall: {[st;consts;trampoline;slot;argc]
+  if[(st[`depth])<argc; :null]
+  d: st[`depth]
+  live: d-argc
+  asm: jitxSaveLive[st[`asm]; d]
+  asm: asm,jitxMovRR[7;jitxVM]
+  asm: asm,jitxMovRI[6;slot]
+  asm: asm,jitxMovRI[2;argc]
+  asm: asm,jitxLoad[1; jitxSP; jitxSPILLBASE+((d-1)*8)]
+  if[argc=2; asm: asm,jitxLoad[8; jitxSP; jitxSPILLBASE+((d-2)*8)]]
+  asm: asm,jitxLeaSP[9;jitxCALLOK]
+  asm: asm,jitxMovRI[jitxSCRATCH;trampoline]
+  asm: asm,jitxCallR jitxSCRATCH
+  asm: asm,jitxLoad[jitxOKTMP;jitxSP;jitxCALLOK]
+  asm: asm,jitxTestRR[jitxOKTMP;jitxOKTMP]
+  asm: asm,jitxJcc jitxCcE
+  st[`deoptFixups]: (st[`deoptFixups]),(count asm)-4
+  asm: asm,jitxMovRR[jitxSTACK+live; jitxSCRATCH]
+  st[`asm]: jitxRestoreLive[asm; live]
+  st[`depth]: live+1
+  st[`pending]: null
+  st}
+
+// x[i]: jit_vec_get(vp; idx; &ok) -> rdi, rsi, rdx. The vector pointer comes from the slot's own
+// register (callee-saved, so the call cannot touch it) or from `buf` for an overflow slot. Same
+// deopt-on-zero-ok convention as a call: out of range, or defensively the wrong type.
+jitxOpVecGet: {[st;vecgetAddr;slot]
+  if[(st[`depth])<1; :null]
+  d: st[`depth]
+  live: d-1
+  asm: jitxSaveLive[st[`asm]; d]
+  asm: jitxLocalToReg[st;asm;7;slot]
+  asm: asm,jitxLoad[6; jitxSP; jitxSPILLBASE+((d-1)*8)]
+  asm: asm,jitxLeaSP[2;jitxCALLOK]
+  asm: asm,jitxMovRI[jitxSCRATCH;vecgetAddr]
+  asm: asm,jitxCallR jitxSCRATCH
+  asm: asm,jitxLoad[jitxOKTMP;jitxSP;jitxCALLOK]
+  asm: asm,jitxTestRR[jitxOKTMP;jitxOKTMP]
+  asm: asm,jitxJcc jitxCcE
+  st[`deoptFixups]: (st[`deoptFixups]),(count asm)-4
+  asm: asm,jitxMovRR[jitxSTACK+live; jitxSCRATCH]
+  st[`asm]: jitxRestoreLive[asm; live]
+  st[`depth]: live+1
+  st[`pending]: null
+  st}
+
+// x[i]:v: jit_vec_set(vp; idx; val; &ok) -> rdi, rsi, rdx, rcx. No return value — the trampoline
+// mutates the vector in place, copy-on-write, so the `StoreL` this always precedes is a no-op.
+// Net depth is -1, not -2, for the reason jitOpVecSet spells out: the interpreter's own `Op::StoreL`
+// peeks rather than pops, so the slot has to exist for `Pop`'s bookkeeping even though nothing
+// ever reads it.
+jitxOpVecSet: {[st;vecsetAddr;slot]
+  if[(st[`depth])<2; :null]
+  d: st[`depth]
+  live: d-2
+  asm: jitxSaveLive[st[`asm]; d]
+  asm: jitxLocalToReg[st;asm;7;slot]
+  asm: asm,jitxLoad[6; jitxSP; jitxSPILLBASE+((d-1)*8)]
+  asm: asm,jitxLoad[2; jitxSP; jitxSPILLBASE+((d-2)*8)]
+  asm: asm,jitxLeaSP[1;jitxCALLOK]
+  asm: asm,jitxMovRI[jitxSCRATCH;vecsetAddr]
+  asm: asm,jitxCallR jitxSCRATCH
+  asm: asm,jitxLoad[jitxOKTMP;jitxSP;jitxCALLOK]
+  asm: asm,jitxTestRR[jitxOKTMP;jitxOKTMP]
+  asm: asm,jitxJcc jitxCcE
+  st[`deoptFixups]: (st[`deoptFixups]),(count asm)-4
+  st[`asm]: jitxRestoreLive[asm; live]
+  st[`depth]: live+1
+  st[`pending]: (`vecwritedone;slot)
+  st}
+
+jitCompileX86: {[input;trampolines]
+  opcodes: input[0]; opargs: input[1]; consts: input[2]; arity: input[3]; nlocals: input[4]
+  n: count opcodes
+  callAddr: trampolines[0]; vecgetAddr: trampolines[1]; vecsetAddr: trampolines[2]
+  vecSlots: jitClassifySlots[opcodes;opargs;n;arity;nlocals]
+  lslots: jitLocalSlots[opcodes;opargs;n]
+  // Same bound arm64.nt checks: a slot is reached in `buf` at a fixed displacement at least once
+  // (the prologue load, or every access for an overflow slot). disp32 could reach far further
+  // than this, but the two backends rejecting different functions would be worse than the room.
+  p: 0
+  while[p<count lslots; if[not (lslots[p])<4096; :null]; p: p+1]
+  lregs: ((count lslots) & count jitxLREGS)#jitxLREGS
+
+  asm: jitxEmitPrologue[()]
+  asm: asm,jitxMovRR[jitxLOC;7]     // rbx <- rdi, the locals buffer
+  asm: asm,jitxMovRR[jitxOK;6]      // r13 <- rsi, the ok word
+  asm: asm,jitxMovRR[jitxVM;2]      // r12 <- rdx, the Vm
+  asm: asm,jitxMovRI[jitxNI;0N]
+  // buf -> the local registers, once. Every one of them, not just the params/captures: a scratch
+  // local's slot is the 0 `buf` was zeroed with, exactly what a load through rbx would have read
+  // before its first StoreL.
+  p: 0
+  while[p<count lregs; asm: asm,jitxLoad[lregs[p]; jitxLOC; 8*lslots[p]]; p: p+1]
+
+  st: jitxNewState[asm;lslots;lregs]
+  ipByte: (n+1)#0   // n+1: a jump target can be the position right after the last op
+  ip: 0
+  while[ip<n
+    if[not isnull (st[`depthAt])[ip]; st[`depth]: (st[`depthAt])[ip]]
+    ipByte[ip]: count st[`asm]
+    if[(st[`depth])<0; :null]
+    if[(st[`depth])>jitMAXDEPTH; :null]
+    op: opcodes[ip]
+    a: opargs[ip]
+    pending: st[`pending]
+    pendKind: $[isnull pending; null; pending[0]]
+    isVecSlot: a in vecSlots
+    isCallHead: (op=7) & ((a=1)|(a=2))
+    isAmendHead: (op=15) & (a=1)
+    isStoreHead: $[isnull pending; 0b; (pendKind=`vecwritedone) & (op=4) & (a=(pending[1]))]
+    okNext: $[isnull pending; 1b
+             ; pendKind=`call; isCallHead
+             ; pendKind=`vecread; isCallHead
+             ; pendKind=`vecwrite; isAmendHead
+             ; pendKind=`vecwritedone; isStoreHead
+             ; 0b]
+    if[not okNext; :null]
+
+    $[op=0; st: jitxOpPush[st;ip;opcodes;consts;a]
+    ; (op=3) & isVecSlot; st[`pending]: (`vecread;a)
+    ; op=3; st: jitxOpLoadL[st;a]
+    ; isStoreHead; st[`pending]: null
+    ; op=4; st: jitxOpStoreL[st;a]
+    ; op=11; st: jitxOpPop st
+    ; op=16; st: jitxOpRet st
+    ; op=6; st: jitxOpDyad[st;consts;a]
+    ; op=9; st: jitxOpJmp[st;a]
+    ; op=10; st: jitxOpJmpf[st;a]
+    ; op=18; st: jitxOpLoop[st;a]
+    ; (op=13) & isVecSlot; st[`pending]: (`vecwrite;a)
+    ; op=1
+    ; $[not (`int)=type consts[a]; st: null
+        ; st[`pending]: (`call;consts[a])]
+    ; (pendKind=`vecwrite) & isAmendHead; st: jitxOpVecSet[st;vecsetAddr;pending[1]]
+    ; (pendKind=`call) & isCallHead; st: jitxOpCall[st;consts;callAddr;pending[1];a]
+    ; (pendKind=`vecread) & isCallHead; st: jitxOpVecGet[st;vecgetAddr;pending[1]]
+    ; st: null]
+
+    if[isnull st; :null]
+    ip: ip+1]
+
+  if[not isnull st[`pending]; :null]
+  ipByte[n]: count st[`asm]
+
+  lastOp: $[n>0; opcodes[n-1]; -1]
+  if[not lastOp=16
+    ; if[(st[`depth])<1; :null]
+      st[`asm]: jitxEmitReturn[st[`asm]; jitxSTACK+((st[`depth])-1)]]
+
+  deoptAt: count st[`asm]
+  asm: jitxEmitDeopt[st[`asm]]
+
+  // Pass two: every branch above was emitted in full with a zero rel32, so this only writes
+  // displacements — four bytes at a recorded offset, nothing moves (see the header comment).
+  fixups: st[`fixups]
+  i: 0
+  while[i<count fixups
+    e: fixups[i]
+    asm: jitxPatch32[asm; e[0]; ipByte[e[1]]]
+    i: i+1]
+  deoptFixups: st[`deoptFixups]
+  i: 0
+  while[i<count deoptFixups
+    asm: jitxPatch32[asm; deoptFixups[i]; deoptAt]
+    i: i+1]
+
+  (`byte$asm; vecSlots)}
+
+
+// ==== tracing JIT (src/trace.rs): compile one recorded loop iteration ====
+//
+// jitCompileTraceX86[input] -> (Bytes; Ints; Ints; Int; List) or null, exactly jitCompileTrace's
+// contract — same input encoding, same result shape, same buffer layout decided here and read back
+// by src/jit.rs. Read jitCompileTrace's section comment in arm64.nt for what a trace *is* and why
+// the exits, the rewind stub and the loop-carried stack look the way they do; only the register
+// assignment, the encoders and two consequences of the ISA differ, and those are what this comment
+// covers.
+//
+// ---- registers. A compiled trace makes no calls at all (a call in the loop is *inlined* by the
+// recorder), so on AArch64 it needs no callee-saved register and no prologue. There are not enough
+// caller-saved registers on this ABI for that: nine, against a buffer pointer, an out pointer, a
+// sentinel, a scratch, six operand-stack slots and one register per local. So this tier *does*
+// have a prologue — `push` of the same six callee-saved registers the whole-function tier saves,
+// popped at the one tail every exit funnels through. That is paid once per entry into the trace,
+// not once per iteration, and it buys the loop body the registers it needs:
+//
+//   rdi  the buffer (touched locals in and out, then the operand-stack area) — src/jit.rs's
+//        `CompiledTrace`; first argument, held for the trace's whole lifetime
+//   rsi  the out pointer (which exit index got there); second argument, likewise
+//   rbx  the int-null sentinel, compared after every int add/sub/mul exactly as x17 is
+//   rax  scratch: the exit index in each stub, and the staging register a float constant's raw
+//        bits go through on their way into an xmm (x86 has no float-immediate form)
+//   r8..r13    the int operand stack (jitMAXDEPTH deep), consecutive like the other tier's
+//   xmm8..xmm13  the float operand stack, mirroring it position for position
+//   rcx,rdx,rbp,r14,r15  one per int local, in first-seen order (jitxTrLOCALS)
+//   xmm0..xmm7           one per float local (jitxTrFLOCALS)
+//   xmm15                the temporary float subtraction needs (see jitxTrDyadFArith)
+//
+// Five int locals against AArch64's eight: a loop body wider than that just doesn't get traced,
+// the same fail-closed way one nested deeper than jitMAXDEPTH doesn't.
+//
+// ---- `&`/`|` on floats are rejected here, not compiled. On AArch64 they are FMINNM/FMAXNM,
+// which is exactly IEEE minNum/maxNum — the behaviour of Rust's `f64::min`/`max`
+// (`min2`/`max2`, src/prims.rs), which propagate the non-NaN side when only one operand is a NaN.
+// SSE2's `minsd`/`maxsd` are *not* that: they return the second operand whenever either is a NaN,
+// so they disagree with the interpreter on `0n & 1.0`. Emulating minNum takes a compare, two
+// branches and a NaN case, for an operation no measured loop does; refusing the trace instead
+// leaves that loop interpreted and correct, which is the same fail-closed default as everything
+// else here. Float `+ - *` and the comparisons compile.
+//
+// ---- the float comparisons go through `ucomisd` and the *unsigned* condition codes, and the
+// reason is NaN. `ucomisd a, b` sets CF/ZF as an unsigned compare would and additionally sets PF
+// when either operand is a NaN — in which case ZF, CF and PF are all 1. So `sete` after it would
+// call two NaNs equal, and `setb` would call a NaN less than everything. `seta` (CF=0 and ZF=0) is
+// true only for an *ordered* strictly-greater, which is why `x<y` compiles to `ucomisd y, x` plus
+// `seta` — the operands swapped rather than the condition inverted. Equality needs the parity flag
+// itself: `sete` and `setnp` and'ed together, the one place this backend's `and` is what the
+// language's `=` actually needs (the integer `&`/`|` verbs are min/max — `cmp`+`cmovcc` — not
+// bitwise).
+//
+// ---- and the stubs are emitted, not predicted. arm64.nt computes where each exit stub will land
+// before emitting any of them, because there its every instruction is one word wide. Here a stub's
+// length depends on what it stores, so instead each stub is emitted and its actual start offset
+// recorded, and the forward branches *inside* the stubs (to the shared writeback, or past it to
+// the tail) join the same fixup list as everything else. Emit, record, patch — see the top of this
+// file on why that is exact.
+
+jitxTrBUF: 7        // rdi
+jitxTrOUT: 6        // rsi
+jitxTrNIREG: 3      // rbx
+jitxTrSTACK: 8      // r8..r13
+jitxTrFSTACK: 8     // xmm8..xmm13
+jitxTrLOCALS: 1 2 5 14 15
+jitxTrFLOCALS: 0 1 2 3 4 5 6 7
+jitxTrFSCRATCH: 15  // xmm15
+
+// One register per local, by position, int and float files handed out independently in first-seen
+// order — jitTrLocalRegs (arm64.nt) with this backend's two files. Null if either runs out.
+jitxTrLocalRegs: {[stys]
+  regs: ()
+  ni: 0; nf: 0
+  p: 0
+  while[p<count stys
+    isF: (stys[p])=1
+    if[isF
+      ; if[not nf<count jitxTrFLOCALS; :null]
+        regs: regs,jitxTrFLOCALS[nf]
+        nf: nf+1]
+    if[not isF
+      ; if[not ni<count jitxTrLOCALS; :null]
+        regs: regs,jitxTrLOCALS[ni]
+        ni: ni+1]
+    p: p+1]
+  regs}
+
+// The local registers -> the buffer, for the positions in `which`: the exit path (what makes the
+// locals visible to the interpreter again) and, only when the trace has a rewind in it, the top of
+// every iteration.
+jitxTrStoreLocals: {[asm;which;stys;lregs]
+  i: 0
+  while[i<count which
+    p: which[i]
+    $[(stys[p])=1
+    ; asm: asm,jitxMovsdStore[jitxTrBUF; p*8; lregs[p]]
+    ; asm: asm,jitxStore[jitxTrBUF; p*8; lregs[p]]]
+    i: i+1]
+  asm}
+// The buffer -> the local registers, once on entry. Every local of the loop's own frame; an
+// inlined callee's local has nothing to load (its first write is inside the loop).
+jitxTrLoadLocals: {[asm;slots;stys;lregs;realUpto]
+  p: 0
+  while[p<count stys
+    if[(slots[p])<realUpto
+      ; $[(stys[p])=1
+        ; asm: asm,jitxMovsdLoad[lregs[p]; jitxTrBUF; p*8]
+        ; asm: asm,jitxLoad[lregs[p]; jitxTrBUF; p*8]]]
+    p: p+1]
+  asm}
+
+// The operand stack <-> the buffer's stack area, one word per live value, bottom first: value j at
+// word `stackBase+j`, in the register its file and its position among that file's values below it
+// put it in (jitTrPos's numbering). A null placeholder is skipped — nothing was ever written to
+// its register, and its tag alone tells the interpreter what to push.
+jitxTrStoreStack: {[asm;tags;stackBase]
+  j: 0
+  while[j<count tags
+    t: tags[j]
+    reg: jitTrPos[j#tags;t]
+    $[t=`null; asm
+    ; t=`float; asm: asm,jitxMovsdStore[jitxTrBUF; (stackBase+j)*8; jitxTrFSTACK+reg]
+    ; asm: asm,jitxStore[jitxTrBUF; (stackBase+j)*8; jitxTrSTACK+reg]]
+    j: j+1]
+  asm}
+jitxTrLoadStack: {[asm;tags;stackBase]
+  j: 0
+  while[j<count tags
+    t: tags[j]
+    reg: jitTrPos[j#tags;t]
+    $[t=`null; asm
+    ; t=`float; asm: asm,jitxMovsdLoad[jitxTrFSTACK+reg; jitxTrBUF; (stackBase+j)*8]
+    ; asm: asm,jitxLoad[jitxTrSTACK+reg; jitxTrBUF; (stackBase+j)*8]]
+    j: j+1]
+  asm}
+
+// The branch a guard leaves the loop on — the condition under which the recorded direction is
+// *not* the one being taken this time, in jitTrBranch's own numbering: 0 = the `Jmpf` condition
+// went false, 1 = it went true, 2 = an int result hit the null sentinel (after a cmp), 3/4 = a `do`
+// counter that is not / is positive (after a cmp against 0). Kinds 0 and 1 need the flags a `test`
+// sets, so unlike AArch64's single CBZ/CBNZ word this emits two instructions — which is why the
+// branch kind is decided here, at emission time, and only the displacement is left for the patch.
+jitxTrBranchEmit: {[asm;kind;reg]
+  $[kind=0; (asm,jitxTestRR[reg;reg]),jitxJcc jitxCcE
+  ; kind=1; (asm,jitxTestRR[reg;reg]),jitxJcc jitxCcNE
+  ; kind=2; asm,jitxJcc jitxCcE
+  ; kind=3; asm,jitxJcc jitxCcLE
+  ; asm,jitxJcc jitxCcG]}
+
+// The guard word (now: the guard's branch) leaving through exit `exitIdx`, or through the one
+// rewind stub. jitTrExit (arm64.nt) records the exit itself — pure bookkeeping, shared.
+jitxTrGuardWord: {[st;exitIdx;branchKind;reg]
+  st[`asm]: jitxTrBranchEmit[st[`asm];branchKind;reg]
+  st[`fixups]: (st[`fixups]),enlist ((count st[`asm])-4; exitIdx)
+  st}
+jitxTrRewindWord: {[st;branchKind;reg]
+  st[`asm]: jitxTrBranchEmit[st[`asm];branchKind;reg]
+  st[`rewFixups]: (st[`rewFixups]),(count st[`asm])-4
+  st}
+
+jitxTrPush: {[st;consts;a;ty]
+  tstack: st[`tstack]
+  reg: jitTrPos[tstack;ty]
+  if[not reg<jitMAXDEPTH; :null]
+  c: consts[a]
+  isFloat: ty=`float
+  if[not $[isFloat; (`float)=type c; ty=`int; (`int)=type c; 0b]; :null]
+  if[(not isFloat) & (c=0N); :null]
+  asm: st[`asm]
+  // No float-immediate form: the bits go through the scratch GPR, the way AArch64 goes through
+  // x15 and FMOV.
+  $[isFloat
+  ; asm: (asm,jitxMovRI[jitxSCRATCH; fbits c]),jitxMovqXR[jitxTrFSTACK+reg; jitxSCRATCH]
+  ; asm: asm,jitxMovRI[jitxTrSTACK+reg; c]]
+  st[`asm]: asm
+  st[`tstack]: tstack,ty
+  st}
+
+jitxTrPushNull: {[st] st[`tstack]: (st[`tstack]),`null; st}
+
+jitxTrLoadL: {[st;slots;lregs;a;ty]
+  tstack: st[`tstack]
+  reg: jitTrPos[tstack;ty]
+  if[not reg<jitMAXDEPTH; :null]
+  pos: slots?a
+  if[pos=count slots; :null]
+  asm: st[`asm]
+  $[ty=`float
+  ; asm: asm,jitxMovsdRR[jitxTrFSTACK+reg; lregs[pos]]
+  ; asm: asm,jitxMovRR[jitxTrSTACK+reg; lregs[pos]]]
+  st[`asm]: asm
+  st[`tstack]: tstack,ty
+  st}
+
+// Doesn't pop — the interpreter's own `Op::StoreL` only peeks the top.
+jitxTrStoreL: {[st;slots;lregs;a;ty]
+  tstack: st[`tstack]
+  n: count tstack
+  if[n<1; :null]
+  if[not (tstack[n-1])=ty; :null]
+  reg: (jitTrPos[tstack;ty])-1
+  pos: slots?a
+  if[pos=count slots; :null]
+  asm: st[`asm]
+  $[ty=`float
+  ; asm: asm,jitxMovsdRR[lregs[pos]; jitxTrFSTACK+reg]
+  ; asm: asm,jitxMovRR[lregs[pos]; jitxTrSTACK+reg]]
+  st[`asm]: asm
+  st}
+
+jitxTrPop: {[st]
+  tstack: st[`tstack]
+  n: count tstack
+  if[n<1; :null]
+  st[`tstack]: (n-1)#tstack
+  st}
+
+// x is the top of the stack and y the one below it, and the top is a dyad's *left* argument, so
+// `x-y` — not `y-x` — is what these emit. See the section comment on the condition codes.
+jitxTrDyadFCmp: {[asm;x;y;dst;kind]
+  $[kind=5
+  ; ((asm,jitxUcomisd[y;x]),jitxSetcc[jitxCcA;dst]),jitxMovzx[dst;dst]
+  ; kind=6
+  ; ((asm,jitxUcomisd[x;y]),jitxSetcc[jitxCcA;dst]),jitxMovzx[dst;dst]
+  ; asm: (asm,jitxUcomisd[x;y]),jitxSetcc[jitxCcE;dst]
+    asm: (asm,jitxSetcc[jitxCcNP;jitxSCRATCH]),jitxMovzx[dst;dst]
+    (asm,jitxMovzx[jitxSCRATCH;jitxSCRATCH]),jitxAndRR[dst;jitxSCRATCH]]}
+jitxTrDyadICmp: {[asm;x;y;dst;kind]
+  cc: $[kind=5;jitxCcL; kind=6;jitxCcG; jitxCcE]
+  ((asm,jitxCmpRR[x;y]),jitxSetcc[cc;dst]),jitxMovzx[dst;dst]}
+// `&`/`|` never reach here (jitxTrDyad rejects them for floats — see the section comment), so this
+// is `+ - *` only, and only `-` needs a temporary: addsd/mulsd commute onto dst, subsd does not.
+jitxTrDyadFArith: {[asm;x;y;dst;kind]
+  $[kind=0; asm,jitxAddsd[dst;x]
+  ; kind=1; ((asm,jitxMovsdRR[jitxTrFSCRATCH;x]),jitxSubsd[jitxTrFSCRATCH;y]),jitxMovsdRR[dst;jitxTrFSCRATCH]
+  ; asm,jitxMulsd[dst;x]]}
+jitxTrDyadIArith: {[asm;x;y;dst;kind]
+  $[kind=0; asm,jitxAddRR[dst;x]
+  ; kind=1; ((asm,jitxMovRR[jitxSCRATCH;x]),jitxSubRR[jitxSCRATCH;y]),jitxMovRR[dst;jitxSCRATCH]
+  ; kind=2; asm,jitxImulRR[dst;x]
+  ; kind=3; (asm,jitxCmpRR[x;y]),jitxCmovcc[jitxCcL;dst;x]
+  ; (asm,jitxCmpRR[x;y]),jitxCmovcc[jitxCcG;dst;x]]}
+
+// Type rules, the null-collision exit and the reject cases are jitTrDyad's, unchanged; see its
+// comment. The one addition is the float `&`/`|` refusal (section comment).
+jitxTrDyad: {[st;consts;a;ty;rip]
+  tstack: st[`tstack]
+  n: count tstack
+  if[n<2; :null]
+  opTy: tstack[n-1]; opTy2: tstack[n-2]
+  if[not (opTy in `int`bool`float) & (opTy2 in `int`bool`float); :null]
+  isFloat: opTy=`float
+  if[not isFloat=(opTy2=`float); :null]
+  p: consts[a]
+  kind: jitDyadKind string p
+  if[isnull kind; :null]
+  if[isFloat & ((kind=3)|(kind=4)); :null]
+  isCmp: kind>4
+  bothBool: (opTy=`bool)&(opTy2=`bool)
+  resultTy: $[isCmp; `bool; isFloat; `float; bothBool & ((kind=3)|(kind=4)); `bool; `int]
+  if[not resultTy=ty; :null]
+  base: $[isFloat; jitxTrFSTACK; jitxTrSTACK]
+  x: base+((jitTrPos[tstack;opTy])-1)
+  y: base+((jitTrPos[tstack;opTy])-2)
+  newTstack: (n-2)#tstack
+  dst: $[isCmp; jitxTrSTACK+(jitTrPos[newTstack;`int]); y]
+  asm: $[isCmp & isFloat; jitxTrDyadFCmp[st[`asm];x;y;dst;kind]
+       ; isCmp; jitxTrDyadICmp[st[`asm];x;y;dst;kind]
+       ; isFloat; jitxTrDyadFArith[st[`asm];x;y;dst;kind]
+       ; jitxTrDyadIArith[st[`asm];x;y;dst;kind]]
+  st[`asm]: asm
+  st[`tstack]: newTstack,resultTy
+  // Two ordinary ints wrapping to exactly the null sentinel (`0W+1`) — the interpreter would
+  // propagate a null from here and this backend would keep doing plain wrapping arithmetic. Exit
+  // to the op after this one with the stack as it stands; inside an inlined callee that ip is in
+  // another frame's bytecode, so it rewinds the iteration instead. Only `+ - *` can do it.
+  if[(not isFloat) & (kind<3)
+    ; st[`asm]: (st[`asm]),jitxCmpRR[dst;jitxTrNIREG]
+      inFrame: 0<count st[`frames]
+      if[inFrame; st: jitxTrRewindWord[st;2;0]]
+      if[not inFrame
+        ; st: jitTrExit[st;rip;st[`tstack]]
+          st: jitxTrGuardWord[st; (count st[`exits])-1; 2; 0]]]
+  st}
+
+jitxTrGuard: {[st;taken;bailIp]
+  tstack: st[`tstack]
+  n: count tstack
+  if[n<1; :null]
+  if[not (tstack[n-1]) in `int`bool; :null]
+  reg: jitxTrSTACK+((jitTrPos[tstack;`int])-1)
+  rest: (n-1)#tstack
+  st: jitTrExit[st;bailIp;rest]
+  st: jitxTrGuardWord[st; (count st[`exits])-1; $[taken;1;0]; reg]
+  st[`tstack]: rest
+  st}
+
+jitxTrGuardRewind: {[st;taken]
+  tstack: st[`tstack]
+  n: count tstack
+  if[n<1; :null]
+  if[not (tstack[n-1]) in `int`bool; :null]
+  reg: jitxTrSTACK+((jitTrPos[tstack;`int])-1)
+  st: jitxTrRewindWord[st; $[taken;1;0]; reg]
+  st[`tstack]: (n-1)#tstack
+  st}
+
+jitxTrLoop: {[st;exited;bailIp]
+  tstack: st[`tstack]
+  n: count tstack
+  if[n<1; :null]
+  if[not (tstack[n-1])=`int; :null]
+  reg: jitxTrSTACK+((jitTrPos[tstack;`int])-1)
+  rest: (n-1)#tstack
+  st[`asm]: (st[`asm]),jitxCmpRI8[reg;0]
+  st: jitTrExit[st;bailIp;$[exited;tstack;rest]]
+  st: jitxTrGuardWord[st; (count st[`exits])-1; $[exited;4;3]; reg]
+  if[exited; st[`tstack]: rest]
+  if[not exited; st[`asm]: (st[`asm]),jitxSubRI8[reg;1]]
+  st}
+
+jitxTrFramePush: {[st;nargs]
+  n: count st[`tstack]
+  if[n<nargs; :null]
+  st[`frames]: (st[`frames]),(n-nargs)
+  st}
+
+jitxTrFrameEnd: {[st]
+  frames: st[`frames]
+  nf: count frames
+  if[nf<1; :null]
+  base: frames[nf-1]
+  tstack: st[`tstack]
+  n: count tstack
+  if[n<(base+1); :null]
+  ty: tstack[n-1]
+  kept: base#tstack
+  file: $[ty=`float; jitxTrFSTACK; jitxTrSTACK]
+  src: file+((jitTrPos[tstack;ty])-1)
+  dst: file+jitTrPos[kept;ty]
+  asm: st[`asm]
+  if[(not src=dst) & (not ty=`null)
+    ; $[ty=`float; asm: asm,jitxMovsdRR[dst;src]; asm: asm,jitxMovRR[dst;src]]]
+  st[`asm]: asm
+  st[`tstack]: kept,ty
+  st[`frames]: (nf-1)#frames
+  st}
+
+jitCompileTraceX86: {[input]
+  kinds: input[0]; args: input[1]; tys: input[2]; ips: input[3]; consts: input[4]
+  header: input[5]; realUpto: input[6]
+  entry: $[0=count input[7]; (); jitTrTag each input[7]]
+  n: count kinds
+  touched: jitTraceTouched[kinds;args;tys;realUpto]
+  if[isnull touched; :null]
+  slots: touched[0]; stys: touched[1]; stored: touched[2]
+  nslots: count slots
+  if[not nslots<jitTrMAXTOUCHED; :null]
+  lregs: jitxTrLocalRegs stys
+  if[isnull lregs; :null]   // out of local registers
+  stackBase: nslots
+
+  // The body is assembled on its own first (offsets relative to its own start, fixed up by
+  // `bodyAt` below): whether the top of the iteration has to store anything is known only once
+  // the body has been walked, and everything it branches to is placed after it anyway.
+  st: `asm`tstack`fixups`exits`rewFixups`frames!((); entry; (); (); (); ())
+  i: 0
+  while[i<n
+    kind: kinds[i]; a: args[i]
+    ty: jitTrTag tys[i]
+    $[kind=0; st: jitxTrPush[st;consts;a;ty]
+    ; kind=1; st: jitxTrPushNull st
+    ; kind=2; st: jitxTrLoadL[st;slots;lregs;a;ty]
+    ; kind=3; st: jitxTrStoreL[st;slots;lregs;a;ty]
+    ; kind=4; st: jitxTrDyad[st;consts;a;ty;ips[i]]
+    ; kind=5; st: jitxTrPop st
+    ; kind=6; st: jitxTrGuard[st;1b;a]
+    ; kind=7; st: jitxTrGuard[st;0b;a]
+    ; kind=8; st: jitxTrGuardRewind[st;1b]
+    ; kind=9; st: jitxTrGuardRewind[st;0b]
+    ; kind=10; st: jitxTrFramePush[st;a]
+    ; kind=11; st: jitxTrFrameEnd st
+    ; kind=12; st: jitxTrLoop[st;0b;a]
+    ; kind=13; st: jitxTrLoop[st;1b;a]
+    ; st: null]
+    if[isnull st; :null]
+    i: i+1]
+
+  if[not jitTrSameTags[st[`tstack];entry]; :null]
+  if[not 0=count st[`frames]; :null]
+  exits: st[`exits]
+  hasRewind: 0<count st[`rewFixups]
+  if[hasRewind; exits: exits,enlist (header; entry)]
+  numExits: count exits
+  if[numExits<1; :null]
+
+  // Entry: save the callee-saved registers this tier uses (see the section comment — unlike
+  // AArch64's version, it needs some), then the sentinel, the locals and the entry stack.
+  asm: ()
+  i: 0
+  while[i<count jitxSAVED; asm: asm,jitxPush jitxSAVED[i]; i: i+1]
+  asm: asm,jitxMovRI[jitxTrNIREG;0N]
+  asm: jitxTrLoadLocals[asm;slots;stys;lregs;realUpto]
+  asm: jitxTrLoadStack[asm;entry;stackBase]
+  loopStart: count asm
+  // Only a rewind needs the iteration's starting point kept anywhere; without one the loop body
+  // has no memory operation in it at all.
+  if[hasRewind
+    ; asm: jitxTrStoreLocals[asm;stored;stys;lregs]
+      asm: jitxTrStoreStack[asm;entry;stackBase]]
+  bodyAt: count asm
+  asm: asm,st[`asm]
+  asm: jitxJmpTo[asm;loopStart]
+
+  // One stub per exit — its index into rax, its live stack into the buffer's stack area, then the
+  // shared writeback — emitted here and *measured*, not predicted (section comment). The rewind
+  // stub skips the writeback: the buffer already holds what this iteration started with.
+  starts: ()
+  stubFix: ()
+  ei: 0
+  while[ei<numExits
+    starts: starts,count asm
+    isRew: hasRewind & (ei=(numExits-1))
+    asm: asm,jitxMovRI[jitxSCRATCH;ei]
+    if[not isRew; asm: jitxTrStoreStack[asm;(exits[ei])[1];stackBase]]
+    asm: asm,jitxJmp[]
+    stubFix: stubFix,enlist ((count asm)-4; isRew)
+    ei: ei+1]
+  writebackAt: count asm
+  asm: jitxTrStoreLocals[asm;stored;stys;lregs]
+  tailAt: count asm
+  asm: asm,jitxStore[jitxTrOUT; 0; jitxSCRATCH]   // *out = the index of whichever exit got here
+  i: count jitxSAVED
+  while[i>0; i: i-1; asm: asm,jitxPop jitxSAVED[i]]
+  asm: asm,jitxRet[]
+
+  // Pass two, all three fixup lists: the stubs' forward branches, the guards' branches to their
+  // stubs, and the rewinding guards' branches to the one rewind stub.
+  i: 0
+  while[i<count stubFix
+    e: stubFix[i]
+    asm: jitxPatch32[asm; e[0]; $[e[1]; tailAt; writebackAt]]
+    i: i+1]
+  fixups: st[`fixups]
+  fi: 0
+  while[fi<count fixups
+    e: fixups[fi]
+    asm: jitxPatch32[asm; bodyAt+e[0]; starts[e[1]]]
+    fi: fi+1]
+  rfix: st[`rewFixups]
+  rewAt: starts[numExits-1]
+  fi: 0
+  while[fi<count rfix
+    asm: jitxPatch32[asm; bodyAt+rfix[fi]; rewAt]
+    fi: fi+1]
+
+  (`byte$asm; `int$slots; `int$stys; stackBase; {(x[0]; jitTrTagCodes x[1])} each exits)}

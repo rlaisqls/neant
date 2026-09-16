@@ -527,6 +527,85 @@ memory-layout assumption this project has no reason to make. At entry the slot's
 holds a pointer into it. The trampolines bounds-check and deopt like every other guarded point.
 Numbers for both tiers are together at the end of Stage 2b.
 
+#### The x86-64 backend (compiled, never executed)
+
+Both tiers have a second backend, `src/neant/jit/x86.nt`, for x86-64 System V. Its entry points are
+`jitCompileX86` and `jitCompileTraceX86` — the same contracts as the AArch64 pair, named apart so
+both files can be in the boot image at once — and `src/jit.rs` picks the pair its target
+architecture needs (`CODEGEN`) and is otherwise the same code for both. Everything that decides
+*whether* something compiles is called out of `arm64.nt` rather than copied (`jitClassifySlots`,
+`jitLocalSlots`, `jitDyadKind`, `jitTraceTouched`, `jitTrPos`, ...), so the compilability walk, the
+slot classification and the deopt/guard points are literally the same code and the two backends
+accept and reject the same functions and traces. What differs is the encoders, the register
+assignment, and how branches are resolved.
+
+The roles the AArch64 file documents map onto this ABI with less room. The long-lived pointers have
+to survive the calls a compiled function makes, so they take callee-saved registers: `rbx` the
+locals buffer, `rbp` the int-null sentinel, `r12` the `Vm`, `r13` the ok word. The operand stack is
+`rsi`, `rdi`, `r8`–`r11` — caller-saved and spilled around every call, as `x9..x14` are — and `rax`
+carries the trampoline address for `call rax` and then its result. That leaves `r14`/`r15` for
+locals-in-registers (against AArch64's eleven), with the third local and beyond staying in `buf`
+exactly as the AArch64 overflow slots do, so no function is rejected for being wide. Because this
+ABI's six argument registers *are* four of the operand-stack registers, a call spills the whole
+live stack and then loads its arguments back out of those spill slots: there is no order in which
+the register moves alone are safe, and this removes the class of bug entirely for a handful of
+memory operations on a path that is already making a call. The tracing tier, unlike its AArch64
+twin, does need a prologue — six `push`es and six `pop`s at the one tail every exit funnels through
+— because nine caller-saved registers cannot hold a buffer pointer, an out pointer, a sentinel, a
+scratch, six operand-stack slots and a register per local.
+
+An x86 instruction is variable length, so **every** branch is emitted in its `rel32` form and never
+the short `rel8` one, every memory operand uses a full `disp32`, and every constant the 10-byte
+`mov r64, imm64`: an instruction's length then depends on its form alone and never on its operands'
+values, which is what makes the standard two-pass resolution exact. Pass one emits the instruction
+in full with a zero displacement and records the byte offset of that four-byte field; pass two
+subtracts and writes four bytes, moving nothing. (The AArch64 file can re-encode a whole branch
+word at patch time; here the opcode — and the `test` that sets the flags a conditional branch reads
+— is chosen at emission time and only the displacement is left.)
+
+Two places this backend is deliberately narrower, both refusals, so the affected loop just stays
+interpreted: **`&`/`|` on floats are not compiled**, because SSE2's `minsd`/`maxsd` return their
+second operand when either is a NaN, which is not the IEEE minNum/maxNum that `f64::min`/`max`
+(and therefore the interpreter) implement — AArch64 has `FMINNM`/`FMAXNM` and this does not, and
+emulating it is a compare, two branches and a NaN case for an operation no measured loop performs.
+And the tracing tier has five int local registers against AArch64's eight, so a wider loop body is
+not traced. Float `+ - *` and the float comparisons do compile; the comparisons go through
+`ucomisd` and the *unsigned* condition codes, because NaN sets ZF, CF and PF together — `x<y` is
+`ucomisd y, x` plus `seta` (operands swapped rather than the condition inverted), and `=` needs
+`sete` and `setnp` and'ed, which is the one place the integer `&`/`|` verbs being min/max leaves
+`and` with a job to do.
+
+In `src/jit.rs` the only architecture-specific parts left are that codegen name and the instruction
+cache: `__clear_cache` is declared and called under `#[cfg(target_arch = "aarch64")]` only, because
+on x86-64 the caches are coherent and the `mprotect` already orders the write — there is nothing to
+do, which is why that is a `cfg` on the call rather than a call to a helper that would be empty on
+one target. `MAX_CALL_DEPTH` keeps its AArch64 calibration; the x86-64 frame is smaller (six pushes
+and a 72-byte frame, 128 bytes with the return address, against 192), so the same limit is if
+anything more conservative there.
+
+**What is verified.** Every encoder is asserted byte for byte against `nasm -f bin` output for the
+same mnemonic and operands (`tests/x86.nt`, which says how to re-derive each expectation), and the
+emitted code was read back with `ndisasm -b 64` and `llvm-mc --disassemble --triple=x86_64` — the
+`llvm-objdump` in this image does not take `-b binary`. The two-pass branch resolution is checked by
+computing where a displacement has to land from the encoders' own lengths and reading the four bytes
+that were patched in, for a forward jump, a backward jump and a deopt branch. Compilability is
+asserted against the AArch64 backend on 25 sources and 10 recorded traces — the accept/reject
+verdict, the classified vector slots, and for a trace the whole buffer layout and exits table that
+`src/jit.rs` reads back — and the same input twice is required to give byte-identical output.
+`cargo check --release --target x86_64-unknown-linux-gnu` passes with no warnings, where before this
+work that target compiled 17 dead-code warnings' worth of stubbed-out JIT; that clean build is the
+proof the `cfg` work is right.
+
+**What is not.** Nothing this backend emits has ever executed. The development machine is AArch64,
+so there is no evidence that the code runs, that the System V details are right in practice (stack
+alignment at a `call`, what the trampolines actually preserve), or that a compiled function returns
+what the interpreter would. That last one matters most: a wrong register here is a *wrong answer*,
+not a crash, and the fail-closed design of both tiers does not help with it — it only guarantees
+that what fails to compile falls back. So the first thing to run on an x86-64 box is
+`cargo test --release`, whose JIT tests compare every compiled path against the interpreter
+(["What the tests check"](#what-the-tests-check)); expect to debug. Every performance number in this
+section and the next is AArch64's.
+
 ### Stage 2b (started): a tracing JIT for hot loops
 
 The tier above tiers up whole *functions*, after 64 calls. That misses the shape this language is
