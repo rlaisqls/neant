@@ -26,6 +26,11 @@ fn int_dyad(name: &str, a: i64, b: i64) -> Option<Value> {
 /// The value `n` down from the top of a stack, for peeking at a callee before popping it.
 fn f_at(st: &[Value], n: usize) -> &Value { &st[st.len() - 1 - n] }
 
+/// How deep interpreted calls may nest — see `call_code`'s guard for the calibration. Shared with
+/// the JIT's `jit_call` (src/jit.rs), whose compiled-to-compiled chain sits *on top of* whatever
+/// interpreted depth it was entered from and so has to count against the same budget.
+pub(crate) const MAX_DEPTH: usize = 1000;
+
 /// One call-stack frame of an error: the function's name (None when it is not a plain global call) and
 /// the source line it was on. A frame is named by its *caller*, which knows the global it loaded to call it.
 type Frame = (Option<Arc<str>>, u32);
@@ -33,18 +38,21 @@ type Frame = (Option<Arc<str>>, u32);
 /// Globals live in a slot vector; names are interned once when code is loaded, so LoadG is an index, not a hash.
 /// trace: frames an in-flight error is unwinding through, innermost first.
 /// last_trace: the same, kept for `elast` after @[f;x;h] catches.
-pub struct Vm { vals: Vec<Option<Value>>, names: HashMap<Arc<str>, u32>, slot_names: Vec<Arc<str>>, depth: usize, pool: Vec<Vec<Value>>, trace: Vec<Frame>, last_trace: Vec<Frame> }
+/// recorder: the tracing JIT's in-flight recording (src/trace.rs), if any. On the VM rather than in
+/// `run_ops`'s own frame because a recording follows calls *into* their frames — `call_code` and
+/// the nested `run_ops` both need to reach it.
+pub struct Vm { vals: Vec<Option<Value>>, names: HashMap<Arc<str>, u32>, slot_names: Vec<Arc<str>>, depth: usize, pool: Vec<Vec<Value>>, trace: Vec<Frame>, last_trace: Vec<Frame>, recorder: Option<crate::trace::Recorder> }
 
 impl Vm {
     pub fn new() -> Vm {
-        let mut vm = Vm { vals: vec![], names: HashMap::new(), slot_names: vec![], depth: 0, pool: vec![], trace: vec![], last_trace: vec![] };
+        let mut vm = Vm { vals: vec![], names: HashMap::new(), slot_names: vec![], depth: 0, pool: vec![], trace: vec![], last_trace: vec![], recorder: None };
         for p in BUILTINS { vm.set(p.name, Prim(p)); }
         vm
     }
     /// A fresh VM for a `spawn`ed thread: the parent's globals and name→slot map (so the child
     /// resolves `LoadG`/`StoreG` in already-compiled bytecode identically), a clean call stack.
     fn forked(vals: Vec<Option<Value>>, names: HashMap<Arc<str>, u32>, slot_names: Vec<Arc<str>>) -> Vm {
-        Vm { vals, names, slot_names, depth: 0, pool: vec![], trace: vec![], last_trace: vec![] }
+        Vm { vals, names, slot_names, depth: 0, pool: vec![], trace: vec![], last_trace: vec![], recorder: None }
     }
     fn slot(&mut self, name: &str) -> u32 {
         if let Some(&s) = self.names.get(name) { return s; }
@@ -59,6 +67,8 @@ impl Vm {
     /// trampoline (src/jit.rs) uses to resolve a compiled call site's callee, the same lookup
     /// `Op::LoadG` does in `run_ops` below.
     pub(crate) fn global_at(&self, slot: usize) -> Option<Value> { self.vals.get(slot).cloned().flatten() }
+    /// The current interpreted call depth (`call_code`), for `jit_call`'s combined depth guard.
+    pub(crate) fn depth(&self) -> usize { self.depth }
     /// All global values, for save/restore around test cases (slots only grow, so a snapshot stays valid).
     #[allow(dead_code)]
     pub fn snapshot(&self) -> Vec<Option<Value>> { self.vals.clone() }
@@ -115,41 +125,44 @@ impl Vm {
     fn run_ops(&mut self, code: Option<&Arc<FnCode>>, ops: &[Op], k: &[Value], loc: &mut Vec<Value>, ipc: &mut usize) -> R<Value> {
         let mut st: Vec<Value> = self.pool.pop().unwrap_or_default();
         let mut ip = 0;
-        let mut recorder: Option<crate::trace::Recorder> = None;
         while ip < ops.len() {
             let op = ops[ip]; ip += 1; *ipc = ip;   // where the error reporter looks when an op fails
             let ip_before_op = ip as u32;
-            let was_recording = recorder.is_some();
+            let was_recording = self.recorder.is_some();
             // A backward `Jmp` is a loop header being reached again — both `while` (jumps back to
-            // its own condition check) and `do` (jumps back to its body after decrementing) emit
-            // this shape; `Op::Loop`'s own target is always *forward* (the loop's exit), never a
-            // header, so it's not checked here. Only meaningful with a real `FnCode` to key the
-            // per-header counter on (see `execute`'s doc comment). An empty stack at this point is
-            // what distinguishes `while` (traceable — see src/trace.rs's module doc comment) from
-            // `do` (its counter is still live here, so it's silently left untraced this pass).
-            if recorder.is_none() {
+            // its own condition check) and `do` (jumps back to the `Op::Loop` that decrements its
+            // counter) emit this shape; `Op::Loop`'s own target is always *forward* (the loop's
+            // exit), never a header, so it's not checked here. Only meaningful with a real `FnCode`
+            // to key the per-header counter on (see `execute`'s doc comment). What the operand
+            // stack holds at this point — nothing for a `while`, its counter for a `do`, the
+            // counters of enclosing `do` loops for either — is part of the trace (`entry_tags`;
+            // see src/trace.rs's module doc comment): it has to be plain ints, or this pass of the
+            // loop is silently left interpreted.
+            if !was_recording {
                 if let Op::Jmp(t) = op {
                     if (t as usize) < ip {
                         if let Some(code) = code {
                             match code.loop_action(t) {
                                 // Already compiled: run it instead of interpreting this iteration.
-                                // The empty-stack check is the same one recording required — the
-                                // trace bails back to a bytecode ip carrying nothing of its own,
-                                // so the stack it resumes on has to be the one it started from.
-                                // A `None` from `run` means the current locals don't match the
-                                // types this trace assumed — same "just don't use the compiled
-                                // version this time" fallback as everywhere else in the JIT; both
-                                // fall through to the ordinary `Op::Jmp` below.
-                                LoopAction::Run(trace) if st.is_empty() => {
-                                    if let Some(bail_ip) = trace.run(loc) {
-                                        ip = bail_ip; *ipc = ip;
-                                        continue;
+                                // `run` checks the stack against what the trace was recorded on,
+                                // and on a bail leaves `st` holding what the interpreter would have
+                                // had at `bail_ip`. A refusal falls through to the ordinary
+                                // `Op::Jmp` below: a type mismatch is the same "just don't use the
+                                // compiled version this time" fallback as everywhere else in the
+                                // JIT; a callee global that has been reassigned since the trace
+                                // was recorded is for good, so that trace is retired and the loop
+                                // counted afresh (`FnCode::retrace`).
+                                LoopAction::Run(trace) => match trace.run(loc, &mut st, self) {
+                                    crate::jit::TraceRun::Bailed(bail_ip) => { ip = bail_ip; *ipc = ip; continue; }
+                                    crate::jit::TraceRun::TypeMismatch => {}
+                                    crate::jit::TraceRun::StaleCallee => code.retrace(t),
+                                },
+                                LoopAction::StartRecording => {
+                                    if let Some(entry) = crate::trace::TraceTy::entry_tags(&st) {
+                                        self.recorder = Some(crate::trace::Recorder::start(t, loc.len() as u32, code.clone(), entry));
                                     }
                                 }
-                                LoopAction::StartRecording if st.is_empty() => {
-                                    recorder = Some(crate::trace::Recorder::start(t));
-                                }
-                                _ => {}
+                                LoopAction::None => {}
                             }
                         }
                     }
@@ -219,19 +232,23 @@ impl Vm {
                 Op::Ret => { let v = st.pop().unwrap_or(Null); st.clear(); self.pool.push(st); return Ok(v); }
                 Op::List(n) => { let items = (0..n).map(|_| st.pop().unwrap()).collect(); st.push(pack(items)); }
             }
+            // `was_recording`, not a fresh check: a recording that *started* on this very op (the
+            // backward `Jmp` above) begins with the next one. The outcome goes to the recorder's
+            // own owner, not this frame's `code` — a recording can end inside an inlined callee,
+            // where `code` is the callee's and its loop table has nothing to do with the header.
             if was_recording {
-                if let Some(rec) = recorder.as_mut() {
-                    if rec.step(op, ip_before_op, ip as u32, &st) {
-                        let t = recorder.take().unwrap().finish();
-                        if let Some(code) = code {
-                            match crate::jit::compile_trace(&t, &code.consts, self) {
-                                Some(compiled) => code.set_trace_compiled(t.header, Arc::new(compiled)),
-                                None => code.set_trace_rejected(t.header),
-                            }
+                if let Some(rec) = self.recorder.as_mut() {
+                    if rec.step(op, ip_before_op, ip as u32, &st, k) {
+                        let rec = self.recorder.take().unwrap();
+                        let owner = rec.owner().clone();
+                        let t = rec.finish();
+                        match crate::jit::compile_trace(&t, self) {
+                            Some(compiled) => owner.set_trace_compiled(t.header, Arc::new(compiled)),
+                            None => owner.set_trace_rejected(t.header),
                         }
                     } else if rec.failed() {
-                        if let Some(code) = code { code.set_trace_rejected(rec.header()); }
-                        recorder = None;
+                        let rec = self.recorder.take().unwrap();
+                        rec.owner().set_trace_rejected(rec.header());
                     }
                 }
             }
@@ -267,17 +284,26 @@ impl Vm {
         // the smallest stack this can run on, not just the main thread's — a `spawn`ed thread
         // (src/prims.rs) defaults to a 2MiB OS stack. 1800 levels of plain recursion overflows one;
         // this leaves real margin. src/jit.rs's `MAX_CALL_DEPTH` mirrors this for the same reason.
-        if self.depth > 1000 { return err("stack: recursion too deep"); }
+        if self.depth > MAX_DEPTH { return err("stack: recursion too deep"); }
+        let nargs = args.len();
         let mut loc = args; loc.resize(code.nlocals.max(arity), Null); loc.extend_from_slice(caps);
         self.depth += 1;
         // A hot, integer-only function may have a compiled native version (src/jit.rs); its entry
         // guard and its own deopt path both just mean "run it on the interpreter instead", so a
         // `None` here always falls straight through to the same `execute` that runs everything else.
-        let compiled = code.jitted(self);
+        // Not while a trace is being recorded, though: the recording has to *see* this frame's ops
+        // to inline them (src/trace.rs), and a compiled version would run them where it can't. The
+        // recording is one loop iteration long, so this only ever defers a tier-up, never skips it.
+        let compiled = if self.recorder.is_some() { None } else { code.jitted(self) };
         let jit_result = match &compiled { Some(c) => c.try_run(&loc, self), None => None };
         let r = match jit_result {
             Some(v) => Ok(v),
-            None => self.execute(Some(code), &code.ops, &code.consts, &code.lines, &mut loc),
+            None => {
+                if let Some(rec) = self.recorder.as_mut() { rec.enter_frame(code, nargs, &loc); }
+                let r = self.execute(Some(code), &code.ops, &code.consts, &code.lines, &mut loc);
+                if let Some(rec) = self.recorder.as_mut() { if r.is_ok() { rec.exit_frame() } else { rec.abort() } }
+                r
+            }
         };
         self.depth -= 1;
         loc.clear(); self.pool.push(loc);
