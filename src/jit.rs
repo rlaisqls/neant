@@ -110,11 +110,14 @@ mod arm64 {
     }
 
     thread_local! { static CALL_DEPTH: std::cell::Cell<u32> = const { std::cell::Cell::new(0) }; }
-    /// Same limit `Vm::call_code` (src/vm.rs) enforces for ordinary recursion — compiled-to-compiled
-    /// calls go through `blr`, not `call_code`, so they'd otherwise blow the real machine stack
-    /// (a hard crash) instead of failing like every other kind of runaway recursion in this
-    /// language does.
-    const MAX_CALL_DEPTH: u32 = 1000;
+    /// Compiled-to-compiled calls go through `blr`, not `Vm::call_code`, so they'd otherwise blow
+    /// the real machine stack (a hard crash) instead of failing like every other kind of runaway
+    /// recursion in this language does — needs its own limit for the same reason `call_code`'s
+    /// `self.depth` guard (src/vm.rs) needs one, and a lower one: `try_run_raw`'s `[i64; MAX_SLOTS]`
+    /// stack buffer makes each level here heavier than a plain interpreted call. Calibrated the
+    /// same way — empirically, against the smallest stack this can run on (a `spawn`ed thread
+    /// defaults to 2MiB) — with real margin below where it actually overflows.
+    const MAX_CALL_DEPTH: u32 = 500;
 
     /// The one fixed trampoline every compiled call site reaches via `blr` (see the module doc
     /// comment for why proving the callee pure *before* calling it is the safety argument here).

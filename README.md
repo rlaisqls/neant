@@ -281,24 +281,32 @@ can still bail out mid-run back to the interpreter (`deopt`) at a few points it 
 blindly: two ordinary ints wrapping to exactly the null sentinel by coincidence (`0W+1`); a call
 whose arity doesn't match or whose callee turns out not to be a plain function; runaway recursion
 (compiled-to-compiled calls go through `blr`, not `Vm::call_code`'s own recursion-depth guard, so
-they need their own — `MAX_CALL_DEPTH`, mirroring `call_code`'s limit for the same reason: it has to
-stay safe on the smallest stack this can run on, not just the main thread's, since a `spawn`ed
-thread defaults to a 2MiB one). Since the compilable subset can't observe anything outside its own
-locals — and a call is only made at all once the callee is independently proven just as pure, by
-literally attempting to compile it too — every one of these is always safe to just re-run from
-scratch on the interpreter.
+they need their own, `MAX_CALL_DEPTH` — lower than `call_code`'s `self.depth` limit, since each
+level here carries a `[i64; MAX_SLOTS]` stack buffer (see below) that a plain interpreted call
+doesn't, and both are calibrated empirically against the smallest stack this can run on, not just
+the main thread's, since a `spawn`ed thread defaults to a 2MiB one). Since the compilable subset
+can't observe anything outside its own locals — and a call is only made at all once the callee is
+independently proven just as pure, by literally attempting to compile it too — every one of these
+is always safe to just re-run from scratch on the interpreter.
 
 Calling another compiled function goes through one fixed trampoline (`jit_call`) reached via `blr`:
 it resolves the callee exactly like `Op::LoadG` would, proves it pure (or refuses to call it at all
 if not — the only way to avoid firing a real side effect twice if the *caller* later deopts), and
 recurses through compiled code directly, never dropping back into the bytecode interpreter unless
-something along the way deopts.
+something along the way deopts. The callee's compiled version is cached on its own `FnCode` behind
+a `OnceLock` (`FnCode::jit_for_call`, `src/value.rs`), not a mutex — built at most once, read with a
+plain atomic load on every call after that, since this runs on every single recursive step. Its
+locals go on a fixed-size native stack buffer (`try_run_raw`, `src/jit.rs`) instead of a heap
+`Vec`, since the arguments are already known to be plain ints (they came from another compiled
+function's own int-typed registers) and real functions have nowhere near `MAX_SLOTS` (64) locals —
+between the two, a hot recursive call pays neither a lock nor an allocation.
 
 Measured on this machine: a tight scalar `while` loop is **~58x** faster compiled (cold/interpreted
 vs. warm — `cargo test --release jit_tests::manual_perf_measurement -- --ignored --nocapture`).
-Recursive calls (`fib`) are a more modest **~1.6x** — each call still pays a trampoline lookup, a
-lock on the callee's compiled-code cache, and a heap allocation for its locals, none of which a
-loop iteration needs (`jit_tests::manual_recursive_perf_measurement`).
+Recursive calls (`fib`) are **~4x** (`jit_tests::manual_recursive_perf_measurement`) — smaller than
+the loop case since a call still costs more than a loop iteration even with the lock and the
+allocation gone (marshalling arguments, the depth guard, resolving the callee), just far less than
+before.
 
 ### What the tests check
 
