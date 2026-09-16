@@ -61,10 +61,13 @@ pub struct FnCode {
     loops: Mutex<std::collections::HashMap<u32, LoopSlot>>,
 }
 
+/// The second number in `Counting`/`Compiled` is how many more times this header may be
+/// re-recorded after its trace goes stale (`retrace`, below) — a budget, so a global that keeps
+/// changing can't keep a loop recompiling forever.
 enum LoopSlot {
-    Counting(u32),
-    Compiled(Arc<crate::jit::CompiledTrace>),
-    /// Recording was attempted and failed (an op outside Milestone 1's scope, a slot whose
+    Counting(u32, u32),
+    Compiled(Arc<crate::jit::CompiledTrace>, u32),
+    /// Recording was attempted and failed (an op outside the trace's scope, a slot whose
     /// observed type conflicted, ...) — permanent for this header, same as the method-JIT's own
     /// "rejected once, stays rejected" convention (`FnCode::jit`, below).
     Rejected,
@@ -88,6 +91,12 @@ const JIT_THRESHOLD: u32 = 64;
 /// its containing function's own call count does (one top-level call can iterate a loop thousands
 /// of times), so this is checked independently, per header, not per function.
 const TRACE_THRESHOLD: u32 = 64;
+/// How many times one header's trace may be thrown away and re-recorded because a global it
+/// inlined a callee from was reassigned (`FnCode::retrace`). Reassigning a function a hot loop
+/// calls is ordinary (a REPL redefining `f` between runs); doing it *every* run is not, and a
+/// compile is far more expensive than 64 interpreted iterations, so past this the header is
+/// simply left interpreted rather than recompiled on every change.
+const MAX_RETRACE: u32 = 4;
 
 impl FnCode {
     pub fn new(ops: Vec<Op>, consts: Vec<Value>, lines: Vec<u32>, params: Vec<String>, nlocals: usize) -> FnCode {
@@ -98,12 +107,12 @@ impl FnCode {
     pub(crate) fn loop_action(&self, header_ip: u32) -> LoopAction {
         let mut loops = self.loops.lock().unwrap();
         match loops.get(&header_ip) {
-            Some(LoopSlot::Compiled(t)) => return LoopAction::Run(t.clone()),
+            Some(LoopSlot::Compiled(t, _)) => return LoopAction::Run(t.clone()),
             Some(LoopSlot::Rejected) => return LoopAction::None,
             _ => {}
         }
-        let slot = loops.entry(header_ip).or_insert(LoopSlot::Counting(0));
-        if let LoopSlot::Counting(n) = slot {
+        let slot = loops.entry(header_ip).or_insert(LoopSlot::Counting(0, MAX_RETRACE));
+        if let LoopSlot::Counting(n, _) = slot {
             *n += 1;
             if *n == TRACE_THRESHOLD { return LoopAction::StartRecording; }
         }
@@ -111,9 +120,23 @@ impl FnCode {
     }
     /// Recording finished (`crate::trace::Recorder`) and compiled successfully — remember it so
     /// every later hit of this header jumps straight into it (`LoopAction::Run`) instead of
-    /// recording or interpreting again.
+    /// recording or interpreting again. The re-record budget carries over from the counting slot.
     pub(crate) fn set_trace_compiled(&self, header_ip: u32, t: Arc<crate::jit::CompiledTrace>) {
-        self.loops.lock().unwrap().insert(header_ip, LoopSlot::Compiled(t));
+        let mut loops = self.loops.lock().unwrap();
+        let left = match loops.get(&header_ip) { Some(LoopSlot::Counting(_, left)) => *left, _ => MAX_RETRACE };
+        loops.insert(header_ip, LoopSlot::Compiled(t, left));
+    }
+    /// The compiled trace's entry guard found a global it inlined a callee from no longer holding
+    /// that callee (`CompiledTrace::run`, src/jit.rs) — so it will never run again as it stands.
+    /// Start counting afresh so the loop is recorded again against the new definition, while the
+    /// budget lasts (`MAX_RETRACE`); after that, reject for good.
+    pub(crate) fn retrace(&self, header_ip: u32) {
+        let mut loops = self.loops.lock().unwrap();
+        let next = match loops.get(&header_ip) {
+            Some(LoopSlot::Compiled(_, left)) if *left > 0 => LoopSlot::Counting(0, left - 1),
+            _ => LoopSlot::Rejected,
+        };
+        loops.insert(header_ip, next);
     }
     /// Recording finished but didn't compile (or never finished at all — an op outside scope
     /// mid-recording) — never try this header again.

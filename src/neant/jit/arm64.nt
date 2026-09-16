@@ -35,8 +35,9 @@ jitCondGT: 12
 jitCondEQ: 0
 
 // ---- tracing JIT registers (src/trace.rs / jitCompileTrace below): a compiled trace makes no
-// calls at all (Milestone 1 has no `Call` in scope), so it needs no prologue/epilogue and no
-// callee-saved registers — everything lives in caller-saved ones. x0=buffer pointer (touched
+// calls at all (a call in the loop is *inlined* by the recorder, never called — see "Calls are
+// inlined" in src/trace.rs), so it needs no prologue/epilogue and no callee-saved registers —
+// everything lives in caller-saved ones. x0=buffer pointer (touched
 // locals, in and out — see jit.rs's `CompiledTrace`), x1=out bail-ip pointer, both held for the
 // trace's whole lifetime since nothing ever clobbers them (no `blr`). d16..d21 mirror x9..x14 as
 // a parallel float operand stack (chosen above d0-d7 so a later pass giving trampolines float
@@ -450,17 +451,21 @@ jitCompile: {[input;trampolines]
   (,/jitLE each asm; vecSlots)}
 
 
-// ==== tracing JIT (Milestone 1, src/trace.rs): compile one recorded `while`-loop iteration ====
+// ==== tracing JIT (src/trace.rs): compile one recorded `while`-loop iteration ====
 //
 // jitCompileTrace[input] -> (Bytes; Ints; Ints) or null (not compilable).
 //   result = (machine code; the locals this trace touches, in buffer order; their types, 0=int
 //   1=float). The slot list is *decided here* and read back by src/jit.rs rather than recomputed
 //   there — the buffer's layout has to mean the same thing on both sides of the boundary, and one
 //   side computing it and the other believing it is the only way to guarantee that.
-// input = (kinds:Ints; args:Ints; tys:Ints; consts:List; header:Int) — Trace::to_neant_input
-//   (src/trace.rs) plus the loop header's own bytecode ip, which is where a mid-iteration deopt
-//   resumes interpreting (see the rollback snapshot below).
-// kinds: 0=Push 1=PushNull 2=LoadL 3=StoreL 4=Dyad 5=Pop 6=Guard(taken) 7=Guard(not taken).
+// input = (kinds:Ints; args:Ints; tys:Ints; consts:List; header:Int; realUpto:Int) —
+//   Trace::to_neant_input (src/trace.rs) plus the loop header's own bytecode ip, which is where a
+//   mid-iteration deopt resumes interpreting, and the slot count of the loop's own frame: a slot at
+//   or past it belongs to an inlined callee (see "Calls are inlined" in src/trace.rs) and is never
+//   loaded from or stored to the buffer — it has no value before the loop and none anyone wants
+//   after it.
+// kinds: 0=Push 1=PushNull 2=LoadL 3=StoreL 4=Dyad 5=Pop 6=Guard(taken) 7=Guard(not taken)
+//   8=GuardRewind(taken) 9=GuardRewind(not taken) 10=FramePush(nargs) 11=FrameEnd.
 // tys: 0=int 1=float (per-step; for Dyad this is the *result* type, not necessarily the operand
 // type — comparisons narrow float operands to an int/bool result, so jitTrDyad below derives the
 // operand type from its own tracked stack, then double-checks it against this as a sanity check).
@@ -484,8 +489,9 @@ jitCompile: {[input;trampolines]
 //   tail: *x1 = x15; ret
 //
 // There is no prologue/epilogue in the calling-convention sense and no callee-saved register:
-// Milestone 1 has no `Call` in scope, so nothing here can clobber a caller-saved one and there is
-// nothing to restore. x9..x14 (`jitSTACK`) are the int operand stack, d16..d21 (`jitFSTACK`) the
+// a compiled trace never calls anything (a call in the loop body arrives already inlined — its
+// frame is FramePush, StoreL+Pop per argument, its body, FrameEnd, all on this same operand
+// stack), so nothing here can clobber a caller-saved one and there is nothing to restore. x9..x14 (`jitSTACK`) are the int operand stack, d16..d21 (`jitFSTACK`) the
 // float one, x2..x8/x16 (`jitTrLOCALS`) and d0..d7 (`jitTrFLOCALS`) the locals, x15 (`jitSCRATCH`)
 // the exit ip and constant-loading scratch, x17 the int-null sentinel. x16/x17 are the linker's
 // IP0/IP1, free here precisely because this code never makes a call or crosses a PLT; x18 is left
@@ -517,7 +523,7 @@ jitTrMAXTOUCHED: 16
 // would give one local two buffer positions, each written back independently with whichever ran
 // last winning — a real correctness bug, not a safe "just don't compile" fallback like everything
 // else here, so it's checked.
-jitTraceTouched: {[kinds;args;tys]
+jitTraceTouched: {[kinds;args;tys;realUpto]
   slots: (); stys: (); stored: ()
   i: 0
   n: count kinds
@@ -529,7 +535,10 @@ jitTraceTouched: {[kinds;args;tys]
         pos: slots?s
         if[pos=count slots; slots: slots,s; stys: stys,t]
         if[not (stys[pos])=t; :null]
-        if[(k=3) & (not pos in stored); stored: stored,pos]]
+        // an inlined callee's local is written every time round (its arguments are bound by
+        // StoreL) but is nobody's to keep: neither the top-of-iteration store nor the exit
+        // writeback has any business with it
+        if[(k=3) & (s<realUpto) & (not pos in stored); stored: stored,pos]]
     i: i+1]
   (slots;stys;stored)}
 
@@ -566,14 +575,16 @@ jitTrStoreLocals: {[asm;which;stys;lregs]
     i: i+1]
   asm}
 
-// The buffer -> the local registers, once on entry. Every local, not just the written ones: a
-// read-only local is exactly the kind this loads for good and never stores back.
-jitTrLoadLocals: {[asm;stys;lregs]
+// The buffer -> the local registers, once on entry. Every local of the loop's own frame, not just
+// the written ones: a read-only local is exactly the kind this loads for good and never stores
+// back. An inlined callee's local has nothing to load — its first write is inside the loop.
+jitTrLoadLocals: {[asm;slots;stys;lregs;realUpto]
   p: 0
   while[p<count stys
-    $[(stys[p])=1
-    ; asm: asm,jitFLdrImm[lregs[p]; jitTrBUF; p*8]
-    ; asm: asm,jitLdrImm[lregs[p]; jitTrBUF; p*8]]
+    if[(slots[p])<realUpto
+      ; $[(stys[p])=1
+        ; asm: asm,jitFLdrImm[lregs[p]; jitTrBUF; p*8]
+        ; asm: asm,jitLdrImm[lregs[p]; jitTrBUF; p*8]]]
     p: p+1]
   asm}
 
@@ -741,11 +752,61 @@ jitTrGuard: {[st;taken;bailIp]
   st[`tstack]: ()
   st}
 
+// A guard inside an inlined callee. Same test, different exit: the `ip` it would resume at is in
+// the callee's bytecode, and the interpreter is not in that frame — so it goes where the int-null
+// deopt goes, back to the loop header with the iteration thrown away (the stub jitTrDyad's check
+// also branches to; see jitCompileTrace). No empty-stack requirement either, for the same reason:
+// nothing on the trace's stack survives a rewind, so nothing has to be accounted for.
+jitTrGuardRewind: {[st;taken]
+  tstack: st[`tstack]
+  n: count tstack
+  if[n<1; :null]
+  if[not (tstack[n-1])=`int; :null]
+  reg: jitSTACK+((jitTrPos[tstack;`int])-1)
+  st[`rewFixups]: (st[`rewFixups]),enlist ((count st[`asm]); reg; taken)
+  st[`asm]: (st[`asm]),$[taken; jitCbnz[reg;0]; jitCbz[reg;0]]
+  st[`tstack]: (n-1)#tstack
+  st}
+
+// An inlined callee's frame opens with its `nargs` arguments as the top of the stack (the callee
+// itself was never a value here — see `TraceOp::FramePush`, src/trace.rs) and the recorder's
+// StoreL+Pop pairs about to bind them. Remember where the stack stands underneath them: that is
+// where the frame's one result has to end up (jitTrFrameEnd).
+jitTrFramePush: {[st;nargs]
+  n: count st[`tstack]
+  if[n<nargs; :null]
+  st[`frames]: (st[`frames]),(n-nargs)
+  st}
+
+// The callee's one result is the top of the stack; everything else it left behind (an early
+// `:x` discards the rest of its frame's stack, and the interpreter does the same) goes. If that
+// leaves the result in a different register than the one its new position calls for, move it.
+jitTrFrameEnd: {[st]
+  frames: st[`frames]
+  nf: count frames
+  if[nf<1; :null]
+  base: frames[nf-1]
+  tstack: st[`tstack]
+  n: count tstack
+  if[n<(base+1); :null]
+  ty: tstack[n-1]
+  kept: base#tstack
+  file: $[ty=`float; jitFSTACK; jitSTACK]
+  src: file+((jitTrPos[tstack;ty])-1)
+  dst: file+jitTrPos[kept;ty]
+  asm: st[`asm]
+  if[not src=dst
+    ; $[ty=`float; asm: asm,jitFMovD[dst;src]; asm: asm,jitMovR[dst;src]]]
+  st[`asm]: asm
+  st[`tstack]: kept,ty
+  st[`frames]: (nf-1)#frames
+  st}
+
 jitCompileTrace: {[input]
-  kinds: input[0]; args: input[1]; tys: input[2]; consts: input[3]; header: input[4]
+  kinds: input[0]; args: input[1]; tys: input[2]; consts: input[3]; header: input[4]; realUpto: input[5]
   n: count kinds
-  if[not header<65536; :null]   // the int-null stub's own resume ip, loaded by one MOVZ
-  touched: jitTraceTouched[kinds;args;tys]
+  if[not header<65536; :null]   // the rewind stub's own resume ip, loaded by one MOVZ
+  touched: jitTraceTouched[kinds;args;tys;realUpto]
   if[isnull touched; :null]
   slots: touched[0]; stys: touched[1]; stored: touched[2]
   nslots: count slots
@@ -756,11 +817,11 @@ jitCompileTrace: {[input]
   // x17 = the int-null sentinel, compared against after every int add/sub/mul exactly as the
   // whole-function JIT's x20 is (jitOpDyad). Loaded once, above the loop, with the locals.
   asm: jitLoadConst[();jitTrNIREG;0N]
-  asm: jitTrLoadLocals[asm;stys;lregs]
+  asm: jitTrLoadLocals[asm;slots;stys;lregs;realUpto]
   loopStart: count asm
   asm: jitTrStoreLocals[asm;stored;stys;lregs]
 
-  st: `asm`tstack`fixups`bails`niFixups!(asm; (); (); (); ())
+  st: `asm`tstack`fixups`bails`niFixups`rewFixups`frames!(asm; (); (); (); (); (); ())
   i: 0
   while[i<n
     kind: kinds[i]; a: args[i]
@@ -773,6 +834,10 @@ jitCompileTrace: {[input]
     ; kind=5; st: jitTrPop st
     ; kind=6; st: jitTrGuard[st;1b;a]
     ; kind=7; st: jitTrGuard[st;0b;a]
+    ; kind=8; st: jitTrGuardRewind[st;1b]
+    ; kind=9; st: jitTrGuardRewind[st;0b]
+    ; kind=10; st: jitTrFramePush[st;a]
+    ; kind=11; st: jitTrFrameEnd st
     ; st: null]
     if[isnull st; :null]
     i: i+1]
@@ -781,6 +846,7 @@ jitCompileTrace: {[input]
   // stack was empty (src/vm.rs checks exactly that before it will start one), so the trace can't
   // be holding a value of its own here either.
   if[not 0=count st[`tstack]; :null]
+  if[not 0=count st[`frames]; :null]   // every inlined frame closed (the recorder guarantees it; checked anyway)
   bails: st[`bails]
   numGuards: count bails
   // No guard means no way out: the emitted back edge would spin forever. Can't happen for a real
@@ -802,9 +868,10 @@ jitCompileTrace: {[input]
     asm: asm,jitB[writebackAt-(count asm)]
     gi: gi+1]
 
-  // Straight to the tail, over the writeback: the buffer already holds this iteration's starting
-  // values (stored at loopStart) and the registers hold a half-finished iteration, which is
-  // exactly the state this deopt exists to discard.
+  // The rewind stub — the int-null deopt's and every callee-side guard's exit. Straight to the
+  // tail, over the writeback: the buffer already holds this iteration's starting values (stored
+  // at loopStart) and the registers hold a half-finished iteration, which is exactly the state
+  // this exit exists to discard.
   asm: asm,jitMovz[jitSCRATCH; header; 0]
   asm: asm,jitB[tailAt-(count asm)]
 
@@ -825,6 +892,13 @@ jitCompileTrace: {[input]
   while[fi<count nfix
     word: nfix[fi]
     asm[word]: jitBcond[jitCondEQ; niStubAt-word]
+    fi: fi+1]
+  rfix: st[`rewFixups]
+  fi: 0
+  while[fi<count rfix
+    e: rfix[fi]
+    word: e[0]; reg: e[1]; taken: e[2]
+    asm[word]: $[taken; jitCbnz[reg;niStubAt-word]; jitCbz[reg;niStubAt-word]]
     fi: fi+1]
 
   (,/jitLE each asm; `int$slots; `int$stys)}
