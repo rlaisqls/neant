@@ -287,14 +287,14 @@ mod arm64 {
         }
     }
 
-    /// A compiled trace (tracing JIT Milestone 1, `src/trace.rs`): a hot `while` loop's body,
-    /// running natively until a guard disagrees with what was recorded. Unlike `Compiled` above,
-    /// there's no "return" — every exit is a bail, handing back exactly where in the original
-    /// bytecode to resume interpreting and the current value of every local the trace touched, so
-    /// `Vm::run_ops` can just splice them into its own `loc`/`ip` and keep going, indistinguishable
-    /// from having interpreted the whole time. Sound because recording only ever *observes* —
-    /// nothing here can make an already-correct program produce a different result, only run some
-    /// of it faster.
+    /// A compiled trace (`src/trace.rs`): a hot loop's body, running natively until a guard
+    /// disagrees with what was recorded. Unlike `Compiled` above, there's no "return" — every exit
+    /// is a bail, handing back exactly where in the original bytecode to resume interpreting, the
+    /// current value of every local the trace touched, and the operand stack the interpreter
+    /// would have had at that point, so `Vm::run_ops` can just splice them into its own
+    /// `loc`/`st`/`ip` and keep going, indistinguishable from having interpreted the whole time.
+    /// Sound because recording only ever *observes* — nothing here can make an already-correct
+    /// program produce a different result, only run some of it faster.
     pub struct CompiledTrace {
         mem: *mut u8,
         len: usize,
@@ -309,7 +309,18 @@ mod arm64 {
         /// Every global an inlined callee was loaded from, and the lambda it held when the trace
         /// was recorded. Checked at entry, once: nothing a compiled trace runs can assign a global.
         callees: Vec<(usize, Arc<FnCode>)>,
-        entry: unsafe extern "C" fn(*mut i64, *mut i64),
+        /// The operand stack this trace was recorded on (`Trace::entry`, src/trace.rs) — a `do`
+        /// counter, or the counters of the `do` loops the header sits inside — and what `run`
+        /// must find on the interpreter's stack to enter: those values go into the buffer's stack
+        /// area and are loop-carried from there.
+        entry: Vec<crate::trace::TraceTy>,
+        /// Where in the buffer the stack area starts (right after the locals — but codegen's
+        /// number, read back, not this side's assumption), and, per exit, the ip to resume at and
+        /// the tags of the values the exit left in that area, bottom first. The compiled code hands
+        /// back an *index* into this table, not an ip: an exit is an ip *and* a stack now.
+        stack_base: usize,
+        exits: Vec<(usize, Vec<crate::trace::TraceTy>)>,
+        entry_fn: unsafe extern "C" fn(*mut i64, *mut i64),
     }
     unsafe impl Send for CompiledTrace {}
     unsafe impl Sync for CompiledTrace {}
@@ -321,24 +332,42 @@ mod arm64 {
     /// `jitTrMAXTOUCHED` (src/neant/jit/arm64.nt), which rejects the trace before emitting any
     /// code that would index past the buffer.
     const MAX_TOUCHED: usize = 16;
+    /// The most operand-stack values an exit can hand back: the trace's int and float stacks are
+    /// each `jitMAXDEPTH` (6) registers deep (src/neant/jit/arm64.nt), and a null placeholder
+    /// holds an int position. The stack area of the buffer is sized for this, and `compile_trace`
+    /// refuses any exits table that would index past it — codegen respects its own depth cap, but
+    /// the buffer is this side's, so this side checks.
+    const MAX_STACK: usize = 12;
+    const BUF_WORDS: usize = MAX_TOUCHED + MAX_STACK;
 
     impl CompiledTrace {
         /// Runs the trace until a guard bails, writes every touched local's new value back into
-        /// `loc`, and returns the bytecode `ip` to resume interpreting from (`Bailed`). The two
-        /// refusals are the entry guards: `TypeMismatch` means the *current* values in `loc` don't
+        /// `loc`, replaces the entry values on `st` with the operand stack the exit handed back,
+        /// and returns the bytecode `ip` to resume interpreting from (`Bailed`). The two refusals
+        /// are the entry guards: `TypeMismatch` means the *current* values in `loc`/`st` don't
         /// match the types this trace was compiled assuming (the same kind of guard `try_run`'s
         /// entry check already makes for the method-JIT) — same fallback as everywhere else here,
         /// just don't use the compiled version this time. `StaleCallee` means a global this trace
         /// inlined a callee from has been reassigned since it was recorded, which no later entry
         /// can undo — the caller retires the trace (`FnCode::retrace`, src/value.rs).
-        pub fn run(&self, loc: &mut [Value], vm: &Vm) -> TraceRun {
+        pub fn run(&self, loc: &mut [Value], st: &mut Vec<Value>, vm: &Vm) -> TraceRun {
+            use crate::trace::TraceTy;
             for (slot, code) in &self.callees {
                 match vm.global_at(*slot) { Some(Value::Lambda(c)) if Arc::ptr_eq(&c, code) => {}, _ => return TraceRun::StaleCallee }
             }
+            // The loop-carried stack: exactly the entry values, and — same guard as a local — a
+            // plain non-null int each (`TraceTy::entry_tags` recorded nothing else).
+            if st.len() != self.entry.len() { return TraceRun::TypeMismatch; }
+            let mut buf = [0i64; BUF_WORDS];
+            for (j, (v, ty)) in st.iter().zip(&self.entry).enumerate() {
+                buf[self.stack_base + j] = match (ty, v) {
+                    (TraceTy::Int, Value::Int(n)) if *n != crate::value::NI => *n,
+                    _ => return TraceRun::TypeMismatch,
+                };
+            }
             // Only how the locals get in and out: the compiled code keeps them in registers for
-            // the whole loop and touches this again just once per iteration, to leave behind the
-            // values the iteration started with for its one mid-iteration deopt to resume from.
-            let mut buf = [0i64; MAX_TOUCHED];
+            // the whole loop and touches this again only on the way out (or, if the trace has a
+            // rewind in it, once per iteration — see jitCompileTrace's section comment).
             for (i, (slot, ty)) in self.touched.iter().enumerate() {
                 if *slot >= self.real_upto { continue; }
                 let Some(v) = loc.get(*slot) else { return TraceRun::TypeMismatch };
@@ -346,50 +375,82 @@ mod arm64 {
                     // A null int is rejected, not passed through: the interpreter propagates it
                     // through arithmetic and compiled code does plain wrapping arithmetic — the
                     // same entry guard `try_run` makes, for the same reason.
-                    (crate::trace::TraceTy::Int, Value::Int(n)) if *n != crate::value::NI => *n,
-                    (crate::trace::TraceTy::Float, Value::Float(f)) => f.to_bits() as i64,
+                    (TraceTy::Int, Value::Int(n)) if *n != crate::value::NI => *n,
+                    (TraceTy::Float, Value::Float(f)) => f.to_bits() as i64,
                     _ => return TraceRun::TypeMismatch,
                 };
             }
-            let mut bail_ip: i64 = 0;
-            unsafe { (self.entry)(buf.as_mut_ptr(), &mut bail_ip as *mut i64); }
+            let mut exit_idx: i64 = 0;
+            unsafe { (self.entry_fn)(buf.as_mut_ptr(), &mut exit_idx as *mut i64); }
             for (i, (slot, ty)) in self.touched.iter().enumerate() {
                 if *slot >= self.real_upto { continue; }
                 loc[*slot] = match ty {
-                    crate::trace::TraceTy::Int => Value::Int(buf[i]),
-                    crate::trace::TraceTy::Float => Value::Float(f64::from_bits(buf[i] as u64)),
+                    TraceTy::Float => Value::Float(f64::from_bits(buf[i] as u64)),
+                    _ => Value::Int(buf[i]),
                 };
             }
-            TraceRun::Bailed(bail_ip as usize)
+            // `compile_trace` checked every index the code can hand back is in the table.
+            let (resume_ip, tags) = &self.exits[exit_idx as usize];
+            st.truncate(st.len() - self.entry.len());
+            for (j, ty) in tags.iter().enumerate() {
+                let bits = buf[self.stack_base + j];
+                st.push(match ty {
+                    TraceTy::Int => Value::Int(bits),
+                    TraceTy::Float => Value::Float(f64::from_bits(bits as u64)),
+                    TraceTy::Bool => Value::Bool(bits != 0),
+                    TraceTy::Null => Value::Null,
+                });
+            }
+            TraceRun::Bailed(*resume_ip)
         }
     }
 
     pub fn compile_trace(trace: &crate::trace::Trace, vm: &mut Vm) -> Option<CompiledTrace> {
+        use crate::trace::TraceTy;
         let f = vm.get("jitCompileTrace")?;
-        let (kinds, args, tys) = trace.to_neant_input();
+        let (kinds, args, tys, ips) = trace.to_neant_input();
         let input = Value::List(Arc::new(vec![
-            crate::value::ints(kinds), crate::value::ints(args), crate::value::ints(tys),
+            crate::value::ints(kinds), crate::value::ints(args), crate::value::ints(tys), crate::value::ints(ips),
             crate::value::list(trace.consts.clone()), Value::Int(trace.header as i64),
             Value::Int(trace.real_upto as i64),
+            crate::value::ints(trace.entry.iter().map(|t| t.code()).collect()),
         ]));
         // Same reentrancy guard `compile` above uses: `jitCompileTrace`'s own helpers are neant
         // functions too and could cross the JIT threshold while compiling themselves.
         COMPILING.with(|c| c.set(c.get() + 1));
         let result = vm.call(&f, vec![input]);
         COMPILING.with(|c| c.set(c.get() - 1));
-        // Success is `(bytes; slots; tys)` — the buffer layout rides along with the code that was
-        // built around it (see `CompiledTrace::touched`). Null (not compilable) or an error in the
-        // codegen itself both just mean this loop stays interpreted.
+        // Success is `(bytes; slots; tys; stackBase; exits)` — the buffer layout and the exits
+        // table ride along with the code that was built around them (see `CompiledTrace`). Null
+        // (not compilable) or an error in the codegen itself both just mean this loop stays
+        // interpreted.
         let Ok(Value::List(items)) = result else { return None };
-        if items.len() != 3 { return None; }
+        if items.len() != 5 { return None; }
         let Value::Bytes(bytes) = &items[0] else { return None };
         let slots = int_vec(&items[1])?;
         let tys = int_vec(&items[2])?;
-        if slots.len() != tys.len() || slots.len() > MAX_TOUCHED { return None; }
+        let Value::Int(stack_base) = &items[3] else { return None };
+        let stack_base = *stack_base as usize;
+        if slots.len() != tys.len() || slots.len() > MAX_TOUCHED || stack_base > MAX_TOUCHED { return None; }
         let touched = slots.iter().zip(&tys)
-            .map(|(&s, &t)| (s as usize, if t == 1 { crate::trace::TraceTy::Float } else { crate::trace::TraceTy::Int }))
-            .collect();
-        emit_trace(bytes, touched, trace.real_upto as usize, trace.callees.clone())
+            .map(|(&s, &t)| TraceTy::from_code(t).map(|t| (s as usize, t)))
+            .collect::<Option<Vec<_>>>()?;
+        if touched.iter().any(|(_, t)| !matches!(t, TraceTy::Int | TraceTy::Float)) { return None; }
+        // Every index the code can hand back must name an entry, and every entry's stack — like
+        // the entry stack itself — must fit the buffer's stack area: the one bound codegen can't
+        // check for this side.
+        let fits = |tags: &[TraceTy]| stack_base + tags.len() <= BUF_WORDS;
+        let mut exits = Vec::new();
+        for e in items[4].seq() {
+            let Value::List(pair) = &e else { return None };
+            if pair.len() != 2 { return None; }
+            let Value::Int(ip) = &pair[0] else { return None };
+            let tags = int_vec(&pair[1])?.into_iter().map(TraceTy::from_code).collect::<Option<Vec<_>>>()?;
+            if !fits(&tags) { return None; }
+            exits.push((*ip as usize, tags));
+        }
+        if exits.is_empty() || !fits(&trace.entry) { return None; }
+        emit_trace(bytes, touched, trace.real_upto as usize, trace.callees.clone(), trace.entry.clone(), stack_base, exits)
     }
 
     /// An `Ints` result as a `Vec<i64>`. A neant vector that happens to be empty comes back as an
@@ -402,7 +463,10 @@ mod arm64 {
         }
     }
 
-    fn emit_trace(bytes: &[u8], touched: Vec<(usize, crate::trace::TraceTy)>, real_upto: usize, callees: Vec<(usize, Arc<FnCode>)>) -> Option<CompiledTrace> {
+    fn emit_trace(
+        bytes: &[u8], touched: Vec<(usize, crate::trace::TraceTy)>, real_upto: usize, callees: Vec<(usize, Arc<FnCode>)>,
+        entry: Vec<crate::trace::TraceTy>, stack_base: usize, exits: Vec<(usize, Vec<crate::trace::TraceTy>)>,
+    ) -> Option<CompiledTrace> {
         let page = 4096usize;
         let len = bytes.len().div_ceil(page) * page;
         unsafe {
@@ -411,8 +475,8 @@ mod arm64 {
             std::ptr::copy_nonoverlapping(bytes.as_ptr(), mem as *mut u8, bytes.len());
             if mprotect(mem, len, PROT_READ | PROT_EXEC) != 0 { munmap(mem, len); return None; }
             __clear_cache(mem as *mut std::ffi::c_char, (mem as *mut u8).add(len) as *mut std::ffi::c_char);
-            let entry: unsafe extern "C" fn(*mut i64, *mut i64) = std::mem::transmute(mem);
-            Some(CompiledTrace { mem: mem as *mut u8, len, touched, real_upto, callees, entry })
+            let entry_fn: unsafe extern "C" fn(*mut i64, *mut i64) = std::mem::transmute(mem);
+            Some(CompiledTrace { mem: mem as *mut u8, len, touched, real_upto, callees, entry, stack_base, exits, entry_fn })
         }
     }
 }
@@ -446,7 +510,7 @@ pub fn compile(_code: &Arc<FnCode>, _vm: &mut Vm) -> Option<Compiled> { None }
 pub struct CompiledTrace(std::convert::Infallible);
 #[cfg(not(target_arch = "aarch64"))]
 impl CompiledTrace {
-    pub fn run(&self, _loc: &mut [Value], _vm: &Vm) -> TraceRun { match self.0 {} }
+    pub fn run(&self, _loc: &mut [Value], _st: &mut Vec<Value>, _vm: &Vm) -> TraceRun { match self.0 {} }
 }
 #[cfg(not(target_arch = "aarch64"))]
 pub fn compile_trace(_trace: &crate::trace::Trace, _vm: &mut Vm) -> Option<CompiledTrace> { None }

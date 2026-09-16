@@ -282,20 +282,22 @@ mod jit_tests {
     }
 
     /// `f`'s own cold run stopped being an interpreted baseline once the tracing JIT landed — a
-    /// single call is enough for it to take the loop over partway through. `fDo` is the same body
-    /// as a `do` loop, which no trace is ever started on (its counter is live on the operand stack
-    /// at the backward jump, and `run_ops` only starts recording on an empty one, src/vm.rs), so
-    /// it stays interpreted however many iterations it runs. It does marginally *less* work per
-    /// iteration than `f` — no `i<k` compare — so if anything this understates the ratio, which
-    /// is the right direction for a baseline to be wrong in.
+    /// single call is enough for it to take the loop over partway through. `fSlow` is the same
+    /// loop with two monadic negations (`- -`, an identity) spliced in: `Op::Monad` is rejected by
+    /// both tiers, so it stays interpreted however many iterations it runs. (A `do` loop used to
+    /// serve as this baseline, being the one loop form no trace was started on; since `do`
+    /// headers trace too, the `- -` twin every differential test already uses is the only shape
+    /// left that is guaranteed interpreted.) The twin does marginally *more* work per iteration
+    /// than `f` — two extra dispatches — so this overstates the ratio by a few percent, which is
+    /// the same direction every other manual_* number here is biased in.
     #[test]
     #[ignore]
     fn manual_perf_measurement() {
         let mut v = boot_vm();
         v.eval("f: {[k] n:0; i:0; while[i<k; n: n+i*i; i: i+1]; n}").unwrap();
-        v.eval("fDo: {[k] n:0; i:0; do[k; n: n+i*i; i: i+1]; n}").unwrap();
+        v.eval("fSlow: {[k] n:0; i:0; while[i<k; n: n+(- - i*i); i: i+1]; n}").unwrap();
         let t0 = std::time::Instant::now();
-        v.eval("fDo 1000000").unwrap();
+        v.eval("fSlow 1000000").unwrap();
         let cold = t0.elapsed();
         for _ in 0..70 { v.eval("f 10").unwrap(); } // cross the tier-up threshold
         let t1 = std::time::Instant::now();
@@ -587,13 +589,14 @@ mod jit_tests {
 
     /// `0W+1` wraps to exactly the int-null sentinel — the same case
     /// `deopts_on_null_collision_instead_of_diverging` covers for the whole-function JIT, but a
-    /// trace can only hit it *mid-loop*, with earlier iterations' writes already committed. So
-    /// this is the one deopt that has to undo something: it restores the snapshot the compiled
-    /// code re-takes at the top of every iteration and resumes at the loop header
-    /// (`jitCompileTrace`, src/neant/jit/arm64.nt). Starting at `0W-200` is what puts the
-    /// collision ~200 iterations in — well after the trace was recorded and compiled, which
-    /// starting at `0W` would not (`n` would already be null by then, and a null local is refused
-    /// at the recorder).
+    /// trace can only hit it *mid-loop*, with earlier iterations' writes already committed. The
+    /// exit hands the interpreter the locals as they stand and the operand stack at the failing
+    /// op — here just the null result — and resumes at the op after the `Dyad`
+    /// (`TraceOp::Dyad`'s `resume_ip`, src/trace.rs; `jitTrDyad`, src/neant/jit/arm64.nt), so the
+    /// interpreter's own `StoreL` puts the null in `n` and propagates it from there. Starting at
+    /// `0W-200` is what puts the collision ~200 iterations in — well after the trace was recorded
+    /// and compiled, which starting at `0W` would not (`n` would already be null by then, and a
+    /// null local is refused at the recorder).
     #[test]
     fn traced_loop_deopts_on_null_collision_instead_of_diverging() {
         let mut v = boot_vm();
@@ -666,15 +669,20 @@ mod jit_tests {
     }
 
     /// One call each — the whole-function JIT never enters into it (that needs 64) — against the
-    /// same `do`-loop baseline `manual_perf_measurement` above uses, and for the same reason.
+    /// same `- -` twin `manual_perf_measurement` above uses, and for the same reason: a `do` loop
+    /// is no longer an interpreted baseline now that `do` headers trace. The body of the loop
+    /// this measures has no branch in it and no call, so its trace has no rewind exit and
+    /// therefore no store in it at all (`jitCompileTrace`, src/neant/jit/arm64.nt) — this is the
+    /// number to compare against the one before the operand-stack handoff landed, when the loop
+    /// still stored its written locals once per iteration (5.6ms then; see README "Stage 2b").
     #[test]
     #[ignore]
     fn manual_trace_perf_measurement() {
         let mut v = boot_vm();
         v.eval("f: {[k] n:0; i:0; while[i<k; n: n+i*i; i: i+1]; n}").unwrap();
-        v.eval("fDo: {[k] n:0; i:0; do[k; n: n+i*i; i: i+1]; n}").unwrap();
+        v.eval("fSlow: {[k] n:0; i:0; while[i<k; n: n+(- - i*i); i: i+1]; n}").unwrap();
         let t0 = std::time::Instant::now();
-        let slow = v.eval("fDo 5000000").unwrap();
+        let slow = v.eval("fSlow 5000000").unwrap();
         let interpreted = t0.elapsed();
         let t1 = std::time::Instant::now();
         let fast = v.eval("f 5000000").unwrap();
@@ -893,6 +901,196 @@ mod jit_tests {
              ({[k] (g k)=gSlow k} each 63 64 65 200), {[k] (gb k)=gbSlow k} each 63 64 65 200",
         ).unwrap();
         assert_eq!(got.fmt(), "11111111b");
+    }
+
+    /// An int-null collision used to rewind to the loop header; now it hands the interpreter the
+    /// live operand stack at the failing op (`TraceOp::Dyad`'s `resume_ip`, src/trace.rs). With
+    /// `n: (i*i)+(m*m)` the colliding `m*m` has `i*i` already computed *under* it, so the exit
+    /// has two values to hand back, not one — the interpreter then adds them itself and gets the
+    /// null the twin gets. A handoff that dropped the stack, or rebuilt it in the wrong order,
+    /// would give a wrong `n` or a stack underflow at the resumed `Dyad`. Starting `m` at `0W-200`
+    /// puts the collision ~200 iterations in, well after the trace was recorded.
+    #[test]
+    fn traced_loop_hands_off_a_deep_live_stack_on_null_collision() {
+        let mut v = boot_vm();
+        let got = v.eval(
+            "g: {[k] n:0; m: 0W-200; i:0; while[i<k; n: (i*i)+(m*m); m: m+1; i: i+1]; n}; \
+             gS: {[k] n:0; m: 0W-200; i:0; while[i<k; n: (i*i)+(- - m*m); m: m+1; i: i+1]; n}; \
+             ({[k] (g k)~gS k} each 0 1 63 64 65 200 1000), (,(g 1000)~0N)",
+        ).unwrap();
+        assert_eq!(got.fmt(), "11111111b");
+    }
+
+    /// A comparison result on the trace's virtual stack is tagged `bool`, not `int`, so that an
+    /// exit hands it back as the `Value::Bool` the interpreter would have had. Two shapes exercise
+    /// that. In `f`, `(i<k)` is computed first (a dyad's right operand is generated first) and is
+    /// under the `$[..]` when its condition flips at `i=100`: the guard hands `[1b]` back, the
+    /// interpreter evaluates the other branch, and `&` of two bools is a bool — an `Int` handed
+    /// back instead would make it `1b & 1`, an int, and `type x` sees that. In `h` the bool is
+    /// under the colliding `m+i` at an int-null handoff, and `0N + 1b` has to come out the same as
+    /// in the twin. The `g` loop checks the typing rule itself while traced: `&` is a bool exactly
+    /// when both operands are (`jitTrDyad`, src/neant/jit/arm64.nt), and a wrong result *type*
+    /// there would be caught at recording time as a tag mismatch and leave the loop interpreted —
+    /// which this can't tell from success, so `a_hot_loop_really_is_traced` is what keeps that honest.
+    #[test]
+    fn a_bool_live_at_a_handoff_comes_back_a_bool() {
+        let mut v = boot_vm();
+        let got = v.eval(
+            "f: {[k] i:0; x:0; while[i<k; x: $[i<100; 1; 0b<1b] & (i<k); i: i+1]; (type x; x)}; \
+             fS: {[k] i:0; x:0; while[i<k; x: $[i<100; - - 1; 0b<1b] & (i<k); i: i+1]; (type x; x)}; \
+             h: {[k] s:0; m: 0W-200; i:0; while[i<k; s: (m+i)+(i<k); m: m+1; i: i+1]; s}; \
+             hS: {[k] s:0; m: 0W-200; i:0; while[i<k; s: (- - m+i)+(i<k); m: m+1; i: i+1]; s}; \
+             g: {[k] i:0; n:0; while[i<k; n: n+((i<50)&(i<k)); n: n+(2&(i<k)); i: i+1]; n}; \
+             gS: {[k] i:0; n:0; while[i<k; n: n+((i<50)&(i<k)); n: n+(- - 2&(i<k)); i: i+1]; n}; \
+             ((f 101)~(`bool;1b)), ({[k] (f k)~fS k} each 99 100 101 1000), \
+             ({[k] (h k)~hS k} each 63 64 65 200 1000), ((h 1000)~0N), {[k] (g k)=gS k} each 63 64 65 200",
+        ).unwrap();
+        assert_eq!(got.fmt(), "111111111111111b");
+    }
+
+    /// A `do[n;..]` header is reached with its counter live on the operand stack, which used to
+    /// keep it from ever being traced. Now the counter is a loop-carried stack value of the trace
+    /// (`Trace::entry`, src/trace.rs) and `Op::Loop` is a step of its own: a guard that bails to
+    /// the loop's exit with the counter popped, and a decrement (`jitTrLoop`, src/neant/jit/
+    /// arm64.nt). Sizes straddle the 64-iteration threshold; the exit edge is what every size
+    /// past it ends on, so a counter decremented wrongly, or not handed back, gives a wrong `n`.
+    #[test]
+    fn traced_do_loop_and_interpreted_agree() {
+        let mut v = boot_vm();
+        let got = v.eval(
+            "d: {[k] n:0; i:0; do[k; n: n+i*i; i: i+1]; n}; \
+             dS: {[k] n:0; i:0; do[k; n: n+(- - i*i); i: i+1]; n}; \
+             {[k] (d k)=dS k} each 0 1 63 64 65 200 1000",
+        ).unwrap();
+        assert_eq!(got.fmt(), "1111111b");
+    }
+
+    /// Every way two loops can nest with a `do` involved. `do` in `do`: the inner header is hot
+    /// first and is traced with *two* counters on its entry stack; the outer, when it goes hot,
+    /// records the inner loop unrolled — its `Loop` steps in both directions, the exited one
+    /// bailing to the `Loop` op itself if the counter is ever positive there. With an inner count
+    /// of 100 the unrolled recording overruns the step cap and the outer stays interpreted while
+    /// the inner runs traced from inside it. `do` in `while`: the inner `do` is entered from an
+    /// interpreted `while` iteration with its counter on the stack. `while` in `do`: the inner
+    /// `while` header has the outer counter under it the whole time and hands it back at every
+    /// exit. A counter written back at the wrong depth, or a stack rebuilt in the wrong order,
+    /// would corrupt the enclosing loop's count.
+    #[test]
+    fn traced_nested_do_loops_and_interpreted_agree() {
+        let mut v = boot_vm();
+        let got = v.eval(
+            "dd: {[k] n:0; do[k; do[3; n: n+1]]; n}; \
+             ddS: {[k] n:0; do[k; do[3; n: n+(- - 1)]]; n}; \
+             dd2: {[k] n:0; do[k; do[100; n: n+1]]; n}; \
+             dd2S: {[k] n:0; do[k; do[100; n: n+(- - 1)]]; n}; \
+             dw: {[k] n:0; i:0; while[i<k; do[3; n: n+i]; i: i+1]; n}; \
+             dwS: {[k] n:0; i:0; while[i<k; do[3; n: n+(- - i)]; i: i+1]; n}; \
+             wd: {[k] n:0; do[k; j:0; while[j<3; n: n+j; j: j+1]]; n}; \
+             wdS: {[k] n:0; do[k; j:0; while[j<3; n: n+(- - j); j: j+1]]; n}; \
+             ({[k] (dd k)=ddS k} each 0 1 63 64 65 200 1000), ({[k] (dd2 k)=dd2S k} each 0 1 63 64 65 200), \
+             ({[k] (dw k)=dwS k} each 0 1 63 64 65 200 1000), {[k] (wd k)=wdS k} each 0 1 63 64 65 200 1000",
+        ).unwrap();
+        assert_eq!(got.fmt(), "111111111111111111111111111b");
+    }
+
+    /// Every exit from a `do` trace has to hand the counter back, since the interpreter's next op
+    /// expects it there. `di`: a statement-level `if` whose condition flips at `i=101` — from then
+    /// on every entry bails at that guard with the counter under the popped condition, the rest
+    /// of the iteration runs interpreted, and the next backward jump re-enters. `hd`: an int-null
+    /// collision in the body, handed off with the counter under the null result. Either exit
+    /// losing the counter would end the loop early or underflow the stack.
+    #[test]
+    fn traced_do_loop_exits_hand_the_counter_back() {
+        let mut v = boot_vm();
+        let got = v.eval(
+            "di: {[k] n:0; i:0; do[k; if[i>100; n: n+10]; n: n+1; i: i+1]; n}; \
+             diS: {[k] n:0; i:0; do[k; if[i>100; n: n+10]; n: n+(- - 1); i: i+1]; n}; \
+             hd: {[k] s:0; m: 0W-200; i:0; do[k; s: m+i; m: m+1; i: i+1]; s}; \
+             hdS: {[k] s:0; m: 0W-200; i:0; do[k; s: (- - m)+i; m: m+1; i: i+1]; s}; \
+             ({[k] (di k)=diS k} each 0 1 63 64 65 100 101 102 1000), ({[k] (hd k)~hdS k} each 63 64 65 200 1000), (,(hd 1000)~0N)",
+        ).unwrap();
+        assert_eq!(got.fmt(), "111111111111111b");
+    }
+
+    /// A call in a `do` body inlines exactly as one in a `while` body does — the counter sits
+    /// under the callee's frame on the virtual stack. `ab` has a branch inside it that flips at
+    /// `i=101`, so from then on every entry *rewinds*: the only exit that can't hand the stack
+    /// off, since its ip is in the callee's frame. A `do` trace with a rewind in it stores its
+    /// entry stack (the counter) at the top of every iteration alongside its written locals, and
+    /// the rewind stub hands that back with the header ip — a counter missing there would restart
+    /// the loop with a stale or empty stack.
+    #[test]
+    fn traced_do_loop_with_an_inlined_call_and_interpreted_agree() {
+        let mut v = boot_vm();
+        let got = v.eval(
+            "f: {x*2}; ab: {$[x<0;0-x;x]}; \
+             dc: {[k] s:0; i:0; do[k; s: s+f i; i: i+1]; s}; \
+             dcS: {[k] s:0; i:0; do[k; s: s+(- - f i); i: i+1]; s}; \
+             dr: {[k] s:0; i:0; do[k; s: s+ab[100-i]; i: i+1]; s}; \
+             drS: {[k] s:0; i:0; do[k; s: s+(- - ab[100-i]); i: i+1]; s}; \
+             ({[k] (dc k)=dcS k} each 0 1 63 64 65 200 1000), {[k] (dr k)=drS k} each 63 64 65 100 101 102 1000",
+        ).unwrap();
+        assert_eq!(got.fmt(), "11111111111111b");
+    }
+
+    /// Two shapes the recorder refuses, which must then simply stay interpreted and right. An
+    /// `Op::Loop` inside an inlined callee (`cnt`) would need a bail into the callee's bytecode,
+    /// and unlike a callee's branch it can't be rewound either — it mutates the stack — so the
+    /// recording fails and the calling loop is never traced. A `do` whose counter isn't a plain
+    /// int is legal for the interpreter (`int_of` takes a bool or a whole float) but not for a
+    /// trace: as the traced loop's own header (`fl`) the entry check refuses to record; nested
+    /// inside a traced `while` (`nb`, `nf`) the counter carries a `bool`/`float` tag on the
+    /// virtual stack and `jitTrLoop` rejects it at codegen.
+    #[test]
+    fn a_do_loop_the_trace_cannot_take_stays_interpreted_and_correct() {
+        let mut v = boot_vm();
+        let got = v.eval(
+            "cnt: {[x] n:0; do[x; n: n+1]; n}; \
+             g: {[k] s:0; i:0; while[i<k; s: s+cnt 3; i: i+1]; s}; \
+             gS: {[k] s:0; i:0; while[i<k; s: s+(- - cnt 3); i: i+1]; s}; \
+             fl: {[k] n:0; do[k*1.0; n: n+1]; n}; \
+             flS: {[k] n:0; do[k*1.0; n: n+(- - 1)]; n}; \
+             nb: {[k] n:0; i:0; while[i<k; do[1b; n: n+1]; i: i+1]; n}; \
+             nbS: {[k] n:0; i:0; while[i<k; do[1b; n: n+(- - 1)]; i: i+1]; n}; \
+             nf: {[k] n:0; i:0; while[i<k; do[2.0; n: n+1]; i: i+1]; n}; \
+             nfS: {[k] n:0; i:0; while[i<k; do[2.0; n: n+(- - 1)]; i: i+1]; n}; \
+             ({[k] (g k)=gS k} each 63 64 65 200), ({[k] (fl k)=flS k} each 63 64 65 200), \
+             ({[k] (nb k)=nbS k} each 63 64 65 200), {[k] (nf k)=nfS k} each 63 64 65 200",
+        ).unwrap();
+        assert_eq!(got.fmt(), "1111111111111111b");
+    }
+
+    /// The `do` counterpart of `a_hot_loop_really_is_traced`: everything above stays correct
+    /// whether or not a `do` loop is ever actually compiled, so one test has to notice that it
+    /// was. 20M iterations interpret in ~2.9s here and trace in ~40ms.
+    #[test]
+    #[cfg(target_arch = "aarch64")]
+    fn a_hot_do_loop_really_is_traced() {
+        let mut v = boot_vm();
+        let t = std::time::Instant::now();
+        let r = v.eval("{[k] n:0; i:0; do[k; n: n+i; i: i+1]; n} 20000000").unwrap();
+        assert_eq!(r.fmt(), "199999990000000");
+        assert!(t.elapsed().as_millis() < 250, "took {:?}", t.elapsed());
+    }
+
+    /// A `do` loop against its `- -` twin, the same way `manual_trace_perf_measurement` measures
+    /// the `while` form. The traced body is one `Op::Loop` step (a compare, a branch, a
+    /// decrement) longer than the `while` loop's is shorter (no `i<k`), so the two should land
+    /// within noise of each other.
+    #[test]
+    #[ignore]
+    fn manual_trace_do_perf_measurement() {
+        let mut v = boot_vm();
+        v.eval("d: {[k] n:0; i:0; do[k; n: n+i*i; i: i+1]; n}").unwrap();
+        v.eval("dSlow: {[k] n:0; i:0; do[k; n: n+(- - i*i); i: i+1]; n}").unwrap();
+        let t0 = std::time::Instant::now();
+        let slow = v.eval("dSlow 5000000").unwrap();
+        let interpreted = t0.elapsed();
+        let t1 = std::time::Instant::now();
+        let fast = v.eval("d 5000000").unwrap();
+        let traced = t1.elapsed();
+        assert_eq!(slow.fmt(), fast.fmt());
+        println!("interpreted {interpreted:?}  traced {traced:?}  ratio {:.1}x", interpreted.as_secs_f64() / traced.as_secs_f64());
     }
 
     /// The calling loop against the same loop with `- -` spliced in — the untraceable twin, which

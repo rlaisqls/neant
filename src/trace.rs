@@ -1,18 +1,32 @@
-//! The tracing JIT's recording side: record one concrete pass through a hot `while` loop as a
+//! The tracing JIT's recording side: record one concrete pass through a hot loop as a
 //! flat, branch-free op sequence with observed (not inferred) types, for `src/jit.rs`/
 //! `src/neant/jit/arm64.nt` to compile (`jitCompileTrace`). This module is purely the *recording*
 //! side — `Vm::run_ops` (src/vm.rs) drives it by feeding it every op it executes; recording never
 //! influences what actually runs, only observes it, so a trace failing to record (or never being
 //! attempted at all) can never change a program's result, only whether it gets to run faster.
 //!
-//! Scope, deliberately narrow: `while` loops only (a loop header must have an *empty* operand
-//! stack — true for `while`, false for `do[n;..]`, whose backward jump lands back on the
-//! still-live counter; `Vm::run_ops` checks this before ever starting a recording), no
-//! `Op::Loop`, and `Push`/`LoadL`/`StoreL`/`Dyad`/`Pop`/`Jmpf`/`Jmp` plus a call to a plain lambda
-//! held by a global (`f x`, `f[a;b]`, nested however deep) in the body. Anything else — a
-//! closure, a primitive, a projection, a global that isn't the function being called, a `Ret`
-//! out of the loop's own frame — just aborts the attempt: same fail-closed default the
-//! method-JIT's own compilability check already uses.
+//! Scope, deliberately narrow: `while` and `do[n;..]` loops, `Push`/`LoadL`/`StoreL`/`Dyad`/
+//! `Pop`/`Jmpf`/`Jmp`/`Loop` plus a call to a plain lambda held by a global (`f x`, `f[a;b]`,
+//! nested however deep) in the body. Anything else — a closure, a primitive, a projection, a
+//! global that isn't the function being called, a `Ret` out of the loop's own frame, an
+//! `Op::Loop` inside a callee — just aborts the attempt: same fail-closed default the method-JIT's
+//! own compilability check already uses.
+//!
+//! **The operand stack is part of the trace.** A `do` header is reached with the loop counter
+//! live on the operand stack (the backward jump lands on the `Op::Loop` that decrements it), and
+//! a loop nested inside a `do` has the outer counter under it the whole time. So a recording
+//! starts with whatever plain ints the stack holds at the header (`entry`, checked by
+//! `Vm::run_ops` — nothing else is ever live there in practice) and treats them as loop-carried
+//! values: on the trace's virtual stack from step 0, back on it at the back edge, and handed back
+//! to the interpreter at every exit. Which is also how *every* exit works now: a bail writes the
+//! locals back, writes whatever the trace's stack holds at that point into the same buffer, and
+//! the interpreter resumes at the bail's `ip` with exactly that stack (`CompiledTrace::run`,
+//! src/jit.rs, rebuilds the `Value`s by the tags codegen recorded per exit). A `Jmpf` inside an
+//! expression, an `Op::Loop`'s exit edge, an int-null collision in the middle of `n: (i*i)+(m*m)`
+//! — each just names the ip the interpreter would have been at and what would have been on its
+//! stack. `Dyad` steps record their own `resume_ip` for exactly that: the interpreter resumes at
+//! the op *after* the colliding one with the null result already on the stack, and propagates it
+//! from there the way it always would have.
 //!
 //! A trace is *linear*: one concrete path, with every branch it took pinned by a guard, not a
 //! control-flow graph. That's why an unconditional `Jmp` needs no representation at all (the ops
@@ -36,26 +50,53 @@
 //! - A branch inside a callee can't bail the way one in the loop's own frame does: the `ip` it
 //!   would resume at belongs to another frame's bytecode, and the interpreter is not in that frame
 //!   any more. Those become `GuardRewind` — throw the half-finished iteration away and re-enter the
-//!   interpreter at the loop header, which is sound for exactly the reason the int-null deopt is
-//!   (nothing in the traceable subset can be observed from outside the loop).
+//!   interpreter at the loop header with the locals and the operand stack the iteration started
+//!   with, which is sound because nothing in the traceable subset can be observed from outside
+//!   the loop. An int-null collision inside a callee rewinds the same way, for the same reason
+//!   (`jitTrDyad`, src/neant/jit/arm64.nt); one in the loop's own frame hands off instead.
 
 use crate::value::*;
 use std::sync::Arc;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum TraceTy { Int, Float }
+pub enum TraceTy { Int, Float, Bool, Null }
 
 impl TraceTy {
-    /// `Bool` counts as `Int` — comparison results (`Op::Dyad`'s `<`/`>`/`=`) are `Value::Bool`,
-    /// but represented identically to a plain 0/1 int by every op that might consume one
-    /// afterwards (`Jmpf`'s `truthy()`, arithmetic via the general — not fast — path). Anything
-    /// else (a vector, a symbol, `Null`, ...) is out of scope for this pass.
+    /// What a value passing through the operand stack is. `Bool` is its own tag, not an `Int`:
+    /// a comparison result (`Op::Dyad`'s `<`/`>`/`=`) is `Value::Bool`, and since an exit can now
+    /// hand the live stack back to the interpreter, one that is handed back has to come back a
+    /// `Bool` — `type`/`show` can see the difference, and so can `&`/`|`, whose result type
+    /// depends on it (`1b&0b` is a bool, `2&1b` an int). In registers it is a plain 0/1 like
+    /// any int, so `+ - *` and the comparisons treat it as one (`jitTrDyad`, src/neant/jit/
+    /// arm64.nt). Anything else (a vector, a symbol, `Null`, ...) is out of scope for this pass.
     pub fn of(v: &Value) -> Option<TraceTy> {
         match v {
-            Value::Int(_) | Value::Bool(_) => Some(TraceTy::Int),
+            Value::Int(_) => Some(TraceTy::Int),
+            Value::Bool(_) => Some(TraceTy::Bool),
             Value::Float(_) => Some(TraceTy::Float),
             _ => None,
         }
+    }
+
+    /// The wire encoding shared with `jitCompileTrace` (src/neant/jit/arm64.nt) — per-step types
+    /// on the way in, per-exit stack tags on the way back out. `Null` only ever comes *back*: it
+    /// is the tag codegen gives a `PushNull` placeholder (`if`/`while`/`do`'s statement value)
+    /// that happens to be live on the stack at an exit, so the interpreter gets its `Null` back
+    /// rather than whatever the never-written register held; `of` never produces it (a `Null`
+    /// being pushed is a `PushNull` step, not a typed `Push`).
+    pub fn code(self) -> i64 { match self { TraceTy::Int => 0, TraceTy::Float => 1, TraceTy::Bool => 2, TraceTy::Null => 3 } }
+    pub fn from_code(c: i64) -> Option<TraceTy> {
+        match c { 0 => Some(TraceTy::Int), 1 => Some(TraceTy::Float), 2 => Some(TraceTy::Bool), 3 => Some(TraceTy::Null), _ => None }
+    }
+
+    /// The loop-carried operand stack a recording may start on (see the module doc comment): a
+    /// `do` counter, or the counters of the `do` loops this one is nested in. Plain non-null
+    /// ints only — a `Bool`/`Float` counter (`do[1b;..]` is legal — `int_of` accepts both) would
+    /// be handed back to the interpreter as an `Int`, and the null is the one int a trace never
+    /// takes for granted. `None` leaves this pass of the loop interpreted, exactly as before.
+    pub fn entry_tags(st: &[Value]) -> Option<Vec<TraceTy>> {
+        if st.len() > MAX_ENTRY_STACK { return None; }
+        st.iter().map(|v| match TraceTy::of_local(v) { Some(TraceTy::Int) => Some(TraceTy::Int), _ => None }).collect()
     }
 
     /// The same, for a value that a *local* holds rather than one passing through the operand
@@ -84,8 +125,17 @@ pub enum TraceOp {
     PushNull,
     LoadL { slot: u32, ty: TraceTy },
     StoreL { slot: u32, ty: TraceTy },
-    Dyad { k: u32, ty: TraceTy },
+    /// `resume_ip` is the op after this one: where the interpreter picks up if the result wraps
+    /// to exactly the int-null sentinel, with that null on the stack where the result would be.
+    Dyad { k: u32, ty: TraceTy, resume_ip: u32 },
     Pop,
+    /// `do[n;..]`'s `Op::Loop`, as the direction this pass took. Not exited: the counter on top of
+    /// the stack was positive and was decremented in place — a guard that bails to the loop's exit
+    /// `t` with the counter popped if it ever isn't (that is exactly the interpreter's other edge).
+    /// Exited (only a `do` *nested inside* the traced loop can record this — the loop's own
+    /// header exiting ends the recording): the counter was `<= 0` and was popped — a guard that
+    /// bails to the `Loop` op itself, counter still on the stack, if it is ever positive.
+    Loop { exited: bool, bail_ip: u32 },
     /// The recorded direction of a branch this trace took, and where a later replay should resume
     /// *interpretation* if it disagrees — the other destination this exact `Jmpf` could have gone
     /// to (the loop's own condition check included — recorded the same as any other `Jmpf`).
@@ -118,38 +168,51 @@ pub struct Trace {
     /// entry (`CompiledTrace::run`, src/jit.rs), which is enough: nothing a compiled trace runs
     /// can assign a global, so within one run they cannot change under it.
     pub callees: Vec<(usize, Arc<FnCode>)>,
+    /// The operand stack the recording started on (see the module doc comment) — what a compiled
+    /// trace must find on the interpreter's stack to be entered, and what its own virtual stack
+    /// holds at step 0 and again at the back edge.
+    pub entry: Vec<TraceTy>,
 }
 
 impl Trace {
-    /// `(kinds;args;tys)` — what `src/neant/jit/arm64.nt`'s `jitCompileTrace` reads. One entry
+    /// `(kinds;args;tys;ips)` — what `src/neant/jit/arm64.nt`'s `jitCompileTrace` reads. One entry
     /// per step, in order; `kinds` follows `TraceOp`'s own numbering (see the match arms below),
-    /// `args` is whichever int that step carries (a const/slot index, or a bail `ip`), `tys`
-    /// is `0` for `Int`/untyped steps and `1` for `Float`.
-    pub fn to_neant_input(&self) -> (Vec<i64>, Vec<i64>, Vec<i64>) {
+    /// `args` is whichever int that step carries (a const/slot index, or a bail `ip`), `tys` is
+    /// `TraceTy::code` (`0` for `Int`/untyped steps), `ips` is a `Dyad`'s `resume_ip` (`0` for
+    /// every other step — a second int only that one kind of step needs).
+    pub fn to_neant_input(&self) -> (Vec<i64>, Vec<i64>, Vec<i64>, Vec<i64>) {
         let mut kinds = Vec::with_capacity(self.steps.len());
         let mut args = Vec::with_capacity(self.steps.len());
         let mut tys = Vec::with_capacity(self.steps.len());
-        let ty_bit = |t: TraceTy| if t == TraceTy::Float { 1 } else { 0 };
+        let mut ips = Vec::with_capacity(self.steps.len());
         for step in &self.steps {
-            let (kind, arg, ty) = match *step {
-                TraceOp::Push { k, ty } => (0, k, ty_bit(ty)),
-                TraceOp::PushNull => (1, 0, 0),
-                TraceOp::LoadL { slot, ty } => (2, slot, ty_bit(ty)),
-                TraceOp::StoreL { slot, ty } => (3, slot, ty_bit(ty)),
-                TraceOp::Dyad { k, ty } => (4, k, ty_bit(ty)),
-                TraceOp::Pop => (5, 0, 0),
-                TraceOp::Guard { taken: true, bail_ip } => (6, bail_ip, 0),
-                TraceOp::Guard { taken: false, bail_ip } => (7, bail_ip, 0),
-                TraceOp::GuardRewind { taken: true } => (8, 0, 0),
-                TraceOp::GuardRewind { taken: false } => (9, 0, 0),
-                TraceOp::FramePush { nargs } => (10, nargs, 0),
-                TraceOp::FrameEnd => (11, 0, 0),
+            let (kind, arg, ty, ip) = match *step {
+                TraceOp::Push { k, ty } => (0, k, ty.code(), 0),
+                TraceOp::PushNull => (1, 0, 0, 0),
+                TraceOp::LoadL { slot, ty } => (2, slot, ty.code(), 0),
+                TraceOp::StoreL { slot, ty } => (3, slot, ty.code(), 0),
+                TraceOp::Dyad { k, ty, resume_ip } => (4, k, ty.code(), resume_ip),
+                TraceOp::Pop => (5, 0, 0, 0),
+                TraceOp::Guard { taken: true, bail_ip } => (6, bail_ip, 0, 0),
+                TraceOp::Guard { taken: false, bail_ip } => (7, bail_ip, 0, 0),
+                TraceOp::GuardRewind { taken: true } => (8, 0, 0, 0),
+                TraceOp::GuardRewind { taken: false } => (9, 0, 0, 0),
+                TraceOp::FramePush { nargs } => (10, nargs, 0, 0),
+                TraceOp::FrameEnd => (11, 0, 0, 0),
+                TraceOp::Loop { exited: false, bail_ip } => (12, bail_ip, 0, 0),
+                TraceOp::Loop { exited: true, bail_ip } => (13, bail_ip, 0, 0),
             };
-            kinds.push(kind); args.push(arg as i64); tys.push(ty);
+            kinds.push(kind); args.push(arg as i64); tys.push(ty); ips.push(ip as i64);
         }
-        (kinds, args, tys)
+        (kinds, args, tys, ips)
     }
 }
+
+/// How deep an operand stack a recording may start on (`TraceTy::entry_tags`) — one `do` counter
+/// per level of `do` nesting around the header, so this is a nesting depth, and a generous one.
+/// The compiled trace's operand-stack registers (`jitMAXDEPTH`, src/neant/jit/arm64.nt) are the
+/// real limit, and codegen enforces that one itself; this just keeps the entry check cheap.
+const MAX_ENTRY_STACK: usize = 4;
 
 /// Caps a recording attempt that never finds its way back to the header (e.g. the loop actually
 /// exited on this pass) at a fixed size, rather than adding separate exit detection — it will
@@ -180,6 +243,7 @@ pub struct Recorder {
     /// The function whose loop this is — where the outcome is filed (`FnCode::set_trace_compiled`/
     /// `set_trace_rejected`), whichever frame the recording happens to end in.
     owner: Arc<FnCode>,
+    entry: Vec<TraceTy>,
     /// Set by `exit_frame`, cleared by the `Op::Call` that caused it — a `Call` that arrives
     /// without it is one that never became an inlined frame (a primitive, a projection, an
     /// already-compiled callee), and aborts the recording.
@@ -188,10 +252,11 @@ pub struct Recorder {
 }
 
 impl Recorder {
-    pub fn start(header: u32, nlocals: u32, owner: Arc<FnCode>) -> Recorder {
+    /// `entry` is what the interpreter's operand stack held at the header (`TraceTy::entry_tags`).
+    pub fn start(header: u32, nlocals: u32, owner: Arc<FnCode>, entry: Vec<TraceTy>) -> Recorder {
         Recorder {
             header, steps: Vec::new(), consts: Vec::new(), callees: Vec::new(), pending: None,
-            frames: Vec::new(), real_upto: nlocals, next_base: nlocals, owner, returned: false, failed: false,
+            frames: Vec::new(), real_upto: nlocals, next_base: nlocals, owner, entry, returned: false, failed: false,
         }
     }
 
@@ -222,8 +287,29 @@ impl Recorder {
             // Both ops leave the value on the stack: `LoadL` pushed it, `StoreL` only peeks.
             Op::LoadL(a) => self.push_local_typed(st, |ty| TraceOp::LoadL { slot: base + a, ty }),
             Op::StoreL(a) => self.push_local_typed(st, |ty| TraceOp::StoreL { slot: base + a, ty }),
-            Op::Dyad(a) => { let c = self.konst(k, a); self.push_typed(st, |ty| TraceOp::Dyad { k: c, ty }) }
+            // `ip_after` is the op after this one — where the interpreter resumes if this very op's
+            // result turns out to be the int null on some later pass (see `TraceOp::Dyad`).
+            Op::Dyad(a) => { let c = self.konst(k, a); self.push_typed(st, |ty| TraceOp::Dyad { k: c, ty, resume_ip: ip_after }) }
             Op::Pop => self.steps.push(TraceOp::Pop),
+            // `do[n;..]`'s counter test — see `TraceOp::Loop`. `ip_before` is the op *after* the
+            // `Loop` (run_ops has already advanced), so `ip_before - 1` is the `Loop` itself: where
+            // the exited direction bails to, counter and all, if the counter is ever positive
+            // again. Only in the loop's own frame: an `Op::Loop` in an inlined callee would need a
+            // bail into the callee's bytecode, which the interpreter is not in — rejected, the
+            // same way any other unsupported shape is, rather than rewound: a rewind is only
+            // sound for a *branch*, and this op also mutates the stack. The traced loop's own
+            // header exiting ends the recording outright: the ops that follow are not the loop.
+            // Nothing about the counter's type is checked here — the interpreter has already
+            // replaced it with a plain `Int` by now whatever it was (`int_of` takes a bool or a
+            // whole float too), so the recorder can't see it; the tag it carries on the trace's
+            // own virtual stack can, and `jitTrLoop` (src/neant/jit/arm64.nt) rejects anything
+            // but a plain int there.
+            Op::Loop(t) => {
+                let exited = ip_after == t;
+                let loop_ip = ip_before - 1;
+                if !self.frames.is_empty() || (exited && loop_ip == self.header) { self.failed = true; }
+                else { self.steps.push(TraceOp::Loop { exited, bail_ip: if exited { loop_ip } else { t } }); }
+            }
             // Only a plain lambda about to be called, and only by the global it was loaded from —
             // that pair is what the entry guard rechecks. Anything else on the stack here (a
             // closure, a primitive, an ordinary global value) isn't something this can inline.
@@ -257,7 +343,7 @@ impl Recorder {
             // any other jump. `exit_frame` is what closes the frame; the value `Ret` returns is the
             // top of the stack, which is where `FrameEnd` looks for it.
             Op::Ret if !self.frames.is_empty() => {}
-            _ => self.failed = true,   // out of scope — Loop, Monad, StoreG, MkClosure, ...
+            _ => self.failed = true,   // out of scope — Monad, StoreG, MkClosure, ...
         }
         false
     }
@@ -332,7 +418,7 @@ impl Recorder {
     pub fn finish(self) -> Trace {
         Trace {
             header: self.header, steps: self.steps, consts: self.consts,
-            real_upto: self.real_upto, callees: self.callees,
+            real_upto: self.real_upto, callees: self.callees, entry: self.entry,
         }
     }
 }
