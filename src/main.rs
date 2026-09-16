@@ -972,14 +972,13 @@ mod rsa {
     }
 }
 
-/// src/neant/crypto/verify.nt is a loadable module, not part of the image: certificate chain
-/// verification, hostname matching and a trust store on top of der/x509/rsa/bignum -- and the
-/// TLS 1.3 wiring in tls.nt that finally uses all of it.
+/// src/neant/crypto/verify.nt and the TLS 1.3 wiring in tls.nt, for the part of them that needs
+/// the host: a real `openssl s_server` to handshake against, and two timings. Everything that is
+/// pure neant -- hostname matching, every bad chain and its reason, the Certificate and
+/// CertificateVerify messages -- lives in tests/verify.nt, which tests::nt_tests runs.
 ///
-/// The fixture PKI every case runs against is built by tests/data/pki-gen.sh, which records the
-/// exact `openssl` (3.6.2) commands and pins every date, so pki-expired.pem stays expired and
-/// pki-leaf.pem stays valid. Nothing here reaches the network: the end-to-end cases talk to an
-/// `openssl s_server` this test starts on 127.0.0.1 with those same fixtures.
+/// The fixture PKI is built by tests/data/pki-gen.sh, which records the exact `openssl` (3.6.2)
+/// commands and pins every date. Nothing here reaches the network: every server is on 127.0.0.1.
 #[cfg(test)]
 mod verify {
     use super::*;
@@ -991,155 +990,33 @@ mod verify {
             v.eval(&std::fs::read_to_string(&f).unwrap()).unwrap_or_else(|e| panic!("{f}: '{}", e.0));
         }
         // P reads one fixture; RS is a trust store holding only the fixture root; NOW is a fixed
-        // instant inside every good fixture's validity window and outside every bad one's.
+        // instant inside every good fixture's validity window -- the same three tests/verify.nt
+        // sets up, so a case can be moved between the two files unchanged.
         for src in ["P: {[f] x509Parse (pemLoad \"tests/data/\",f,\".pem\")[0]}",
                     "RS: x509LoadRoots \"tests/data/pki-root.pem\"",
-                    "NOW: (2026.09.16; 12:00:00.000)",
-                    "V: {[c;h] x509VerifyChain[c;RS;h;NOW]}"] {
+                    "NOW: (2026.09.16; 12:00:00.000)"] {
             v.eval(src).unwrap_or_else(|e| panic!("{src}: '{}", e.0));
         }
         v
     }
-    /// Every fixture's subject, spelled the way x509.nt's RFC 2253 `subject` spells it.
+    /// Two fixture subjects, spelled the way x509.nt's RFC 2253 `subject` spells them.
     const LEAF: &str = "CN=leaf.neant.test,O=neant fixtures,C=US";
     const INT: &str = "CN=neant fixture intermediate,O=neant fixtures,C=US";
     const ROOT: &str = "CN=neant fixture root,O=neant fixtures,C=US";
 
-    /// RFC 6125, and only the part of it every modern verifier keeps: SAN entries, never the CN.
-    /// Every fixture here has CN=leaf.neant.test, so a case that passes on the CN would show up.
+    /// What a verified chain costs: two RSA-2048 signature checks and the rest of RFC 5280 6.1.
     #[test]
-    fn hostname_matching_is_rfc6125_and_san_only() {
+    fn chain_verification_time() {
         let mut v = verify_vm();
-        for (cert, host, want, why) in [
-            ("pki-leaf", "leaf.neant.test", "1b", "the dNSName, exactly"),
-            ("pki-leaf", "LEAF.NEANT.TEST", "1b", "DNS names are case-insensitive"),
-            ("pki-leaf", "leaf.neant.test.", "1b", "one trailing root dot is not part of the name"),
-            ("pki-leaf", "other.neant.test", "0b", "a name nobody attested to"),
-            ("pki-leaf", "leaf.neant.test.evil.example", "0b", "a prefix is not a match"),
-            ("pki-leaf", "eaf.neant.test", "0b", "nor is a suffix"),
-            ("pki-leaf", "127.0.0.1", "1b", "the iPAddress SAN, for an address literal"),
-            ("pki-leaf", "127.0.0.2", "0b", "a different address"),
-            ("pki-leaf", "127.000.000.001", "0b", "a leading zero is refused, not read as octal"),
-            ("pki-leaf", "::1", "0b", "an IPv6 literal is never matched here"),
-            // an address literal is an address: it must never fall through to a dNSName, or a
-            // certificate for the *name* "127.0.0.1" would answer for the host at that address
-            ("pki-selfsigned", "127.0.0.1", "1b", "its SAN carries the address too"),
-            ("pki-wildcard", "a.wild.neant.test", "1b", "* is the whole leftmost label"),
-            ("pki-wildcard", "A.WiLd.NeAnT.TeSt", "1b", "and still case-insensitive"),
-            ("pki-wildcard", "wild.neant.test", "0b", "* stands for one label, never zero"),
-            ("pki-wildcard", "a.b.wild.neant.test", "0b", "and never two"),
-            ("pki-wildcard", "host.two.neant.test", "1b", "the plain second SAN entry"),
-            ("pki-wrong-host", "leaf.neant.test", "0b", "CN says leaf, SAN says other: SAN wins"),
-        ] {
-            let src = format!("x509CheckHost[P \"{cert}\"; \"{host}\"]");
-            assert_eq!(tests::ev(&mut v, &src), want, "{host} against {cert}: {why}");
-        }
-        // a pattern is matched, never re-read: these are the wildcards that are not wildcards
-        for (pat, host, want) in [(r"*.a.test", "x.a.test", "1b"), (r"w*.a.test", "wx.a.test", "0b"),
-                                  (r"*.*.a.test", "x.y.a.test", "0b"), (r"*", "a", "0b"),
-                                  (r"a.*.test", "a.x.test", "0b"), (r"*.a.test", ".a.test", "0b")] {
-            let src = format!("x509DnsMatch[\"{pat}\"; \"{host}\"]");
-            assert_eq!(tests::ev(&mut v, &src), want, "source: {src}");
-        }
-        assert_eq!(tests::ev(&mut v, "x509CheckHost[P \"pki-leaf\"; \"\"]"),
-                   "'x509: an empty hostname");
-    }
-
-    /// The chains that must verify, and how long one costs.
-    #[test]
-    fn the_fixture_chain_verifies() {
-        let mut v = verify_vm();
-        for (src, want, why) in [
-            ("V[(P \"pki-leaf\"; P \"pki-int\"); \"leaf.neant.test\"]", "1b", "leaf, intermediate, root"),
-            ("V[(P \"pki-leaf\"; P \"pki-int\"); \"127.0.0.1\"]", "1b", "the same chain by address"),
-            // a server that also sends the root: an anchor is trusted by identity, so a chain that
-            // already ends in one simply ends there
-            ("V[(P \"pki-leaf\"; P \"pki-int\"; P \"pki-root\"); \"leaf.neant.test\"]", "1b",
-             "the server sent the root as well"),
-            ("V[(P \"pki-wildcard\"; P \"pki-int\"); \"a.wild.neant.test\"]", "1b", "a wildcard leaf"),
-            // pinning: the store may hold the leaf itself, which is the one case where a
-            // self-signed certificate is allowed to verify
-            ("x509VerifyChain[enlist P \"pki-selfsigned\"; \
-              x509LoadRoots \"tests/data/pki-selfsigned.pem\"; \"leaf.neant.test\"; NOW]", "1b",
-             "a self-signed certificate that is itself in the trust store"),
-        ] {
-            assert_eq!(tests::ev(&mut v, src), want, "{why}");
-        }
-        let ms: f64 = tests::ev(&mut v,
-            "t0: now`time; do[10; V[(P \"pki-leaf\"; P \"pki-int\"); \"leaf.neant.test\"]]; \
-             `int$now[`time]-t0").parse().unwrap();
+        let src = "t0: now`time; do[10; x509VerifyChain[(P \"pki-leaf\"; P \"pki-int\"); RS; \
+                   \"leaf.neant.test\"; NOW]]; `int$now[`time]-t0";
+        let ms: f64 = tests::ev(&mut v, src).parse().unwrap();
         eprintln!("chain verification (leaf + intermediate + root, RSA-2048): {:.1}ms", ms / 10.0);
         assert!(ms < 10000.0, "a two-link chain took {}ms", ms / 10.0);
     }
 
-    /// Every way a chain can be wrong, each with the sentence a caller would have to act on. The
-    /// point of asserting the exact text is that these must stay *distinguishable*: a verifier that
-    /// answered "refused" to all of them would pass a test that only checked for a signal.
-    #[test]
-    fn every_bad_chain_is_refused_with_its_own_reason() {
-        let mut v = verify_vm();
-        let cases: [(&str, String, String); 13] = [
-            ("the chain in the order the server should not have sent it",
-             "V[(P \"pki-int\"; P \"pki-leaf\"); \"leaf.neant.test\"]".into(),
-             format!("'x509: {INT} was not issued by the next certificate in the chain, {LEAF}; \
-                      the server sent them in the wrong order or left one out")),
-            ("the intermediate left out",
-             "V[enlist P \"pki-leaf\"; \"leaf.neant.test\"]".into(),
-             format!("'x509: no trusted root named {INT}, which issued {LEAF}")),
-            ("a leaf that signed itself",
-             "V[enlist P \"pki-selfsigned\"; \"leaf.neant.test\"]".into(),
-             format!("'x509: {LEAF} signed itself and is not in the trust store")),
-            ("an expired leaf",
-             "V[(P \"pki-expired\"; P \"pki-int\"); \"leaf.neant.test\"]".into(),
-             format!("'x509: {LEAF} expired on 2021.01.01T00:00:00.000")),
-            ("a leaf that is not valid yet",
-             "V[(P \"pki-future\"; P \"pki-int\"); \"leaf.neant.test\"]".into(),
-             format!("'x509: {LEAF} is not valid until 2035.01.01T00:00:00.000")),
-            ("a SAN for a different host",
-             "V[(P \"pki-wrong-host\"; P \"pki-int\"); \"leaf.neant.test\"]".into(),
-             format!("'x509: {LEAF} is not valid for leaf.neant.test \
-                      (subjectAltName: other.neant.test)")),
-            ("a wildcard reaching one label too far",
-             "V[(P \"pki-wildcard\"; P \"pki-int\"); \"a.b.wild.neant.test\"]".into(),
-             format!("'x509: {LEAF} is not valid for a.b.wild.neant.test \
-                      (subjectAltName: *.wild.neant.test,host.two.neant.test)")),
-            ("an intermediate with basicConstraints CA:FALSE",
-             "V[(P \"pki-under-notca\"; P \"pki-notca\"); \"leaf.neant.test\"]".into(),
-             "'x509: CN=neant fixture not-a-ca,O=neant fixtures,C=US is not a CA \
-              (no basicConstraints cA) and may not have issued the certificate below it".into()),
-            ("one CA too many under a pathlen:0 intermediate",
-             "V[(P \"pki-deep\"; P \"pki-int2\"; P \"pki-int\"); \"leaf.neant.test\"]".into(),
-             format!("'x509: {INT} has pathLenConstraint 0 but 1 certificates hang below it")),
-            ("a critical extension nobody models",
-             "V[(P \"pki-critical\"; P \"pki-int\"); \"leaf.neant.test\"]".into(),
-             format!("'x509: {LEAF} has a critical extension this verifier does not model: \
-                      1.3.6.1.4.1.99999.1")),
-            ("a flipped bit in the leaf's signature",
-             "c: P \"pki-leaf\"; c[`sig]: (255#c`sig),bnot (c`sig)[255]; \
-              V[(c; P \"pki-int\"); \"leaf.neant.test\"]".into(),
-             format!("'x509: the signature on {LEAF} does not verify with {INT}'s key")),
-            ("a trust store that does not hold the root",
-             "x509VerifyChain[(P \"pki-leaf\"; P \"pki-int\"); \
-              x509LoadRoots \"tests/data/selfsigned-rsa.pem\"; \"leaf.neant.test\"; NOW]".into(),
-             format!("'x509: no trusted root named {ROOT}, which issued {INT}")),
-            // a real chain off the public web, refused for the one reason that matters here: this
-            // build has no ECDSA verifier, so it says no rather than waving the chain through
-            ("an algorithm this build cannot check",
-             "g: x509Parse each pemLoad \"tests/data/chain-google.pem\"; \
-              x509VerifyChain[2#g; x509SystemRoots[]; \"www.google.com\"; NOW]".into(),
-             "'x509: CN=www.google.com is signed with ecdsaSha256 (1.2.840.10045.4.3.2), \
-              which this build cannot verify".into()),
-        ];
-        for (what, src, want) in cases {
-            assert_eq!(tests::ev(&mut v, &src), want, "{what}");
-        }
-        assert_eq!(tests::ev(&mut v, "V[(); \"leaf.neant.test\"]"), "'x509: an empty certificate chain");
-        // the same certificate against the wrong key, with nothing else changed
-        assert_eq!(tests::ev(&mut v, "x509SigVerify[P \"pki-leaf\"; (P \"pki-root\")`spki]"), "0b");
-    }
-
-    /// The trust store over the real system bundle: how big, how long, and that every root in it
-    /// can be found by the canonical subject a chain would come looking with.
+    /// The trust store over the real system bundle -- how big, how long, and that every root in it
+    /// is found by the canonical subject a chain would come looking with.
     #[test]
     fn the_system_trust_store_loads() {
         let path = "/etc/ssl/certs/ca-certificates.crt";
@@ -1155,80 +1032,6 @@ mod verify {
                   tests::ev(&mut v, "S`skipped"));
         assert!(n > 100, "only {n} roots in {path}");
         assert_eq!(tests::ev(&mut v, "all {0<count x509Find[S;x`subjectCanon]} each S`certs"), "1b");
-    }
-
-    /// The TLS 1.3 Certificate message (RFC 8446 4.4.2), built here and taken apart again, plus
-    /// every malforming that has to be refused rather than read past.
-    #[test]
-    fn the_certificate_message_is_parsed_and_its_malformings_refused() {
-        let mut v = verify_vm();
-        v.eval("ds: (pemLoad \"tests/data/pki-leaf.pem\"), pemLoad \"tests/data/pki-int.pem\"").unwrap();
-        // context(1) | lp24 [ lp24 cert | lp16 extensions ]*
-        v.eval("msg: 0x00, wlp24 raze {(wlp24 x), wlp16 0x} each ds").unwrap();
-        assert_eq!(tests::ev(&mut v, "(parseCerts msg) ~ ds"), "1b");
-        // a certificate entry's extensions are read past, not read: a stapled OCSP response here
-        // changes nothing, which is exactly what the tls.nt header says
-        v.eval("m2: 0x00, wlp24 raze {(wlp24 x), wlp16 0x0005000100} each ds").unwrap();
-        assert_eq!(tests::ev(&mut v, "(parseCerts m2) ~ ds"), "1b");
-        for (what, src, msg) in [
-            ("a certificate_request_context", "parseCerts 0x01ff, wdrop[1;msg]",
-             "the server sent a certificate_request_context, which 4.4.2 forbids"),
-            ("an empty message", "parseCerts 0x", "an empty Certificate message"),
-            ("a truncated header", "parseCerts 0x000000", "a truncated Certificate message"),
-            ("a list length that lies", "parseCerts 0x00, (wu24 1+wbe msg[1 2 3]), wdrop[4;msg]",
-             "the certificate_list length does not match the Certificate message"),
-            ("a certificate running off the end",
-             "parseCerts 0x00, wlp24 (wu24 999), (wu16 0), 0x00",
-             "a certificate runs past the end of the Certificate message"),
-            ("a zero-length certificate", "parseCerts 0x00, wlp24 (wu24 0), wu16 0",
-             "an empty certificate in the chain"),
-            ("an entry with no extensions", "parseCerts 0x00, wlp24 (wlp24 0x05), 0x00",
-             "a certificate entry with no extensions"),
-            ("extensions running off the end",
-             "parseCerts 0x00, wlp24 (wlp24 0x05), wu16 9", "a certificate entry's extensions \
-              run past the end of the message"),
-            ("no certificates at all", "parseCerts 0x00, wu24 0", "the server sent no certificates"),
-        ] {
-            assert_eq!(tests::ev(&mut v, src), format!("'tls: {msg}"), "{what}");
-        }
-    }
-
-    /// CertificateVerify (RFC 8446 4.4.3). The signature is over 64 octets of 0x20, the context
-    /// string, a 0x00 and the transcript hash; the vector below is that content with the transcript
-    /// hash fixed at 00..1f, signed by the fixture leaf's key:
-    ///   python3 -c 'import sys; sys.stdout.buffer.write(b"\x20"*64 \
-    ///     + b"TLS 1.3, server CertificateVerify" + b"\x00" + bytes(range(32)))' > cv.bin
-    ///   openssl dgst -sha256 -sigopt rsa_padding_mode:pss -sigopt rsa_pss_saltlen:32 \
-    ///     -sign tests/data/pki-leaf.key -out cv.sig cv.bin     (OpenSSL 3.6.2)
-    /// It is tied to pki-leaf.key as committed, so re-running tests/data/pki-gen.sh means running
-    /// these two again as well.
-    #[test]
-    fn certificate_verify_matches_rfc8446_and_openssl() {
-        const SIG: &str = "22ae9f0797d06c6829e68dc4d35bd7ae62c7ff0da23c275f9869699aa5882c1a73c9269b32a7c73461be198f5fac0c58b7df96558601b15a0ed595b1add83bb909bc4af14338eb10b99d542b384aeded45729e8c2a0c80043b4c531c3ead88ee750412fed374e28a6626b8cccdaf2cec2a70bca0ec6fc33d62df58f7938c3b627768538794eca66cbc026ce00a5e2d5f47f29e9804a1baa41ff7f0a769cf7fc4bb9f9ce535277f6e99b9c9ef2f2a55864d425ff49cf618b447abb3466e7a262e2d12e3baced09f999ab96d5fa426550f14b7fe69c489ed5b5060582a523182b0620d5c6d97f83a64167c18218a05a42a00e07c7cc4a70fed45188802e3234e46";
-        let mut v = verify_vm();
-        // the context, byte for byte: 64 spaces, the label, one separator
-        assert_eq!(tests::ev(&mut v, "(count TLSCVCTX; `char$TLSCVCTX[64+til 33]; TLSCVCTX[97])"),
-                   "(98;\"TLS 1.3, server CertificateVerify\";0x00)");
-        v.eval(&format!("k: (P \"pki-leaf\")`spki; sg: unhex \"{SIG}\"; th: `byte$til 32")).unwrap();
-        assert_eq!(tests::ev(&mut v, "certVerify[(k; 2052; sg; th)]"), "1b");
-        for (what, src, msg) in [
-            // 1027 is ecdsa_secp256r1_sha256 and 1025 is rsa_pkcs1_sha256; 4.4.3 forbids the
-            // pkcs1 code points in a handshake signature outright, whoever holds the key
-            ("ecdsa_secp256r1_sha256", "certVerify[(k; 1027; sg; th)]",
-             "CertificateVerify uses signature scheme 1027, which this build cannot verify"),
-            ("rsa_pkcs1_sha256", "certVerify[(k; 1025; sg; th)]",
-             "CertificateVerify uses signature scheme 1025, which this build cannot verify"),
-            ("a different transcript", "certVerify[(k; 2052; sg; 32#0x00)]",
-             "the server's CertificateVerify did not verify"),
-            ("a flipped signature bit", "certVerify[(k; 2052; (255#sg),bnot sg[255]; th)]",
-             "the server's CertificateVerify did not verify"),
-            ("the wrong server's key", "certVerify[((P \"pki-int\")`spki; 2052; sg; th)]",
-             "the server's CertificateVerify did not verify"),
-            ("a key that is not RSA", "certVerify[((P \"selfsigned-ec\")`spki; 2052; sg; th)]",
-             "the server's key is not RSA, which is the only kind this build verifies"),
-        ] {
-            assert_eq!(tests::ev(&mut v, src), format!("'tls: {msg}"), "{what}");
-        }
     }
 
     /// `openssl s_server -rev` on a free port with a fixture certificate: it echoes every line back
@@ -1250,17 +1053,17 @@ mod verify {
                    "-ciphersuites", "TLS_CHACHA20_POLY1305_SHA256", "-rev", "-quiet"])
             .stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null())
-            .spawn().expect("openssl s_server (OpenSSL 3.6.2 is on PATH for the other fixtures too)");
-        // no -naccept: the server keeps looping, so this probe connection costs nothing and is a
-        // real readiness check instead of a sleep long enough to hope
+            .spawn().expect("openssl s_server (OpenSSL 3.6.2 makes the fixtures too)");
+        // no -naccept, so the server keeps looping and this probe connection costs nothing: a real
+        // readiness check instead of a sleep long enough to hope
         for _ in 0..200 {
             if std::net::TcpStream::connect(("127.0.0.1", port)).is_ok() { break; }
             std::thread::sleep(std::time::Duration::from_millis(25));
         }
         Server(child, port)
     }
-    /// One tlsConnectOpts against that server, with `RS` (the fixture root alone) as the store
-    /// unless another is named, and the result of a send/recv round trip -- or the refusal.
+    /// One tlsConnectOpts against that server with `store` as the trust store, then a send/recv
+    /// round trip -- or, when the certificate does not check out, the sentence it was refused with.
     fn talk(v: &mut vm::Vm, port: u16, host: &str, store: &str) -> String {
         v.set("port", value::chars(port.to_string().chars().collect()));
         let src = format!(
@@ -1276,17 +1079,17 @@ mod verify {
         tests::ev(v, &src).split(" at line ").next().unwrap().to_string()
     }
 
-    /// The whole thing: a real TLS 1.3 handshake with a real server, verified against a real trust
-    /// store, and then bytes both ways. Then the two refusals that matter -- an untrusted root and
-    /// a hostname the certificate does not cover -- which must fail *before* any data moves.
+    /// The whole thing: a real TLS 1.3 handshake with a real server, a real chain verified against
+    /// a real trust store, and then bytes both ways.
     #[test]
     fn handshake_verifies_and_data_round_trips() {
         let srv = s_server("pki-leaf");
         let mut v = verify_vm();
         // the leaf's SAN carries IP:127.0.0.1, so the address literal is matched against the
-        // iPAddress entry, not against a name
+        // iPAddress entry and never against a name
         assert_eq!(talk(&mut v, srv.1, "127.0.0.1", "RS"), "(2;\"slt olleh\n\")");
     }
+    /// The same server, refused before a byte of application data moves.
     #[test]
     fn a_root_the_store_does_not_hold_is_refused() {
         let srv = s_server("pki-leaf");
