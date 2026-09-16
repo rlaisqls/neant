@@ -491,6 +491,50 @@ mod tls {
         assert_eq!(got.fmt(), "\"echo:hi there\"");
         srv.join().unwrap();
     }
+    /// The whole point of `accept` handing connections to `spawn`ed workers: one worker blocked
+    /// on `hrecv` (client A, deliberately never sent) must not stall the others. If the global
+    /// socket table (`SOCKS`, src/prims.rs) held its lock across blocking I/O instead of cloning
+    /// the fd and releasing it first, B and C's `hsend`/`hrecv` would hang behind A's — instead
+    /// they're asserted to finish, with A still pending, before A is ever unblocked.
+    #[test]
+    fn accept_hands_connections_to_independent_spawned_workers() {
+        use std::io::{Read, Write};
+        let mut v = boot_vm();
+        // src/prims.rs keeps no way to ask a listener its bound port (out of scope, see README) —
+        // the test bypasses that by binding its own listener on an OS-assigned port, dropping it
+        // immediately, and pointing neant's `hlisten` at that same port. A small, accepted TOCTOU
+        // race in exchange for not growing the primitive surface just for this test.
+        let probe = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = probe.local_addr().unwrap().port();
+        drop(probe);
+        v.eval(&format!("l: hlisten \"127.0.0.1:{port}\"")).unwrap();
+        let server = std::thread::spawn(move || {
+            v.eval(
+                "i:0; while[i<3; c: accept l; spawn {x: hrecv[c;1]; hsend[c;\"ok\\n\"]; hclose c}; i+:1]; hclose l",
+            ).unwrap();
+        });
+        std::thread::sleep(std::time::Duration::from_millis(100)); // let the accept loop start
+        let mut a = std::net::TcpStream::connect(("127.0.0.1", port)).unwrap();
+        let (tx, rx) = std::sync::mpsc::channel();
+        for _ in 0..2 {
+            let tx = tx.clone();
+            let mut c = std::net::TcpStream::connect(("127.0.0.1", port)).unwrap();
+            std::thread::spawn(move || {
+                c.write_all(b"x").unwrap();
+                let mut buf = [0u8; 3];
+                c.read_exact(&mut buf).unwrap();
+                tx.send(&buf == b"ok\n").unwrap();
+            });
+        }
+        // B and C must both complete while A is still blocked on its own hrecv.
+        assert_eq!(rx.recv_timeout(std::time::Duration::from_secs(5)), Ok(true));
+        assert_eq!(rx.recv_timeout(std::time::Duration::from_secs(5)), Ok(true));
+        a.write_all(b"x").unwrap();
+        let mut buf = [0u8; 3];
+        a.read_exact(&mut buf).unwrap();
+        assert_eq!(&buf, b"ok\n");
+        server.join().unwrap();
+    }
     #[test]
     fn client_hello_is_well_formed() {
         let mut v = tls_vm();

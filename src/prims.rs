@@ -365,15 +365,38 @@ fn read0(x: Value) -> R<Value> {
     let p = text(&x);
     Ok(lines(std::fs::read_to_string(&p).map_err(|e| NError(format!("{p}: {e}")))?))
 }
-// ---- TCP sockets. Handles are ints into a process-local table; the VM is single-threaded, so
-// a thread_local is all the state these need and the prims stay plain fn(Value) -> R<Value>.
-thread_local! {
-    static SOCKS: std::cell::RefCell<(i64, HashMap<i64, std::net::TcpStream>)> =
-        std::cell::RefCell::new((0, HashMap::new()));
-}
+// ---- TCP sockets. Handles are ints into a process-local table. One global table, not a
+// thread_local: `accept`'s whole point is handing a connection handle to a `spawn`ed worker
+// (src/vm.rs), which runs on a different OS thread and needs to resolve that same handle.
+enum Sock { Stream(std::net::TcpStream), Listener(std::net::TcpListener) }
+static SOCKS: std::sync::LazyLock<std::sync::Mutex<(i64, HashMap<i64, Sock>)>> =
+    std::sync::LazyLock::new(|| std::sync::Mutex::new((0, HashMap::new())));
+// `hsend`/`hrecv`/`accept` all block on real I/O; holding SOCKS locked across that would
+// serialize every socket in the process behind whichever one happens to be waiting (exactly the
+// concurrency an accept-loop-plus-spawn server needs not to have). So these clone the underlying
+// fd (`try_clone`, a plain OS-level dup — reads/writes on the clone hit the same kernel socket)
+// and block on the clone, holding the lock only for the lookup and the clone itself.
 fn sock<T>(h: &Value, f: impl FnOnce(&mut std::net::TcpStream) -> R<T>) -> R<T> {
     let h = int_of(h)?;
-    SOCKS.with(|c| match c.borrow_mut().1.get_mut(&h) { Some(s) => f(s), None => err(format!("hsock: no handle {h}")) })
+    let mut s = match SOCKS.lock().unwrap().1.get(&h) {
+        Some(Sock::Stream(s)) => s.try_clone().map_err(|e| NError(format!("hsock: {e}")))?,
+        Some(Sock::Listener(_)) => return err(format!("hsock: {h} is a listener, not a connection")),
+        None => return err(format!("hsock: no handle {h}")),
+    };
+    f(&mut s)
+}
+fn listener<T>(h: &Value, f: impl FnOnce(&std::net::TcpListener) -> R<T>) -> R<T> {
+    let h = int_of(h)?;
+    let l = match SOCKS.lock().unwrap().1.get(&h) {
+        Some(Sock::Listener(l)) => l.try_clone().map_err(|e| NError(format!("hsock: {e}")))?,
+        Some(Sock::Stream(_)) => return err(format!("hsock: {h} is a connection, not a listener")),
+        None => return err(format!("hsock: no handle {h}")),
+    };
+    f(&l)
+}
+fn new_handle(s: Sock) -> Value {
+    let mut c = SOCKS.lock().unwrap();
+    c.0 += 1; let h = c.0; c.1.insert(h, s); Int(h)
 }
 /// bytes to put on the wire: a byte vector as-is, a string as UTF-8 (what `` `byte$ `` would give).
 fn wire(v: &Value) -> R<Vec<u8>> {
@@ -401,11 +424,25 @@ fn hopen(x: Value) -> R<Value> {
     let s = sock.ok_or(last)?;
     s.set_read_timeout(Some(to)).ok();
     s.set_nodelay(true).ok();
-    Ok(SOCKS.with(|c| { let mut c = c.borrow_mut(); c.0 += 1; let h = c.0; c.1.insert(h, s); Int(h) }))
+    Ok(new_handle(Sock::Stream(s)))
+}
+/// `hlisten "host:port"` -> handle; `accept` blocks on it for the next inbound connection.
+fn hlisten(x: Value) -> R<Value> {
+    let addr = text(&x);
+    let l = std::net::TcpListener::bind(&addr).map_err(|e| NError(format!("hlisten {addr}: {e}")))?;
+    Ok(new_handle(Sock::Listener(l)))
+}
+/// `accept h` blocks for the next inbound connection on listener `h` and returns a connection
+/// handle — from there it's an ordinary handle, same as one from `hopen`: `hsend`/`hrecv`/`hclose`
+/// all just work, and it can be captured into a `spawn`ed closure to hand the connection off.
+fn accept(x: Value) -> R<Value> {
+    let (s, _) = listener(&x, |l| l.accept().map_err(|e| NError(format!("accept: {e}"))))?;
+    s.set_nodelay(true).ok();
+    Ok(new_handle(Sock::Stream(s)))
 }
 fn hclose(x: Value) -> R<Value> {
     let h = int_of(&x)?;
-    SOCKS.with(|c| c.borrow_mut().1.remove(&h));
+    SOCKS.lock().unwrap().1.remove(&h);
     Ok(Null)
 }
 /// `hsend[h;x]` writes every byte of x; the count written.
@@ -700,6 +737,7 @@ pub static BUILTINS: &[PrimDef] = &[
     p!("show", Some(show), None), p!("print", Some(print), None), p!("signal", Some(signal), None), p!("exit", Some(exit), None),
     p!("read0", Some(read0), None), p!("write0", None, Some(write0)),
     p!("hopen", Some(hopen), None), p!("hclose", Some(hclose), None), p!("hsend", None, Some(hsend)), p!("hrecv", None, Some(hrecv)),
+    p!("hlisten", Some(hlisten), None), p!("accept", Some(accept), None),
     p!("shared", Some(shared), None), p!("sget", Some(sget), None), p!("sset", None, Some(sset)),
     p!("each", None, None), p!("over", None, None), p!("scan", None, None),   // adverb keywords, dispatched in the VM
     p!("exec", None, None),   // runs bytecode data; dispatched in the VM

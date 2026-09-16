@@ -98,7 +98,7 @@ Only what needs the host; everything expressible with the verbs lives in the pre
 | Values | `isnull now` |
 | Output | `show print signal exit` |
 | Files | `read0 write0` |
-| Sockets | `hopen hclose hsend hrecv` |
+| Sockets | `hopen hclose hsend hrecv hlisten accept` |
 | Concurrency | `spawn join shared sget sset supd` — see [Concurrency](#concurrency) |
 | Adverb keywords | `each over scan` |
 | Errors | `elast` |
@@ -110,7 +110,20 @@ h: hopen "example.com:80"          // TCP; hopen ("host:port"; timeoutMs) sets t
 hsend[h; "GET / HTTP/1.0\r\n\r\n"]
 hrecv[h; 4096]                     // one read, up to n bytes; empty means the peer closed
 hclose h
+
+l: hlisten "0.0.0.0:8080"          // a listener is a handle too — hclose works on it unchanged
+while[1; c: accept l; spawn {hsend[c; "hi\r\n"]; hclose c}]   // one spawned worker per connection
 ```
+
+`accept` blocks for the next inbound connection and returns an ordinary connection handle — capture
+it into a `spawn`ed closure (src/vm.rs) and `hsend`/`hrecv`/`hclose` on it there exactly as if it
+came from `hopen`. This is why socket handles (`src/prims.rs`) live in one global table behind a
+lock rather than a thread-local one: the accepting thread and the worker handling the connection are
+different OS threads, and both need to resolve the same handle. That lock is held only for the
+lookup, never across the actual blocking read/write/accept (each clones the underlying file
+descriptor and blocks on the clone) — otherwise one worker still waiting on a slow client would
+stall every other socket in the process, exactly the concurrency this is for. No TLS server side yet
+— `boot/tls.nt`'s handshake code is still client-only.
 
 ## Tables
 
