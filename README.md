@@ -413,12 +413,12 @@ bytecode `ip` the other direction would have gone to — and an unconditional `J
 at all, since the ops it skipped simply never ran. So an `if` or a `$[..]` inside the loop costs
 nothing until the day its condition actually flips.
 
-Scope for a first pass: `while` only (a `do[n;..]` header is reached with its counter still live on
-the operand stack, and recording only starts on an empty one), no calls, no early `Ret`, and
-`Push`/`LoadL`/`StoreL`/`Dyad`/`Pop`/`Jmpf`/`Jmp` in the body. Anything else aborts the recording,
-and that header is never tried again — the same rejected-once-stays-rejected default the
-whole-function JIT already uses. Recording is pure observation: it can't change what a program
-computes, only whether some of it gets to run faster.
+Scope: `while` only (a `do[n;..]` header is reached with its counter still live on the operand
+stack, and recording only starts on an empty one), `Push`/`LoadL`/`StoreL`/`Dyad`/`Pop`/`Jmpf`/`Jmp`
+in the body, and calls to plain lambdas held by globals (below). Anything else aborts the
+recording, and that header is never tried again — the same rejected-once-stays-rejected default
+the whole-function JIT already uses. Recording is pure observation: it can't change what a
+program computes, only whether some of it gets to run faster.
 
 What a trace buys over the method JIT is types. The whole-function JIT has to *prove* every op is
 integer from the bytecode alone; a trace just writes down what the values were, so **floats compile
@@ -463,10 +463,52 @@ whole-function JIT: what it measures didn't change, only how it gets something i
 measure against. The same loop now runs faster traced than method-compiled, for the register reason
 above — the older tier is the one with a buffer in its inner loop.)
 
-What's next here, in rough order: calls, so a trace can cross a function boundary the method JIT
-would have to compile whole; `do[n;..]`, which needs the header's live counter handled rather than
-avoided; and a deopt that hands back the operand stack instead of rewinding, which would take the
-last store out of the loop.
+**Calls are inlined, not called.** The recorder lives on the `Vm`, not in one `run_ops` frame, so
+when the loop body does `Op::Call` on a plain lambda it simply follows the interpreter into the
+callee's frame (`Vm::call_code` → `Recorder::enter_frame`/`exit_frame`) and keeps writing down
+what runs. What comes out is still one flat sequence with no call in it: the callee's frame is a
+`FramePush` (remembering how deep the operand stack stood under its arguments — that is where its
+result has to end up), a `StoreL`+`Pop` per argument binding it into a slot of the callee's own,
+the body's ops exactly as in the loop, and a `FrameEnd` that moves the one value the frame leaves
+behind to where the caller expects it. Each inlined frame gets a disjoint range of trace-local
+slots past the loop's own frame (`real_upto`), and those slots are **virtual**: they get a register
+like any other local but are never loaded from the buffer on entry, never stored at the top of an
+iteration, and never written back to the interpreter's frame — they have no value before the loop
+and nobody wants one after. So `f[a;b]`, `f[g[x]]`, a callee that calls another lambda, the same
+lambda at two call sites, a callee with a scratch local or an early `:x`, all inline; a bounded
+recursion inlines as far as it actually recursed and is stopped by the register file (or the step
+cap) beyond that. The whole-function JIT is bypassed for a callee while a recording is in
+progress — the recorder has to *see* the callee's ops, and a compiled version would run them where
+it can't; the recording is one iteration long, so that only ever defers a tier-up.
+
+Two new kinds of guard fall out. **Which function the global holds** is checked once per entry
+(`CompiledTrace::run`, src/jit.rs) — once is enough, since nothing a compiled trace runs can assign
+a global — and a trace that finds its callee reassigned is not refused forever but retired: the
+header counts afresh and is recorded again against the new definition, up to `MAX_RETRACE` (4)
+times, after which it stays interpreted (`FnCode::retrace`, src/value.rs) — reassigning a function
+at the REPL between runs is ordinary; a loop whose callee changes on every run is not worth a
+compile each time. **A branch inside a callee** can't bail the way one in the loop's own frame
+does: the `ip` it would resume at is in the callee's bytecode, and the interpreter is not in that
+frame. Those are `GuardRewind`s — they exit through the same stub the int-null deopt uses, throwing
+the half-finished iteration away and resuming the interpreter at the loop header from the values
+the buffer says the iteration started with, sound for the same reason that deopt is. If a callee's
+condition flips for good, every later iteration enters the trace, rewinds, and is interpreted;
+measured, that costs nothing over interpreting alone (496ms vs 510ms for 2M such iterations), so
+there is no cliff to fall off. Everything that is *not* a plain lambda in a global — a closure, a
+primitive, a projection (an arity mismatch is one), a vector being indexed, a callee that reads a
+global, a `Ret` out of the loop's own frame — fails the recording and leaves the loop interpreted,
+never miscompiled: a `Call` that didn't become an inlined frame arrives at the recorder without
+one having `returned`, and that is the whole check.
+
+Measured: **~200x** on a 5M-iteration loop calling `{x*2}` (`jit_tests::manual_trace_call_perf_measurement`)
+— 5.6ms traced against 1.13s for the same loop with `- -` spliced in, which pays a real
+`Op::Call` → `call_code` → `execute` per iteration; the traced loop runs at the same speed as the
+one with no call in it at all (5.7ms, `manual_trace_perf_measurement`, ~100x), which is what
+inlining should mean.
+
+What's next here, in rough order: `do[n;..]`, which needs the header's live counter handled rather
+than avoided; a deopt that hands back the operand stack instead of rewinding, which would take the
+last store out of the loop; and int/float promotion inside a trace, so `1.0*i` compiles.
 
 ### What the tests check
 
@@ -486,8 +528,13 @@ There is no external oracle left, so the front end is pinned by fixpoints and by
   compilability check rejects; or a `do` loop, which no trace is started on) — and requiring the two
   to agree. That covers the guards and deopts too: a branch that flips after the trace was recorded,
   an `0W+1` wrapping to the null sentinel mid-loop, an out-of-range index, a second live reference to
-  an amended vector. One test asserts a wall-clock bound instead, since everything else here would
-  still pass if the JIT silently stopped compiling anything at all.
+  an amended vector. For inlined calls: every shape that inlines (two arguments, in order; nested;
+  float; a scratch local; an early return; a callee branch that flips; two call sites), a global
+  reassigned between runs (the result has to follow the new definition, through the re-record
+  budget and past it), and every shape that must refuse (closure, primitive, projection, arity
+  mismatch, a global read, a deep recursion, too many locals). One test asserts a wall-clock bound
+  instead, since everything else here would still pass if the JIT silently stopped compiling
+  anything at all.
 - RFC vectors for the crypto and the TLS key schedule; the record layer round-trips offline.
 
 What this gives up relative to the oracle: a bug that the compiler introduces *and* reproduces
@@ -523,8 +570,8 @@ caller's `LoadG`, so the bytecode carries positions but no names.
 
 ### Next
 
-For the JIT, the next steps are in "Stage 2b" above: locals in registers across a traced iteration,
-then calls, then `do[n;..]`.
+For the JIT, the next steps are in "Stage 2b" above: `do[n;..]` headers, and a deopt that hands
+back the live operand stack instead of rewinding to the header.
 
 A register-style calling convention was tried and reverted — it measured slower, and the profile
 said frame setup is ~5% while `Value` clone/drop and small-list allocation are ~35%. The allocation
