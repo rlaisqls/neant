@@ -1425,6 +1425,208 @@ mod ed25519 {
     }
 }
 
+/// RSA signature verification, on the general modular arithmetic in src/neant/crypto/bignum.nt.
+/// Nothing here is in the boot image, so both files are loaded into a plain boot VM. Every vector
+/// was made on this machine with the command quoted above it and can be regenerated from it; the
+/// key is throwaway and its private half only ever existed to forge the blocks that must NOT verify.
+#[cfg(test)]
+mod rsa {
+    use super::*;
+    fn rsa_vm() -> vm::Vm {
+        let mut v = boot_vm();
+        for f in ["src/neant/crypto/bignum.nt", "src/neant/crypto/rsa.nt"] {
+            v.eval(&std::fs::read_to_string(f).unwrap()).unwrap_or_else(|e| panic!("{f}: '{}", e.0));
+        }
+        v
+    }
+
+    // openssl genrsa -out rsa2048.pem 2048            (OpenSSL 3.6.2)
+    // openssl rsa -in rsa2048.pem -noout -modulus     — the exponent is the default 65537
+    const N: &str = "d7252f153f75e2036073b54aa1d31ec5846375cefd29a6c7a33d58c1a977caac6e0594ac0962e09c7e59d2f3ec881227436cd323a4ee5de03d15041770b66fe399eee9eab885cbf7be0e90a13112780d6fe79d4dbb2a9f842d3eda4d2e559cbc163b4e71024bc3b62da4dc57ca3d3e34a4ee2f47bf37752fb397a1178b0fdba151fd1c9f311ec9bc7585a95078c3ed249883b4f5247d17cea4aa86398ff94aea8bc595dcc5ed637e9bcf9ad7a9f08b4d672507014f816da600247ea832e78522939654f56a11667dd17839264bd2fc9ec78da4b4b7c2d0d2fd3f2c3df5fa37de3d23365644ae2cc0bbf1ee7e55c161f7dfba2d3b9bb69e4db1c1533f2c6ceb11";
+    // printf 'neant rsa test vector\n' > msg.txt && openssl dgst -sha256 msg.txt
+    const DIGEST: &str = "d4663dfa5e7a0c65e3c005537874a194dbd6735b382cc18a6c297908f1faef9d";
+    // openssl dgst -sha256 -sign rsa2048.pem -out sig.bin msg.txt
+    const SIG_PKCS1: &str = "1078ecb416e3904023443b1dda9a5bc3bb1c01318d0db3878667893c6f1a6b1cdef9386255ebfff6e6884d03ab4475ffd41697589f10ee2f71828739cfce4e86b81ceba2e9602831ad13afa873cc5854491f1fb6a13290344dc7e35db547fbf4f2f8cb4b663396617d7355c7635acac2757f6511c572215fdd0b2983d8816fa34a9257247d158e80c5d2155dee8a1eb3085db19e17a82adf68ceb81c09ef7ff1143e64c2cf1b0b6d6f7cfcd81b6d64f59ba05211439f0b24313b4919b57f57a26e850b865bd45a4271152eb1a58cee78105c477665dff8093bda9152d3bde07a52aae9abf47c711ae87999e6e7fd0189328aebdf4ad3e80515447f6d65b80657";
+    // openssl dgst -sha256 -sigopt rsa_padding_mode:pss -sigopt rsa_pss_saltlen:<32|20|0> \
+    //   -sign rsa2048.pem -out sig.bin msg.txt
+    const SIG_PSS32: &str = "6000dc8a4802b8ad752abbbbae0fdc0f4944f011e6e1c090389ba7581df83c655f204f0a1355c31d0a4fcf16ea4123016f8fabe1e5fc82b696818d42fdae7bb016db84fb3097ddac8b5ad2de0cd0f569d239a30a026ab0f52fcec14ffcd3e947b7d5ecb4d6367a81a7bedcf6e4b02be9b38b7d89fcb6b7ae912176449a166fba528460ceec28b8a62e6a53c9e66b2a64be39d820e46c5f0797402820b3618a67e1c73f208e7b7082e6479e5cf80e9839ec62f1f637ba3c128fd590b5f366c85b8ea59df77ccee60cf4e78a36f8cd4a2c89afad2c34c05e5d0e88f092325b01b7032ada80e99fcd4caeaf8ae7ba0d8e98797daadbac50580fb6fcac06d9ac6f61";
+    const SIG_PSS20: &str = "974980df531a3e259146454c3c7f4c580faaba6c58b1cc5ae4d219a9b27af2ef5f222490b756c51d91f4f41c7266544e91f4a23f3c457d1c348196d981c247188acae32a28575c7c60ba4f37b9005013e81f8c902bc138f0822e1ed6c51202452df96d65e98cb783521c45fe5f6371748762eb4563c0096246e1626340bae4e7c5cd60bdd250cb7a870e351250a78314f6c4bd1b6b2dc861269171e521bd953ef6766970c0b497a4afd6a15c6db510bda9aa6aa43dcf68f493aa5005e46f6786ae5460dac8d5748752f6c426e6bc0f40fc889dee7d33417e9ddeb3cde290d3c5814430c4df8ac6390e58919bb5492a251a7ebbedaa63e33a6e7aa1fd3dbf7d44";
+    const SIG_PSS0: &str = "1483891a33d1d6255da5fc475e8a5ce5cda15294d30bfa1f41e6dee71340ed14d6d3411389a5610ea7e621f964a9a447c8136766edb283069c968e44cb90cc16f587acfa3f884fc441a0823d8cb2849981c5e9b3064c5d89ca63b25be828c749099b0588999a97f9258b6a40f53f189615add933bc457dcd691211824ee57378986c43b4231b62bb9bde54ed0b075675ae4dd9765cad577a7f9c7ca509aa7b697e959b95cb82699da10b746035fe1cfd7a9d799469b1e7435cd809af621635b3ed9c6809626e45cee0e49b06a2e6b08bee884748ade5a84618d51479d2736fd3c2bb560061dede5f5f6d1cfcc816cbb593d356a5475919bf54b2f112a2cd5f9a";
+    // The forgeries. openssl will not produce a bad block, so these are `pow(EM, d, n)` in python
+    // over the d that `openssl rsa -in rsa2048.pem -noout -text` prints, with EM built by hand.
+    // BLEICH_EM is 0x00 0x01 <eight 0xFF> 0x00 DigestInfo <0xAA filler>: the right digest, the right
+    // DigestInfo, and 245 bytes of garbage where the padding should be — Bleichenbacher '06.
+    const BLEICH_SIG: &str = "7ca59fd84f87ff5a2cebb684aab0dda8f5df6aaa687fcfadf670f97eb0d8614ff0f96a2f8c565872101ea854192ce9a30ae25f94a61d1186acbbc4eea7647df2362ad6a337dabf266d4aefa354e157916b4e64ee0d64a4d5bb231acb362b22659bd1c23789189029c69c6b0f3c2f7eda9060df66de4e381fc029e36b16690513b9816cf9966e1ed6cec93d31069a9b9123eb4cee4a906eb55c383f79eff42b75def548304730fd5f19c035c39b46b7192ac469150ca6af72f92ab7d754812dab10224be96dc7ab003926444235dc30df82f6980173e5008912595c7457989e7bcd965b6b636f63a7dd942e072dcd60c0e3302ea9cbcc93891ad60470d5dd02a1";
+    const BLEICH_EM: &str = "0001ffffffffffffffff003031300d060960864801650304020105000420d4663dfa5e7a0c65e3c005537874a194dbd6735b382cc18a6c297908f1faef9daaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    // A hand-built PSS block (salt 00 01 .. 1f) and three corruptions of it, all signed the same way.
+    const PSS_HAND: &str = "64cc48620dc22058678213f5d3fd19a1b665dd07bee9b0b1ce00880e5d682c966651cfd1d5f194b16def32a29bf8fff8e3c9629afe5df479dec282c50be14c4338ea206d01b4c7989ccbbc55f338d781083fd45ccf20b3d3a3dae198d59f65c7d817fe025ae0d0e8b096e151aef55d54bfe08cb76345856ad80ed0a1b19e12923740629e4e6eb1042e82bce30bda1cc0650ec300d5c4d1b5f57b5180593716fedd2b5ab01156c19f1150a29504096128d7a34e97035defd34f2e793092d40458d84d0e9a7b5adc455f98066f70bf43138be59dd0156ac9773a9ef3438bb1a626ebf6152cef3ce4104cdb0e0faf37eca6d7e6c91f3719275829e10f7dc72fcff7";
+    const PSS_TRAIL: &str = "cee0346c14fee0c6e038d5d47580d13e594bfd16b747063fc1e7bda198858fe34616e3194bea699e5ffcab055ae6187f071dc16809a51654b587d75c23d385ca973a61f96844e288a1a4dfdd5f25088dc0e2c7213af0f72f99f84b11cd875c467398951d7fca58d0830588ecf2acf3e2a2e0c40202493c95c7506aaa6f3ea71eba6f326d1d80d004bb65fcbeb409dbbb7cd1e019fc3dbe643e8fc3693169d1bfe02f12d6e6472aee72b4b09fac4156b0942346db47b40a4c73089b51722339c19fc8b852181e79ef26c05214cdbb0d6b035e624142f9557b146311fd4192aa0de803537ecf9b9d5bc685c174be90eaef961c17924a0e11c4eef45233184b0854";      // 0xbc trailer turned into 0xbb
+    const PSS_TOPBIT: &str = "8b2d4a40ad4ad70eedf69bc532faad24a65e4200956da0ec80e536267ad2bc7d553aa10efbb3b679723308b392b7cfd3e16c0fc5667603d6d88c6ef8645b302e154a0e736fe50cff7c8c31af584fcd55af6582ffdec8eadf314bb64636004f651f18974458b2cf253410fec2ae01b857fde59a43311b145743f4bc2e1c96ca3609f1b1be55fc49b5246dddfca2b784a426a8c48e751ffba62f9b126fed067da10c1dd61aac356629de1e06f3b103c36d992ca31415da5bf7da7566711fd2b3b40a46e6127d6aea86a6014cc280ba8e0e49d383a15c8abf7c5fb6a937bb77ca52d06e6c0a85746e3a265fad3523c07d0c3dc37bd1fefea8021d6fb027ea0bd81d";    // top bit of maskedDB set, which emBits forbids
+    const PSS_PS: &str = "5103acac7b014c32a8f7fd5a747bffb02823dbe81974030d0628757c1f41e95a6435209855e15d1f1484f734ab08a94412305f6382baa7faafd96de4c2529ef3f3b2e89fd8906b2e5a9f7cab8072ec6789b7d55343919dd640a83424c4f392c10fd1364c2f22d7e4ecebb4272f3cc97a13e65fbe37a1f6078392cdbd374e905c702cd5eceb71338c37a2085577f2088a5127923203460fe8a09b60057e5c5a67ec21a3ec78d288da1348e57ee3228802b7e1d669f87d0bddb7d609d379cff8c1977e7cd9e4724ec58ad4b9c66d271634dc21bc493dd3bbfcf4314fac85ebb42545cd823f0b1cc9eabb372d9f93c67f1f873d8142236dd201904cbaed67ee62ae";            // a 0x07 in DB's zero padding, before the 0x01
+    // With e = 1 the "signature" is the encoded message itself — this is a correct PKCS#1 block.
+    const E1_SIG: &str = "0001ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff003031300d060960864801650304020105000420d4663dfa5e7a0c65e3c005537874a194dbd6735b382cc18a6c297908f1faef9d";
+
+    /// n, e, the digest and one signature, bound in the VM so a test reads as one line.
+    fn key(sig: &str) -> String {
+        format!("n: unhex \"{N}\"; e: 0x010001; dg: unhex \"{DIGEST}\"; s: unhex \"{sig}\"; ")
+    }
+
+    /// The limb layer under everything else: 26-bit limbs in and out of big-endian bytes, and the
+    /// four operations bnModExp is built from. python3 -c "print(hex(<expr>))" for each.
+    #[test]
+    fn bignum_arithmetic_matches_python() {
+        let mut v = rsa_vm();
+        for (src, want) in [
+            // the representation itself: 2^26 is one limb over, and zero has no bytes at all
+            ("bnFromBytes 0x04000000", "0 1"),
+            ("hex bnBytes bnFromBytes 0x000000deadbeef", "\"deadbeef\""),   // leading zeros do not survive
+            ("count bnBytes bnFromBytes 0x00", "0"),
+            ("hex bnBytesN[bnFromBytes 0xff; 4]", "\"000000ff\""),
+            ("bnBits bnFromBytes 0x0100", "9"), ("bnBits bnFromBytes 0x", "0"),
+            ("(bnCmp[bnFromBytes 0x02; bnFromBytes 0x0100]; bnCmp[bnFromBytes 0x02; bnFromBytes 0x02])", "-1 0"),
+            // hex(0xffffffffffffffff * 0xffffffffffffffff)
+            ("hex bnBytes bnMul[bnFromBytes 0xffffffffffffffff; bnFromBytes 0xffffffffffffffff]",
+             "\"fffffffffffffffe0000000000000001\""),
+            // hex(0x100000000000000000000 - 1), a borrow through every limb
+            ("hex bnBytes bnSub[bnFromBytes 0x0100000000000000000000; bnFromBytes 0x01]",
+             "\"ffffffffffffffffffff\""),
+            ("hex bnBytes bnAdd[bnFromBytes 0xffffffffffffffffffff; bnFromBytes 0x01]",
+             "\"0100000000000000000000\""),
+            ("hex bnBytes bnShl[bnFromBytes 0x01; 100]", "\"10000000000000000000000000\""),
+            ("hex bnBytes bnShr[bnFromBytes 0x10000000000000000000000000; 90]", "\"0400\""),
+            // divmod(0xdeadbeefcafebabe1337, 0x0123456789abcdef)
+            ("d: bnDivMod[bnFromBytes 0xdeadbeefcafebabe1337; bnFromBytes 0x0123456789abcdef]; \
+              (hex bnBytes d[0]; hex bnBytes d[1])", "(\"c3b6b4\";\"ed8473ec7c5d2b\")"),
+            ("hex bnBytes bnMod[bnFromBytes 0xdeadbeefcafebabe1337; bnFromBytes 0x0123456789abcdef]",
+             "\"ed8473ec7c5d2b\""),
+            ("bnBytes bnSub[bnFromBytes 0x01; bnFromBytes 0x02]", "'bn: subtraction would go negative"),
+        ] {
+            assert_eq!(tests::ev(&mut v, src), want, "source: {src}");
+        }
+    }
+
+    /// bnModExp against python3 -c "print(pow(b,e,m))" — three small ones that exercise the odd
+    /// corners, then the RSA-2048 exponentiation an actual verification performs.
+    #[test]
+    fn bnmodexp_matches_python_pow() {
+        let mut v = rsa_vm();
+        for (src, want) in [
+            ("`int$bnModExp[0x05; 0x03; 0x0d]", ",8"),                              // pow(5,3,13) = 8
+            ("hex bnModExp[0x02; 0x0a; unhex \"3b9aca07\"]", "\"0400\""),          // pow(2,10,1000000007)
+            ("hex bnModExp[unhex \"deadbeef\"; 0x010001; unhex \"fffffffb\"]",
+             "\"8e338be9\""),                                                     // pow(0xdeadbeef,65537,0xfffffffb)
+            ("count bnModExp[0x; 0x05; 0x61]", "0"),                              // pow(0,5,97) = 0
+            ("`int$bnModExp[0x03; 0x; 0x07]", ",1"),                                // an empty exponent is zero
+            ("bnModExp[0x05; 0x03; 0x0c]", "'bn: even modulus, Montgomery reduction needs an odd one"),
+            ("bnModExp[0x05; 0x03; 0x]", "'bn: modulus is zero"),
+        ] {
+            assert_eq!(tests::ev(&mut v, src), want, "source: {src}");
+        }
+        // python3 -c "print(hex(pow(<SIG_PKCS1>, 65537, <N>)))" — the recovered PKCS#1 block, whose
+        // leading 0x00 is not in the minimal byte form bnModExp returns.
+        let src = format!("{}hex bnModExp[s; e; n]", key(SIG_PKCS1));
+        assert_eq!(tests::ev(&mut v, &src), "\"01ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff003031300d060960864801650304020105000420d4663dfa5e7a0c65e3c005537874a194dbd6735b382cc18a6c297908f1faef9d\"");
+    }
+
+    /// The signatures openssl made over msg.txt, with the salt length recovered from the encoding
+    /// rather than told to the verifier: 32, 20 and 0 all have to work.
+    #[test]
+    fn openssl_signatures_verify() {
+        let mut v = rsa_vm();
+        for (what, sig, call) in [
+            ("pkcs1-v1_5", SIG_PKCS1, "rsaVerifyPkcs1[n;e;`sha256;dg;s]"),
+            ("pss salt 32", SIG_PSS32, "rsaVerifyPss[n;e;dg;s]"),
+            ("pss salt 20", SIG_PSS20, "rsaVerifyPss[n;e;dg;s]"),
+            ("pss salt 0", SIG_PSS0, "rsaVerifyPss[n;e;dg;s]"),
+            ("pss hand-built, salt 32", PSS_HAND, "rsaVerifyPss[n;e;dg;s]"),
+        ] {
+            let src = format!("{}{call}", key(sig));
+            assert_eq!(tests::ev(&mut v, &src), "1b", "did not verify: {what}");
+        }
+    }
+
+    /// A verifier's whole job. One flipped bit anywhere, a signature that is not exactly k bytes, a
+    /// scheme confusion, an unknown hash, a digest of the wrong length, and e = 1.
+    #[test]
+    fn tampering_and_malformed_signatures_are_rejected() {
+        let mut v = rsa_vm();
+        let p1 = key(SIG_PKCS1);
+        let ps = key(SIG_PSS32);
+        for (what, src) in [
+            ("flipped last bit of the pkcs1 signature", format!("{p1}rsaVerifyPkcs1[n;e;`sha256;dg;(255#s),bnot s[255]]")),
+            ("flipped first bit of the pkcs1 signature", format!("{p1}rsaVerifyPkcs1[n;e;`sha256;dg;(bnot s[0]),1_s]")),
+            ("flipped bit in the digest", format!("{p1}rsaVerifyPkcs1[n;e;`sha256;(31#dg),bnot dg[31];s]")),
+            ("signature one byte short", format!("{p1}rsaVerifyPkcs1[n;e;`sha256;dg;255#s]")),
+            ("signature one byte long", format!("{p1}rsaVerifyPkcs1[n;e;`sha256;dg;s,0x00]")),
+            ("e = 1 over a correct pkcs1 block", format!("n: unhex \"{N}\"; dg: unhex \"{DIGEST}\"; rsaVerifyPkcs1[n;0x01;`sha256;dg;unhex \"{E1_SIG}\"]")),
+            ("unknown hash symbol", format!("{p1}rsaVerifyPkcs1[n;e;`sha1;dg;s]")),
+            ("digest of the wrong length", format!("{p1}rsaVerifyPkcs1[n;e;`sha256;31#dg;s]")),
+            ("a pss signature offered to the pkcs1 verifier", format!("{ps}rsaVerifyPkcs1[n;e;`sha256;dg;s]")),
+            ("flipped last bit of the pss signature", format!("{ps}rsaVerifyPss[n;e;dg;(255#s),bnot s[255]]")),
+            ("flipped bit in the digest, pss", format!("{ps}rsaVerifyPss[n;e;(31#dg),bnot dg[31];s]")),
+            ("pss signature one byte short", format!("{ps}rsaVerifyPss[n;e;dg;255#s]")),
+            ("a pkcs1 signature offered to the pss verifier", format!("{p1}rsaVerifyPss[n;e;dg;s]")),
+            ("an even modulus: 0b, not the signal bnModExp would raise", format!("{p1}rsaVerifyPkcs1[(255#n),0x00;e;`sha256;dg;s]")),
+            // 32776 bits is 1261 limbs, past the 1023 bnMul insists on — rsaRecover's width cap has
+            // to turn that into 0b before bnMul gets the chance to signal, or a certificate could
+            // make the verifier raise instead of answering.
+            ("a 32776-bit modulus with a signature to match", format!("{p1}rsaVerifyPkcs1[(4096#0xff),0x01;e;`sha256;dg;4097#0x02]")),
+        ] {
+            assert_eq!(tests::ev(&mut v, &src), "0b", "accepted a forgery: {what}");
+        }
+    }
+
+    /// Bleichenbacher '06: the block really does carry the right DigestInfo for the right digest,
+    /// and a verifier that scans for it instead of checking the whole encoding accepts it. The first
+    /// assertion proves the vector is the attack and not just noise — the recovered block is
+    /// byte-for-byte the crafted one — and the second is the check that has to say no.
+    #[test]
+    fn bleichenbacher_forged_padding_is_rejected() {
+        let mut v = rsa_vm();
+        let k = key(BLEICH_SIG);
+        // the leading 0x00 of the block is not in bnModExp's minimal byte form
+        assert_eq!(tests::ev(&mut v, &format!("{k}(bnModExp[s;e;n]) ~ 1_unhex \"{BLEICH_EM}\"")), "1b");
+        assert_eq!(tests::ev(&mut v, &format!("{k}b: unhex \"{BLEICH_EM}\"; (b[til 11] ~ 0x0001ffffffffffffffff00; b[11+til 51] ~ (unhex \"3031300d060960864801650304020105000420\"),dg)")), "11b");
+        assert_eq!(tests::ev(&mut v, &format!("{k}rsaVerifyPkcs1[n;e;`sha256;dg;s]")), "0b");
+    }
+
+    /// The three PSS encoding rules that are easy to skip, each one broken on its own in a block
+    /// that is otherwise exactly PSS_HAND — which verifies, so the broken bit is the only change.
+    #[test]
+    fn pss_encoding_rules_are_enforced() {
+        let mut v = rsa_vm();
+        for (what, sig) in [
+            ("0xbc trailer", PSS_TRAIL),
+            ("the leftmost 8*emLen-emBits bits of maskedDB", PSS_TOPBIT),
+            ("the zero padding before DB's 0x01 separator", PSS_PS),
+        ] {
+            let src = format!("{}rsaVerifyPss[n;e;dg;s]", key(sig));
+            assert_eq!(tests::ev(&mut v, &src), "0b", "ignored {what}");
+        }
+    }
+
+    /// A bad signature is an answer (0b); a missing key is a bug at the call site, and signals.
+    #[test]
+    fn empty_key_material_signals() {
+        let mut v = rsa_vm();
+        let k = key(SIG_PKCS1);
+        assert_eq!(tests::ev(&mut v, &format!("{k}rsaVerifyPkcs1[0x;e;`sha256;dg;s]")), "'rsa: modulus is empty");
+        assert_eq!(tests::ev(&mut v, &format!("{k}rsaVerifyPss[n;0x;dg;s]")), "'rsa: exponent is empty");
+    }
+
+    /// e = 65537 is sixteen squarings and two multiplies, so the whole verification is about twenty
+    /// 2048-bit Montgomery multiplications plus the one division that makes R^2 mod N. The bound is
+    /// loose — the number in the log is the point.
+    #[test]
+    fn rsa2048_verification_time() {
+        let mut v = rsa_vm();
+        let src = format!("{}t0: now`time; do[20; rsaVerifyPkcs1[n;e;`sha256;dg;s]]; `int$now[`time]-t0", key(SIG_PKCS1));
+        let ms: f64 = tests::ev(&mut v, &src).parse().unwrap();
+        eprintln!("RSA-2048 PKCS#1 v1.5 verification: {:.1}ms", ms / 20.0);
+        assert!(ms < 4000.0, "an RSA-2048 verification took {}ms", ms / 20.0);
+    }
+}
+
 #[cfg(test)]
 mod boot {
     use super::*;
