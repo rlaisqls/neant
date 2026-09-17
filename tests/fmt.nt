@@ -34,14 +34,26 @@ teq["fmt untokenisable source"; nfmt "s: \"unterminated  "; "s: \"unterminated  
 teq["fmt empty"; nfmt ""; ""]
 
 // ---- the whole corpus.  There is no directory listing builtin, so the files are named (as in
-// tests/run.nt); a new .nt file in the repo belongs in this list.
+// tests/run.nt); a new .nt file in the repo belongs in this list.  The crypto modules were missing
+// from it -- every one of them was added after this test was written and none was registered -- so
+// they are all here now, together with the tests that go with them.
 fmtFiles: ()
 fmtFiles,: ,"src/neant/core/compile.nt"
 fmtFiles,: ,"src/neant/core/lex.nt"
 fmtFiles,: ,"src/neant/core/parse.nt"
+fmtFiles,: ,"src/neant/crypto/bignum.nt"
 fmtFiles,: ,"src/neant/crypto/crypto.nt"
+fmtFiles,: ,"src/neant/crypto/der.nt"
+fmtFiles,: ,"src/neant/crypto/ec.nt"
 fmtFiles,: ,"src/neant/crypto/ed25519.nt"
+fmtFiles,: ,"src/neant/crypto/p256.nt"
+fmtFiles,: ,"src/neant/crypto/p384.nt"
+fmtFiles,: ,"src/neant/crypto/rsa.nt"
+fmtFiles,: ,"src/neant/crypto/sha512.nt"
 fmtFiles,: ,"src/neant/crypto/tls.nt"
+fmtFiles,: ,"src/neant/crypto/tlsclient.nt"
+fmtFiles,: ,"src/neant/crypto/verify.nt"
+fmtFiles,: ,"src/neant/crypto/x509.nt"
 fmtFiles,: ,"src/neant/jit/arm64.nt"
 fmtFiles,: ,"src/neant/net/http.nt"
 fmtFiles,: ,"src/neant/stdlib/encode.nt"
@@ -53,13 +65,17 @@ fmtFiles,: ,"src/neant/stdlib/test.nt"
 fmtFiles,: ,"src/neant/tools/fmt.nt"
 fmtFiles,: ,"src/neant/tools/lsp.nt"
 fmtFiles,: ,"tests/fmt.nt"
+fmtFiles,: ,"tests/crypto.nt"
 fmtFiles,: ,"tests/json.nt"
+fmtFiles,: ,"tests/p256.nt"
+fmtFiles,: ,"tests/p384.nt"
 fmtFiles,: ,"tests/prelude.nt"
 fmtFiles,: ,"tests/regex.nt"
 fmtFiles,: ,"tests/run.nt"
 fmtFiles,: ,"tests/stdlib2.nt"
 fmtFiles,: ,"tests/table2.nt"
 fmtFiles,: ,"tests/table.nt"
+fmtFiles,: ,"tests/verify.nt"
 
 fmtSrc: {[p] "\n" sv read0 p}
 // the token stream with the line each token starts on — everything nparse reads, so equal here
