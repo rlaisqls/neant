@@ -29,7 +29,7 @@ BTXS:   unhex "5edb82e2616d6cfb93e03cda4fecce3da94951f5ed1a8704a352a1733ed008c9"
 BTXRX:  unhex "ffffffff00000000ffffffffffffffffe82590f7fc7a57b1b23ed796e0a2a244"
 
 // ---- the lane-major arithmetic itself, against bignum.nt on the same numbers. This is cheap --
-// no ladder runs -- and it is where a carry or a conditional subtraction that is wrong shows up as
+// no ladder runs — and it is where a carry or a conditional subtraction that is wrong shows up as
 // a number rather than as a signature that mysteriously does not verify. The values include the
 // ones the branches turn on: zero, one, p-1 (so a+b wraps and a-b borrows) and a full-width pair.
 btC: bfCtx P256C`p

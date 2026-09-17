@@ -154,8 +154,8 @@
 // ---- lane-major values -------------------------------------------------------------------------
 // A batched value is `limbs` int vectors: column j holds limb j of every lane, so lane l's number is
 // {col[l]} each cols and an operation on all the lanes' limb j is one vector operation. Everything
-// below carries its modulus in a context record with bignum.nt's names -- `p the modulus in limbs,
-// `np its -N^-1 mod 2^26, `r2 R^2 mod N and `one R mod N -- so the same arithmetic runs mod p for
+// below carries its modulus in a context record with bignum.nt's names — `p the modulus in limbs,
+// `np its -N^-1 mod 2^26, `r2 R^2 mod N and `one R mod N — so the same arithmetic runs mod p for
 // the curve and mod n for the scalars. P256C is already such a record; bfCtx builds the one for n.
 bfCtx: {[M]
   np: bnMontInv M[0]
@@ -176,7 +176,7 @@ bfCat:   {[A;B] {[u;v] u,v}'[A;B]}                           // A's lanes then B
 // about 13% and cost exactly that.
 //
 // One carry pass, low column to high, each limb down to 26 bits. The columns may hold anything an
-// i64 can: bfMul's are under 2^56.4. Unlike bnCarry this does not iterate -- one pass over columns
+// i64 can: bfMul's are under 2^56.4. Unlike bnCarry this does not iterate — one pass over columns
 // that carry a scalar upward settles it, because the carry out of a column is at most 2^38 and the
 // column above has 2^62 of room.
 bfCarryCols: {[T]
@@ -185,8 +185,8 @@ bfCarryCols: {[T]
   T,,c}
 
 // One conditional subtraction of the modulus: R is nl carried columns plus a 0/1 top column, and
-// the value is below 2N. The borrow chain runs to the end whatever the lanes hold -- t band BNM is
-// the right limb for a negative t too, two's complement being what band reads -- and then the sign
+// the value is below 2N. The borrow chain runs to the end whatever the lanes hold — t band BNM is
+// the right limb for a negative t too, two's complement being what band reads — and then the sign
 // of the last borrow against the top column picks, per lane, between R and R-N.
 bfCondSub: {[C;R;top]
   nl: count C`p; P: C`p
@@ -254,8 +254,8 @@ bfEq: {[A;B]
 bfSel: {[s;A;B] {[m;a;b] b + m*a-b}[s]'[A;B]}
 
 // ---- one modular inversion for the whole batch -------------------------------------------------
-// Montgomery's trick as a binary product tree. Lanes are multiplied pairwise up the tree -- N/2
-// lanes, then N/4, down to one -- the single product at the root is inverted once with bignum.nt's
+// Montgomery's trick as a binary product tree. Lanes are multiplied pairwise up the tree — N/2
+// lanes, then N/4, down to one — the single product at the root is inverted once with bignum.nt's
 // Fermat exponentiation, and the inverse is pushed back down, each level's inverse times the other
 // half giving this half's. About three full-width batched multiplications and one scalar inversion
 // for the whole batch, against one 415-multiplication exponentiation per signature; and halving a
@@ -374,7 +374,7 @@ bfBit: {[U;i] 1 band U[i div BNB] shr i mod BNB}
 
 // The per-signature checks that are decisions rather than arithmetic: r and s in [1,n-1], the
 // digest the right length, the public key an on-curve uncompressed point with both coordinates
-// below p -- ec.nt's own ecPoint, so there is one copy of that check in the tree. () is no, for
+// below p — ec.nt's own ecPoint, so there is one copy of that check in the tree. () is no, for
 // every reason, exactly as ec.nt's ecVerify answers 0b for every reason. One list argument because
 // `@` below applies it to one, and `@` is here for the same belt-and-braces ec.nt wraps its own
 // exports in: bignum.nt signals on an operand wider than it can multiply exactly, and a signature
@@ -393,7 +393,7 @@ bqLane: {[a]
   (rv; sd; bnMod[bnFromBytes dg; C`n]; Q[0]; Q[1])}
 
 // A lane that bqLane refused is answered 0b without the batch ever seeing it, and is filled with a
-// well-formed stand-in -- r = s = e = 1 and Q = G -- so that the lanes around it still step
+// well-formed stand-in — r = s = e = 1 and Q = G — so that the lanes around it still step
 // together. The stand-in cannot change any other lane's answer: no lane's arithmetic reads another
 // lane, and its own answer was already decided here.
 bqPrep: {[C;keys;digests;sigs]
@@ -442,7 +442,7 @@ bqTable: {[C;T1;T2]
 
 // The whole batch, as one answer per signature. The order is: the per-signature refusals, then the
 // scalars (one inversion mod n for the batch, then u1 = e*w and u2 = r*w and their bits), then the
-// table, then the ladder, then the projective comparison -- and finally the handful of lanes, if
+// table, then the ladder, then the projective comparison — and finally the handful of lanes, if
 // any, that the mixed addition could not compute, answered by ec.nt's scalar verifier.
 bqVerify: {[C;keys;digests;sigs]
   nn: count sigs
@@ -479,7 +479,7 @@ bqVerify: {[C;keys;digests;sigs]
 
 // ---- the exports -------------------------------------------------------------------------------
 // A DER signature that does not parse is a lane answered 0b, exactly as ecdsaVerifyP256Der answers
-// it: the zero r below fails bqPrep's range check and nothing about it reaches the arithmetic.
+// it: the zero r below fails bqLane's range check and nothing about it reaches the arithmetic.
 bqDerSplit: {[sigs] {[d] rs: @[ecSigRS; d; {()}]; $[2 = count rs; rs; (0x00;0x00)]} each sigs}
 
 batchVerifyP256:    {[keys;digests;sigs] all 0 < bqVerify[P256C;keys;digests;sigs]}
@@ -513,7 +513,7 @@ BATCHNT: "src/neant/crypto/batch.nt"
 // Threads cost lanes, too: a batch split k ways has k times fewer lanes per vector operation, and
 // the dispatch is amortised over those lanes, so splitting ONE batch k ways is worth far less than
 // k. Measured on the 512-signature corpus: 2512 ms in one thread, 1818 ms split four ways (1.38x),
-// 1967 ms split twenty (1.29x) -- four threads beat twenty. This entry point is for a caller who has
+// 1967 ms split twenty (1.29x) — four threads beat twenty. This entry point is for a caller who has
 // one batch and wants it sooner; twenty INDEPENDENT batches is the shape that scales, and that is
 // the twenty-thread column in the header's table.
 batchVerifyP256Par: {[keys;digests;sigs;nthr]
