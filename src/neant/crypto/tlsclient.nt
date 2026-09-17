@@ -1,0 +1,24 @@
+// The whole TLS 1.3 client in one load, because ten files in the right order is a list a caller
+// gets wrong before they get anything else wrong:
+//   load "src/neant/crypto/tlsclient.nt"
+//   h: tlsConnect["example.com"; 443]
+//
+// This is the ONLY thing in this file. It adds no function, no constant and no behaviour; every
+// module below still stands on its own and still documents its own dependencies in its own header,
+// and a program that wants only the hash, only the bignums or only one curve should load exactly
+// those and not this. Nothing here is in the boot image either — `load` is a runtime call, so this
+// file costs whatever the ten cost and nothing more.
+//
+// The order is the dependency order and it matters: bignum before anything that multiplies, sha512
+// before rsa (which needs sha384 for the SHA-384 DigestInfo and MGF1), der before ec and x509,
+// ec before the two curves, and verify before tls.
+load "src/neant/crypto/bignum.nt"
+load "src/neant/crypto/sha512.nt"
+load "src/neant/crypto/rsa.nt"
+load "src/neant/crypto/der.nt"
+load "src/neant/crypto/ec.nt"
+load "src/neant/crypto/p256.nt"
+load "src/neant/crypto/p384.nt"
+load "src/neant/crypto/x509.nt"
+load "src/neant/crypto/verify.nt"
+load "src/neant/crypto/tls.nt"
