@@ -24,7 +24,9 @@ teq["httpAbs keeps a nonstandard port"; httpAbs["http://a.com:8080/x"; "/z"]; "h
 
 // ---- against a real socket.  httpRaw answers one request with a fixed byte string, so a response
 // this client has to parse can be written out exactly as it goes on the wire.
-httpPort: 18500
+// a fixed base would collide with a leftover listener from an interrupted run, and src/prims.rs has
+// no way to ask a listener which port it got, so the base is randomised instead
+httpPort: 18000+first 1 rand 40000
 httpNext: {[] httpPort:: httpPort+1; "127.0.0.1:",string httpPort}
 httpRaw: {[addr;resp] l: hlisten addr; spawn {c: accept l; hrecv[c;65536]; hsend[c;resp]; hclose c; hclose l; 0}}
 httpOne: {[resp] a: httpNext[]; h: httpRaw[a;resp]; r: httpFetch["http://",a,"/"; "GET"; ()!(); ""]; join h; r}
@@ -113,3 +115,57 @@ teq["reuse: first exchange"; `char$(httpExchange[httpC; httpU; "GET"; "/a"; ()!(
 teq["reuse: second exchange on the same connection"; `char$(httpExchange[httpC; httpU; "GET"; "/b"; ()!(); ""])`body; ,"1"]
 teq["reuse: the server saw two requests"; join httpS; 2]
 (httpC 2)[]
+
+// ---- server keep-alive: several requests on one connection, and the ways it ends.
+// These serve ONE connection and then stop, rather than httpServe's endless accept loop, so the
+// listener is closed and the thread is joinable — a test that leaks a listener makes every later
+// run of this file fail on the port.
+httpKA: {[handler]
+  a: httpNext[]
+  l: hlisten a
+  h: spawn {c: httpConn accept l; n: httpServeConn[c;handler]; (c 2)[]; hclose l; n}
+  (a; h)}
+httpEcho: {[req] (200;"OK";()!();"got ",req`path)}
+
+ka: httpKA httpEcho
+httpC: httpPlain hopen ka 0
+httpU: urlParse "http://",(ka 0),"/"
+teq["keep-alive: request 1"; `char$(httpExchange[httpC; httpU; "GET"; "/a"; ()!(); ""])`body; "got /a"]
+teq["keep-alive: request 2 on the same connection"; `char$(httpExchange[httpC; httpU; "GET"; "/b"; ()!(); ""])`body; "got /b"]
+teq["keep-alive: request 3"; `char$(httpExchange[httpC; httpU; "GET"; "/c"; ()!(); ""])`body; "got /c"]
+teq["the server framed each reply with a Content-Length"; `int$((httpExchange[httpC; httpU; "GET"; "/dd"; ()!(); ""])`headers) HTTPCL; 7]
+(httpC 2)[]
+teq["the server loop ended when the client went away"; join ka 1; 0]
+
+// a body on one request must not be read as part of the next
+ka: httpKA {[req] (200;"OK";()!();(req`path),"=",`char$req`body)}
+httpC: httpPlain hopen ka 0
+httpU: urlParse "http://",(ka 0),"/"
+teq["a request body stays with its own request"; `char$(httpExchange[httpC; httpU; "POST"; "/p1"; ()!(); "one"])`body; "/p1=one"]
+teq["and the next request reads its own"; `char$(httpExchange[httpC; httpU; "POST"; "/p2"; ()!(); "twotwo"])`body; "/p2=twotwo"]
+(httpC 2)[]
+join ka 1
+
+// a request that asks to close gets the connection closed
+ka: httpKA httpEcho
+httpC: httpPlain hopen ka 0
+httpU: urlParse "http://",(ka 0),"/"
+teq["Connection: close is answered"; `char$(httpExchange[httpC; httpU; "GET"; "/x"; (,`connection)!(,"close"); ""])`body; "got /x"]
+teq["and then the connection really is closed"; 0=count (httpC 0)[]; 1b]
+(httpC 2)[]
+join ka 1
+
+// so does a handler that answers Connection: close
+ka: httpKA {[req] (200;"OK";(,`connection)!(,"close");"bye")}
+httpC: httpPlain hopen ka 0
+httpU: urlParse "http://",(ka 0),"/"
+teq["a handler can close the connection"; `char$(httpExchange[httpC; httpU; "GET"; "/y"; ()!(); ""])`body; "bye"]
+teq["and it is closed after that response"; 0=count (httpC 0)[]; 1b]
+(httpC 2)[]
+join ka 1
+
+// HTTP/1.0 closes unless it asks not to
+teq["1.1 keeps the connection"; httpKeep `version`headers!("HTTP/1.1"; ()!()); 1b]
+teq["1.1 closes when asked"; httpKeep `version`headers!("HTTP/1.1"; (,`connection)!(,"close")); 0b]
+teq["1.0 closes by default"; httpKeep `version`headers!("HTTP/1.0"; ()!()); 0b]
+teq["1.0 keeps when asked"; httpKeep `version`headers!("HTTP/1.0"; (,`connection)!(,"keep-alive")); 1b]

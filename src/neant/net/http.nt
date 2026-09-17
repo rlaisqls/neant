@@ -5,18 +5,21 @@
 //   r`status                                       // 200
 //   `char$r`body                                   // the body, as text
 //
-// A connection is a triple of functions — (read; write; close) — where read[] gives the next bytes
-// and empty means end of stream, write[bytes] sends, and close[] tears down. `httpPlain h` makes
-// one over an hopen/accept handle and `httpTls h` over a tlsConnect handle, and everything else
-// here is written against the triple, so the client and the server both speak either transport.
-// That is the whole of what HTTPS needed: src/neant/crypto/tls.nt's tlsSend/tlsRecv have exactly
-// the shape hsend/hrecv have.
+// A connection is (read; write; close; pending) — read[] gives the next bytes and empty means end
+// of stream, write[bytes] sends, close[] tears down, and pending is a `shared` cell holding bytes
+// read past the end of the last message. `httpPlain h` makes one over an hopen/accept handle and
+// `httpTls h` over a tlsConnect handle, and everything else here is written against that, so the
+// client and the server both speak either transport. That is the whole of what HTTPS needed:
+// src/neant/crypto/tls.nt's tlsSend/tlsRecv have exactly the shape hsend/hrecv have.
+//
+// The pending buffer is what makes a connection reusable in both directions: finding the end of a
+// header block means reading past it, and those bytes are the next message's. Without somewhere to
+// put them, a second request or response on the same connection loses its first bytes.
 //
 // Bodies are BYTES, not text, in both directions: a response may be gzip, an image or any other
 // binary, and decoding that as UTF-8 corrupts it. `char$ a body when you know it is text.
 //
-// Scope: no keep-alive on the server side (it closes after one response) though the client side
-// reuses a connection happily (httpOpen/httpExchange); no multipart; no compression, so nothing
+// Scope: no pipelining (a request is answered before the next is read); no multipart; no compression, so nothing
 // here sends Accept-Encoding and a server that ignores that and gzips anyway hands back bytes this
 // does not decode; no cookies; no proxy support; and no TLS server side, so httpServe is plaintext
 // until src/neant/crypto/tls.nt grows a server handshake.
@@ -27,9 +30,12 @@ HTTPCL: `$"content-length"
 HTTPTE: `$"transfer-encoding"
 
 // ---- transports
-httpPlain: {[h] ({[] hrecv[h;65536]}; {[d] hsend[h;d]}; {[] hclose h})}
-httpTls: {[h] ({[] tlsRecv h}; {[d] tlsSend[h;d]}; {[] tlsClose h})}
+httpPlain: {[h] ({[] hrecv[h;65536]}; {[d] hsend[h;d]}; {[] hclose h}; shared 0x)}
+httpTls: {[h] ({[] tlsRecv h}; {[d] tlsSend[h;d]}; {[] tlsClose h}; shared 0x)}
 httpConn: {$[`int=@x; httpPlain x; x]}
+// take everything buffered, then read from the transport; give back what a message did not consume
+httpTake: {[c] b: sget c 3; if[count b; sset[c 3; 0x]]; b}
+httpPush: {[c;b] sset[c 3; b]; 0}
 
 // ---- byte-buffer reading.  The header block has to be found before its length is known, so these
 // read ahead into a buffer and hand back what is left over for the next read to continue from.
@@ -41,23 +47,23 @@ httpFind: {[b;p] n: count p; m: (count b)-n; i: 0
 httpUntil: {[rd;buf;p]
   i: httpFind[buf;p]
   while[i<0
-    c: rd[]
-    if[0=count c; :(-1; buf)]
-    buf,: c
+    b: rd[]
+    if[0=count b; :(-1; buf)]
+    buf,: b
     i: httpFind[buf;p]]
   (i; buf)}
 // the buffer with at least n bytes in it, or short when the stream ended
 httpAtLeast: {[rd;buf;n]
   while[(count buf)<n
-    c: rd[]
-    if[0=count c; :buf]
-    buf,: c]
+    b: rd[]
+    if[0=count b; :buf]
+    buf,: b]
   buf}
 httpToEnd: {[rd;buf]
   while[1
-    c: rd[]
-    if[0=count c; :buf]
-    buf,: c]
+    b: rd[]
+    if[0=count b; :buf]
+    buf,: b]
   buf}
 
 // ---- headers
@@ -142,7 +148,7 @@ httpRequest: {[c;method;target;hdrs;body]
 // -> `status`reason`headers`body!(int; string; dict keyed by lowercased symbol; bytes)
 httpResponse: {[c;method]
   rd: c 0
-  r: httpUntil[rd; 0x; HTTPEND]
+  r: httpUntil[rd; httpTake c; HTTPEND]
   if[r[0]<0; signal "http: connection closed before the response headers"]
   buf: r[1]
   ls: vs["\r\n"; `char$buf[til r[0]]]
@@ -156,9 +162,10 @@ httpResponse: {[c;method]
   // RFC 9112 §6.3: these never carry a body, whatever the headers say
   none: $[(httpStr method)~"HEAD"; 1b; $[status in 204 304; 1b; status<200]]
   body: 0x
+  if[none; httpPush[c;rest]]
   if[not none
-    if[ch; body: first httpDechunk[rd;rest]]
-    if[$[ch; 0b; not cl<0]; body: cl#httpAtLeast[rd;rest;cl]]
+    if[ch; d: httpDechunk[rd;rest]; body: d 0; httpPush[c; d 1]]
+    if[$[ch; 0b; not cl<0]; rest: httpAtLeast[rd;rest;cl]; body: cl#rest; httpPush[c; cl _ rest]]
     if[$[ch; 0b; cl<0]; body: httpToEnd[rd;rest]]]
   `status`reason`headers`body!(status; " " sv 2_sl; hdrs; body)}
 
@@ -205,7 +212,7 @@ httpPost: {[url;hdrs;body] httpFetchN[url;"POST";hdrs;body;5]}
 httpRecv: {[h]
   c: httpConn h
   rd: c 0
-  r: httpUntil[rd; 0x; HTTPEND]
+  r: httpUntil[rd; httpTake c; HTTPEND]
   if[r[0]<0; signal "http: connection closed before headers"]
   buf: r[1]
   ls: vs["\r\n"; `char$buf[til r[0]]]
@@ -216,23 +223,47 @@ httpRecv: {[h]
   ch: httpChunked hdrs
   cl: $[httpHas[hdrs;HTTPCL]; `int$httpStr hdrs HTTPCL; 0]
   body: 0x
-  if[ch; body: first httpDechunk[rd;rest]]
-  if[$[ch; 0b; cl>0]; body: cl#httpAtLeast[rd;rest;cl]]
+  if[ch; d: httpDechunk[rd;rest]; body: d 0; httpPush[c; d 1]]
+  if[$[ch; 0b; cl>0]; rest: httpAtLeast[rd;rest;cl]; body: cl#rest; httpPush[c; cl _ rest]]
+  if[$[ch; 0b; not cl>0]; httpPush[c;rest]]
   q: (rl 1)?"?"
   `method`target`path`query`version`headers`body ! (rl 0; rl 1; urldec q#rl 1; qparse (q+1)_rl 1; rl 2; hdrs; body)}
 
 /// Writes a response: status (int), reason (string), headers (dict, any key type stringifies),
 // body (string or bytes — sent as-is after the headers).
+// A reply on a connection that stays open has to say where it ends, so Content-Length is filled in
+// when the handler did not set it and the response is not chunked.
 httpSend: {[h;status;reason;headers;body]
   c: httpConn h
   body: $[`byte=@body; body; `byte$httpStr body]
+  hs: headers
+  if[not httpChunked hs; if[not HTTPCL in key hs; hs[HTTPCL]: count body]]
   statusLine: "HTTP/1.1 ",(string status)," ",httpStr reason
-  head: sv["\r\n"; (enlist statusLine),(httpLines headers),(enlist "")]
+  head: sv["\r\n"; (enlist statusLine),(httpLines hs),(enlist "")]
   (c 1)[(`byte$head,"\r\n"),body]}
 
-/// `httpServe[l;handler]`: accepts forever, one spawned worker per connection. `handler` is
-// `req -> (status;reason;headers;body)`, called with `httpRecv`'s dict.
+// Does this request want the connection kept open?  HTTP/1.1 keeps it unless asked not to, 1.0
+// closes it unless asked to keep it — and a handler can override by answering `Connection: close`.
+httpKeep: {[req]
+  v: lower httpStr httpVal[req`headers; `connection; ""]
+  if[not (httpFind[`byte$v; `byte$"close"])<0; :0b]
+  $[(req`version)~"HTTP/1.0"; not (httpFind[`byte$v; `byte$"keep-alive"])<0; 1b]}
+
+/// `httpServe[l;handler]`: accepts forever, one spawned worker per connection, and serves requests
+// on that connection until either side is done with it. `handler` is `req -> (status;reason;headers;body)`,
+// called with `httpRecv`'s dict.  A handler that answers `Connection: close` gets the connection
+// closed after that response; so does a request that asked for it, a malformed one, and end of stream.
 httpServe: {[l;handler]
   while[1
     c: accept l
-    spawn {r: handler httpRecv c; httpSend[c;r[0];r[1];r[2];r[3]]; hclose c}]}
+    spawn {httpServeConn[httpConn c; handler]; hclose c}]}
+
+httpServeConn: {[c;handler]
+  while[1
+    q: @[httpRecv; c; {[e] `httpdone}]
+    if[`httpdone~q; :0]
+    r: handler q
+    httpSend[c; r 0; r 1; r 2; r 3]
+    if[not httpKeep q; :0]
+    if[not (httpFind[`byte$lower httpStr httpVal[r 2; `connection; ""]; `byte$"close"])<0; :0]]
+  0}
