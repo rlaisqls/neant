@@ -597,6 +597,17 @@ read and overwrite it, but only `supd[s;f]` is atomic — it holds the lock for 
 concurrent `supd`s on the same cell serialize instead of losing an update the way `sset[s; f sget s]`
 would if two threads interleaved between the get and the set.
 
+**What it costs.** "No lock" is true and is not the same as free. `Value` held an `Rc` before `spawn`
+existed, and crossing a thread needs `Send`, so every refcount became an atomic read-modify-write
+instead of a plain increment. Refcount traffic through the operand stack is about 35% of samples
+("Performance"), and making that traffic 2–3x dearer per operation costs **~13% of single-threaded
+throughput**: the same 64KB SHA-256 measures 196ms at `c49736a` and 221ms at its child `fbdeb99`, the
+commit that did the conversion, and is flat from there to today. That is the price of the whole
+concurrency story above, paid by every program whether it spawns anything or not. It is not cheaply
+recoverable — reverting loses threads and biased refcounting is a pile of `unsafe` — and the lever
+that does work is making fewer `Value` clones rather than cheaper ones, which is what the JIT does by
+never touching a `Value` at all inside compiled code.
+
 ## Gotchas (shared with q)
 
 - `i+1<n` is `i+(1<n)`. Write `(i+1)<n`. Every comparison inside arithmetic needs parens.
@@ -993,9 +1004,10 @@ Those absolute figures are **not reproducible on the machine this is developed o
 read as ratios only. `crypto.nt` has not changed since (only the move into `src/neant/crypto/`), and
 checking out that same commit here measures SHA-256 at 195ms per 64KB rather than 119ms — so the
 numbers above came from different hardware. Measured here today: SHA-256 **220ms** per 64KB
-(0.22ms/block), ChaCha20-Poly1305 **22ms** per 10KB, X25519 **48ms**. The 195ms → 220ms between that
-commit and now is a real 13% drift on this box, unexplained and not yet chased; it is small next to
-the gap to the figures above, which is hardware.
+(0.22ms/block), ChaCha20-Poly1305 **22ms** per 10KB, X25519 **48ms**. The 196ms → 221ms between that
+commit and now is real, and it is one commit: `fbdeb99`, which converted `Value` from `Rc` to `Arc`
+so that `spawn` could exist. Everything after it is flat. See "Concurrency" for the trade — it is the
+price of threads, not a regression anyone can take back.
 
 Runtime errors carry a line table, which costs ~10% of compile throughput. A frame is named by its
 caller's `LoadG`, so the bytecode carries positions but no names.
