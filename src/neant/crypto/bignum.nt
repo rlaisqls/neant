@@ -6,16 +6,27 @@
 // the TLS wire hand you. Inside, a number is a list of ints holding 26-bit limbs, least significant
 // first, the same shape poly1305 uses in crypto.nt. Leading zero limbs are trimmed; zero is `,0`.
 //
-// Why 26 bits: a limb product is < 2^52, and bnMul forms one column of the schoolbook product with
-// a single vectorised `acc[i+til nb] +: a[i]*b` exactly as fmul does — a column takes min(na;nb) of
-// those products, so it stays under min(na;nb)*2^52 with no carries in between. An int is an i64,
-// so 1023 products still fit under 2^62 and leave bnMontMul's carry (< 2^33) room on top; bnMul
-// refuses anything wider. 1023 limbs is 26598 bits, five times an RSA-4096 modulus. Carries are not
-// propagated per product: bnCarry runs them as vector passes afterwards, fmul's trick again.
+// Why 26 bits: a limb product is < 2^52, and a column of the schoolbook product accumulates
+// min(na;nb) of them with no carries in between, so it stays under min(na;nb)*2^52. An int is an
+// i64, so 1023 products still fit under 2^62 and leave bnMontMul's carry (< 2^33) room on top;
+// bnMul refuses anything wider. 1023 limbs is 26598 bits, five times an RSA-4096 modulus. Carries
+// are not propagated per product: bnCarryL runs them in one pass afterwards.
+//
+// EVERY INNER LOOP HERE IS A SCALAR LOOP OVER LIMBS, and that is deliberate — see README "Stage 2"
+// and "the bignum arithmetic runs as compiled scalar loops". This file used to be written as vector
+// column operations (`acc[i+til nb] +: a[i]*b`, one per limb of a), which is the fastest shape an
+// interpreter has and the slowest thing to hand a JIT: each one allocates intermediates and makes
+// several passes over memory, and none of them is a loop the whole-function tier can take. Written
+// as `while` loops over `x[i]` instead — with the index inlined, a written vector uniquely owned at
+// entry, a vector as a return value and `band`/`shr` as instructions — the same arithmetic compiles
+// to machine code and runs about ten times faster. The names ending in L are those kernels; bnMulV,
+// bnMontMulV and bnCarryV are the vector forms they replaced, kept because tests/bignum.nt checks
+// thousands of random operands against them. bnWarm at the bottom is why they are compiled before
+// the first caller needs them.
 //
 // Montgomery, not Barrett, for bnModExp: with e = 65537 a verification is 16 squarings and 2
-// multiplies, and REDC is n rounds of that same vectorised multiply-accumulate plus one scalar
-// carry, so a modmul is 2n vector ops and no division at all. Barrett would need two n-limb
+// multiplies, and REDC is n rounds of the same multiply-accumulate plus one scalar carry, so a
+// modmul is 2n^2 limb products and no division at all. Barrett would need two n-limb
 // multiplications per reduction *and* a mu = floor(b^2k / N) that only a general division can
 // produce. The division is written here anyway (bnDivMod, Knuth 4.3.1D) because R^2 mod N has to
 // come from somewhere and because bnMod should work for any modulus — but it runs twice per
@@ -30,56 +41,140 @@ BNBIAS: 4503599627370496            // 2^52, a base multiple: keeps bnMontInv's 
 BNZERO: ,0
 
 // ---- shape
-bnTrim: {[v] n: count v; while[(n>1) & 0 = v[n-1]; n: n-1]; n#v}
+bnTrimL: {[v;n] i: n; while[(1<i) & 0=v[i-1]; i: i-1]; i}   // the kept length, not the value
+bnTrim: {[v] (bnTrimL[v; count v])#v}
 bnPad:  {[v;n] $[n < count v; v; v, (n-count v)#0]}       // to at least n limbs; never truncates
 // carry pass over limbs that may hold anything up to ~2^59, e.g. straight out of bnMul's acc.
 // One pass moves each carry up one limb, so it repeats until nothing is left; the sum of the limbs
 // strictly drops whenever a carry is nonzero, which is why it terminates.
-bnCarry: {[v]
+bnCarryV: {[v]
   c: v shr BNB
   while[0 < |/c
     if[0 < last c; v,: 0; c,: 0]                          // a carry off the top needs a new limb
     v: (v band BNM) + 0,-1_c
     c: v shr BNB]
   v}
+// The same thing as one sequential pass, which is what the JIT compiles (see "the limb kernels"
+// below): a running carry means each limb is settled once instead of once per round. Two zero
+// limbs of headroom are enough for whatever comes out the top — a limb is under 2^59, so the
+// carry out of it is under 2^33 and takes 26 bits and then 7.
+bnCarryL: {[v;n;msk;sh]
+  c: 0
+  i: 0
+  while[i<n
+    t: c + v[i]
+    v[i]: t band msk
+    c: t shr sh
+    i: i+1]
+  v}
+bnCarry: {[v] bnCarryL[v,0 0; (count v)+2; BNM; BNB]}
 bnIsZero: {[v] (1 = count bnTrim v) & 0 = v[0]}
 // bit length; 0 for zero
 bnBits: {[v] v: bnTrim v; t: v[(count v)-1]; k: 0
   while[t>0; t: t shr 1; k+:1]
   (BNB * (count v)-1) + k}
-// -1 / 0 / 1, like ed25519's scGe: the highest limb they differ in decides
-bnCmp: {[a;b]
-  n: (count a)|count b
-  d: bnPad[a;n] - bnPad[b;n]
-  i: where not d=0
-  $[0 = count i; 0; 0 < d[last i]; 1; -1]}
+// -1 / 0 / 1, like ed25519's scGe: the highest limb they differ in decides. A scalar walk down
+// from the top rather than the vector form (pad both, subtract, `where`, take the last): on the
+// ten-limb field of P-256 the allocations that form makes cost several times the comparison, and
+// a field operation makes three of them.
+bnCmpL: {[a;b;na;nb;n]
+  i: n
+  r: 0
+  while[(0<i) & r=0
+    i: i-1
+    x: $[i<na; a[i]; 0]
+    y: $[i<nb; b[i]; 0]
+    r: $[x<y; -1; y<x; 1; 0]]
+  r}
+bnCmp: {[a;b] na: count a; nb: count b; bnCmpL[a;b;na;nb;na|nb]}
 
 // ---- conversion. bytes are big-endian and limbs little-endian, so the byte list is reversed
-// first and laid out as one bit list least-significant-first, the way fdecode does it.
+// first; both directions are then a shift register — pull 8 bits in and push 26 out, or the other
+// way round — as a scalar loop the JIT compiles, rather than the bit-list-per-element form that
+// came before (which built two 2048-element lists and a lambda call per byte).
+bnPackL: {[out;src;nb;nl;msk;sh]
+  acc: 0
+  nbits: 0
+  shm: sh-1
+  i: 0
+  o: 0
+  while[i<nb
+    acc: acc bor (src[i]) shl nbits
+    nbits: nbits+8
+    while[shm<nbits                      // `not nbits<sh` would be a monad, which neither tier compiles
+      out[o]: acc band msk
+      o: o+1
+      acc: acc shr sh
+      nbits: nbits-sh]
+    i: i+1]
+  if[o<nl; out[o]: acc]
+  out}
 bnFromBytes: {[b]
   if[0 = count b; :BNZERO]
-  m: 8 * count b
-  n: BNB * ceiling m % BNB
-  bits: (raze {(x shr til 8) band 1} each `int$ reverse b), (n-m)#0
-  bnTrim {+/x*2^til BNB} each BNB cut bits}
+  nb: count b
+  nl: ceiling (8*nb) % BNB
+  bnTrim bnPackL[nl#0; `int$ reverse b; nb; nl; BNM; BNB]}
+// the other direction, least significant byte first — one limb is pulled in whenever fewer than
+// eight bits are left, which is always enough since a limb is wider than a byte
+bnUnpackL: {[out;v;nv;k;sh]
+  acc: 0
+  nbits: 0
+  i: 0
+  o: 0
+  while[o<k
+    if[(nbits<8) & i<nv
+      acc: acc bor (v[i]) shl nbits
+      nbits: nbits+sh
+      i: i+1]
+    out[o]: acc band 255
+    acc: acc shr 8
+    nbits: $[nbits<8; 0; nbits-8]
+    o: o+1]
+  out}
 // exactly k big-endian bytes, zero-padded on the left; signals when the value does not fit
 bnBytesN: {[v;k]
   if[k < ceiling (bnBits v) % 8; signal "bn: value needs more than k bytes"]
   if[k<1; :0x]                                            // only zero fits in no bytes at all
-  bits: (raze {(x shr til BNB) band 1} each v), (8*k)#0  // over-pad: `#` would cycle a short list
-  `byte$ reverse {+/x*2^til 8} each 8 cut (8*k)#bits}
+  `byte$ reverse bnUnpackL[k#0; v; count v; k; BNB]}
 bnBytes: {[v] bnBytesN[v; ceiling (bnBits v) % 8]}        // minimal form; zero is 0x
 
-// ---- add, subtract, compare-free shifts
-bnAdd: {[a;b] n: 1 + (count a)|count b; bnTrim bnCarry bnPad[a;n] + bnPad[b;n]}
+// ---- add, subtract, compare-free shifts. Both are one pass with a running carry (or borrow),
+// short enough that the operands are read straight where they are rather than padded to a common
+// width first — a pad is an allocation, and on P-256's ten limbs that is most of the cost.
+bnAddL: {[out;a;b;na;nb;n;msk;sh]
+  c: 0
+  i: 0
+  while[i<n
+    x: c
+    if[i<na; x: x + a[i]]
+    if[i<nb; x: x + b[i]]
+    out[i]: x band msk
+    c: x shr sh
+    i: i+1]
+  out}
+bnAdd: {[a;b] na: count a; nb: count b; n: 1 + na|nb; bnTrim bnAddL[n#0;a;b;na;nb;n;BNM;BNB]}
 // a-b, and a signal when that would go negative — callers here always know it does not.
-// The bias (2^26 at limb 0, 2^26-1 on every limb above it) is exactly 2^(26n), so every limb stays
-// non-negative while the value is a-b+2^(26n): the top limb comes out 1 iff a >= b.
+// The bias of one base per limb keeps every intermediate non-negative (`shr` is the raw logical
+// shift and there is no arithmetic one in the compiled subset), so bit 26 of the biased difference
+// is "this limb did not borrow"; the last borrow out is written past the result as 1 for a >= b.
+bnSubL: {[out;a;b;na;nb;n;msk;sh]
+  base: msk+1
+  c: 0
+  i: 0
+  while[i<n
+    x: base + c
+    if[i<na; x: x + a[i]]
+    if[i<nb; x: x - b[i]]
+    out[i]: x band msk
+    c: (x shr sh) - 1
+    i: i+1]
+  out[n]: 1+c
+  out}
 bnSub: {[a;b]
-  n: (count a)|count b
-  d: bnPad[a;n+1] - bnPad[b;n+1]
-  r: bnCarry d + ((BNBASE, (n-1)#BNM), 0)
-  if[not 1 = r[n]; signal "bn: subtraction would go negative"]
+  na: count a; nb: count b
+  n: na|nb
+  r: bnSubL[(n+1)#0; a; b; na; nb; n; BNM; BNB]
+  if[0 = r[n]; signal "bn: subtraction would go negative"]
   bnTrim n#r}
 bnShl: {[v;s] bnTrim bnCarry ((s div BNB)#0), v * 2^s mod BNB}
 bnShr: {[v;s]
@@ -89,15 +184,85 @@ bnShr: {[v;s]
   if[b>0; w: (w shr b) bor BNM band (1_w,0) shl BNB-b]   // the limb above slides its low bits down
   bnTrim w}
 
-// ---- multiply. One vector multiply-accumulate per limb of a, no carries until the end.
-bnMul: {[a;b]
+// ---- multiply. bnMulL is the schoolbook double loop over limbs, scalar, one limb product at a
+// time and no carries until the end — the shape the whole-function JIT compiles (see "the limb
+// kernels" below). bnMulV is the vector column form it replaced, one `acc[i+til nb] +: a[i]*b`
+// per limb of a, kept because the two must agree on every input and tests/bignum.nt checks that.
+bnMulL: {[acc;a;b;na;nb]
+  i: 0
+  while[i<na
+    ai: a[i]
+    j: 0
+    k: i                               // k is i+j carried along: the index is wanted twice an
+    while[j<nb                         // iteration and computing it costs as much as a product
+      acc[k]: (acc[k]) + ai*b[j]
+      k: k+1
+      j: j+1]
+    i: i+1]
+  acc}
+bnMulV: {[a;b]
   na: count a; nb: count b
-  if[1023 < na&nb; signal "bn: operands too wide for an exact column sum"]
   acc: (na+nb)#0
   i: 0
   while[i<na; acc[i+til nb]+: a[i]*b; i+:1]
   bnTrim bnCarry acc}
+bnMul: {[a;b]
+  na: count a; nb: count b
+  if[1023 < na&nb; signal "bn: operands too wide for an exact column sum"]
+  bnTrim bnCarry bnMulL[(na+nb)#0; a; b; na; nb]}
 bnMulSmall: {[v;k] bnTrim bnCarry v*k}                    // k < 2^26, so every product is < 2^52
+
+// ---- add and subtract MOD m, for operands already below m: the shape a prime field wants, and
+// where the arithmetic is ten limbs wide the allocations of doing it as an add, a compare and a
+// subtract cost several times the arithmetic. `out` is n limbs, m is the modulus's n limbs.
+bnAddModL: {[out;a;b;m;na;nb;n;msk;sh]
+  c: 0
+  i: 0
+  while[i<n
+    x: c
+    if[i<na; x: x + a[i]]
+    if[i<nb; x: x + b[i]]
+    out[i]: x band msk
+    c: x shr sh
+    i: i+1]
+  r: $[0<c; 1; 0]                       // a carry off the top settles it without comparing
+  j: n
+  while[(0<j) & r=0
+    j: j-1
+    x: out[j]
+    y: m[j]
+    r: $[x<y; -1; y<x; 1; 0]]
+  if[r>-1
+    c: 0
+    i: 0
+    while[i<n
+      x: ((msk+1) + c) + (out[i]) - m[i]
+      out[i]: x band msk
+      c: (x shr sh) - 1
+      i: i+1]]
+  out}
+bnSubModL: {[out;a;b;m;na;nb;n;msk;sh]
+  base: msk+1
+  c: 0
+  i: 0
+  while[i<n
+    x: base + c
+    if[i<na; x: x + a[i]]
+    if[i<nb; x: x - b[i]]
+    out[i]: x band msk
+    c: (x shr sh) - 1
+    i: i+1]
+  if[c<0                                // went below zero: one m back
+    c: 0
+    i: 0
+    while[i<n
+      x: (c + out[i]) + m[i]
+      out[i]: x band msk
+      c: x shr sh
+      i: i+1]]
+  out}
+bnAddMod: {[a;b;m] n: count m; r: bnAddModL[n#0;a;b;m;count a;count b;n;BNM;BNB]; (bnTrimL[r;n])#r}
+bnSubMod: {[a;b;m] n: count m; r: bnSubModL[n#0;a;b;m;count a;count b;n;BNM;BNB]; (bnTrimL[r;n])#r}
 
 // ---- divide: Knuth 4.3.1 algorithm D. bnDivMod[u;v] -> (quotient; remainder).
 // The estimated digit is corrected by comparing qhat*v against the working slice outright rather
@@ -107,6 +272,37 @@ bnDivSmall: {[u;d]                                   // one-limb divisor: (r*2^2
   n: count u; q: n#0; r: 0; i: n-1
   while[not i<0; t: (r*BNBASE) + u[i]; q[i]: t div d; r: t mod d; i: i-1]
   (bnTrim q; ,r)}
+// un[j..j+n] -= qh*vn, one limb at a time with a running borrow — Knuth's step D4, and the whole
+// cost of a division. `c` is the non-negative amount still owed to the next limb up: the product's
+// own carry plus one if this limb had to borrow, which the `base +` bias makes a test of bit 26
+// rather than a sign test (there is no arithmetic shift in the compiled subset, and `shr` is the
+// raw logical one). `c` stays at or under 2^26 all the way, so the top limb comes out
+// `base + true` in [0;2^27): D4's "went negative" is then `< base`, and because nothing ever reads
+// that limb again the bias never needs taking back out.
+bnMsubL: {[u;v;qh;j;n;msk;sh]
+  base: msk+1
+  c: 0
+  k: 0
+  while[k<n
+    p: c + qh*v[k]
+    t: (base + u[j+k]) - p band msk
+    u[j+k]: t band msk
+    c: (1 + p shr sh) - t shr sh
+    k: k+1]
+  u[j+n]: (base + u[j+n]) - c
+  u}
+// D6, the add-back: qh was one (or, without the three-limb refinement, two) too large, so put one
+// vn back and let the carry out of the top cancel that much of the borrow.
+bnAddBackL: {[u;v;j;n;msk;sh]
+  c: 0
+  k: 0
+  while[k<n
+    t: (c + u[j+k]) + v[k]
+    u[j+k]: t band msk
+    c: t shr sh
+    k: k+1]
+  u[j+n]: (u[j+n]) + c
+  u}
 bnDivMod: {[u0;v0]
   u: bnTrim u0; v: bnTrim v0
   if[bnIsZero v; signal "bn: divide by zero"]
@@ -124,11 +320,11 @@ bnDivMod: {[u0;v0]
   while[not j<0
     qh: ((un[j+n]*BNBASE) + un[(j+n)-1]) div vn[n-1]    // < 2^52 over >= 2^25: off by at most 2
     if[qh > BNM; qh: BNM]
-    p: bnPad[bnMulSmall[vn;qh]; n+1]
-    sl: un[j+til n+1]
-    while[0 < bnCmp[p;sl]; qh: qh-1; p: bnPad[bnSub[p;vn]; n+1]]
+    un: bnMsubL[un;vn;qh;j;n;BNM;BNB]
+    while[(un[j+n]) < BNBASE                            // subtracted too much: give one vn back
+      qh: qh-1
+      un: bnAddBackL[un;vn;j;n;BNM;BNB]]
     q[j]: qh
-    un[j+til n+1]: bnPad[bnSub[sl;p]; n+1]
     j: j-1]
   (bnTrim q; bnShr[bnTrim n#un; s])}
 bnMod: {[u;v] (bnDivMod[u;v])[1]}
@@ -144,9 +340,25 @@ bnMontInv: {[n0]
 // a*b*R^-1 mod N, for a,b < N. The product's low limbs are cleared one at a time: m makes limb i a
 // multiple of 2^26, and the one scalar carry out of it is the only carry the loop propagates —
 // every other limb grows unchecked (< 2^58.4 for a 2048-bit modulus) and is normalised at the end.
-bnMontMul: {[a;b;N;np]
+// bnRedcL is the reduction loop itself, scalar over limbs: for each i, the multiple of N that
+// clears limb i, then that multiple accumulated across N's limbs, then the one carry the loop
+// propagates. Same arithmetic as the vector form below, in the shape the JIT compiles.
+bnRedcL: {[t;N;np;n;msk;sh]
+  i: 0
+  while[i<n
+    m: msk band (t[i])*np
+    j: 0
+    k: i
+    while[j<n
+      t[k]: (t[k]) + m*N[j]
+      k: k+1
+      j: j+1]
+    t[i+1]: (t[i+1]) + (t[i]) shr sh
+    i: i+1]
+  t}
+bnMontMulV: {[a;b;N;np]
   n: count N
-  t: bnPad[bnMul[a;b]; (2*n)+1]
+  t: bnPad[bnMulV[a;b]; (2*n)+1]
   i: 0
   while[i<n
     m: BNM band t[i]*np
@@ -154,7 +366,44 @@ bnMontMul: {[a;b;N;np]
     t[i+1]+: t[i] shr BNB
     i+:1]
   r: bnCarry t[n+til n+1]
-  $[0 > bnCmp[r;N]; bnTrim r; bnTrim bnSub[r;N]]}     // < 2N, so one subtraction settles it
+  $[0 > bnCmp[r;N]; bnTrim r; bnTrim bnSub[r;N]]}
+// the tail: carry the reduced half in place, then the one conditional subtraction REDC needs —
+// the result is under 2N, so comparing and taking N off at most once settles it. All three passes
+// are in one kernel because each is n steps and a separate call, slice and allocation for each is
+// what a ten-limb field spends most of a multiply on.
+bnMontFinL: {[out;t;N;n;msk;sh]
+  hi: (2*n)+1
+  c: 0
+  i: n
+  while[i<hi
+    x: c + t[i]
+    out[i-n]: x band msk
+    c: x shr sh
+    i: i+1]
+  r: $[0<out[n]; 1; 0]
+  j: n
+  while[(0<j) & r=0
+    j: j-1
+    x: out[j]
+    c: N[j]
+    r: $[x<c; -1; c<x; 1; 0]]
+  if[r>-1
+    c: 0
+    i: 0
+    while[i<n
+      x: ((msk+1) + c) + (out[i]) - N[i]
+      out[i]: x band msk
+      c: (x shr sh) - 1
+      i: i+1]]
+  out}
+bnMontMul: {[a;b;N;np]
+  n: count N
+  // straight into the reduction: REDC wants limb i only mod 2^26 and shifts the rest up itself,
+  // so the product never needs carrying or trimming first. An uncarried limb is under 2^58.3 and
+  // the reduction adds n more products to it, which still leaves it under 2^59.4.
+  t: bnRedcL[bnMulL[((2*n)+1)#0; a; b; count a; count b]; N; np; n; BNM; BNB]
+  r: bnMontFinL[(n+1)#0; t; N; n; BNM; BNB]
+  (bnTrimL[r;n])#r}
 // exponent bits most-significant-first with the leading zeros gone
 bnExpBits: {[e] k: bnBits e; $[k=0; (); reverse k # raze {(x shr til BNB) band 1} each e]}
 // base^exp mod N on limbs. N odd and > 1.
@@ -179,3 +428,32 @@ bnModExp: {[bb;eb;mb]
   if[0 = N[0] band 1; signal "bn: even modulus, Montgomery reduction needs an odd one"]
   if[1 = bnBits N; :0x]                                   // mod 1 is 0 for every base
   bnBytes bnModExpL[bnFromBytes bb; bnFromBytes eb; N]}
+
+// ---- the limb kernels, and why they are called eighty times here for nothing.
+// bnMulL, bnRedcL and bnCarryL are the three loops the whole-function JIT compiles (README
+// "Stage 2"): scalar loops over `Ints` parameters, where `x[i]` and `x[i]:v` are a bounds check
+// and one instruction instead of the interpreter's dispatch and boxing, and where `band`/`shr`
+// are `and`/`lsr` rather than calls. That tier compiles a function after 64 calls, and one
+// RSA-2048 verification makes about twenty — so without this the first verification would run the
+// whole schoolbook product interpreted, which is much slower than the vector column form these
+// replaced, and only a caller doing thousands of modmuls (an ECDSA verification) would ever see
+// the compiled version at all. Eighty tiny calls at load is a few milliseconds once, and after it
+// every caller gets compiled arithmetic from its first multiply.
+bnWarm: {[]
+  do[80
+    bnMulL[4#0; 1 1; 1 1; 2; 2]
+    bnRedcL[5#0; 1 1; 1; 2; BNM; BNB]
+    bnCarryL[4#0; 4; BNM; BNB]
+    bnMsubL[4#0; 1 1; 1; 0; 2; BNM; BNB]
+    bnAddBackL[4#0; 1 1; 0; 2; BNM; BNB]
+    bnPackL[2#0; 1 1; 2; 2; BNM; BNB]
+    bnUnpackL[2#0; 1 1; 2; 2; BNB]
+    bnCmpL[1 1; 1 1; 2; 2; 2]
+    bnAddL[3#0; 1 1; 1 1; 2; 2; 3; BNM; BNB]
+    bnSubL[3#0; 1 1; 1 1; 2; 2; 2; BNM; BNB]
+    bnMontFinL[3#0; 5#0; 1 1; 2; BNM; BNB]
+    bnTrimL[1 1; 2]
+    bnAddModL[2#0; 1 1; 1 0; 1 1; 2; 2; 2; BNM; BNB]
+    bnSubModL[2#0; 1 1; 1 0; 1 1; 2; 2; 2; BNM; BNB]]
+  1b}
+bnWarm[]

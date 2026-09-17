@@ -75,6 +75,27 @@ mod native {
         /// read via `x[i]` or written via `x[i]:v` — see `try_run`/`try_run_raw` below for how
         /// these get a vector pointer instead of a plain int at entry.
         vec_slots: Vec<usize>,
+        /// The subset of `vec_slots` the body writes (`x[i]:v`). A written slot is made uniquely
+        /// owned at entry (`Arc::make_mut` on our own clone) so the inlined store below can write
+        /// straight into it: copy-on-write happens once, here, instead of on the first write from
+        /// inside the loop, and the data pointer then cannot move for the rest of the call.
+        vec_writes: Vec<usize>,
+        /// `Some(k)`: this function returns `vec_slots[k]`'s vector rather than an int — the
+        /// compiled code's x0 is a placeholder and the `Value` in `vecbuf` is the real result.
+        /// That is what lets a compiled function fill a vector at all, since nothing else it does
+        /// is visible to its caller (locals are never written back; see `run`).
+        ret_vec: Option<usize>,
+        /// `(global slot; the `&'static PrimDef` that slot held when this was compiled)` for every
+        /// bit builtin the body inlined as a machine instruction instead of a `jit_call`
+        /// (`band`/`bor`/`bxor`/`badd`/`shl`/`shr`). Those names are ordinary globals and can be
+        /// reassigned, so entry re-checks each one is still the same primitive; a rebound `band`
+        /// just means this function runs interpreted from then on.
+        prim_guards: Vec<(usize, i64)>,
+        /// True when the codegen used the inlined-vector-access layout: a vector slot's word in
+        /// `buf` is the element data pointer (not a `*mut Value`) and its length is in the
+        /// descriptor area at `buf[MAX_SLOTS + k]`. False for a backend that still calls the
+        /// `jit_vec_get`/`jit_vec_set` trampolines, which want the `*mut Value` there instead.
+        inline_vec: bool,
         entry: unsafe extern "C" fn(*mut i64, *mut i64, *mut Vm) -> i64,
     }
     unsafe impl Send for Compiled {}
@@ -106,6 +127,20 @@ mod native {
     /// a plain int (see `try_run`/`try_run_raw`) — capped separately from `MAX_SLOTS` since real
     /// functions have at most a couple of vector params/captures, never dozens.
     const MAX_VEC_SLOTS: usize = 8;
+    /// `buf` is `MAX_SLOTS` local words followed by one *descriptor* word per vector slot — its
+    /// element count, at `buf[MAX_SLOTS + k]` for the k'th entry of `vec_slots`. That is the whole
+    /// of what an inlined `x[i]` needs beyond the data pointer already in the slot's own word: a
+    /// bounds check and a scaled load, with no call. The codegen names this same base
+    /// (`jitVECBASE`, src/neant/jit/arm64.nt) and the two have to agree.
+    const BUFLEN: usize = MAX_SLOTS + MAX_VEC_SLOTS;
+
+    /// The six bit builtins a compiled body can inline as one machine instruction instead of a
+    /// `jit_call` — `x band y` and friends are ordinary two-argument calls to a global holding a
+    /// `Value::Prim`, so without this every limb mask and every shift in a compiled loop is a
+    /// trampoline call. Order is the kind code the codegen switches on; `compile` below resolves
+    /// each name to its global slot and hands the six slots over, and every function that inlines
+    /// one carries an entry guard that the slot still holds that exact primitive.
+    const BIT_PRIMS: [&str; 6] = ["badd", "band", "bor", "bxor", "shl", "shr"];
 
     impl Compiled {
         /// `None` means the entry guard failed (some arg/capture isn't the type its slot was
@@ -117,29 +152,58 @@ mod native {
         /// comment), so re-running from scratch is always safe.
         pub fn try_run(&self, loc: &[Value], vm: &mut Vm) -> Option<Value> {
             if loc.len() > MAX_SLOTS || self.vec_slots.len() > MAX_VEC_SLOTS { return None; }
+            if !self.prims_intact(vm) { return None; }
             // args (0..arity) and captures (nlocals..) must already be the right type; the slots
             // in between are the interpreter's own Null-until-first-StoreL scratch locals, which
             // the compilability check guarantees are always written before they're read (and,
             // separately, never classified as vector slots — see jitClassifySlots's own comment).
-            let mut buf = [0i64; MAX_SLOTS];
+            let mut buf = [0i64; BUFLEN];
             // Cloned (Arc bump) `Ints` values a vector-classified slot's pointer aims at, kept
             // alive here for exactly as long as `buf`'s pointers into it need to be — this same
             // stack frame, for the whole duration of `run` below.
             let mut vecbuf: [Value; MAX_VEC_SLOTS] = std::array::from_fn(|_| Value::Null);
-            let mut vk = 0usize;
             for (i, v) in loc.iter().enumerate() {
                 if i < self.arity || i >= self.nlocals {
-                    if self.vec_slots.contains(&i) {
+                    if let Some(k) = self.vec_slots.iter().position(|&s| s == i) {
                         let Value::Ints(_) = v else { return None };
-                        vecbuf[vk] = v.clone();
-                        buf[i] = &mut vecbuf[vk] as *mut Value as i64;
-                        vk += 1;
+                        vecbuf[k] = v.clone();
+                        buf[i] = self.bind_vec(&mut vecbuf[k], i, &mut buf[MAX_SLOTS + k]);
                     } else {
                         match v { Value::Int(n) if *n != crate::value::NI => buf[i] = *n, _ => return None }
                     }
                 }
             }
-            self.run(buf.as_mut_ptr(), vm).map(Value::Int)
+            let out = self.run(buf.as_mut_ptr(), vm)?;
+            // A vector-returning body's x0 is a placeholder: the answer is the (now filled in)
+            // `Value` the slot was bound to, taken out of `vecbuf` before it is dropped.
+            Some(match self.ret_vec {
+                Some(k) => std::mem::replace(&mut vecbuf[k], Value::Null),
+                None => Value::Int(out),
+            })
+        }
+
+        /// What a vector slot's word in `buf` holds, and the descriptor word beside it. Under the
+        /// inlined layout that is the element data pointer and the element count: for a slot the
+        /// body writes, `Arc::make_mut` first — our clone shares with the caller's value, so this
+        /// is the one copy-on-write this call makes, and after it the buffer is uniquely ours and
+        /// cannot be reallocated under the inlined stores. For a read-only slot nothing is copied
+        /// and the `Arc` we hold is what keeps the elements from moving. A backend still using the
+        /// trampolines gets the `*mut Value` it has always had instead.
+        fn bind_vec(&self, v: &mut Value, slot: usize, desc: &mut i64) -> i64 {
+            if !self.inline_vec { return v as *mut Value as i64; }
+            let Value::Ints(items) = v else { return 0 };
+            *desc = items.len() as i64;
+            if self.vec_writes.contains(&slot) { Arc::make_mut(items).as_mut_ptr() as i64 }
+            else { items.as_ptr() as i64 }
+        }
+
+        /// Every bit builtin this body inlined still resolves to the same primitive it did at
+        /// compile time. Empty for a function that inlined none, which is the common case, so this
+        /// is a length check on the hot path.
+        fn prims_intact(&self, vm: &Vm) -> bool {
+            self.prim_guards.iter().all(|&(slot, want)| {
+                matches!(vm.global_at(slot), Some(Value::Prim(p)) if p as *const crate::value::PrimDef as i64 == want)
+            })
         }
         /// The direct recursive-call path (`jit_call` below): args are already known to be plain
         /// ints (they came from another compiled function's own int-typed registers, per the same
@@ -156,19 +220,21 @@ mod native {
             let total = self.nlocals.max(self.arity) + caps.len();
             if total > MAX_SLOTS || self.vec_slots.len() > MAX_VEC_SLOTS { return None; }
             if self.vec_slots.iter().any(|&s| s < argc) { return None; }
-            let mut buf = [0i64; MAX_SLOTS];
+            // A vector-returning callee has nothing to hand back through this path, whose whole
+            // point is that a result is a plain int in a register: that call deopts instead.
+            if self.ret_vec.is_some() { return None; }
+            if !self.prims_intact(vm) { return None; }
+            let mut buf = [0i64; BUFLEN];
             let mut vecbuf: [Value; MAX_VEC_SLOTS] = std::array::from_fn(|_| Value::Null);
-            let mut vk = 0usize;
             if argc >= 1 { buf[0] = arg0; }
             if argc >= 2 { buf[1] = arg1; }
             let capbase = self.nlocals.max(self.arity);
             for (i, v) in caps.iter().enumerate() {
                 let slot = capbase + i;
-                if self.vec_slots.contains(&slot) {
+                if let Some(k) = self.vec_slots.iter().position(|&s| s == slot) {
                     let Value::Ints(_) = v else { return None };
-                    vecbuf[vk] = v.clone();
-                    buf[slot] = &mut vecbuf[vk] as *mut Value as i64;
-                    vk += 1;
+                    vecbuf[k] = v.clone();
+                    buf[slot] = self.bind_vec(&mut vecbuf[k], slot, &mut buf[MAX_SLOTS + k]);
                 } else {
                     match v { Value::Int(n) if *n != crate::value::NI => buf[slot] = *n, _ => return None }
                 }
@@ -278,10 +344,20 @@ mod native {
         let f = vm.get(CODEGEN.0)?;
         // neant has no way to take a Rust function's address itself — hand it over explicitly, the
         // same way the old Rust encoder used to compute `jit_call`'s address inline.
+        // The global slots of the six bit builtins, in `BIT_PRIMS` order, so the codegen can turn
+        // a `Call` to one of them into the instruction it is; -1 for a name that is not currently
+        // a global holding that very primitive, which simply means it is not inlinable here.
+        // `bit_now` is the same lookup, kept to pair each inlined slot with the identity the entry
+        // guard re-checks.
+        let bit_now: Vec<(i64, i64)> = BIT_PRIMS.iter().map(|n| match (vm.slot_of(n), vm.get(n)) {
+            (Some(s), Some(Value::Prim(p))) if p.name == *n => (s as i64, p as *const crate::value::PrimDef as i64),
+            _ => (-1, 0),
+        }).collect();
         let trampolines = Value::List(Arc::new(vec![
             Value::Int(jit_call as *const () as i64),
             Value::Int(jit_vec_get as *const () as i64),
             Value::Int(jit_vec_set as *const () as i64),
+            crate::value::ints(bit_now.iter().map(|&(s, _)| s).collect()),
         ]));
         // `jitCompile` and its own helpers (jitOpDyad, ...) are neant functions too, and their own
         // bytecode contains the very op kinds they exist to handle — a Dyad inside `jitOpDyad`'s own
@@ -295,22 +371,42 @@ mod native {
         let result = vm.call(&f, vec![code.jit_input(), trampolines]);
         COMPILING.with(|c| c.set(c.get() - 1));
         // Success is `(bytes; vecSlots)` — the classified param/capture slots (`jitClassifySlots`)
-        // ride along so the entry guard below knows which ones need `Ints`, not a plain int.
-        let (bytes, vec_slots) = match result {
-            Ok(Value::List(items)) if items.len() == 2 => {
+        // ride along so the entry guard below knows which ones need `Ints`, not a plain int — or,
+        // from a backend that inlines vector access, the five-element form that also says which of
+        // those slots are written, which one (if any) is the returned vector, and which global
+        // slots were inlined as bit instructions. A two-element result keeps the old layout, where
+        // a vector slot's word is a `*mut Value` for the trampolines; that is what makes this one
+        // glue path serve a backend that has the inlining and one that does not.
+        let ints_of = |v: &Value| -> Option<Vec<usize>> {
+            match v { Value::Ints(v) => Some(v.iter().map(|&n| n as usize).collect()), _ => None }
+        };
+        let (bytes, vec_slots, vec_writes, ret_vec, prim_slots, inline_vec) = match result {
+            Ok(Value::List(items)) if items.len() == 2 || items.len() == 5 => {
                 let bytes = match &items[0] { Value::Bytes(b) => b.clone(), _ => return None };
-                let vec_slots: Vec<usize> = match &items[1] {
-                    Value::Ints(v) => v.iter().map(|&n| n as usize).collect(),
-                    _ => return None,
-                };
-                (bytes, vec_slots)
+                let vec_slots = ints_of(&items[1])?;
+                if items.len() == 2 { (bytes, vec_slots, Vec::new(), None, Vec::new(), false) } else {
+                    let vec_writes = ints_of(&items[2])?;
+                    let ret_vec = match &items[3] { Value::Int(n) if *n >= 0 => Some(*n as usize), Value::Int(_) => None, _ => return None };
+                    if ret_vec.is_some_and(|k| k >= vec_slots.len()) { return None; }
+                    let prim_slots = ints_of(&items[4])?;
+                    (bytes, vec_slots, vec_writes, ret_vec, prim_slots, true)
+                }
             }
             _ => return None, // Null (not compilable) or a runtime error in the codegen itself
         };
-        emit(&bytes, code.params.len(), code.nlocals, vec_slots)
+        // Pair each inlined bit-builtin slot with the primitive it resolved to just now; that pair
+        // is what `prims_intact` re-checks at every entry.
+        let mut prim_guards = Vec::new();
+        for slot in prim_slots {
+            let want = bit_now.iter().find(|&&(s, _)| s == slot as i64)?.1;
+            prim_guards.push((slot, want));
+        }
+        emit(&bytes, code.params.len(), code.nlocals, vec_slots, vec_writes, ret_vec, prim_guards, inline_vec)
     }
 
-    fn emit(bytes: &[u8], arity: usize, nlocals: usize, vec_slots: Vec<usize>) -> Option<super::Compiled> {
+    #[allow(clippy::too_many_arguments)]
+    fn emit(bytes: &[u8], arity: usize, nlocals: usize, vec_slots: Vec<usize>, vec_writes: Vec<usize>,
+            ret_vec: Option<usize>, prim_guards: Vec<(usize, i64)>, inline_vec: bool) -> Option<super::Compiled> {
         if vec_slots.len() > MAX_VEC_SLOTS { return None; }
         let page = 4096usize;
         let len = bytes.len().div_ceil(page) * page;
@@ -328,7 +424,7 @@ mod native {
             #[cfg(target_arch = "aarch64")]
             __clear_cache(mem as *mut std::ffi::c_char, (mem as *mut u8).add(len) as *mut std::ffi::c_char);
             let entry: unsafe extern "C" fn(*mut i64, *mut i64, *mut Vm) -> i64 = std::mem::transmute(mem);
-            Some(super::Compiled { mem: mem as *mut u8, len, arity, nlocals, vec_slots, entry })
+            Some(super::Compiled { mem: mem as *mut u8, len, arity, nlocals, vec_slots, vec_writes, ret_vec, prim_guards, inline_vec, entry })
         }
     }
 

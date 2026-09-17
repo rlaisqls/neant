@@ -195,7 +195,6 @@ xjSrcs,: enlist "{[x] 1+count x}"
 xjSrcs,: enlist "{[x] (x;x)}"
 xjSrcs,: enlist "{[x] hh[1;2;3]}"
 xjSrcs,: enlist "{[x] ((((((((x+x)+x)+x)+x)+x)+x)+x)+x)}"
-xjSrcs,: enlist "{[v;i] v[i]: 7; v}"
 xjSrcs,: enlist "{[x] 0N+x}"
 xjAgree: 1b
 xjSame: 1b
@@ -209,6 +208,14 @@ while[xjI<count xjSrcs
   xjI: xjI+1]
 tok["every source: the same verdict as the AArch64 backend"; xjAgree]
 tok["every source: the same classified vector slots"; xjSame]
+// The one shape the two deliberately part company on: a function that *returns* the vector it
+// filled is AArch64-only (see "the vector a compiled function leaves behind" in arm64.nt), so the
+// x86-64 walk meets a classified slot where it expects an index and refuses the whole function —
+// fail-closed, as every disagreement here has to be. Giving x86-64 the same shape needs the
+// inlined vector access first; until then this stays a one-sided accept.
+xjVecRet: "{[v;i] v[i]: 7; v}"
+tok["a vector return compiles on AArch64"; not null~xjA xjVecRet]
+tok["a vector return is refused on x86-64"; null~xjX xjVecRet]
 
 tsection "x86: the same input twice is byte-identical"
 xjTwice: {[src] (first xjX src)~first xjX src}

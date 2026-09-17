@@ -46,13 +46,13 @@ teq["double recursive call compiled and interpreted agree"; jtev "fib: {$[x<2;x;
 
 // consumed by `Call(1)`, the same shape `x[i]` and plain application (`f x`) both compile to.
 // `x[i]:v` on a vector parameter — `TakeL;Amend;StoreL`, always emitted back to back for a
-// single-index amend. Returns `x[n-1]` (a scalar), not `x` itself: nothing in this scheme can
-// return a vector — see `jitOpVecSet`'s doc comment on why that's fine, the write only needs
+// single-index amend. This pair returns `x[n-1]` (a scalar) rather than `x`; returning the vector
+// itself is its own shape, below. Either way the write only needs
 teq["vector index read compiled and interpreted agree"; jtev "f: {[x;n] s:0; i:0; while[i<n; s: s+x[i]; i: i+1]; s}; r: (); i: 0; while[i<100; r,: f[1 2 3 4 5 6 7 8 9 10; 10]; i+:1]; distinct r"; ",55"]
 
 // to be visible to *later reads within the same compiled call*, exactly like this one.
-// An out-of-range index is a bounds check inside `jit_vec_get`/`jit_vec_set` (src/jit.rs),
-// not something the codegen can prove away at compile time — same deopt convention as every
+// An out-of-range index is a bounds check the codegen emits inline against the length in `buf`,
+// not something it can prove away at compile time — same deopt convention as every
 teq["vector index write compiled and interpreted agree"; jtev "f: {[x;n] i:0; while[i<n; x[i]: x[i]*2; i: i+1]; x[n-1]}; r: (); i: 0; while[i<100; r,: f[1 2 3 4 5; 5]; i+:1]; distinct r"; ",10"]
 
 // oracle; `distinct` over both proves all 100 compiled-or-not calls agree with it.
@@ -280,3 +280,42 @@ jtrun[70; "f[1 2 3; 3]"]      // cross the tier-up threshold
 teq["vector write never corrupts a live second reference"; jtev "orig: 1 2 3; also: orig; r: f[orig;3]; (r; orig; also)"; "(2;1 2 3;1 2 3)"]
 
 teq["a bool local is still a bool after a traced loop"; jtev "{[k] i:0; b: 0b; while[i<k; b: i<100; i: i+1]; (type b; b)} 200"; "(`bool;0b)"]
+
+// ---- inlined vector access, the bit builtins and a vector return (README "Stage 2"). `x[i]` is
+// no longer a call: the slot's register is the element data pointer and the length sits beside it
+// in `buf`, so a read is a bounds check and an `ldr`. Everything below is the same differential
+// method as above — the compiled shape against the `- -` twin that provably never compiles.
+
+// an index off either end still lands wherever the interpreter lands, by deopting rather than by
+// reading past the buffer
+jtp: {[f] @[{[g] g[]}; f; {"'",x}]}     // the error text, or the value if there is none
+teq["an out-of-range inlined read deopts"; jtev "jt_vg: {[x;i] x[i]}; jt_vgS: {[x;i] - - x[i]}; jt_xs: 1 2 3; r: (); i: 0; while[i<80; r,: jt_vg[jt_xs;1]; i+:1]; ((jtp {jt_vg[jt_xs;5]})~jtp {jt_vgS[jt_xs;5]}; (jtp {jt_vg[jt_xs;-1]})~jtp {jt_vgS[jt_xs;-1]}; distinct r)"; "(1b;1b;,2)"]
+teq["an out-of-range inlined write deopts"; jtev "jt_vs: {[x;n] j:0; while[j<n; x[j]: 7; j: j+1]; x[0]}; jt_vsS: {[x;n] j:0; while[j<n; x[j]: 7; j: j+1]; - - x[0]}; jt_xs: 1 2 3; r: (); i: 0; while[i<80; r,: jt_vs[jt_xs;3]; i+:1]; ((jtp {jt_vs[jt_xs;9]})~jtp {jt_vsS[jt_xs;9]}; distinct r)"; "(1b;,7)"]
+
+// a compiled function may now hand its caller the vector it filled, which is what lets a whole
+// schoolbook product be one compiled call (src/neant/crypto/bignum.nt)
+teq["a compiled function returns the vector it filled"; jtev "jt_vr: {[x;n] i:0; while[i<n; x[i]: x[i]*3; i: i+1]; x}; jt_vrS: {[x;n] i:0; while[i<n; x[i]: x[i]*3; i: i+1]; - -1; x}; jt_xs: 1 2 3 4; r: (); i: 0; while[i<80; r,: enlist jt_vr[jt_xs;4]; i+:1]; ((jt_vr[jt_xs;4])~jt_vrS[jt_xs;4]; jt_xs; distinct r)"; "(1b;1 2 3 4;(3 6 9 12))"]
+teq["and through an explicit early return"; jtev "jt_vq: {[x;n] i:0; while[i<n; x[i]: x[i]+1; i: i+1]; :x}; jt_vqS: {[x;n] i:0; while[i<n; x[i]: x[i]+1; i: i+1]; - -1; :x}; jt_ys: 5 6; r: (); i: 0; while[i<80; r,: enlist jt_vq[jt_ys;2]; i+:1]; ((jt_vq[jt_ys;2])~jt_vqS[jt_ys;2]; distinct r)"; "(1b;(6 7))"]
+teq["a function that returns a vector down one path and an int down another is refused"; jtev "jt_vm: {[x;n;c] i:0; while[i<n; x[i]: 1; i: i+1]; $[c; x; 0]}; jt_vmS: {[x;n;c] i:0; while[i<n; x[i]: 1; i: i+1]; - -1; $[c; x; 0]}; jt_zs: 9 9; r: (); i: 0; while[i<80; r,: enlist jt_vm[jt_zs;2;1]; i+:1]; ((jt_vm[jt_zs;2;1])~jt_vmS[jt_zs;2;1]; (jt_vm[jt_zs;2;0])~jt_vmS[jt_zs;2;0])"; "11b"]
+
+// band/bor/bxor/badd/shl/shr inline as one instruction each instead of a trampoline call; they
+// work on the raw 64-bit pattern, so unlike `+ - *` they may legitimately produce the int-null
+// sentinel and the deopt on it is what keeps that honest
+teq["the bit builtins compiled and interpreted agree"; jtev "jt_bb: {[a;b] (((a band b) bor a bxor b) badd a shl 3) badd a shr 2}; jt_bbS: {[a;b] (((a band b) bor a bxor b) badd a shl 3) badd a shr (- - 2)}; r: (); i: 0; while[i<80; r,: jt_bb[12345;6789]; i+:1]; ((jt_bb[12345;6789])=jt_bbS[12345;6789]; (jt_bb[-1;-1])=jt_bbS[-1;-1]; distinct r)"; "(1b;1b;,116883)"]
+teq["a masked carry loop agrees"; jtev "jt_cl: {[v;n;m;s] i:0; c:0; while[i<n; t: c+v[i]; v[i]: t band m; c: t shr s; i: i+1]; v}; jt_clS: {[v;n;m;s] i:0; c:0; while[i<n; t: c+v[i]; v[i]: t band m; c: t shr (- - s); i: i+1]; v}; jt_ws: 1000000 2000000 3000000; r: (); i: 0; while[i<80; r,: enlist jt_cl[jt_ws;3;1023;10]; i+:1]; ((jt_cl[jt_ws;3;1023;10])~jt_clS[jt_ws;3;1023;10]; distinct r)"; "(1b;(576 80 610))"]
+teq["a shift of 64 or more, or a negative one, deopts to the interpreter"; jtev "jt_sh: {[a;b] a shl b}; jt_shS: {[a;b] - - a shl b}; r: (); i: 0; while[i<80; r,: jt_sh[3;4]; i+:1]; ((jt_sh[3;64])=jt_shS[3;64]; (jt_sh[3;200])=jt_shS[3;200]; (jt_sh[3;-1])=jt_shS[3;-1]; distinct r)"; "(1b;1b;1b;,48)"]
+teq["a bit op landing exactly on the int null deopts"; jtev "jt_sn: {[a;b] a shl b}; jt_snS: {[a;b] - - a shl b}; r: (); i: 0; while[i<80; r,: jt_sn[1;2]; i+:1]; ((jt_sn[1;63])~jt_snS[1;63]; distinct r)"; "(1b;,4)"]
+// the name is an ordinary global, so a compiled body that inlined it carries an entry guard
+nrun "jt_ob: band; jt_bg: {[a;b] a band b}"
+jtrun[80; "jt_bg[6;3]"]
+teq["rebinding band sends a compiled body back to the interpreter"; jtev "band: {[x;y] 999}; r: jt_bg[6;3]; band: jt_ob; (r; jt_bg[6;3])"; "999 2"]
+
+// ---- the virtual operand stack (a local feeds an op out of its own register, a small literal is
+// an immediate, a comparison feeding a Jmpf is one branch). All three are invisible unless a value
+// is in the wrong place at a merge, so these are the shapes where the two halves of a branch
+// disagree about where something lives.
+teq["a local aliased across a branch merge"; jtev "jt_am: {[k] a: 1; s: 0; i: 0; while[i<k; s: s + $[i<5; a; 2]; a: a+1; i: i+1]; s}; jt_amS: {[k] a: 1; s: 0; i: 0; while[i<k; s: s + $[i<5; a; (- - 2)]; a: a+1; i: i+1]; s}; ((jt_am 20)=jt_amS 20; jt_am 20)"; "(1b;45)"]
+teq["a local reassigned while an older copy of it is still on the stack"; jtev "jt_rs: {[k] a: 10; s: 0; i: 0; while[i<k; s: s + $[i<3; a; 0] + (a: a+1); i: i+1]; s}; jt_rsS: {[k] a: 10; s: 0; i: 0; while[i<k; s: s + $[i<3; a; (- - 0)] + (a: a+1); i: i+1]; s}; ((jt_rs 8)=jt_rsS 8; jt_rs 8)"; "(1b;152)"]
+teq["a do counter taken from a local does not consume the local"; jtev "jt_dc: {[k] m: 4; s: 0; do[m; s: s+1]; s+m+k}; jt_dcS: {[k] m: 4; s: 0; do[m; s: s+(- - 1)]; s+m+k}; r: (); i: 0; while[i<80; r,: jt_dc 0; i+:1]; ((jt_dc 0)=jt_dcS 0; distinct r)"; "(1b;,8)"]
+teq["constants too wide for an immediate, and negative ones"; jtev "jt_ci: {[k] s: 0; i: 0; while[i<k; s: s + 100000; s: s + -5; s: s - 4095; s: s - 4096; i: i+1]; s}; jt_ciS: {[k] s: 0; i: 0; while[i<k; s: s + 100000; s: s + (- - -5); s: s - 4095; s: s - 4096; i: i+1]; s}; r: (); i: 0; while[i<80; r,: jt_ci 10; i+:1]; ((jt_ci 10)=jt_ciS 10; distinct r)"; "(1b;,918040)"]
+teq["every comparison fused with the branch that reads it"; jtev "jt_fc: {[k] s: 0; i: 0; while[i<k; if[i<3; s: s+1]; if[i>7; s: s+10]; if[i=5; s: s+100]; i: i+1]; s}; jt_fcS: {[k] s: 0; i: 0; while[i<k; if[i<3; s: s+(- - 1)]; if[i>7; s: s+10]; if[i=5; s: s+100]; i: i+1]; s}; r: (); i: 0; while[i<80; r,: jt_fc 10; i+:1]; ((jt_fc 10)=jt_fcS 10; distinct r)"; "(1b;,123)"]
