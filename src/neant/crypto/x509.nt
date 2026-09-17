@@ -80,7 +80,18 @@ X509ATTRNAMES,: ("serialNumber";"SN";"GN";"businessCategory")
 // backslash-escaped; a control character goes out as \XX, which is what OpenSSL does too.
 X509DNESC: ",+\"\\<>;"
 x509DnEsc: {[s]
-  out: ""; i: 0; n: count s
+  n: count s
+  if[0=n; :""]
+  // Almost no AttributeValue in a real name needs any of that, and the check is four vectorised
+  // passes where the loop below is eight interpreted steps per character. Over the system trust
+  // store that is the difference between 35 ms and 2 ms: the loop runs only for the values that
+  // actually carry a metacharacter.
+  ok: not any (`code$s)<32
+  if[ok; ok: not any s in X509DNESC]
+  if[ok; ok: not s[0] in " #"]
+  if[ok; ok: not " "=s[n-1]]
+  if[ok; :s]
+  out: ""; i: 0
   while[i<n
     c: s[i]
     edge: $[i=0; c in " #"; $[i=n-1; c=" "; 0b]]
@@ -94,7 +105,16 @@ x509Str: {[nd] (`univ=nd`cls) & nd[`tag] in DERSTRTAGS}
 x509DnVal: {[nd] $[x509Str nd; x509DnEsc derStr nd; "#",upper hex nd`raw]}
 // leading and trailing whitespace dropped, internal runs collapsed to one space
 x509Ws: {[s]
-  if[0=count s; :""]
+  n: count s
+  if[0=n; :""]
+  // the same fast path as x509DnEsc: a value with no tab or newline, no leading or trailing space
+  // and no doubled space is already canonical, and that is what a certificate's names look like
+  sp: s=" "
+  ok: not any s in "\t\r\n"
+  if[ok; ok: not sp[0]]
+  if[ok; ok: not sp[n-1]]
+  if[ok & n>1; ok: not any (1_sp) & -1_sp]
+  if[ok; :s]
   t: {$[x in "\t\r\n"; " "; x]} each s
   out: ""; i: 0
   while[i<count t
@@ -400,26 +420,361 @@ x509Parse: {[der]
   v3: (x509Spki spki; spki`raw; san; eku; isCa; pathLen; ku; cru)
   ((k1,k2),k3)!(v1,v2),v3}
 
+// ---- the same certificate, out of a derScan's columns
+// x509Parse above walks a tree of dicts: 146 system roots are 9387 of them and cost 81 ms. The
+// reader below asks der.nt's derScan to find every element of every certificate first — one
+// breadth-first sweep of whole-vector operations — and then reads the fields out of the columns,
+// where a node is an int and its children are `fc`/`ns` lookups rather than a re-parse of the
+// bytes. Every check is the one above, in the same order and the same words; nothing here is
+// looser. What it does not model it hands back: derScan refuses the high-tag-number form, and
+// x509ParseMany catches that (and anything else) and falls back to x509Parse, so the strict reader
+// is still what decides whether an odd certificate is legal.
+x509cStr: {[s;k] (0=(s`cls)[k]) & (s`tag)[k] in DERSTRTAGS}
+// the prelude's `lower` is `x in upperc`, a 26-element membership test per character; A..Z is a
+// range, so a comparison does the same work. 0.9 us on an attribute value against 2.0, and the
+// same answer — both leave every codepoint outside A..Z alone.
+x509Lower: {[s] v: `code$s; `char$v+32*(v>64) & v<91}
+// the RFC 2253 value and the canonical value together, because they read the same octets and
+// decoding a DirectoryString twice is 5 us of the 33 an attribute used to cost
+x509cDnPair: {[s;k]
+  if[not x509cStr[s;k]
+    rw: dsRaw[s;k]
+    :("#",upper hex rw; "#",hex rw)]
+  w: dsStr[s;k]
+  (x509DnEsc w; x509Ws x509Lower w)}
+
+x509cName: {[s;k]
+  dsWant[s;k;DERSEQ;1b]
+  pr: ""; cn: ""
+  r: (s`fc)[k]
+  while[not r=-1
+    dsWant[s;r;DERSET;1b]
+    a: (s`fc)[r]
+    if[a=-1; signal "x509: an RDN must hold at least one attribute"]
+    ps: (); cs: ()
+    while[not a=-1
+      dsWant[s;a;DERSEQ;1b]
+      o1: (s`fc)[a]
+      v1: $[o1=-1; -1; (s`ns)[o1]]
+      if[v1=-1; signal "x509: an AttributeTypeAndValue is a type and a value"]
+      if[-1<(s`ns)[v1]; signal "x509: an AttributeTypeAndValue is a type and a value"]
+      o: dsOid[s;o1]
+      j: X509ATTROIDS?o
+      pc: x509cDnPair[s;v1]
+      ps: x509Cons[ps; ($[j<count X509ATTROIDS; X509ATTRNAMES[j]; o]),"=",pc[0]]
+      cs: x509Cons[cs; o,"=",pc[1]]
+      a: (s`ns)[a]]
+    // an RDN holds one attribute unless someone went out of their way: the sort and the join are
+    // 1.4 us that the common shape does not need
+    p1: $[1=count ps; ps[0]; "+" sv ps]
+    pr: $[0=count pr; p1; p1,",",pr]
+    c1: $[1=count cs; cs[0]; "+" sv asc cs]
+    cn: $[0=count cn; c1; cn,",",c1]
+    r: (s`ns)[r]]
+  (pr;cn)}
+
+x509cAlg: {[s;k]
+  dsWant[s;k;DERSEQ;1b]
+  o1: (s`fc)[k]
+  if[o1=-1; signal "x509: an empty AlgorithmIdentifier"]
+  p1: (s`ns)[o1]
+  if[not p1=-1
+    if[-1<(s`ns)[p1]
+      signal "x509: an AlgorithmIdentifier is an OID and at most one parameter"]]
+  (dsOid[s;o1]; $[p1=-1; (); enlist p1])}
+
+x509cHash: {[s;a]
+  if[1<count a[1]; signal "x509: a hash algorithm takes at most a NULL parameter"]
+  if[1=count a[1]; dsNull[s;(a[1])[0]]]
+  i: X509HASHOIDS?a[0]
+  $[i<count X509HASHOIDS; X509HASHSYMS[i]; `unknown]}
+
+x509cPss: {[s;a]
+  if[not 1=count a[1]; signal "x509: RSASSA-PSS needs parameters"]
+  p: (a[1])[0]
+  dsWant[s;p;DERSEQ;1b]
+  h: `sha1; mg: `sha1; sl: 20
+  lt: -1
+  f: (s`fc)[p]
+  while[not f=-1
+    if[not 2=(s`cls)[f]; signal "x509: RSASSA-PSS parameters are context-tagged"]
+    if[not (s`cons)[f]; signal "x509: an RSASSA-PSS parameter must be constructed (EXPLICIT)"]
+    fk: (s`fc)[f]
+    if[fk=-1; signal "x509: an RSASSA-PSS parameter holds one value"]
+    if[-1<(s`ns)[fk]; signal "x509: an RSASSA-PSS parameter holds one value"]
+    tg: (s`tag)[f]
+    if[not tg>lt; signal "x509: RSASSA-PSS parameters repeat or are out of order"]
+    lt: tg
+    if[tg=0; h: x509cHash[s; x509cAlg[s;fk]]]
+    if[tg=1
+      mgf: x509cAlg[s;fk]
+      if[not (mgf[0]) ~ "1.2.840.113549.1.1.8"; signal "x509: RSASSA-PSS masking must be MGF1"]
+      if[not 1=count mgf[1]; signal "x509: MGF1 needs a hash parameter"]
+      mg: x509cHash[s; x509cAlg[s;(mgf[1])[0]]]]
+    if[tg=2; sl: dsIntVal[s;fk]; if[sl<0; signal "x509: a negative RSASSA-PSS salt length"]]
+    if[tg=3; if[not 1=dsIntVal[s;fk]; signal "x509: RSASSA-PSS trailerField must be 1"]]
+    if[tg>3; signal "x509: unknown RSASSA-PSS parameter"]
+    f: (s`ns)[f]]
+  nm: `unknown
+  if[(h ~ mg) & sl = $[h=`sha256;32; h=`sha384;48; h=`sha512;64; -1]
+    nm: $[h=`sha256;`rsaPssSha256; h=`sha384;`rsaPssSha384; `rsaPssSha512]]
+  (nm; `hash`mgfHash`saltLen!(h;mg;sl))}
+
+x509cSigAlg: {[s;a]
+  o: a[0]
+  k: X509SIGOIDS?o
+  if[k<count X509SIGOIDS
+    nm: X509SIGSYMS[k]
+    if[nm in X509RSAV15
+      if[not 1=count a[1]; signal "x509: ",o," must carry NULL parameters"]
+      dsNull[s;(a[1])[0]]]
+    if[not nm in X509RSAV15; if[0<count a[1]; signal "x509: ",o," must not carry parameters"]]
+    :(nm; ()!())]
+  if[o ~ "1.2.840.113549.1.1.10"; :x509cPss[s;a]]
+  (`unknown; ()!())}
+
+x509cSpki: {[s;k]
+  dsWant[s;k;DERSEQ;1b]
+  a1: (s`fc)[k]
+  b1: $[a1=-1; -1; (s`ns)[a1]]
+  if[b1=-1; signal "x509: a SubjectPublicKeyInfo is an algorithm and a key"]
+  if[-1<(s`ns)[b1]; signal "x509: a SubjectPublicKeyInfo is an algorithm and a key"]
+  a: x509cAlg[s;a1]
+  b: dsBits[s;b1]
+  o: a[0]
+  if[o ~ "1.2.840.113549.1.1.1"
+    if[not 1=count a[1]; signal "x509: rsaEncryption must carry NULL parameters"]
+    dsNull[s;(a[1])[0]]
+    r: derParse b                                  // the key is a DER RSAPublicKey inside the bits
+    derWant[r;DERSEQ;1b]
+    rk: derKids r
+    if[not 2=count rk; signal "x509: an RSAPublicKey is a modulus and an exponent"]
+    :`alg`n`e!(`rsa; x509Mag rk[0]; x509Mag rk[1])]
+  if[o ~ "1.2.840.10045.2.1"
+    if[not 1=count a[1]; signal "x509: id-ecPublicKey must name a curve"]
+    c: dsOid[s;(a[1])[0]]
+    i: X509CURVEOIDS?c
+    if[0=count b; signal "x509: an empty EC point"]
+    :`alg`curve`oid`point!(`ec; $[i<count X509CURVEOIDS; X509CURVESYMS[i]; `unknown]; c; b)]
+  if[o ~ "1.3.101.112"
+    if[0<count a[1]; signal "x509: id-Ed25519 must not carry parameters"]
+    if[not 32=count b; signal "x509: an Ed25519 key is 32 octets"]
+    :`alg`pub!(`ed25519; b)]
+  `alg`oid`bits!(`unknown; o; b)}
+
+// the certificate whose top-level element is node `top` of the scan `s`
+x509ParseAt: {[s;top]
+  dsWant[s;top;DERSEQ;1b]
+  tbs: (s`fc)[top]
+  ka: $[tbs=-1; -1; (s`ns)[tbs]]
+  kg: $[ka=-1; -1; (s`ns)[ka]]
+  if[kg=-1; signal "x509: a Certificate is a tbsCertificate, an algorithm and a signature"]
+  if[-1<(s`ns)[kg]
+    signal "x509: a Certificate is a tbsCertificate, an algorithm and a signature"]
+  dsWant[s;tbs;DERSEQ;1b]
+  oa: x509cAlg[s;ka]
+  sa: x509cSigAlg[s;oa]
+  sig: dsBits[s;kg]
+  if[0=count sig; signal "x509: an empty signature"]
+
+  t0: (s`fc)[tbs]
+  ver: 1; i: t0
+  if[not t0=-1
+    if[(2=(s`cls)[t0]) & 0=(s`tag)[t0]
+      if[not (s`cons)[t0]; signal "x509: the version tag must be constructed (EXPLICIT)"]
+      vk: (s`fc)[t0]
+      if[vk=-1; signal "x509: the version tag holds one INTEGER"]
+      if[-1<(s`ns)[vk]; signal "x509: the version tag holds one INTEGER"]
+      ver: 1+dsIntVal[s;vk]
+      if[not ver in 2 3; signal "x509: a version tag may only say v2 or v3, not v",string ver]
+      i: (s`ns)[t0]]]
+  // serialNumber, signature, issuer, validity, subject, subjectPublicKeyInfo
+  nSer: i
+  nSa: $[nSer=-1; -1; (s`ns)[nSer]]
+  nIss: $[nSa=-1; -1; (s`ns)[nSa]]
+  nVld: $[nIss=-1; -1; (s`ns)[nIss]]
+  nSub: $[nVld=-1; -1; (s`ns)[nVld]]
+  nKey: $[nSub=-1; -1; (s`ns)[nSub]]
+  if[nKey=-1; signal "x509: tbsCertificate is missing fields"]
+  // RFC 5280 4.1.1.2: the two AlgorithmIdentifiers must be the same, down to the encoding
+  if[not dsRaw[s;nSa] ~ dsRaw[s;ka]
+    signal "x509: signatureAlgorithm does not match the one inside tbsCertificate"]
+  serial: dsIntB[s;nSer]
+  issuer: x509cName[s;nIss]
+  if[not (s`cons)[nVld]; signal "der: expected a constructed element, got a primitive one"]
+  nNb: (s`fc)[nVld]
+  nNa: $[nNb=-1; -1; (s`ns)[nNb]]
+  if[nNa=-1; signal "x509: Validity is a notBefore and a notAfter"]
+  if[-1<(s`ns)[nNa]; signal "x509: Validity is a notBefore and a notAfter"]
+  subject: x509cName[s;nSub]
+
+  j: (s`ns)[nKey]
+  // [1] issuerUniqueID and [2] subjectUniqueID are IMPLICIT BIT STRINGs: skipped over, not returned
+  if[not j=-1; if[(2=(s`cls)[j]) & 1=(s`tag)[j]; j: (s`ns)[j]]]
+  if[not j=-1; if[(2=(s`cls)[j]) & 2=(s`tag)[j]; j: (s`ns)[j]]]
+  isCa: 0b; pathLen: 0N; ku: (); san: (); eku: (); cru: ()
+  if[not j=-1
+    if[not (2=(s`cls)[j]) & 3=(s`tag)[j]
+      signal "x509: an unexpected field at the end of tbsCertificate"]
+    if[not (s`cons)[j]; signal "x509: the extensions tag must be constructed (EXPLICIT)"]
+    ek: (s`fc)[j]
+    if[ek=-1; signal "x509: the extensions tag holds one SEQUENCE"]
+    if[-1<(s`ns)[ek]; signal "x509: the extensions tag holds one SEQUENCE"]
+    if[not ver=3; signal "x509: extensions require version 3"]
+    dsWant[s;ek;DERSEQ;1b]
+    x: (s`fc)[ek]
+    if[x=-1; signal "x509: an empty Extensions sequence"]
+    seen: ()!()
+    while[not x=-1
+      dsWant[s;x;DERSEQ;1b]
+      f1: (s`fc)[x]
+      f2: $[f1=-1; -1; (s`ns)[f1]]
+      if[f2=-1; signal "x509: an Extension is an OID, a flag and an OCTET STRING"]
+      f3: (s`ns)[f2]
+      if[not f3=-1
+        if[-1<(s`ns)[f3]; signal "x509: an Extension is an OID, a flag and an OCTET STRING"]]
+      o: dsOid[s;f1]
+      // RFC 5280 4.2: at most one instance of any extension
+      if[0<count seen; if[(`$o) in key seen; signal "x509: a duplicate extension, ",o]]
+      seen[`$o]: 1
+      crit: 0b
+      if[not f3=-1
+        crit: dsBool[s;f2]
+        if[not crit; signal "x509: a critical flag of FALSE must be omitted in DER"]]
+      // the extension's own DER lives inside an OCTET STRING, so it is a buffer of its own and
+      // derParse reads it: the octets must be all of it, exactly as before
+      ev: derParse dsOct[s;$[f3=-1; f2; f3]]
+      known: 1b
+      if[o ~ X509EXTBC; bc: x509Bc ev; isCa: bc[0]; pathLen: bc[1]]
+      if[o ~ X509EXTKU; ku: x509Ku ev]
+      if[o ~ X509EXTSAN; san: x509San ev]
+      if[o ~ X509EXTEKU; eku: x509Eku ev]
+      if[not o in (X509EXTBC;X509EXTKU;X509EXTSAN;X509EXTEKU); known: 0b]
+      if[crit & not known; cru: x509Cons[cru;o]]
+      x: (s`ns)[x]]
+    j: (s`ns)[j]]
+  if[not j=-1; signal "x509: trailing fields in tbsCertificate"]
+
+  k1: `ver`tbs`serial`sigAlg`sigAlgOid`sigParams`sig
+  v1: (ver; dsRaw[s;tbs]; serial; sa[0]; oa[0]; sa[1]; sig)
+  k2: `issuer`issuerCanon`subject`subjectCanon`notBefore`notAfter
+  v2: (issuer[0]; issuer[1]; subject[0]; subject[1]; dsTime[s;nNb]; dsTime[s;nNa])
+  k3: `spki`spkiRaw`san`eku`isCa`pathLen`keyUsage`critUnknown
+  v3: (x509cSpki[s;nKey]; dsRaw[s;nKey]; san; eku; isCa; pathLen; ku; cru)
+  ((k1,k2),k3)!(v1,v2),v3}
+
+// every certificate in `ds`, parsed together: one derScan over the lot, then the fields out of its
+// columns. Anything the columnar reader will not take — a high tag number, or any rejection at all
+// — drops the whole batch back onto x509Parse, which is the reader that decides.
+x509ParseMany: {[ds]
+  if[0=count ds; :()]
+  r: @[{[ds] s: derScan ds; x509ParseAt[s;] each s`root}; ds; {[e] `x509fallback}]
+  $[`x509fallback ~ r; x509Parse each ds; r]}
+
 // ---- PEM
 // text -> the DER of every CERTIFICATE block in it. Anything outside the BEGIN/END lines is
 // ignored, which is what lets `openssl s_client -showcerts` output be handed over unedited.
+//
+// The whole file is decoded in one pass rather than one per block. Three things make that
+// possible, and together they are the difference between 128 ms and 4 ms over the 146-root system
+// trust store:
+//   - `read0` has already split the file into lines, so pemLoad never rejoins them (`"\n" sv` and
+//     `"\n" vs` over 215 KB cost 3 ms and 101 ms respectively; pemLines takes the lines as they
+//     came). `raze` of the body lines is the concatenation, newlines already gone.
+//   - a BEGIN or END line is 25 or 27 characters, so `count each` and one comparison on the line
+//     lengths cut 3610 lines down to ~320 candidates, and the exact `~` runs over those alone.
+//   - every block's base64 is a whole number of 4-character groups, so the groups of the
+//     concatenation of all the bodies are exactly the groups of the bodies: one base64 decode does
+//     the whole store, and each certificate's DER is a slice of the result.
 X509PEMBEGIN: "-----BEGIN CERTIFICATE-----"
 X509PEMEND: "-----END CERTIFICATE-----"
-pemDecode: {[text]
-  ls: "\n" vs text
-  out: (); body: ""; open: 0; i: 0
-  while[i<count ls
-    l: trim ls[i] except "\r"
-    if[l ~ X509PEMBEGIN
+
+// base64 digit -> its 6 bits; 64 is '=', 65 is whitespace, 66 is a character base64 does not have.
+// One 256-entry gather replaces unb64's `b64chars?s` find, which is the whole reason this file
+// carries its own decoder rather than calling unb64: the find is 2.6 ms over the store's 208 KB of
+// base64 and the gather is 0.2 ms.
+X509B64T: 256#66
+X509B64T[`code$b64chars]: til 64
+X509B64T[`code$"="]: 64
+X509B64T[`code$"\r\n\t "]: 65
+
+// a char vector of base64, length a multiple of 4, with the padding positions already named:
+// the bytes. `pads` are the indices of the '=' octets, which are zeroed before the alphabet check
+// so that an '=' anywhere else is still the error it should be.
+x509Unb64: {[s;pads]
+  m: (count s) div 4
+  if[0=m; :0x]
+  d: X509B64T[`code$s]
+  d[pads]: 0
+  if[any d>63; signal "b64: bad char"]
+  i: 4*til m
+  a: d[i]; b: d[i+1]; c: d[i+2]; e: d[i+3]
+  o: `byte$(3*m)#0
+  j: 3*til m
+  o[j]: `byte$(a shl 2)+b shr 4
+  o[j+1]: `byte$((b band 15) shl 4)+c shr 2
+  o[j+2]: `byte$((c band 3) shl 6)+e
+  o}
+
+// the lines of a PEM file -> the DER of every CERTIFICATE block, in order
+pemLines: {[ls]
+  nl: count ls
+  if[0=nl; :()]
+  lens: count each ls
+  st: sums 0,-1_lens                          // where each line begins in `raze ls`
+  cand: where (lens>23) & lens<34             // the markers, and the few base64 tails that size
+  bl: (); el: (); open: 0b; k: 0
+  while[k<count cand
+    c: cand[k]
+    l: ls[c]
+    isb: l ~ X509PEMBEGIN
+    ise: l ~ X509PEMEND
+    if[not isb|ise                            // only a line that is nearly a marker pays for trim
+      l: trim l except "\r"
+      isb: l ~ X509PEMBEGIN
+      ise: l ~ X509PEMEND]
+    if[isb
       if[open; signal "pem: a BEGIN CERTIFICATE inside a block"]
-      open: 1; body: ""]
-    if[l ~ X509PEMEND
+      open: 1b; bl,: c]
+    if[ise
       if[not open; signal "pem: an END CERTIFICATE with no BEGIN"]
-      out: $[0=count out; enlist unb64 body; out,enlist unb64 body]
-      open: 0]
-    if[open & not l ~ X509PEMBEGIN; body,: l]
-    i+:1]
+      open: 0b; el,: c]
+    k+:1]
   if[open; signal "pem: a BEGIN CERTIFICATE with no END"]
-  out}
+  n: count bl
+  if[0=n; :()]
+  // the body of block i is lines bl[i]+1 .. el[i]-1, which is one contiguous run of `raze ls`
+  bs: st[bl+1]; be: st[el]
+  bod: raze {[ls;a;b] ls[a+til b-a]}[ls;;] '[bl+1; el]
+  bod: raze bod
+  cl: be-bs                                   // characters of base64 in each block
+  if[any cl<4; signal "pem: an empty CERTIFICATE block"]
+  if[any 0<cl mod 4; signal "pem: a CERTIFICATE block is not a whole number of base64 groups"]
+  co: sums 0,-1_cl                            // where each block's base64 starts in `bod`
+  // the padding: at most two '=' at the end of each block, and nowhere else
+  pe: co+cl
+  p1: pe-1; p2: pe-2
+  q1: "="=bod[p1&(count bod)-1]
+  q2: "="=bod[p2&(count bod)-1]
+  pads: (p1[where q1]),p2[where q1&q2]
+  der: x509Unb64[bod;pads]
+  // 4 characters are 3 octets, less however many were padding
+  npad: (`int$q1)+`int$q1&q2
+  dl: (3*cl div 4)-npad
+  dof: 3*co div 4                             // the padding octets stay in `der`, so a block's
+                                              // bytes start at its group offset, not at its length
+  {[der;a;b] der[a+til b]}[der;;] '[dof; dl]}
+
+pemDecode: {[text] pemLines x509Split text}
 // a file of PEM blocks -> their DER, for a trust store or an `openssl s_client -showcerts` capture
-pemLoad: {[path] pemDecode "\n" sv read0 path}
+pemLoad: {[path] pemLines read0 path}
+
+// "\n" vs text, without `vs`: 101 ms over the trust store becomes 6 ms, because one vectorised
+// compare finds the newlines and the lines are then slices rather than a scan per character.
+x509Split: {[text]
+  n: count text
+  if[0=n; :,""]
+  nlp: where text="\n"
+  a: 0,1+nlp
+  b: nlp,n
+  {[t;p;q] t[p+til q-p]}[text;;] '[a;b]}

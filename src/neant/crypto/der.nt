@@ -137,11 +137,21 @@ derBool: {[nd]
 // OBJECT IDENTIFIER -> the dotted string. Subidentifiers are base 128, high bit set on every octet
 // but the last; a leading 0x80 would be padding, which DER forbids. The first octet packs the first
 // two arcs as 40*a+b, and a is 0, 1 or 2 — which is what the 40/80 split below recovers.
-derOid: {[nd]
-  v: `int$derWant[nd;DEROID;0b]
+derOid: {[nd] derOidOf `int$derWant[nd;DEROID;0b]}
+// the subidentifier octets -> the dotted string, shared by derOid and dsOid
+derOidOf: {[v]
   n: count v
   if[0=n; signal "der: empty OBJECT IDENTIFIER"]
   if[127<v[n-1]; signal "der: OBJECT IDENTIFIER ends inside a subidentifier"]
+  // every octet below 128 means every subidentifier is one octet: no continuation to follow and no
+  // padding to reject, so the arcs are the octets. 2.5.4.3 and the rest of the attribute types a
+  // name is made of are all this shape, which is why the loop below is not what a name costs.
+  // 2.5.4.x is what an AttributeType almost always is, and a name is a handful of them repeated
+  // over every certificate: worth its own line, at 0.7 us against 2.2 for the general form
+  if[(3=n) & (85=v[0]) & 4=v[1]; :"2.5.4.",string v[2]]
+  if[not any v>127
+    f: v[0]
+    :"." sv string each ($[f<40; 0,f; f<80; 1,f-40; 2,f-80]),1_v]
   arcs: (); acc: 0; k: 0; i: 0
   while[i<n
     c: v[i]
@@ -158,6 +168,10 @@ derOid: {[nd]
 // above 127 is not. Every other string type this reader models is ASCII or is already UTF-8.
 derLatin1: {[w] `byte$ raze {$[x<128; ,x; (192+x div 64; 128+x mod 64)]} each w}
 DERPRINTOK: `code$"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789 '()+,-./:=?"
+// the same set as a 256-entry table: one gather rather than a membership test per character, which
+// on a 20-character attribute value is 0.3 us against 2.5
+DERPRINTOKT: 256#0b
+DERPRINTOKT[DERPRINTOK]: 1b
 derStr: {[nd]
   if[not `univ=nd`cls; signal "der: expected a string, got a ",(string nd`cls)," tag"]
   if[nd`cons; signal "der: a DER string must be primitive"]
@@ -165,7 +179,7 @@ derStr: {[nd]
   if[not t in DERSTRTAGS; signal "der: ",(derTagName t)," is not a string type this reader models"]
   w: `int$nd`v
   if[0<count w
-    if[(t=DERPRINT) & not all w in DERPRINTOK
+    if[(t=DERPRINT) & not all DERPRINTOKT[w]
       signal "der: PrintableString has a character outside its set"]
     if[(t=DERIA5) & any 127<w; signal "der: IA5String is not ASCII"]]
   $[t=DERT61; `char$derLatin1 w; `char$nd`v]}
@@ -176,9 +190,10 @@ derStr: {[nd]
 derTime: {[nd]
   if[not `univ=nd`cls; signal "der: expected a time, got a ",(string nd`cls)," tag"]
   if[nd`cons; signal "der: a DER time must be primitive"]
-  t: nd`tag
-  if[not t in DERUTC,DERGEN; signal "der: expected a time, got ",derTagName t]
-  s: `char$nd`v
+  if[not (nd`tag) in DERUTC,DERGEN; signal "der: expected a time, got ",derTagName nd`tag]
+  derTimeOf[nd`tag; `char$nd`v]}
+// the tag and the content characters -> (date; time), shared by derTime and dsTime
+derTimeOf: {[t;s]
   n: $[t=DERUTC; 13; 15]
   if[not n=count s; signal "der: ",(derTagName t)," must be ",(string n)," characters"]
   if[not "Z"=s[n-1]; signal "der: ",(derTagName t)," must end in Z"]
@@ -214,3 +229,180 @@ DEROIDSYMS,: `ecPublicKey`prime256v1`secp384r1`secp521r1`ecdsaWithSha256`ecdsaWi
 DEROIDSYMS,: `ecdsaWithSha512`ed25519`sha1`sha256`sha384`sha512`keyUsage`subjectAltName
 DEROIDSYMS,: `basicConstraints`extKeyUsage`commonName`countryName`organizationName
 derOidSym: {[o] i: DEROIDS?o; $[i<count DEROIDS; DEROIDSYMS[i]; `unknown]}
+
+// ---- the columnar reader
+// derTLV builds a dict per element and derKids walks one child at a time. A certificate is around
+// 82 elements and the system trust store is 9387 of them, and at that size the *walk* is the cost:
+// 3.3 us an element, of which the dict and the two byte slices are 0.6 and the rest is interpreted
+// control flow — two derByte calls, the branch chain, the arithmetic.
+//
+// derScan reads every element of every buffer at once instead. It keeps a frontier of positions
+// and, at each step, parses the header at all of them with whole-vector operations: one gather for
+// the identifier octet, one for the first length octet, four more for the long-form length, and
+// the rejections are `any` over the vector rather than an `if` per element. A parsed element hands
+// the next step two successors — its first child and its next sibling — so the frontier is wide
+// almost immediately and the whole store is read in 34 steps rather than 9387.
+//
+//   derScan[bufs] -> a dict, the columns. A node is an index into them.
+//     `bb `b     every buffer concatenated, as bytes and as ints; `b is padded so that a header
+//                read at the very last element cannot run off the end
+//     `doff      where each buffer starts in `bb, and `root: buffer i's top-level element is node i
+//     `off `hlen `len `tag `cls `cons    exactly derTLV's fields, `off absolute in `bb, `cls the
+//                                        raw two bits rather than DERCLS's symbol
+//     `par `fc `ns `doc   the parent, the first child, the next sibling (-1 for none), and which
+//                         buffer the node came from
+//
+// Strictness is unchanged and checked the same way: an indefinite length, a non-minimal long-form
+// length, a length running past the end, trailing bytes after a top-level element, and a
+// constructed element whose children do not tile its content exactly (the frontier only stops on
+// e=lim, and e>lim is the rejection above). The one thing it does not do is the high-tag-number
+// form; `tag`31 is signalled, and x509.nt's fallback re-reads such a buffer with derTLV.
+DERSCANHTN: "der: derScan does not read the high-tag-number form"
+derScan: {[bufs]
+  nb: count bufs
+  if[0=nb; signal "der: derScan needs at least one buffer"]
+  lens: count each bufs
+  if[any lens<2; signal "der: input ends inside an element"]
+  doff: sums 0,-1_lens
+  bb: raze bufs
+  b: (`int$bb),6#0
+  de: doff+lens
+  coff: (); chl: (); cln: (); ctg: (); ccl: (); ccn: (); cpar: (); cdoc: ()
+  fcS: (); fcD: (); nsS: (); nsD: ()
+  p: doff; lim: de; par: nb#-1; doc: til nb
+  psrc: nb#-1                                  // the node whose first child this position is
+  ssrc: nb#-1                                  // the node whose next sibling this position is
+  base: 0; first: 1b
+  while[0<count p
+    w: count p
+    if[any lim<p+2; signal "der: input ends inside an element"]
+    id: b[p]
+    tg: id band 31
+    if[any tg=31; signal DERSCANHTN]
+    l0: b[p+1]
+    if[any l0=128; signal "der: indefinite length is not DER"]
+    lng: l0>128
+    nbl: (l0-128)*lng
+    if[any nbl>4; signal "der: length does not fit an int"]
+    if[any lim<p+2+nbl; signal "der: input ends inside an element"]
+    acc: b[p+5]+256*(b[p+4]+256*(b[p+3]+256*b[p+2]))
+    lnL: acc shr 8*4-nbl
+    if[any lng & 0=b[p+2]; signal "der: non-minimal length"]
+    if[any lng & lnL<128; signal "der: non-minimal length"]
+    ln: (lnL*lng)+l0*not lng
+    hl: 2+nbl
+    e: p+hl+ln
+    if[any e>lim; signal "der: length runs past the end of the input"]
+    if[first
+      if[any not e=lim; signal "der: trailing bytes after the top-level element"]
+      first: 0b]
+    idx: base+til w
+    coff,: p; chl,: hl; cln,: ln; ctg,: tg; ccl,: id shr 6; ccn,: 0<id band 32; cpar,: par
+    cdoc,: doc
+    m: where not psrc=-1
+    fcS,: psrc[m]; fcD,: idx[m]
+    m: where not ssrc=-1
+    nsS,: ssrc[m]; nsD,: idx[m]
+    ki: where (0<id band 32) & ln>0             // a constructed element with content has children
+    si: where e<lim                             // and anything short of its parent's end, a sibling
+    nk: count ki
+    p: (p+hl)[ki], e[si]
+    lim: e[ki], lim[si]
+    par: idx[ki], par[si]
+    doc: doc[ki], doc[si]
+    psrc: idx[ki], (count si)#-1
+    ssrc: (nk#-1), idx[si]
+    base+: w]
+  fc: base#-1; ns: base#-1
+  fc[fcS]: fcD; ns[nsS]: nsD
+  k1: `bb`b`doff`root`off`hlen`len
+  v1: (bb;b;doff;til nb;coff;chl;cln)
+  k2: `tag`cls`cons`par`fc`ns`doc
+  v2: (ctg;ccl;ccn;cpar;fc;ns;cdoc)
+  (k1,k2)!v1,v2}
+
+// ---- reading one node out of a scan
+// The whole TLV, and the content octets: the two byte slices derTLV used to take eagerly for every
+// element, now taken only where a caller actually wants the bytes.
+dsRaw: {[s;k] (s`bb)[(s`off)[k]+til (s`hlen)[k]+(s`len)[k]]}
+dsV: {[s;k] (s`bb)[((s`off)[k]+(s`hlen)[k])+til (s`len)[k]]}
+dsVi: {[s;k] (s`b)[((s`off)[k]+(s`hlen)[k])+til (s`len)[k]]}
+dsEnd: {[s;k] ((s`off)[k]+(s`hlen)[k])+(s`len)[k]}
+// the children, in order — a walk of the `ns` column rather than a re-read of the bytes
+dsKids: {[s;k]
+  if[not (s`cons)[k]; signal "der: expected a constructed element, got a primitive one"]
+  out: (); c: (s`fc)[k]
+  while[not c=-1; out,: c; c: (s`ns)[c]]
+  out}
+dsNKids: {[s;k] n: 0; c: (s`fc)[k]; while[not c=-1; n+:1; c: (s`ns)[c]]; n}
+
+// The typed readers again, over a scan's columns rather than over a dict. Every rejection derWant,
+// derInt, derBitStr, derBool, derNull, derOid, derStr and derTime make is made here in the same
+// words — tests/x509.nt runs both readers over every fixture and compares field for field, which is
+// what keeps these two lists of checks from drifting apart.
+dsWant: {[s;k;t;cn]
+  if[not 0=(s`cls)[k]
+    signal "der: expected ",(derTagName t),", got a ",(string DERCLS[(s`cls)[k]])," tag"]
+  if[not t=(s`tag)[k]; signal "der: expected ",(derTagName t),", got ",derTagName (s`tag)[k]]
+  if[not cn=(s`cons)[k]
+    signal "der: ",(derTagName t),$[cn;" must be constructed";" must be primitive"]]
+  1b}
+dsIntB: {[s;k]
+  dsWant[s;k;DERINT;0b]
+  n: (s`len)[k]
+  if[0=n; signal "der: empty INTEGER"]
+  o: (s`off)[k]+(s`hlen)[k]
+  if[1<n
+    a: (s`b)[o]; c: (s`b)[o+1]
+    if[(a=0) & c<128; signal "der: non-minimal INTEGER"]
+    if[(a=255) & 127<c; signal "der: non-minimal INTEGER"]]
+  dsV[s;k]}
+dsIntVal: {[s;k]
+  b: `int$dsIntB[s;k]
+  if[7<count b; signal "der: INTEGER too large for an int"]
+  n: 0 {(256*x)+y}/ b
+  $[127<b[0]; n-1 shl 8*count b; n]}
+dsBitStr: {[s;k]
+  dsWant[s;k;DERBITS;0b]
+  n: (s`len)[k]
+  if[0=n; signal "der: empty BIT STRING"]
+  o: (s`off)[k]+(s`hlen)[k]
+  u: (s`b)[o]
+  if[u>7; signal "der: BIT STRING unused-bit count out of range"]
+  if[(1=n) & 0<u; signal "der: BIT STRING has no octets but claims unused bits"]
+  if[0<u
+    m: (1 shl u)-1
+    if[0<m band (s`b)[(o+n)-1]; signal "der: BIT STRING trailing bits are not zero"]]
+  (u; (s`bb)[(o+1)+til n-1])}
+dsBits: {[s;k]
+  r: dsBitStr[s;k]
+  if[0<r[0]; signal "der: BIT STRING is not a whole number of octets"]
+  r[1]}
+dsOct: {[s;k] dsWant[s;k;DEROCT;0b]; dsV[s;k]}
+dsNull: {[s;k] dsWant[s;k;DERNULL;0b]; if[0<(s`len)[k]; signal "der: NULL with content"]; 0x}
+dsBool: {[s;k]
+  dsWant[s;k;DERBOOL;0b]
+  if[not 1=(s`len)[k]; signal "der: BOOLEAN must be one octet"]
+  v: (s`b)[(s`off)[k]+(s`hlen)[k]]
+  if[not v in 0 255; signal "der: BOOLEAN must be 0x00 or 0xff in DER"]
+  v=255}
+dsOid: {[s;k] dsWant[s;k;DEROID;0b]; derOidOf dsVi[s;k]}
+dsStr: {[s;k]
+  if[not 0=(s`cls)[k]
+    signal "der: expected a string, got a ",(string DERCLS[(s`cls)[k]])," tag"]
+  if[(s`cons)[k]; signal "der: a DER string must be primitive"]
+  t: (s`tag)[k]
+  if[not t in DERSTRTAGS; signal "der: ",(derTagName t)," is not a string type this reader models"]
+  w: dsVi[s;k]
+  if[0<count w
+    if[(t=DERPRINT) & not all DERPRINTOKT[w]
+      signal "der: PrintableString has a character outside its set"]
+    if[(t=DERIA5) & any 127<w; signal "der: IA5String is not ASCII"]]
+  $[t=DERT61; `char$derLatin1 w; `char$dsV[s;k]]}
+dsTime: {[s;k]
+  if[not 0=(s`cls)[k]
+    signal "der: expected a time, got a ",(string DERCLS[(s`cls)[k]])," tag"]
+  if[(s`cons)[k]; signal "der: a DER time must be primitive"]
+  t: (s`tag)[k]
+  if[not t in DERUTC,DERGEN; signal "der: expected a time, got ",derTagName t]
+  derTimeOf[t; `char$dsV[s;k]]}
