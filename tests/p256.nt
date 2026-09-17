@@ -1,7 +1,9 @@
-// ECDSA P-256 in src/neant/crypto/p256.nt: the field, the group law against published multiples of
-// the base point, and every way a signature can be wrong. p256.nt is loaded on demand (it is not in
-// the boot image), exactly as a program would load it. What stays in Rust (mod p256 in
-// src/main.rs) is only the one thing that needs the host: the timing.
+// ECDSA P-256 in src/neant/crypto/p256.nt, on the curve-generic arithmetic in ec.nt: the field, the
+// group law against published multiples of the base point, and every way a signature can be wrong.
+// Neither file is in the boot image, so both are loaded on demand exactly as a program would.
+// What stays in Rust (mod p256 in src/main.rs) is only the one thing that needs the host: the
+// timing. The names below are p256.nt's own; ec.nt is what they now run on, and the point of
+// asserting them unchanged is that generalising the arithmetic to a second curve changed no answer.
 //
 // The vectors are made from tests/data/pki-ec-leaf.key, which is committed, so these regenerate
 // exactly — except (r,s) itself: ECDSA signing picks a random k, so re-running the signature
@@ -15,7 +17,7 @@
 //     | tail -c 33                                                       -> PVPUBC
 // (OpenSSL 3.6.2.)
 tsection "p256"
-{load "src/neant/crypto/",x} each ("bignum.nt";"der.nt";"p256.nt")
+{load "src/neant/crypto/",x} each ("bignum.nt";"der.nt";"ec.nt";"p256.nt")
 
 PVPUB:  unhex "04d80beadaa91bcac982be71619c25106a5d257a6537d2233e689e2c72e6615843873e23bee15467e76c55be95400a63d44cc891a45adbcf74785bf675ebc7da45"
 PVPUBC: unhex "03d80beadaa91bcac982be71619c25106a5d257a6537d2233e689e2c72e6615843"
@@ -101,7 +103,7 @@ teq["(r, n-s) is a second valid signature and must verify"; ecdsaVerifyP256[PVPU
 // openssl will ever hand you has R.x < n already and a verifier that drops the reduction passes
 // all of them. The vector below is built rather than sampled, by tests/data/p256-rx-ge-n.py, which
 // picks a curve point with x >= n and then solves for the key and the signature that recover it.
-// Checked against a deliberately broken copy of p256Verify with the bnMod taken out: it answers 1b
+// Checked against a deliberately broken copy of ec.nt's ecVerify with the bnMod taken out: it answers 1b
 // to the openssl vector above and 0b to this one, so this case really is the one that catches it.
 // (r has sixteen leading zero bytes because r = R.x - n is below p - n, and always will be.)
 PVXPUB: unhex "04425419302e392f41daff51b5a643e7b559ab10c0cd6269f2d33be4d7db886a9cb72831ebd815e82ea0113f630b74e1ed81abf8fef4c39b10e09f3f7a716dfdc6"
