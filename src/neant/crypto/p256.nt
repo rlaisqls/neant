@@ -26,9 +26,12 @@
 //   * the public key is a point ON the curve, both coordinates canonically below p, and not the
 //     point at infinity — an off-curve "key" lands in a group where the discrete log is easy
 //   * the recovered R is not the point at infinity
-//   * the final test is (R.x mod n) = r, with the reduction mod n. R.x is a value mod p and r a
-//     value mod n, and p > n: comparing them without reducing would reject the rare-but-legal
-//     signature where R.x >= n, and, worse, is not the equation ECDSA is defined by
+//   * the final test is (R.x mod n) = r, with the reduction ACTUALLY DONE. R.x is a value mod p
+//     and r a value mod n, and p - n is 0x4319055358e8617b0c46353d039cdaae — 127 bits against a
+//     256-bit field, so a signature whose R.x reaches n turns up about once in 2^129. That is what
+//     makes a missing reduction so easy to ship: every vector openssl will ever hand you has
+//     R.x < n already, and the bare comparison agrees with the right answer on all of them.
+//     tests/data/p256-rx-ge-n.py builds the case that does not agree, and tests/p256.nt asserts it
 // P-256's cofactor is 1, so every point on the curve is in the prime-order group and there is no
 // separate subgroup check to do; on a curve with a cofactor there would be.
 //
@@ -263,7 +266,7 @@ p256Verify: {[a]
   R: p256Shamir[p256Bits u1; P256G; p256Bits u2; Q]
   if[bnIsZero R[2]; :0b]                                  // u1*G + u2*Q is the point at infinity
   xy: p256ToAffine R
-  (bnMod[fpFrom xy[0]; P256N]) ~ rv}                      // R.x reduced mod n, never a bare compare
+  (bnMod[fpFrom xy[0]; P256N]) ~ rv}                      // mod n, never a bare compare: see above
 
 // The two exports. The trap is belt and braces over the explicit checks above: bignum.nt signals
 // on an operand wider than it can multiply exactly, and a certificate does not get to turn that

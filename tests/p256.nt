@@ -94,6 +94,27 @@ teq["and through its DER"; ecdsaVerifyP256Der[PVPUB; PVDG; PVSIG]; 1b]
 PVNS: bnBytes bnSub[bnFromBytes PVNB; bnFromBytes PVS]                      // n - s
 teq["(r, n-s) is a second valid signature and must verify"; ecdsaVerifyP256[PVPUB; PVDG; PVR; PVNS]; 1b]
 
+// ---- the final comparison, which is the single most likely thing to be wrong in a from-scratch
+// ECDSA verifier: the test is (R.x mod n) = r, with R.x a value mod p and r a value mod n. For
+// P-256 p - n is only 0x4319055358e8617b0c46353d039cdaae, 127 bits against a 256-bit field, so a
+// signature whose R.x actually reaches n turns up about once in 2^129 — which means every vector
+// openssl will ever hand you has R.x < n already and a verifier that drops the reduction passes
+// all of them. The vector below is built rather than sampled, by tests/data/p256-rx-ge-n.py, which
+// picks a curve point with x >= n and then solves for the key and the signature that recover it.
+// Checked against a deliberately broken copy of p256Verify with the bnMod taken out: it answers 1b
+// to the openssl vector above and 0b to this one, so this case really is the one that catches it.
+// (r has sixteen leading zero bytes because r = R.x - n is below p - n, and always will be.)
+PVXPUB: unhex "04425419302e392f41daff51b5a643e7b559ab10c0cd6269f2d33be4d7db886a9cb72831ebd815e82ea0113f630b74e1ed81abf8fef4c39b10e09f3f7a716dfdc6"
+PVXDG:  unhex "dfca759ec6b364a9562d2161635fe2dcc5c0b31dac75bc845b9f0de61d54af2d"
+PVXR:   unhex "000000000000000000000000000000002b3e964a5562b92cbe850cd3e43f7cf3"
+PVXS:   unhex "5edb82e2616d6cfb93e03cda4fecce3da94951f5ed1a8704a352a1733ed008c9"
+PVXRX:  unhex "ffffffff00000000ffffffffffffffffe82590f7fc7a57b1b23ed796e0a2a244"   // R.x itself
+teq["R.x >= n: the reduction is done, so it verifies"; ecdsaVerifyP256[PVXPUB; PVXDG; PVXR; PVXS]; 1b]
+// and the other half of the same mistake: R.x itself is not a legal r, because it is >= n. A
+// verifier that dropped the reduction AND the range check would take this one instead.
+teq["R.x >= n: R.x itself is out of range for an r"; ecdsaVerifyP256[PVXPUB; PVXDG; PVXRX; PVXS]; 0b]
+teq["R.x >= n: and it is genuinely a different number from r"; PVXR ~ PVXRX; 0b]
+
 // ---- and every way it can be wrong. r and s out of [1, n-1] first: each of these is a forgery
 // against a verifier that skips the range check, because s = 0 makes s^-1 meaningless and r = 0
 // takes the public key out of the equation entirely.
