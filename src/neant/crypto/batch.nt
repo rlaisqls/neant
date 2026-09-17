@@ -7,8 +7,8 @@
 //   batchVerifyP256[keys;digests;sigs]     -> 1b / 0b      every signature valid?
 //   batchVerifyP256Who[keys;digests;sigs]  -> a boolean per signature
 //   batchVerifyP256Bad[keys;digests;sigs]  -> the indices that failed
-//   batchVerifyP256Der[keys;digests;sigs]     the same three, with each signature the DER
-//   batchVerifyP256DerWho[...]                SEQUENCE { INTEGER r, INTEGER s } a certificate
+//   batchVerifyP256Der[keys;digests;sigs]     the first two again, with each signature the DER
+//   batchVerifyP256DerWho[keys;digests;sigs]  SEQUENCE { INTEGER r, INTEGER s } that a certificate
 //                                             and a TLS CertificateVerify carry
 //   batchVerifyP256Par[keys;digests;sigs;k] -> a boolean per signature, over k OS threads
 //
@@ -82,13 +82,15 @@
 //     bisect or fall back to verifying individually; batchVerifyP256Bad returns the indices
 //     outright, for the same price as the yes/no, because the per-lane answers were computed anyway.
 // What was traded for that is the multi-scalar multiplication's saving, which is real: a Pippenger
-// bucket sum over the 2N+1 points would cut the ~4864 modular multiplications a verification costs
-// here to roughly 880. It is the single biggest thing left on the table, and it is behind one bit
+// bucket sum over the 2N+1 points would cut the ~4900 modular multiplications a verification costs
+// here to roughly 900. It is the single biggest thing left on the table, and it is behind one bit
 // that the wire format does not have.
 //
 // ---- what it does instead: the array language, not the group theory
-// The saving below is not in the number of modular multiplications — it is very nearly the same
-// 4864 per signature that ec.nt pays — it is in what one costs. bnMontMul on 10 limbs of 26 bits is
+// The saving below is not in the number of modular multiplications — ec.nt pays about 4960 per
+// verification (256 doublings at 8, ~192 mixed additions at 11, two Fermat inversions at ~800) and
+// this pays about 4870 (256 doublings, 256 mixed additions because every lane adds at every step,
+// and almost nothing for the inversion) — it is in what one of them costs. bnMontMul on 10 limbs of 26 bits is
 // a dozen interpreted operations on ten-element vectors, and a ten-element vector operation is
 // almost entirely dispatch: measured here, `c + a*b` costs 275 ns at length 10 and 7.2 us at length
 // 5120, which is 27.5 ns per element against 1.41. So the batch is laid out LANE-MAJOR: a field
@@ -103,12 +105,13 @@
 //
 // Two things really are batch ALGORITHMS, and they are the ones an array language can hold:
 //   * ONE MODULAR INVERSION FOR THE WHOLE BATCH (Montgomery's trick, bfInvAll). Each verification
-//     needs s^-1 mod n, which ec.nt pays for with a Fermat exponentiation — 415 modular
-//     multiplications, and in lane-major form that is 415 full-width batched multiplications, more
-//     than the ladder. Instead the lanes are multiplied together up a binary tree (N/2 lanes, then
-//     N/4, ...), the one product at the root is inverted once, and the inverse is pushed back down.
-//     About three full-width multiplications plus one scalar inversion for the whole batch, and the
-//     tree is lane-halving, which is an index operation here, not a copy.
+//     needs s^-1 mod n, which ec.nt pays for with a Fermat exponentiation — about 415 modular
+//     multiplications, and transliterated that would be 415 FULL-WIDTH batched multiplications, 9%
+//     of the ladder, for something a batch need not pay per signature at all. Instead the lanes are
+//     multiplied together up a binary tree (N/2 lanes, then N/4, ...), the one product at the root
+//     is inverted once, and the inverse is pushed back down. About three full-width multiplications
+//     plus one scalar inversion for the whole batch, and the tree is lane-halving, which is an
+//     index operation here, not a copy.
 //   * NO INVERSION MOD p AT ALL. ec.nt finishes by inverting Z to get the affine x, reducing it mod
 //     n and comparing to r. This compares projectively instead: X = r*Z^2 mod p, or X = (r+n)*Z^2
 //     when r+n is still below p. Those are exactly the two solutions of x mod n = r in [0,p),
@@ -118,11 +121,11 @@
 //
 // ---- the security argument
 // Every check ec.nt makes, this makes, and a lane that fails one never reaches the arithmetic:
-// bqPrep refuses an r or s outside [1,n-1], a digest that is not 32 octets, and a public key that
+// bqLane refuses an r or s outside [1,n-1], a digest that is not 32 octets, and a public key that
 // is not an on-curve uncompressed point with both coordinates below p — by calling ec.nt's own
 // ecPoint, so there is one copy of that check in the tree. A refused lane is answered 0b and filled
-// with a stand-in (r=s=1, Q=G) so that the lanes around it still step together; the stand-in cannot
-// change any other lane's answer, because no lane's arithmetic reads any other lane.
+// with a stand-in (r = s = e = 1, Q = G) so that the lanes around it still step together; the
+// stand-in cannot change any other lane's answer, because no lane's arithmetic reads another lane.
 // The ladder is Shamir's trick, ec.nt's, transliterated: 256 doublings and a mixed addition per
 // step, over the same three-entry table (G, Q, G+Q). Two places need lane care and get it:
 //   * dbl-2001-b needs no special case for the point at infinity — with Z = 0 it returns Z3 = 0 —

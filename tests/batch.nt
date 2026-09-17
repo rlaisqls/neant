@@ -28,6 +28,48 @@ BTXR:   unhex "000000000000000000000000000000002b3e964a5562b92cbe850cd3e43f7cf3"
 BTXS:   unhex "5edb82e2616d6cfb93e03cda4fecce3da94951f5ed1a8704a352a1733ed008c9"
 BTXRX:  unhex "ffffffff00000000ffffffffffffffffe82590f7fc7a57b1b23ed796e0a2a244"
 
+// ---- the lane-major arithmetic itself, against bignum.nt on the same numbers. This is cheap --
+// no ladder runs -- and it is where a carry or a conditional subtraction that is wrong shows up as
+// a number rather than as a signature that mysteriously does not verify. The values include the
+// ones the branches turn on: zero, one, p-1 (so a+b wraps and a-b borrows) and a full-width pair.
+btC: bfCtx P256C`p
+btVals: unhex each ("00"
+  ;"01"
+  ;"ffffffff00000001000000000000000000000000fffffffffffffffffffffffe"
+  ;"0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+  ;"7fffffff00000000ffffffffffffffffbce6faada7179e84f3b9cac2fc632551"
+  ;"fedcba9876543210fedcba9876543210fedcba9876543210fedcba9876543210")
+btNums: {bnFromBytes x} each btVals
+btN: count btNums
+// every ordered pair, so both sides of every branch are taken
+btLi: raze {[i] btN#i} each til btN
+btRi: raze btN#,til btN
+btA: bfLift[btC; btNums btLi]
+btB: bfLift[btC; btNums btRi]
+btGotM: bfMul[btC;btA;btB]
+btGotA: bfAdd[btC;btA;btB]
+btGotS: bfSub[btC;btA;btB]
+btWantM: {[i;j] bnMontMul[btNums[i]; btNums[j]; P256C`p; P256C`np]}'[btLi;btRi]
+btWantA: {[i;j] efAdd[P256C; btNums[i]; btNums[j]]}'[btLi;btRi]
+btWantS: {[i;j] efSub[P256C; btNums[i]; btNums[j]]}'[btLi;btRi]
+teq["bfMul agrees with bnMontMul on every pair"; {bfLane[btGotM;x]} each til btN*btN; btWantM]
+teq["bfAdd agrees with efAdd on every pair"; {bfLane[btGotA;x]} each til btN*btN; btWantA]
+teq["bfSub agrees with efSub on every pair"; {bfLane[btGotS;x]} each til btN*btN; btWantS]
+// the batch inversion, on a lane count that is not a power of two so the padding path runs
+btInvIx: 1 + til 5                                        // skip the zero, which has no inverse
+btIn: bfMul[btC; bfLift[btC; btNums btInvIx]; bfCast[btC; btC`r2; 5]]
+teq["bfInvAll inverts every lane at once"; bfEq[bfMul[btC; btIn; bfInvAll[btC;btIn]]; bfCast[btC; btC`one; 5]]; 5#1]
+
+// ---- the one degenerate case in the mixed addition that the formula cannot compute: equal points.
+// bpMAdd has to report it rather than return the (0;0;0) madd-2007-bl would, because bqVerify
+// answers those lanes with ec.nt's scalar verifier instead. Nothing in a batch of honest signatures
+// reaches it, so it is asserted here directly.
+btG2: (bfCast[P256C; P256C`gx; 3]; bfCast[P256C; P256C`gy; 3])
+btJ: (bfCast[P256C; P256C`gx; 3]; bfCast[P256C; P256C`gy; 3]; bfCast[P256C; P256C`one; 3])
+btMd: bpMAdd[P256C; btJ; btG2[0]; btG2[1]; 1 0 1]
+teq["bpMAdd reports the equal-points lanes it cannot compute"; btMd[1]; 1 0 1]
+teq["and reports none of them when nothing is added"; (bpMAdd[P256C; btJ; btG2[0]; btG2[1]; 3#0])[1]; 3#0]
+
 // ---- one batch holding every case there is. A batch is ~750ms of fixed cost whatever N is, so
 // every single-signature assertion in this file rides in this one call rather than in twenty.
 // (name; public key; digest; r; s; expected)
