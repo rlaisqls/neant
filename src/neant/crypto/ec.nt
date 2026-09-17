@@ -104,8 +104,8 @@ efMul:  {[C;a;b] bnMontMul[a;b;C`p;C`np]}
 efSqr:  {[C;a] bnMontMul[a;a;C`p;C`np]}
 efTo:   {[C;x] bnMontMul[x; C`r2; C`p; C`np]}             // x -> xR
 efFrom: {[C;x] bnMontMul[x; ,1; C`p; C`np]}               // xR -> x
-efAdd:  {[C;a;b] r: bnAdd[a;b]; $[0 > bnCmp[r;C`p]; r; bnSub[r;C`p]]}
-efSub:  {[C;a;b] $[0 > bnCmp[a;b]; bnSub[bnAdd[a;C`p];b]; bnSub[a;b]]}
+efAdd:  {[C;a;b] bnAddMod[a;b;C`p]}
+efSub:  {[C;a;b] bnSubMod[a;b;C`p]}
 // a^-1 as a^(p-2): p is prime, so this is the inverse for every a but zero, and zero inverts to
 // zero — which is only ever reached through a Z of zero, and ecToAffine refuses that first.
 // Fermat rather than a binary extended Euclid: Euclid would take roughly 2*bitlen iterations of

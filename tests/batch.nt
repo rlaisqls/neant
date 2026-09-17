@@ -1,0 +1,147 @@
+// The batch verifier in src/neant/crypto/batch.nt: that a batch of N answers exactly what N calls
+// to ecdsaVerifyP256 answer, signature by signature, and that one bad signature anywhere in a batch
+// of 512 is caught and nothing else is. The module's own header says why a batch here is
+// vectorisation rather than the random-linear-combination batch of the literature, and why that
+// makes these assertions exact rather than probabilistic: no lane's arithmetic reads another lane.
+//
+// The 512 signatures are real ones, from tests/data/p256-batch.txt, made by
+// tests/data/p256-batch-gen.sh with openssl over four generated P-256 keys. The single-signature
+// vectors are tests/p256.nt's, repeated here so that a failure names the batch rather than the
+// curve — including the R.x >= n case built by tests/data/p256-rx-ge-n.py, which is the one the
+// projective final comparison in batch.nt has to get right by hand.
+tsection "batch"
+{load "src/neant/crypto/",x} each ("bignum.nt";"der.nt";"ec.nt";"p256.nt";"batch.nt")
+
+BTPUB:  unhex "04d80beadaa91bcac982be71619c25106a5d257a6537d2233e689e2c72e6615843873e23bee15467e76c55be95400a63d44cc891a45adbcf74785bf675ebc7da45"
+BTPUBC: unhex "03d80beadaa91bcac982be71619c25106a5d257a6537d2233e689e2c72e6615843"
+BTDG:   unhex "ddf5bf46337c63b4cef6f1dbfac137cb3e0a8a6e00313db0f98d3d8f9872782d"
+BTSIG:  unhex "3046022100b561094b230ffe88c2f54eeb4dea56d3ddc4c0c0086ad91939a667e88be6373c022100f090ab3512ae71e1c2af3ca720f081e79bb11deb367652e23a8e5fd7e804e8b4"
+BTR:    unhex "b561094b230ffe88c2f54eeb4dea56d3ddc4c0c0086ad91939a667e88be6373c"
+BTS:    unhex "f090ab3512ae71e1c2af3ca720f081e79bb11deb367652e23a8e5fd7e804e8b4"
+BTNB:   unhex "ffffffff00000000ffffffffffffffffbce6faada7179e84f3b9cac2fc632551"
+BTNS:   bnBytes bnSub[bnFromBytes BTNB; bnFromBytes BTS]                      // n - s
+// R.x >= n: r = R.x - n, so the final comparison has to test both r and r+n against X. The second
+// of these is R.x itself, which is not a legal r at all because it is not below n.
+BTXPUB: unhex "04425419302e392f41daff51b5a643e7b559ab10c0cd6269f2d33be4d7db886a9cb72831ebd815e82ea0113f630b74e1ed81abf8fef4c39b10e09f3f7a716dfdc6"
+BTXDG:  unhex "dfca759ec6b364a9562d2161635fe2dcc5c0b31dac75bc845b9f0de61d54af2d"
+BTXR:   unhex "000000000000000000000000000000002b3e964a5562b92cbe850cd3e43f7cf3"
+BTXS:   unhex "5edb82e2616d6cfb93e03cda4fecce3da94951f5ed1a8704a352a1733ed008c9"
+BTXRX:  unhex "ffffffff00000000ffffffffffffffffe82590f7fc7a57b1b23ed796e0a2a244"
+
+// ---- the lane-major arithmetic itself, against bignum.nt on the same numbers. This is cheap --
+// no ladder runs — and it is where a carry or a conditional subtraction that is wrong shows up as
+// a number rather than as a signature that mysteriously does not verify. The values include the
+// ones the branches turn on: zero, one, p-1 (so a+b wraps and a-b borrows) and a full-width pair.
+btC: bfCtx P256C`p
+btVals: unhex each ("00"
+  ;"01"
+  ;"ffffffff00000001000000000000000000000000fffffffffffffffffffffffe"
+  ;"0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+  ;"7fffffff00000000ffffffffffffffffbce6faada7179e84f3b9cac2fc632551"
+  ;"fedcba9876543210fedcba9876543210fedcba9876543210fedcba9876543210")
+btNums: {bnFromBytes x} each btVals
+btN: count btNums
+// every ordered pair, so both sides of every branch are taken
+btLi: raze {[i] btN#i} each til btN
+btRi: raze btN#,til btN
+btA: bfLift[btC; btNums btLi]
+btB: bfLift[btC; btNums btRi]
+btGotM: bfMul[btC;btA;btB]
+btGotA: bfAdd[btC;btA;btB]
+btGotS: bfSub[btC;btA;btB]
+btWantM: {[i;j] bnMontMul[btNums[i]; btNums[j]; P256C`p; P256C`np]}'[btLi;btRi]
+btWantA: {[i;j] efAdd[P256C; btNums[i]; btNums[j]]}'[btLi;btRi]
+btWantS: {[i;j] efSub[P256C; btNums[i]; btNums[j]]}'[btLi;btRi]
+teq["bfMul agrees with bnMontMul on every pair"; {bfLane[btGotM;x]} each til btN*btN; btWantM]
+teq["bfAdd agrees with efAdd on every pair"; {bfLane[btGotA;x]} each til btN*btN; btWantA]
+teq["bfSub agrees with efSub on every pair"; {bfLane[btGotS;x]} each til btN*btN; btWantS]
+// the batch inversion, on a lane count that is not a power of two so the padding path runs
+btInvIx: 1 + til 5                                        // skip the zero, which has no inverse
+btIn: bfMul[btC; bfLift[btC; btNums btInvIx]; bfCast[btC; btC`r2; 5]]
+teq["bfInvAll inverts every lane at once"; bfEq[bfMul[btC; btIn; bfInvAll[btC;btIn]]; bfCast[btC; btC`one; 5]]; 5#1]
+
+// ---- the one degenerate case in the mixed addition that the formula cannot compute: equal points.
+// bpMAdd has to report it rather than return the (0;0;0) madd-2007-bl would, because bqVerify
+// answers those lanes with ec.nt's scalar verifier instead. Nothing in a batch of honest signatures
+// reaches it, so it is asserted here directly.
+btG2: (bfCast[P256C; P256C`gx; 3]; bfCast[P256C; P256C`gy; 3])
+btJ: (bfCast[P256C; P256C`gx; 3]; bfCast[P256C; P256C`gy; 3]; bfCast[P256C; P256C`one; 3])
+btMd: bpMAdd[P256C; btJ; btG2[0]; btG2[1]; 1 0 1]
+teq["bpMAdd reports the equal-points lanes it cannot compute"; btMd[1]; 1 0 1]
+teq["and reports none of them when nothing is added"; (bpMAdd[P256C; btJ; btG2[0]; btG2[1]; 3#0])[1]; 3#0]
+
+// ---- one batch holding every case there is. A batch is ~750ms of fixed cost whatever N is, so
+// every single-signature assertion in this file rides in this one call rather than in twenty.
+// (name; public key; digest; r; s; expected)
+btCases: (("the openssl vector"; BTPUB; BTDG; BTR; BTS; 1b)
+  ;("(r, n-s), the other half of the malleable pair"; BTPUB; BTDG; BTR; BTNS; 1b)
+  ;("R.x >= n: the reduction is done, so it verifies"; BTXPUB; BTXDG; BTXR; BTXS; 1b)
+  ;("R.x >= n: R.x itself is out of range for an r"; BTXPUB; BTXDG; BTXRX; BTXS; 0b)
+  ;("r = 0"; BTPUB; BTDG; 0x00; BTS; 0b)
+  ;("s = 0"; BTPUB; BTDG; BTR; 0x00; 0b)
+  ;("r empty"; BTPUB; BTDG; 0x; BTS; 0b)
+  ;("s empty"; BTPUB; BTDG; BTR; 0x; 0b)
+  ;("r = n"; BTPUB; BTDG; BTNB; BTS; 0b)
+  ;("s = n"; BTPUB; BTDG; BTR; BTNB; 0b)
+  ;("r = n+1"; BTPUB; BTDG; bnBytes bnAdd[bnFromBytes BTNB; ,1]; BTS; 0b)
+  ;("r and s swapped"; BTPUB; BTDG; BTS; BTR; 0b)
+  ;("a flipped bit in r"; BTPUB; BTDG; (31#BTR), bnot BTR[31]; BTS; 0b)
+  ;("a flipped bit in s"; BTPUB; BTDG; BTR; (31#BTS), bnot BTS[31]; 0b)
+  ;("a flipped digest bit"; BTPUB; (31#BTDG), bnot BTDG[31]; BTR; BTS; 0b)
+  ;("a compressed public key is refused"; BTPUBC; BTDG; BTR; BTS; 0b)
+  ;("a public key that is not a point"; (64#BTPUB), bnot BTPUB[64]; BTDG; BTR; BTS; 0b)
+  ;("a public key of the wrong length"; -1_BTPUB; BTDG; BTR; BTS; 0b)
+  ;("an empty public key"; 0x; BTDG; BTR; BTS; 0b)
+  ;("a digest of the wrong length"; BTPUB; -1_BTDG; BTR; BTS; 0b)
+  ;("an empty digest"; BTPUB; 0x; BTR; BTS; 0b)
+  ;("the good one again, after all of those"; BTPUB; BTDG; BTR; BTS; 1b))
+btKeys: {x[1]} each btCases
+btDigs: {x[2]} each btCases
+btSigs: {(x[3]; x[4])} each btCases
+btWant: {x[5]} each btCases
+btGot: batchVerifyP256Who[btKeys; btDigs; btSigs]
+{[t;g] teq["case: ",t[0]; g; t[5]]}'[btCases; btGot]
+// the same thing said once more as a whole, and the two other shapes of the same answer
+teq["a batch with a bad signature in it is not all-valid"; batchVerifyP256[btKeys;btDigs;btSigs]; 0b]
+teq["and the bad ones are named"; batchVerifyP256Bad[btKeys;btDigs;btSigs]; where not btWant]
+teq["every lane agrees with ecdsaVerifyP256"; btGot; btWant]
+
+// ---- the DER entry point, which is the shape a certificate and a CertificateVerify carry
+btDerCases: ((BTPUB; BTDG; BTSIG; 1b)
+  ;(BTPUB; BTDG; -1_BTSIG; 0b)                              // truncated
+  ;(BTPUB; BTDG; 0x; 0b)                                    // empty
+  ;(BTPUB; BTDG; 0x0500; 0b)                                // a NULL, not a SEQUENCE
+  ;(BTPUB; BTDG; BTSIG, 0x00; 0b)                           // a trailing byte after the SEQUENCE
+  ;(BTPUB; BTDG; BTSIG; 1b))
+btDerGot: batchVerifyP256DerWho[{x[0]} each btDerCases; {x[1]} each btDerCases; {x[2]} each btDerCases]
+teq["DER: a batch of signatures as they arrive on the wire"; btDerGot; {x[3]} each btDerCases]
+
+// ---- degenerate shapes
+teq["an empty batch is vacuously all-valid"; batchVerifyP256[();();()]; 1b]
+teq["an empty batch has no answers"; count batchVerifyP256Who[();();()]; 0]
+
+// ---- 512 real signatures, and one bad one at the start, in the middle and at the end.
+// The four batches run on four OS threads, each re-loading the module for its own copy of the hot
+// loops: see batch.nt's note on the FnCode the tracing JIT keeps its loop counters in.
+btRows: read0 "tests/data/p256-batch.txt"
+btIsK:  {(1#x) ~ ,"K"} each btRows
+btKs:   unhex each {2_x} each btRows where btIsK
+btSr:   btRows where not btIsK
+BTKS:   btKs {"0123456789" ? x[2]} each btSr
+BTSD:   {unhex x[4+til 64]} each btSr
+BTRS:   {ecSigRS unhex 69_x} each btSr
+teq["the corpus is 512 signatures over four keys"; (count BTKS; count BTSD; count BTRS); (512;512;512)]
+btSpoil: {[i] g: BTSD; d: g[i]; d[7]: d[7] bxor 0x01; g[i]: d; g}
+btRun: {[dgs] @[load; BATCHNT; {0}]; batchVerifyP256Who[BTKS; dgs; BTRS]}
+btJobs: (BTSD; btSpoil 0; btSpoil 255; btSpoil 511)
+btOut: {join x} each {[d] spawn {btRun d}} each btJobs
+teq["512 real signatures all verify"; all btOut[0]; 1b]
+teq["a bad signature at the start of 512 is caught, and only it"; where not btOut[1]; ,0]
+teq["a bad signature in the middle of 512 is caught, and only it"; where not btOut[2]; ,255]
+teq["a bad signature at the end of 512 is caught, and only it"; where not btOut[3]; ,511]
+
+// ---- and the same answers when the batch is split over OS threads
+btIx: til 40
+btPd: (btSpoil 17) btIx
+btPar: batchVerifyP256Par[BTKS btIx; btPd; BTRS btIx; 4]
+teq["batchVerifyP256Par agrees with one thread"; btPar; batchVerifyP256Who[BTKS btIx; btPd; BTRS btIx]]

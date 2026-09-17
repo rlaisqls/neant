@@ -1,0 +1,178 @@
+// The two DER readers, held to each other. src/neant/crypto/der.nt has the strict one — derTLV
+// builds a dict per element and derKids walks the children one at a time — and the columnar one,
+// derScan, which finds every element of every buffer in one breadth-first sweep of whole-vector
+// operations and hands back columns. x509.nt parses a certificate out of either: x509Parse out of
+// the dicts, x509ParseMany out of the columns.
+//
+// The columnar reader exists for speed (tests/x509bench.nt has the numbers, and the README the
+// comparison with OpenSSL). This file is what says it did not buy that speed by checking less. It
+// asserts three things: that derScan finds exactly the elements derTLV and derKids find, element
+// for element and octet for octet, over every certificate in the repository; that x509ParseMany
+// returns exactly what x509Parse returns, field for field, over the same; and that everything
+// either reader must refuse, both still refuse.
+tsection "x509"
+{load "src/neant/crypto/",x} each ("der.nt";"x509.nt")
+
+// terrLike calls its argument with no arguments, so the thing under test goes in a closure
+x5thunk: {[d] {[] x509Parse d}}
+x5batch: {[d] {[] x509ParseMany enlist d}}
+x5scan: {[d] {[] derScan enlist d}}
+x5parse: {[d] {[] derParse d}}
+
+X5FILES: ("chain-google";"critical-unknown-ext";"pki-critical";"pki-deep";"pki-ec384-leaf")
+X5FILES,: ("pki-ec384-root";"pki-ec-leaf";"pki-ec-root";"pki-expired";"pki-future";"pki-int2")
+X5FILES,: ("pki-int";"pki-leaf";"pki-notca";"pki-p256x-leaf";"pki-p384-leaf";"pki-p384-root")
+X5FILES,: ("pki-pss384-leaf";"pki-root";"pki-selfsigned";"pki-sha384-leaf";"pki-under-notca")
+X5FILES,: ("pki-wildcard";"pki-wrong-host";"selfsigned-ec";"selfsigned-pss";"selfsigned-rsa")
+x5ders: raze {[f] pemLoad "tests/data/",f,".pem"} each X5FILES
+teq["fixtures: every PEM block in tests/data parses"; 0<count x5ders; 1b]
+
+// ---- derScan finds exactly what derTLV and derKids find
+x5old: {[nd] out: enlist nd; if[nd`cons; out,: raze x5old each derKids nd]; out}
+x5new: {[s;k] out: enlist k; if[(s`cons)[k]; out,: raze x5new[s;] each dsKids[s;k]]; out}
+x5S: derScan x5ders
+x5no: raze {[d] x5old derParse d} each x5ders
+x5nn: raze x5new[x5S;] each x5S`root
+teq["derScan: the same number of elements as derTLV"; count x5nn; count x5no]
+// class, tag, the constructed bit, the content length, the whole TLV and the content octets
+x5cols: {[s;k] (DERCLS[(s`cls)[k]]; (s`tag)[k]; (s`cons)[k]; (s`len)[k]; dsRaw[s;k]; dsV[s;k])}
+x5dict: {[a] (a`cls; a`tag; a`cons; a`len; a`raw; a`v)}
+x5same: {[a;k] (x5cols[x5S;k]) ~ x5dict a}
+teq["derScan: every element agrees, in document order"; count where not x5same'[x5no;x5nn]; 0]
+x5span: {[k] (count dsRaw[x5S;k]) = (x5S`hlen)[k]+(x5S`len)[k]}
+teq["derScan: `hlen+`len is the length of the whole element"
+  count where not x5span each til count x5S`off; 0]
+
+// ---- x509ParseMany returns exactly what x509Parse returns
+X5KEYS: `ver`tbs`serial`sigAlg`sigAlgOid`sigParams`sig`issuer`issuerCanon`subject`subjectCanon
+X5KEYS,: `notBefore`notAfter`spki`spkiRaw`san`eku`isCa`pathLen`keyUsage`critUnknown
+x5a: x509Parse each x5ders
+x5b: x509ParseMany x5ders
+teq["x509ParseMany: the documented keys, in the documented order"; key x5b[0]; X5KEYS]
+teq["x509ParseMany: every certificate, field for field"; count where not {x~y}'[x5a;x5b]; 0]
+// the one field a verifier cannot be wrong about: `tbs is what the signature is over
+teq["tbs is the tbsCertificate's own octets, byte for byte"
+  count where not {[d;c] (c`tbs) ~ ((derKids derParse d)[0])`raw}'[x5ders;x5b]; 0]
+teq["a single certificate through the batch reader"; (x509ParseMany enlist x5ders[0])[0]; x5a[0]]
+teq["an empty batch"; x509ParseMany (); ()]
+
+// ---- what both readers must refuse
+// tests/data/malformed.pem, block by block, in the order tests/data/malformed.py writes them
+X5BADMSG: ("der: length runs past the end of the input";"der: non-minimal length")
+X5BADMSG,: ("der: indefinite length is not DER";"der: trailing bytes after the top-level element")
+X5BADMSG,: ,"x509: signatureAlgorithm does not match the one inside tbsCertificate"
+x5m: pemLoad "tests/data/malformed.pem"
+teq["malformed.pem: five blocks"; count x5m; 5]
+{[i] terrLike["malformed ",(string i),": the strict reader"; x5thunk x5m[i]; X5BADMSG[i]]} each til 5
+{[i] terrLike["malformed ",(string i),": the columnar reader"; x5batch x5m[i]; X5BADMSG[i]]} each til 5
+
+// the same rejections at the DER level, where both readers can be pointed straight at them
+X5DER: (("an indefinite length, which is BER and not DER"; 0x30800000
+    ;"der: indefinite length is not DER")
+  ;("a long-form length that the short form could have said"; 0x30810102
+    ;"der: non-minimal length")
+  ;("a long-form length with a leading zero octet"; 0x30820080
+    ;"der: non-minimal length")
+  ;("a length that runs past the end of the input"; 0x300505
+    ;"der: length runs past the end of the input")
+  ;("an octet after the top-level element"; 0x300000
+    ;"der: trailing bytes after the top-level element")
+  ;("a length that does not fit an int"; 0x3085010203040506
+    ;"der: length does not fit an int"))
+{[t] terrLike["der: ",(t[0]),", strict"; x5parse t[1]; t[2]]} each X5DER
+{[t] terrLike["der: ",(t[0]),", columnar"; x5scan t[1]; t[2]]} each X5DER
+// the high-tag-number form: the strict reader decodes it and rejects a non-minimal one; the
+// columnar reader does not read it at all, which is why x509ParseMany falls back to x509Parse
+terrLike["der: a non-minimal high tag number"; x5parse 0x1f80010000; "der: non-minimal tag"]
+terrLike["der: derScan refuses the high-tag-number form outright"; x5scan 0x1f81010000; DERSCANHTN]
+teq["x509ParseMany falls back, so a high tag number is still the strict reader's answer"
+  (tcatch x5batch 0x1f80010000)[1]; "der: non-minimal tag"]
+
+// the typed readers: every check derInt, derBitStr, derBool, derNull, derStr and derOid make, made
+// by dsIntB, dsBitStr, dsBool, dsNull, dsStr and dsOid too
+// run the same accessor through both readers and insist they agree — then behave as whichever it
+// was, so that terrLike sees the rejection and teq sees the value
+x5typed: {[f;g;d] {[]
+  r1: tcatch {[] f derParse d}
+  r2: tcatch {[] g[derScan enlist d; 0]}
+  if[not r1 ~ r2; signal "the readers disagree: ",(tfmt r1[1])," vs ",tfmt r2[1]]
+  if[`ok=r1[0]; signal r1[1]]
+  r1[1]}}
+X5TYPED: (("a non-minimal INTEGER, a leading zero octet that is not needed"; 0x02020001
+    ;"der: non-minimal INTEGER")
+  ;("a non-minimal INTEGER, a leading 0xff that is not needed"; 0x0202ff80
+    ;"der: non-minimal INTEGER")
+  ;("an empty INTEGER"; 0x0200; "der: empty INTEGER")
+  ;("a BIT STRING whose unused bits are not zero"; 0x030201ff
+    ;"der: BIT STRING trailing bits are not zero")
+  ;("a BIT STRING claiming nine unused bits"; 0x030209ff
+    ;"der: BIT STRING unused-bit count out of range")
+  ;("a BIT STRING with no octets that claims unused bits"; 0x030101
+    ;"der: BIT STRING has no octets but claims unused bits")
+  ;("an empty BIT STRING"; 0x0300; "der: empty BIT STRING"))
+{[t] terrLike["der: ",t[0]; x5typed[derInt;dsIntB;t[1]]; t[2]]} each 3#X5TYPED
+{[t] terrLike["der: ",t[0]; x5typed[derBitStr;dsBitStr;t[1]]; t[2]]} each 3_X5TYPED
+terrLike["der: a NULL with content"; x5typed[derNull;dsNull;0x050100]; "der: NULL with content"]
+terrLike["der: a BOOLEAN that is neither 0x00 nor 0xff"; x5typed[derBool;dsBool;0x010101]
+  "der: BOOLEAN must be 0x00 or 0xff in DER"]
+terrLike["der: a constructed string"; x5typed[derStr;dsStr;0x33020500]
+  "der: a DER string must be primitive"]
+terrLike["der: a PrintableString with a character outside its set"; x5typed[derStr;dsStr;0x13012a]
+  "der: PrintableString has a character outside its set"]
+terrLike["der: an OBJECT IDENTIFIER with a padded subidentifier"; x5typed[derOid;dsOid;0x06032a8001]
+  "der: non-minimal OBJECT IDENTIFIER subidentifier"]
+terrLike["der: an OBJECT IDENTIFIER that ends inside a subidentifier"; x5typed[derOid;dsOid;0x06022a80]
+  "der: OBJECT IDENTIFIER ends inside a subidentifier"]
+// and the ones both must accept, with the same answer
+teq["der: a BOOLEAN of 0xff"; x5typed[derBool;dsBool;0x0101ff][]; 1b]
+teq["der: the dotted form of rsaEncryption"; x5typed[derOid;dsOid;0x06092a864886f70d010101][]
+  "1.2.840.113549.1.1.1"]
+teq["der: the dotted form of an attribute type"; x5typed[derOid;dsOid;0x0603550403][]; "2.5.4.3"]
+teq["der: a UTCTime"; x5typed[derTime;dsTime;0x170d3236303931363132303030305a][]
+  (2026.09.16; 12:00:00.000)]
+
+// ---- an unrecognised critical extension is reported, not dropped (RFC 5280 4.2)
+x5crit: (pemLoad "tests/data/critical-unknown-ext.pem")[0]
+teq["a critical extension this parser does not model is reported, by both readers"
+  ((x509Parse x5crit)`critUnknown; ((x509ParseMany enlist x5crit)[0])`critUnknown)
+  (,"1.3.6.1.4.1.99999.1"; ,"1.3.6.1.4.1.99999.1")]
+
+// ---- PEM
+// pemLines takes read0's lines and decodes every block's base64 in one pass; this is the loop it
+// replaced, kept here as the thing to agree with
+x5pemOld: {[ls]
+  out: (); body: ""; open: 0; i: 0
+  while[i<count ls
+    l: trim ls[i] except "\r"
+    if[l ~ X509PEMBEGIN
+      if[open; signal "pem: a BEGIN CERTIFICATE inside a block"]
+      open: 1; body: ""]
+    if[l ~ X509PEMEND
+      if[not open; signal "pem: an END CERTIFICATE with no BEGIN"]
+      out: $[0=count out; enlist unb64 body; out,enlist unb64 body]
+      open: 0]
+    if[open & not l ~ X509PEMBEGIN; body,: l]
+    i+:1]
+  if[open; signal "pem: a BEGIN CERTIFICATE with no END"]
+  out}
+x5pemF: {[f] ls: read0 "tests/data/",f,".pem"; (pemLines ls) ~ x5pemOld ls}
+teq["pemLines: the same DER as the line-at-a-time decoder, on every fixture"
+  count where not x5pemF each X5FILES; 0]
+teq["x509Split: the same lines as \"\\n\" vs"
+  count where not {[f] t: "\n" sv read0 "tests/data/",f,".pem"; (x509Split t) ~ "\n" vs t} each X5FILES; 0]
+X5ONE: "-----BEGIN CERTIFICATE-----\nBQA=\n-----END CERTIFICATE-----"
+teq["pemDecode: anything outside the block is ignored"
+  hex (pemDecode "junk\n",X5ONE,"\ntrailing junk")[0]; "0500"]
+teq["pemDecode: two blocks"; count pemDecode X5ONE,"\n",X5ONE; 2]
+teq["pemDecode: no blocks"; count pemDecode "nothing here"; 0]
+terrLike["pemDecode: a BEGIN with no END"; {[] pemDecode X5ONE,"\n-----BEGIN CERTIFICATE-----"}
+  "pem: a BEGIN CERTIFICATE with no END"]
+terrLike["pemDecode: an END with no BEGIN"; {[] pemDecode "-----END CERTIFICATE-----"}
+  "pem: an END CERTIFICATE with no BEGIN"]
+terrLike["pemDecode: a BEGIN inside a block"
+  {[] pemDecode "-----BEGIN CERTIFICATE-----\nBQA=\n-----BEGIN CERTIFICATE-----\nBQA=\n-----END CERTIFICATE-----"}
+  "pem: a BEGIN CERTIFICATE inside a block"]
+terrLike["pemDecode: a character base64 does not have"
+  {[] pemDecode "-----BEGIN CERTIFICATE-----\nB!A=\n-----END CERTIFICATE-----"}; "b64: bad char"]
+terrLike["pemDecode: an '=' before the end of a block"
+  {[] pemDecode "-----BEGIN CERTIFICATE-----\nB=AA\n-----END CERTIFICATE-----"}; "b64: bad char"]

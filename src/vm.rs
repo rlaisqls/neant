@@ -67,6 +67,10 @@ impl Vm {
     /// trampoline (src/jit.rs) uses to resolve a compiled call site's callee, the same lookup
     /// `Op::LoadG` does in `run_ops` below.
     pub(crate) fn global_at(&self, slot: usize) -> Option<Value> { self.vals.get(slot).cloned().flatten() }
+    /// The slot a name is already interned at, without interning it if it isn't — the JIT
+    /// (src/jit.rs) needs to recognise a `LoadG` of `band`/`shr`/... by slot number, and asking
+    /// for a name nothing has ever mentioned should not create one.
+    pub(crate) fn slot_of(&self, name: &str) -> Option<usize> { self.names.get(name).map(|&s| s as usize) }
     /// The current interpreted call depth (`call_code`), for `jit_call`'s combined depth guard.
     pub(crate) fn depth(&self) -> usize { self.depth }
     /// All global values, for save/restore around test cases (slots only grow, so a snapshot stays valid).
