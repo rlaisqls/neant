@@ -88,6 +88,28 @@ shaBlocksL: {[h;w;k;p;nblk;msk]
     h[7]: msk band (h[7])+hh
     blk: blk+1]
   h}
+// The vector column form shaBlocksL replaced: one 64-byte block at a time, the message schedule
+// grown by append and the eight working words in eight locals. It is kept, and sha256V with it,
+// because the two must agree on every input and tests/crypto.nt checks that on random messages —
+// the same reason src/neant/crypto/bignum.nt keeps bnMulV. Nothing else calls either.
+shaBlockV: {[h;blk]
+  w: be32 blk; i: 16
+  while[i<64
+    s0: (rotr32[w[i-15];7]) bxor (rotr32[w[i-15];18]) bxor w[i-15] shr 3
+    s1: (rotr32[w[i-2];17]) bxor (rotr32[w[i-2];19]) bxor w[i-2] shr 10
+    w,: M32 band w[i-16]+s0+w[i-7]+s1; i+:1]
+  a: h[0]; b: h[1]; c: h[2]; d: h[3]; e: h[4]; f: h[5]; g: h[6]; hh: h[7]; i: 0
+  while[i<64
+    S1: (rotr32[e;6]) bxor (rotr32[e;11]) bxor rotr32[e;25]
+    ch: (e band f) bxor (M32 band bnot e) band g
+    t1: M32 band hh+S1+ch+shaK[i]+w[i]
+    S0: (rotr32[a;2]) bxor (rotr32[a;13]) bxor rotr32[a;22]
+    maj: (a band b) bxor (a band c) bxor b band c
+    t2: M32 band S0+maj
+    hh: g; g: f; f: e; e: M32 band d+t1; d: c; c: b; b: a; a: M32 band t1+t2
+    i+:1]
+  M32 band h+(a;b;c;d;e;f;g;hh)}
+sha256V: {[b] p: shaPad b; h: shaH0; i: 0; while[i<count p; h: shaBlockV[h; p[i+til 64]]; i+:64]; be32bytes h}
 // 64 empty calls (no blocks, so the body does no work at all) take shaBlocksL over the tier's
 // call threshold, on the first hash rather than at load — see the header for why not at load.
 shaWarmed: 0b
@@ -155,6 +177,17 @@ chachaXorL: {[out;dat;n;s;s0;qi;msk]
     pos: pos+64]
   out}
 // chacha20[key;counter;nonce;data]: xor data with the keystream from block `counter`; encrypt and decrypt are the same call
+// the four-column vector form chachaXorL replaced, one block at a time through qround: the same
+// differential reference shaBlockV is, checked against the kernel in tests/crypto.nt.
+chachaBlockV: {[key;counter;nonce]
+  s0: chachaState[key;counter;nonce]
+  s: s0
+  do[10
+    r: qround[s[0 1 2 3]; s[4 5 6 7]; s[8 9 10 11]; s[12 13 14 15]]
+    s[0 1 2 3]: r[0]; s[4 5 6 7]: r[1]; s[8 9 10 11]: r[2]; s[12 13 14 15]: r[3]
+    r: qround[s[0 1 2 3]; s[5 6 7 4]; s[10 11 8 9]; s[15 12 13 14]]
+    s[0 1 2 3]: r[0]; s[5 6 7 4]: r[1]; s[10 11 8 9]: r[2]; s[15 12 13 14]: r[3]]
+  le32bytes add32[s;s0]}
 chachaWarmed: 0b
 chachaWarm: {[] chachaWarmed:: 1b; do[64; chachaXorL[0#0; 0#0; 0; CHS; 16#0; CHQI; M32]]; 1b}
 chacha20: {[key;counter;nonce;data]
@@ -223,6 +256,20 @@ polyBlocksL: {[h;r;acc;msg;nb;msk]
     o: o+16
     b: b+1]
   h}
+// the block-at-a-time form polyBlocksL replaced, kept whole because the seam between the kernel's
+// full blocks and the short last one is where a rewrite like this goes wrong: tests/crypto.nt
+// checks the two against each other on every length either side of a multiple of 16.
+poly1305V: {[key;msg]
+  r: p5[key[til 16];0] band 67108863 67108611 67092735 66076671 1048575   // clamp r
+  h: 5#0; i: 0; n: count msg
+  while[i<n; blk: msg[i+til 16&n-i]; full: 16=count blk; if[not full; blk,: 0x01]; h: p5mul[h+p5[blk;full]; r]; i+:16]
+  h: p5carry p5carry h
+  g: h + 5 0 0 0 0; c: g shr 26; g: (g band M26) + 0,-1_c
+  if[g[4] shr 26; h: g band M26]
+  w: M32 band (h[0] bor h[1] shl 26; (h[1] shr 6) bor h[2] shl 20; (h[2] shr 12) bor h[3] shl 14; (h[3] shr 18) bor h[4] shl 8)
+  f: w + le32 key[16+til 16]
+  do[2; c: f shr 32; f: (f band M32) + 0,-1_c]
+  le32bytes M32 band f}
 polyWarmed: 0b
 polyWarm: {[] polyWarmed:: 1b; do[64; polyBlocksL[5#0; 5#0; POLYACC; 0#0; 0; M26]]; 1b}
 poly1305: {[key;msg]
@@ -298,6 +345,10 @@ fmulL: {[out;acc;a;b;msk]
 // x25519 would tier fmulL up 2% into its own first ladder anyway; this only saves the ~14ms that
 // first run spends on its own first sixty-four multiplications interpreted. src/neant/crypto/
 // ed25519.nt calls the field directly and reaches the threshold on its own volume the same way.
+// the vector column forms fcarryL and fmulL replaced, kept as the differential reference
+// tests/crypto.nt checks the kernels against on random field elements.
+fcarryV: {[v] do[4; c: v shr 22; v: (v band M22) + 9728 1 1 1 1 1 1 1 1 1 1 1 * -1 rotate c]; v}
+fmulV: {[a;b] acc: 23#0; i: 0; while[i<12; acc[i+til 12]+: a[i]*b; i+:1]; fcarryV acc[til 12] + 9728*acc[12+til 11],0}
 fieldWarmed: 0b
 fieldWarm: {[] fieldWarmed:: 1b; do[64; fcarryL[F0; M22]; fmulL[F0; FACC; F0; F0; M22]]; 1b}
 fcarry: {[v] fcarryL[v;M22]}

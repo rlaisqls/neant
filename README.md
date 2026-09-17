@@ -386,10 +386,11 @@ key bxor data                // the bit verbs on two byte operands give bytes
 
 `src/neant/crypto/crypto.nt` is pure neant on those: `sha256 hmac hkdfExtract hkdfExpand chacha20 poly1305
 aeadEncrypt aeadDecrypt x25519`, all checked against the RFC vectors (measured on this machine:
-SHA-256 ~0.22ms/block, ChaCha20-Poly1305 ~22ms per 10KB, X25519 ~48ms — see "Performance" for why
-the older figures in this file read faster). 32-bit words live in ints masked after each sum;
-the 2^255-19 and 2^130-5 fields use 22- and 26-bit limbs so products stay exact in an int, and
-carries run as vector passes.
+SHA-256 **1.0ms** per 64KB, ChaCha20-Poly1305 **2.45ms** per 64KB, X25519 **3.05ms**). 32-bit words
+live in ints masked after each sum; the 2^255-19 and 2^130-5 fields use 22- and 26-bit limbs so
+products stay exact in an int. Every hot kernel is a scalar loop over indices that the
+whole-function JIT tier compiles — see "The hash and the stream cipher run as compiled scalar
+loops" under "Performance", and the file's own header for the three things that used to stop it.
 
 `src/neant/crypto/sha512.nt` and `src/neant/crypto/ed25519.nt` (loadable, not in the boot image) add
 **SHA-512, SHA-384 and Ed25519 verification** on top of that field — FIPS 180-4 and RFC 8032
@@ -1213,8 +1214,9 @@ itself and `Value` clone/drop.
 Those absolute figures are **not reproducible on the machine this is developed on** and should be
 read as ratios only. `crypto.nt` has not changed since (only the move into `src/neant/crypto/`), and
 checking out that same commit here measures SHA-256 at 195ms per 64KB rather than 119ms — so the
-numbers above came from different hardware. Measured here today: SHA-256 **220ms** per 64KB
-(0.22ms/block), ChaCha20-Poly1305 **22ms** per 10KB, X25519 **48ms**. The 196ms → 221ms between that
+numbers above came from different hardware. Measured here on that same code: SHA-256 **233ms** per 64KB,
+ChaCha20-Poly1305 **21.6ms** per 10KB, X25519 **47.5ms** — all three are now 1.0ms, 0.38ms and
+3.05ms, on the compiled kernels below. The 196ms → 221ms between that
 commit and now is real, and it is one commit: `fbdeb99`, which converted `Value` from `Rc` to `Arc`
 so that `spawn` could exist. Everything after it is flat. See "Concurrency" for the trade — it is the
 price of threads, not a regression anyone can take back.
@@ -1282,6 +1284,79 @@ was timed as the same loop with `band`/`shr` in it: 1.84ns per limb product agai
 bits that is 4489 products at 1.84ns = 8.3µs against 6241 at 1.12ns = 7.0µs — 19% *worse*, because
 64% more work per product does not pay for 28% fewer of them. Fewer products has to come from
 Karatsuba, not from the radix.
+
+#### The hash and the stream cipher run as compiled scalar loops
+
+`src/neant/crypto/crypto.nt` got the same treatment `bignum.nt` did, for the same reason and with
+the same recipe. `shaBlock` was written as a vector schedule grown by append, `chachaBlock` as four
+column vectors through `qround`, `p5mul` and `fmul` as `acc[i+til n] +: a[i]*b` — the fastest shape
+an interpreter has, and the three things a JIT cannot take. Every one of them was disqualified at
+least twice over, and none of the disqualifiers needed a compiler change to remove. Measured one
+cause at a time, 2M iterations of a `while` body, after the tier had taken the function:
+
+| the body | cost | |
+|---|---|---|
+| `n: n+i` | 3ms | the baseline |
+| `n: (n+i) band 65535` | 2ms | compiles since the bit builtins became instructions |
+| `n: n+t[i band 63]`, `t` a **parameter** | 1ms | compiles |
+| `w[i]: i`, `w` a **parameter** | 2ms | compiles |
+| `n: n+G`, `G` a global int | **240ms** | a global read is not in the subset |
+| `n: n+W[i mod 3]`, `W` a global vector | **652ms** | nor is indexing one |
+| `n: n+w[i band 3]`, `w` a **scratch local** vector | **400ms** | only a parameter or capture is classifiable |
+| `n: rr[n;3]+i`, `rr` a pure int helper | **209ms** | compiles, but a trampoline call is ~45ns |
+
+So `M32`, `shaK`, `M26` and `M22` became parameters (`msk`, `k`), the message schedule, the ChaCha
+state and both product accumulators became parameters allocated once as module-level scratch, and
+`rotr32`/`rotl32`/`add32`/`qround` were written out by hand inside the kernels rather than called.
+(`bnot` is not one of the six inlined builtins, so `msk bxor x` stands in for it on a masked word.)
+The kernels are `shaBlocksL` — the whole message, every block, in one call — `chachaXorL`, which
+produces the keystream and xors it in the same pass, `polyBlocksL` for the full 16-byte blocks, and
+`fcarryL`/`fmulL` for the 2^255-19 field. The column forms stay in the file as `shaBlockV`,
+`sha256V`, `chachaBlockV`, `poly1305V`, `fcarryV` and `fmulV`, and `tests/crypto.nt` checks the two
+against each other across every length either side of a block boundary and on random field
+elements. Every published vector in `tests/lang.nt` is unchanged and exact.
+
+**A boot file may not warm its own kernels at load, and failing quietly is the whole trap.** The
+tier compiles after 64 calls; one `sha256` of any size is *one* call to `shaBlocksL`, so a TLS
+handshake's thirty hashes would never reach the threshold and `bnWarm`'s trick is needed here too.
+But `crypto.nt` is `BOOT_FILES[9]` and `src/neant/jit/arm64.nt` is `BOOT_FILES[10]`: a kernel driven
+past 64 calls while the image is still loading finds no `jitCompile` global to call, `jit::compile`
+returns `None`, and `FnCode`'s `OnceLock` settles that as "never compile this" for the life of the
+process. Nothing fails — every test still passes, the hash is simply eight times slower than it
+should be, and the only symptom is a number. So each family warms on first *use* instead
+(`shaWarm`, `chachaWarm`, `polyWarm`, `fieldWarm`), which costs ~8ms once on the first hash of a
+process and nothing at startup.
+
+X25519 is the exception that proves the rule and was worth measuring rather than assuming: one key
+exchange is ~2800 calls to `fmulL`, so it tiers up 2% into its own first run whether or not anything
+warmed it — 17ms cold against 3.05ms warm. The warm-up there buys only that 14ms of first-run
+interpretation, not the compilation itself.
+
+Measured on this machine against `8f04ace`, each the minimum of five runs of twenty-plus operations:
+
+| per operation | before | after | |
+|---|---|---|---|
+| `sha256`, 64KB | 233.2 ms | **1.00 ms** | 233x |
+| `sha256`, 4KB | 14.90 ms | **0.090 ms** | 166x |
+| `hmac`, 32 bytes | 0.895 ms | **0.015 ms** | 60x |
+| `chacha20`, 64KB | 95.2 ms | **1.70 ms** | 56x |
+| `poly1305`, 64KB | 43.8 ms | **0.30 ms** | 146x |
+| `aeadEncrypt`, 64KB | 138.2 ms | **2.45 ms** | 56x |
+| `aeadEncrypt`, 10KB | 21.6 ms | **0.38 ms** | 57x |
+| `x25519` | 47.5 ms | **3.05 ms** | 15.6x |
+| verified TLS 1.3 handshake, www.google.com | 394–462 ms | **223–265 ms** | 1.8x |
+
+Against OpenSSL 3.6.2 on the same core (`openssl speed -elapsed`, 2.46 GB/s for both at 16KB and
+44355 X25519/s), SHA-256 over 64KB goes from 8760x to **38x** (26.6µs), ChaCha20-Poly1305 from
+5180x to **92x** (26.7µs) and X25519 from 2110x to **135x** (22.5µs).
+
+What is left is no longer the arithmetic. Of the ~240ms handshake, ~140ms is two network round trips
+and ~80ms is three ECDSA verifications; `crypto.nt` is now a few milliseconds of it. Inside `x25519`
+the 3.05ms is ~2550 `fmulL` calls at 0.7µs each and ~2000 `fadd`/`fsub`/`fmuls` at 0.4–0.5µs, where
+the add still builds a twelve-element vector interpreted before handing it to the compiled carry;
+folding a whole ladder step into one kernel would remove that, and cannot be done by calling the
+field kernels from inside another compiled function — a callee that returns a vector deopts the
+caller, so it would mean writing the nine multiplications out by hand.
 
 ### Next
 
