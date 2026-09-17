@@ -381,17 +381,20 @@ mod tls {
         let mut v = tls_vm();
         let got = v.eval("ch: clientHello[\"a.b\"; 32#0x01; 32#0x02; 32#0x03]; (count ch; hex 6#ch; hex ch[71+til 5])").unwrap();
         // 0x01 ClientHello, 24-bit length, then 0x0303; cipher_suites is the one suite 0x1303.
-        // 160 bytes: signature_algorithms is back to three entries now that src/neant/crypto/
-        // p256.nt can check an ECDSA P-256 signature, so ecdsa_secp256r1_sha256 is offered again.
-        // Every scheme in the list is one verify.nt can verify; the list is asserted in full below.
-        assert_eq!(got.fmt(), "(160;\"0100009c0303\";\"0002130301\")");
+        // 166 bytes: signature_algorithms is six entries now that src/neant/crypto/{p384,sha512}.nt
+        // can check ECDSA-SHA384 on P-384 and RSA over SHA-384, so the SHA-384 schemes are offered
+        // beside the SHA-256 ones. Every scheme in the list is one verify.nt can verify; the list
+        // is asserted in full below.
+        assert_eq!(got.fmt(), "(166;\"010000a20303\";\"0002130301\")");
         // the signature_algorithms extension (13) in full, most preferred first: 1027
-        // ecdsa_secp256r1_sha256, 2052 rsa_pss_rsae_sha256 -- either of which signs the
-        // CertificateVerify -- and 1025 rsa_pkcs1_sha256, which only ever signs a certificate.
+        // ecdsa_secp256r1_sha256 and 1283 ecdsa_secp384r1_sha384 -- between them what the public
+        // web serves -- then 2052 rsa_pss_rsae_sha256 and 2053 rsa_pss_rsae_sha384, any of which
+        // signs the CertificateVerify, and finally 1025 rsa_pkcs1_sha256 and 1281 rsa_pkcs1_sha384,
+        // which only ever sign a certificate.
         // The extensions start at 79: 4 bytes of handshake header, version(2), random(32),
         // a 32-byte session_id behind its length byte, cipher_suites(2+2), compression(1+1) and
         // the extensions' own 2-byte length
-        assert_eq!(tests::ev(&mut v, "hex findExt[wdrop[79;ch]; 13]"), "\"0006040308040401\"");
+        assert_eq!(tests::ev(&mut v, "hex findExt[wdrop[79;ch]; 13]"), "\"000c040305030804080504010501\"");
     }
 }
 
@@ -439,14 +442,18 @@ mod http {
     }
 }
 
-/// src/neant/crypto/ed25519.nt is a loadable module, not part of the image: SHA-512 on raw 64-bit words, and
+/// src/neant/crypto/ed25519.nt is a loadable module, not part of the image, over sha512.nt's SHA-512 on raw 64-bit words, and
 /// Ed25519 verification on src/neant/crypto/crypto.nt's 2^255-19 field. FIPS 180-4 and RFC 8032 vectors.
 #[cfg(test)]
 mod ed25519 {
     use super::*;
     fn ed_vm() -> vm::Vm {
         let mut v = boot_vm();
-        v.eval(&std::fs::read_to_string("src/neant/crypto/ed25519.nt").unwrap()).unwrap();
+        // SHA-512 moved out of ed25519.nt into sha512.nt when SHA-384 needed the same compression
+        // function; ed25519.nt's header says so, and this is a caller loading both.
+        for f in ["src/neant/crypto/sha512.nt", "src/neant/crypto/ed25519.nt"] {
+            v.eval(&std::fs::read_to_string(f).unwrap()).unwrap_or_else(|e| panic!("{f}: '{}", e.0));
+        }
         v
     }
     const V: [(&str, &str, &str); 4] = [
@@ -781,7 +788,7 @@ mod rsa {
     use super::*;
     fn rsa_vm() -> vm::Vm {
         let mut v = boot_vm();
-        for f in ["src/neant/crypto/bignum.nt", "src/neant/crypto/rsa.nt"] {
+        for f in ["src/neant/crypto/bignum.nt", "src/neant/crypto/sha512.nt", "src/neant/crypto/rsa.nt"] {
             v.eval(&std::fs::read_to_string(f).unwrap()).unwrap_or_else(|e| panic!("{f}: '{}", e.0));
         }
         v
@@ -882,10 +889,10 @@ mod rsa {
         let mut v = rsa_vm();
         for (what, sig, call) in [
             ("pkcs1-v1_5", SIG_PKCS1, "rsaVerifyPkcs1[n;e;`sha256;dg;s]"),
-            ("pss salt 32", SIG_PSS32, "rsaVerifyPss[n;e;dg;s]"),
-            ("pss salt 20", SIG_PSS20, "rsaVerifyPss[n;e;dg;s]"),
-            ("pss salt 0", SIG_PSS0, "rsaVerifyPss[n;e;dg;s]"),
-            ("pss hand-built, salt 32", PSS_HAND, "rsaVerifyPss[n;e;dg;s]"),
+            ("pss salt 32", SIG_PSS32, "rsaVerifyPss[n;e;`sha256;dg;s]"),
+            ("pss salt 20", SIG_PSS20, "rsaVerifyPss[n;e;`sha256;dg;s]"),
+            ("pss salt 0", SIG_PSS0, "rsaVerifyPss[n;e;`sha256;dg;s]"),
+            ("pss hand-built, salt 32", PSS_HAND, "rsaVerifyPss[n;e;`sha256;dg;s]"),
         ] {
             let src = format!("{}{call}", key(sig));
             assert_eq!(tests::ev(&mut v, &src), "1b", "did not verify: {what}");
@@ -909,10 +916,10 @@ mod rsa {
             ("unknown hash symbol", format!("{p1}rsaVerifyPkcs1[n;e;`sha1;dg;s]")),
             ("digest of the wrong length", format!("{p1}rsaVerifyPkcs1[n;e;`sha256;31#dg;s]")),
             ("a pss signature offered to the pkcs1 verifier", format!("{ps}rsaVerifyPkcs1[n;e;`sha256;dg;s]")),
-            ("flipped last bit of the pss signature", format!("{ps}rsaVerifyPss[n;e;dg;(255#s),bnot s[255]]")),
-            ("flipped bit in the digest, pss", format!("{ps}rsaVerifyPss[n;e;(31#dg),bnot dg[31];s]")),
-            ("pss signature one byte short", format!("{ps}rsaVerifyPss[n;e;dg;255#s]")),
-            ("a pkcs1 signature offered to the pss verifier", format!("{p1}rsaVerifyPss[n;e;dg;s]")),
+            ("flipped last bit of the pss signature", format!("{ps}rsaVerifyPss[n;e;`sha256;dg;(255#s),bnot s[255]]")),
+            ("flipped bit in the digest, pss", format!("{ps}rsaVerifyPss[n;e;`sha256;(31#dg),bnot dg[31];s]")),
+            ("pss signature one byte short", format!("{ps}rsaVerifyPss[n;e;`sha256;dg;255#s]")),
+            ("a pkcs1 signature offered to the pss verifier", format!("{p1}rsaVerifyPss[n;e;`sha256;dg;s]")),
             ("an even modulus: 0b, not the signal bnModExp would raise", format!("{p1}rsaVerifyPkcs1[(255#n),0x00;e;`sha256;dg;s]")),
             // 32776 bits is 1261 limbs, past the 1023 bnMul insists on — rsaRecover's width cap has
             // to turn that into 0b before bnMul gets the chance to signal, or a certificate could
@@ -947,7 +954,7 @@ mod rsa {
             ("the leftmost 8*emLen-emBits bits of maskedDB", PSS_TOPBIT),
             ("the zero padding before DB's 0x01 separator", PSS_PS),
         ] {
-            let src = format!("{}rsaVerifyPss[n;e;dg;s]", key(sig));
+            let src = format!("{}rsaVerifyPss[n;e;`sha256;dg;s]", key(sig));
             assert_eq!(tests::ev(&mut v, &src), "0b", "ignored {what}");
         }
     }
@@ -958,7 +965,7 @@ mod rsa {
         let mut v = rsa_vm();
         let k = key(SIG_PKCS1);
         assert_eq!(tests::ev(&mut v, &format!("{k}rsaVerifyPkcs1[0x;e;`sha256;dg;s]")), "'rsa: modulus is empty");
-        assert_eq!(tests::ev(&mut v, &format!("{k}rsaVerifyPss[n;0x;dg;s]")), "'rsa: exponent is empty");
+        assert_eq!(tests::ev(&mut v, &format!("{k}rsaVerifyPss[n;0x;`sha256;dg;s]")), "'rsa: exponent is empty");
     }
 
     /// e = 65537 is sixteen squarings and two multiplies, so the whole verification is about twenty
@@ -983,7 +990,7 @@ mod p256 {
     use super::*;
     fn p256_vm() -> vm::Vm {
         let mut v = boot_vm();
-        for m in ["bignum", "der", "p256"] {
+        for m in ["bignum", "der", "ec", "p256"] {
             let f = format!("src/neant/crypto/{m}.nt");
             v.eval(&std::fs::read_to_string(&f).unwrap()).unwrap_or_else(|e| panic!("{f}: '{}", e.0));
         }
@@ -1011,6 +1018,51 @@ mod p256 {
     }
 }
 
+/// ECDSA P-384 verification (src/neant/crypto/p384.nt) on the curve-generic arithmetic in ec.nt,
+/// for the one thing that needs the host: how long one signature takes, and how that compares with
+/// P-256 through the same code. Everything else -- the field, the group law, the openssl vector,
+/// the constructed R.x >= n case and every malformed input -- is pure neant and lives in
+/// tests/p384.nt, which tests::nt_tests runs.
+#[cfg(test)]
+mod p384 {
+    use super::*;
+    fn p384_vm() -> vm::Vm {
+        let mut v = boot_vm();
+        for m in ["bignum", "der", "ec", "p256", "p384"] {
+            let f = format!("src/neant/crypto/{m}.nt");
+            v.eval(&std::fs::read_to_string(&f).unwrap()).unwrap_or_else(|e| panic!("{f}: '{}", e.0));
+        }
+        v
+    }
+    /// The vector is tests/p384.nt's, made from the committed tests/data/pki-p384-leaf.key; the
+    /// same comment there carries the openssl commands.
+    const PUB: &str = "0401fcb79a963bd5815d8f49cd64138db29b0771d1624f56a8bda75fb8bbf8ed317dc0f8d7f8752b907e69a9f644049dee5456cbfe1060afdbb146c274803cab07d1a83f31f6912ffcab4bb2f45d622a5ae65b2b53cd6467038b022ce205dd3efe";
+    const DG: &str = "66101a247503bc96b1bb16792721965500ceba764c4dc1131595933366225ec7099a5d722ccff591439f041453317839";
+    const SIG: &str = "30640230392fde917a8a81e7a35e7263d0dbc317177d5e73823535aa2ca845e39a80e6569f996a776786489b5181b2775c779a0402306ebb460609c568f9319f3210b8c6524bb70e2b46887d7a55d29477bfaa0b48f6da00a6d39785423e0b0b1b9ff2953577";
+    /// The P-256 vector, run through the same loop in the same VM so the ratio in the log is
+    /// measured rather than remembered: the two curves share every line of arithmetic, so what
+    /// differs is 384 doublings against 256 and 15-limb multiplications against 10-limb ones.
+    const PUB256: &str = "04d80beadaa91bcac982be71619c25106a5d257a6537d2233e689e2c72e6615843873e23bee15467e76c55be95400a63d44cc891a45adbcf74785bf675ebc7da45";
+    const DG256: &str = "ddf5bf46337c63b4cef6f1dbfac137cb3e0a8a6e00313db0f98d3d8f9872782d";
+    const SIG256: &str = "3046022100b561094b230ffe88c2f54eeb4dea56d3ddc4c0c0086ad91939a667e88be6373c022100f090ab3512ae71e1c2af3ca720f081e79bb11deb367652e23a8e5fd7e804e8b4";
+
+    #[test]
+    fn p384_verification_time() {
+        let mut v = p384_vm();
+        let setup = format!("pk: unhex \"{PUB}\"; dg: unhex \"{DG}\"; sg: unhex \"{SIG}\"\n");
+        assert_eq!(tests::ev(&mut v, &format!("{setup}ecdsaVerifyP384Der[pk;dg;sg]")), "1b");
+        let src = format!("{setup}t0: now`time; do[5; ecdsaVerifyP384Der[pk;dg;sg]]; `int$now[`time]-t0");
+        let ms384: f64 = tests::ev(&mut v, &src).parse().unwrap();
+        let setup = format!("pk: unhex \"{PUB256}\"; dg: unhex \"{DG256}\"; sg: unhex \"{SIG256}\"\n");
+        assert_eq!(tests::ev(&mut v, &format!("{setup}ecdsaVerifyP256Der[pk;dg;sg]")), "1b");
+        let src = format!("{setup}t0: now`time; do[5; ecdsaVerifyP256Der[pk;dg;sg]]; `int$now[`time]-t0");
+        let ms256: f64 = tests::ev(&mut v, &src).parse().unwrap();
+        eprintln!("ECDSA P-384 verification: {:.1}ms  (P-256 in the same VM: {:.1}ms, ratio {:.2}x)",
+                  ms384 / 5.0, ms256 / 5.0, ms384 / ms256);
+        assert!(ms384 < 10000.0, "a P-384 verification took {}ms", ms384 / 5.0);
+    }
+}
+
 /// src/neant/crypto/verify.nt and the TLS 1.3 wiring in tls.nt, for the part of them that needs
 /// the host: a real `openssl s_server` to handshake against, and the timings. Everything that is
 /// pure neant -- hostname matching, every bad chain and its reason, the Certificate and
@@ -1025,7 +1077,7 @@ mod verify {
 
     fn verify_vm() -> vm::Vm {
         let mut v = boot_vm();
-        for m in ["bignum", "rsa", "der", "p256", "x509", "verify", "tls"] {
+        for m in ["bignum", "sha512", "rsa", "der", "ec", "p256", "p384", "x509", "verify", "tls"] {
             let f = format!("src/neant/crypto/{m}.nt");
             v.eval(&std::fs::read_to_string(&f).unwrap()).unwrap_or_else(|e| panic!("{f}: '{}", e.0));
         }
@@ -1143,6 +1195,99 @@ mod verify {
         let store = "x509LoadRoots \"tests/data/pki-ec-root.pem\"";
         assert_eq!(talk(&mut v, srv.1, "127.0.0.1", store), "(2;\"slt olleh\n\")");
     }
+    /// The same again on P-384 with SHA-384, which is what the public web's intermediates are
+    /// signed with and what this build could not check at all before sha512.nt and p384.nt: the
+    /// leaf and the root are both P-384 signed ecdsa-with-SHA384, and the server picks
+    /// ecdsa_secp384r1_sha384 (0x0503) for its CertificateVerify because the ClientHello now
+    /// offers it. Nothing in this handshake goes near rsa.nt or p256.nt.
+    #[test]
+    fn a_p384_handshake_verifies_and_data_round_trips() {
+        let srv = s_server_with("pki-p384-leaf", "pki-p384-leaf.key", "pki-p384-root.pem");
+        let mut v = verify_vm();
+        let store = "x509LoadRoots \"tests/data/pki-p384-root.pem\"";
+        assert_eq!(talk(&mut v, srv.1, "127.0.0.1", store), "(2;\"slt olleh\n\")");
+    }
+    /// And an RSA chain signed sha384WithRSAEncryption, which is the other half of what was
+    /// missing: the same fixture intermediate and root as the SHA-256 handshake above, and only
+    /// the leaf's signature algorithm changed.
+    #[test]
+    fn a_sha384_rsa_handshake_verifies_and_data_round_trips() {
+        let srv = s_server_with("pki-sha384-leaf", "pki-leaf.key", "pki-int.pem");
+        let mut v = verify_vm();
+        assert_eq!(talk(&mut v, srv.1, "127.0.0.1", "RS"), "(2;\"slt olleh\n\")");
+    }
+    /// What a P-384 chain costs against the P-256 one below it: one ECDSA-SHA384 verification
+    /// rather than one ECDSA-SHA256, through the same code in ec.nt.
+    #[test]
+    fn p384_chain_verification_time() {
+        let mut v = verify_vm();
+        let src = "t0: now`time; do[5; x509VerifyChain[enlist P \"pki-p384-leaf\"; \
+                   x509LoadRoots \"tests/data/pki-p384-root.pem\"; \"leaf.neant.test\"; NOW]]; \
+                   `int$now[`time]-t0";
+        let ms: f64 = tests::ev(&mut v, src).parse().unwrap();
+        eprintln!("chain verification (P-384 leaf + P-384 root, one ECDSA-SHA384 signature): {:.1}ms",
+                  ms / 5.0);
+        assert!(ms < 15000.0, "a one-link P-384 chain took {}ms", ms / 5.0);
+    }
+    /// tests/data/chain-google.pem, the capture that named this whole gap, verified the way a
+    /// browser would: both links AND the trust store AND a clock. `now` is pinned inside the
+    /// captured leaf's window (Sep 4 -- Nov 27 2026) so this keeps meaning the same thing after
+    /// the certificate expires; tests/verify.nt checks the two signatures on their own, with no
+    /// clock and no store, so a missing system bundle only costs this case and not those.
+    /// Before P-384 the second link was refused by algorithm and there was no chain to verify.
+    #[test]
+    fn the_google_chain_verifies_to_the_system_trust_store() {
+        if !std::path::Path::new("/etc/ssl/certs/ca-certificates.crt").exists() {
+            eprintln!("no system CA bundle on this machine, skipping");
+            return;
+        }
+        let mut v = verify_vm();
+        v.eval("G: x509Parse each pemLoad \"tests/data/chain-google.pem\"").unwrap();
+        v.eval("SR: x509SystemRoots[]").unwrap();
+        let src = "t0: now`time; r: x509VerifyChain[G; SR; \"www.google.com\"; \
+                   (2026.10.01; 12:00:00.000)]; (r; `int$now[`time]-t0)";
+        let out = tests::ev(&mut v, src);
+        let ms: f64 = out.trim_start_matches("(1b;").trim_end_matches(')').parse()
+            .unwrap_or_else(|_| panic!("the Google chain did not verify: {out}"));
+        eprintln!("chain verification (www.google.com: P-256/SHA-256 leaf, P-384/SHA-384 \
+                   intermediate, system trust store): {ms:.0}ms");
+        // and the leaf must not be trusted for a name it does not carry
+        let bad = "@[{[x] x509VerifyChain[G; SR; \"www.evil.example\"; (2026.10.01; 12:00:00.000)]}; 0; {x}]";
+        assert!(tests::ev(&mut v, bad).starts_with("\"x509: CN=www.google.com is not valid for"),
+                "a chain for the wrong host was not refused");
+    }
+    /// THE ACCEPTANCE TEST, and the only one here that touches the network -- so it is #[ignore]d
+    /// and run by hand:  cargo test --release the_public_web -- --ignored --nocapture
+    /// Seven hosts, the real system trust store, a real handshake and a real HTTP response. Six of
+    /// them were refused before this change, every one at the same place: an ecdsa-with-SHA384
+    /// intermediate over a P-384 key. The seventh, www.amazon.com, is RSA and always verified.
+    /// A failure here names the host and the sentence it was refused with, which is the whole
+    /// point of verify.nt's per-refusal messages.
+    #[test]
+    #[ignore]
+    fn the_public_web_verifies() {
+        let mut v = verify_vm();
+        v.eval("SR: x509SystemRoots[]").unwrap();
+        let mut bad = Vec::new();
+        for host in ["www.google.com", "cloudflare.com", "example.com", "github.com",
+                     "www.wikipedia.org", "news.ycombinator.com", "www.amazon.com"] {
+            let src = format!(
+                "@[{{[hh]\n\
+                 t0: now`time\n\
+                 h: tlsConnectOpts[hh; 443; (enlist `roots)!enlist SR]\n\
+                 ms: `int$now[`time]-t0\n\
+                 tlsSend[h; \"GET / HTTP/1.0\\r\\nHost: \",hh,\"\\r\\nConnection: close\\r\\n\\r\\n\"]\n\
+                 r: `char$tlsRecv h\n\
+                 n: count tlsCert h\n\
+                 tlsClose h\n\
+                 (ms; n; 15#r)}}; \"{host}\"; {{x}}]");
+            let out = tests::ev(&mut v, &src).split(" at line ").next().unwrap().to_string();
+            eprintln!("{host:>22}  {out}");
+            if !out.starts_with('(') { bad.push(format!("{host}: {out}")); }
+        }
+        assert!(bad.is_empty(), "hosts that did not complete a verified handshake:\n{}", bad.join("\n"));
+    }
+
     /// And how long that costs: two P-256 signature checks (the chain link and the
     /// CertificateVerify) rather than two RSA-2048 exponentiations.
     #[test]
