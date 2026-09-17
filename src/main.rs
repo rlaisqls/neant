@@ -419,8 +419,9 @@ mod http {
         drop(probe);
         v.eval(&format!("l: hlisten \"127.0.0.1:{port}\"")).unwrap();
         v.eval(
+            // `body` is bytes (http.nt: a request body may be binary), so `char$ it to concatenate
             "handler: {[req] (200;\"OK\";(`$\"content-type\")!(,\"text/plain\"); \
-             \"method=\",req[`method],\" path=\",req[`path],\" body=\",req[`body])}",
+             \"method=\",req[`method],\" path=\",req[`path],\" body=\",`char$req[`body])}",
         ).unwrap();
         std::thread::spawn(move || v.eval("httpServe[l;handler]").unwrap());
         std::thread::sleep(std::time::Duration::from_millis(100));

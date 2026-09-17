@@ -304,12 +304,38 @@ qparse "a=1&b=x+y"           // `a`b!("1";"x y")     qbuild inverts it
 
 ## HTTP
 
-`src/neant/net/http.nt` (loadable, not in the boot image): `httpRecv`/`httpSend` parse a request and write a
-response over an `hopen`/`accept` handle; `httpServe` wraps the accept-loop-plus-`spawn` pattern shown earlier (`hlisten`/`accept`, "Rust
-builtins" above) into one call.
+`src/neant/net/http.nt` (loadable, not in the boot image) is a client and a server. A connection is
+a triple of functions — `(read; write; close)`, where `read[]` gives the next bytes and empty means
+end of stream — so `httpPlain h` puts it on an `hopen`/`accept` handle and `httpTls h` on a
+`tlsConnect` one, and everything else is written against the triple. That is the whole of what
+HTTPS needed: `tlsSend`/`tlsRecv` ("Bytes and crypto") already have the shape `hsend`/`hrecv` have.
 
 ```
+load "src/neant/crypto/tlsclient.nt"       // only for https:// — it is what verifies the chain
 load "src/neant/net/http.nt"
+r: httpGet "https://example.com/"
+r`status                                    // 200
+`char$r`body                                // the body; bodies are BYTES, not text
+```
+
+`httpGet` follows up to five redirects; `httpFetch[url;method;headers;body]` does the one exchange
+and hands the `Location` back instead. `httpPost[url;headers;body]` posts. Bodies are bytes in both
+directions, because a response may be gzip or an image and decoding that as UTF-8 corrupts it.
+
+A connection is reusable, which is what makes a verifying TLS client usable at all — the handshake
+is the expensive part and nothing about it needs repeating:
+
+```
+c: httpOpen "https://example.com/"; u: urlParse "https://example.com/"
+httpExchange[c; u; "GET"; "/a"; ()!(); ""]      // handshake ~1.4s, this exchange ~60ms
+httpExchange[c; u; "GET"; "/b"; ()!(); ""]      // ~60ms
+(c 2)[]                                          // close
+```
+
+The server is `httpRecv`/`httpSend` plus `httpServe`, which wraps the accept-loop-plus-`spawn`
+pattern shown earlier (`hlisten`/`accept`, "Rust builtins" above) into one call:
+
+```
 l: hlisten "0.0.0.0:8080"
 httpServe[l; {[req] (200; "OK"; (`$"content-type")!(,"text/plain"); "you asked for ",req[`path])}]
 ```
@@ -319,11 +345,20 @@ query string split off into `query`, a dict of strings keyed by symbol (`target`
 headers keyed by lowercased symbol (build
 one with `` `$"content-length" ``, not a literal `` `content-length `` — a hyphen in a *literal*
 symbol token is the `-` verb, not part of the name; casting a string with `` `$ `` has no such
-limit). A handler returns `(status; reason; headers; body)`. No chunked transfer-encoding, no
-keep-alive (`hclose` after every response), and no HTTPS *here*: `src/neant/crypto/tls.nt` is a
-verifying TLS 1.3 client ("Bytes and crypto"), so an outbound HTTPS request is a matter of writing
-`httpRecv`/`httpSend` over `tlsSend`/`tlsRecv` instead of `hsend`/`hrecv`, but nothing does that
-yet and there is no TLS server side for `httpServe` to sit behind.
+limit). A handler returns `(status; reason; headers; body)`.
+
+Chunked transfer-encoding is decoded on both sides, including chunk extensions and trailer fields —
+the real web needs it, and `example.com` is already one of the sites that answers that way. A
+response with neither a `Content-Length` nor chunking is read to the close, and `204`/`304`/`1xx`
+and a `HEAD` reply never take a body whatever their headers claim.
+
+What is missing: keep-alive on the *server* side (it still closes after one response, though the
+client reuses a connection happily), multipart, cookies, proxies, compression — nothing sends
+`Accept-Encoding`, and a server that gzips anyway hands back bytes this does not decode — and a TLS
+server side for `httpServe` to sit behind, which is `src/neant/crypto/tls.nt`'s missing half.
+
+`tests/http.nt` is the suite, all of it against sockets this process opens; `tests/data/live-http.nt`
+is the one that goes out to the network, run by hand.
 
 ## Bytes and crypto
 

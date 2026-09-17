@@ -1,51 +1,234 @@
-// HTTP/1.1 over hlisten/accept, in neant. load "src/neant/net/http.nt" — not part of the boot image.
+// HTTP/1.1 in neant, client and server. load "src/neant/net/http.nt" — not part of the boot image.
 //
-// Scope: no chunked transfer-encoding, no keep-alive/pipelining (a connection is closed after one
-// response), no multipart, no HTTPS (would compose with src/neant/crypto/tls.nt
-// once that has a server handshake, which it doesn't). A request with no Content-Length is treated
-// as having an empty body.
+//   load "src/neant/crypto/tlsclient.nt"          // only needed for https:// URLs
+//   r: httpGet "https://example.com/"
+//   r`status                                       // 200
+//   `char$r`body                                   // the body, as text
+//
+// A connection is a triple of functions — (read; write; close) — where read[] gives the next bytes
+// and empty means end of stream, write[bytes] sends, and close[] tears down. `httpPlain h` makes
+// one over an hopen/accept handle and `httpTls h` over a tlsConnect handle, and everything else
+// here is written against the triple, so the client and the server both speak either transport.
+// That is the whole of what HTTPS needed: src/neant/crypto/tls.nt's tlsSend/tlsRecv have exactly
+// the shape hsend/hrecv have.
+//
+// Bodies are BYTES, not text, in both directions: a response may be gzip, an image or any other
+// binary, and decoding that as UTF-8 corrupts it. `char$ a body when you know it is text.
+//
+// Scope: no keep-alive on the server side (it closes after one response) though the client side
+// reuses a connection happily (httpOpen/httpExchange); no multipart; no compression, so nothing
+// here sends Accept-Encoding and a server that ignores that and gzips anyway hands back bytes this
+// does not decode; no cookies; no proxy support; and no TLS server side, so httpServe is plaintext
+// until src/neant/crypto/tls.nt grows a server handshake.
 
+HTTPCRLF: `byte$"\r\n"
+HTTPEND: `byte$"\r\n\r\n"
+HTTPCL: `$"content-length"
+HTTPTE: `$"transfer-encoding"
+
+// ---- transports
+httpPlain: {[h] ({[] hrecv[h;65536]}; {[d] hsend[h;d]}; {[] hclose h})}
+httpTls: {[h] ({[] tlsRecv h}; {[d] tlsSend[h;d]}; {[] tlsClose h})}
+httpConn: {$[`int=@x; httpPlain x; x]}
+
+// ---- byte-buffer reading.  The header block has to be found before its length is known, so these
+// read ahead into a buffer and hand back what is left over for the next read to continue from.
+// first position of the byte sequence p in b, or -1
+httpFind: {[b;p] n: count p; m: (count b)-n; i: 0
+  while[not i>m; if[p~b[i+til n]; :i]; i+:1]
+  -1}
+// (position of p; buffer) — reads until p appears, position -1 if the stream ends first
+httpUntil: {[rd;buf;p]
+  i: httpFind[buf;p]
+  while[i<0
+    c: rd[]
+    if[0=count c; :(-1; buf)]
+    buf,: c
+    i: httpFind[buf;p]]
+  (i; buf)}
+// the buffer with at least n bytes in it, or short when the stream ended
+httpAtLeast: {[rd;buf;n]
+  while[(count buf)<n
+    c: rd[]
+    if[0=count c; :buf]
+    buf,: c]
+  buf}
+httpToEnd: {[rd;buf]
+  while[1
+    c: rd[]
+    if[0=count c; :buf]
+    buf,: c]
+  buf}
+
+// ---- headers
 // one header line "Name: value" -> (`name (lowercased, as a symbol); trimmed value)
 httpHdr: {[line]
   i: first line ss ":"
   (`$lower line[til i]; trim line[(i+1)+til (count line)-(i+1)])}
+httpHdrs: {[ls] $[0=count ls; ()!(); {[hp] (first each hp)!(last each hp)} httpHdr each ls]}
+httpHas: {[hdrs;k] k in key hdrs}
+httpVal: {[hdrs;k;dflt] $[k in key hdrs; hdrs k; dflt]}
+// a header value as it goes on the wire: strings stay, everything else stringifies
+httpStr: {$[(@x) in `char`chars; $[`char=@x; ,x; x]; string x]}
+httpLines: {[hdrs] {[k;v] (httpStr k),": ",httpStr v}'[key hdrs; value hdrs]}
+// Transfer-Encoding may be a list ("gzip, chunked"); chunked is the last one when present at all
+httpChunked: {[hdrs] not (httpFind[`byte$lower httpStr httpVal[hdrs;HTTPTE;""]; `byte$"chunked"])<0}
 
-/// Blocks for one full request on connection h: reads until the header/body boundary, then reads
-// exactly Content-Length more if present. `path`/`method`/`version` are strings; `path` is the
-// percent-decoded path without its query string, which is `query`, a dict of strings keyed by symbol
-// (src/neant/stdlib/encode.nt's qparse; `target` is the raw request-target as sent); `headers` is a
-// dict keyed by lowercased symbol; `body` is a string (raw bytes decoded as chars).
+// ---- chunked transfer-encoding (RFC 9112 §7.1): <hex size>[;ext]CRLF <size bytes> CRLF, until a
+// zero size, then trailer fields and a blank line.
+httpHex: {[s] d: "0123456789abcdef"?lower trim s; if[|/d=16; signal "http: bad chunk size"]; 0 {(16*x)+y}/ d}
+// consume trailer fields up to and including the blank line that ends them
+httpTrailers: {[rd;buf]
+  while[1
+    r: httpUntil[rd;buf;HTTPCRLF]
+    if[r[0]<0; :buf]
+    buf: (r[0]+2)_r[1]
+    if[r[0]=0; :buf]]
+  buf}
+// (the decoded body; whatever followed it)
+httpDechunk: {[rd;buf]
+  out: 0x
+  while[1
+    r: httpUntil[rd;buf;HTTPCRLF]
+    if[r[0]<0; signal "http: stream ended inside a chunk header"]
+    buf: r[1]
+    ln: `char$buf[til r[0]]
+    sz: httpHex (ln?";")#ln
+    buf: (r[0]+2)_buf
+    if[sz=0; :(out; httpTrailers[rd;buf])]
+    buf: httpAtLeast[rd;buf;sz+2]
+    if[(count buf)<sz+2; signal "http: stream ended inside a chunk body"]
+    out,: buf[til sz]
+    buf: (sz+2)_buf]
+  (out; buf)}
+
+// ---- client
+// urlParse "https://host:8443/a/b?x=1" -> `scheme`host`port`target!("https";"host";8443;"/a/b?x=1")
+// The scheme defaults to http and the port to the scheme's. No IPv6 literals, no userinfo beyond
+// dropping it, no fragment handling beyond leaving it on the target.
+urlParse: {[u]
+  u: httpStr u
+  p: u ss "://"
+  scheme: $[count p; lower (first p)#u; "http"]
+  rest: $[count p; ((first p)+3)_u; u]
+  j: rest?"/"
+  hp: j#rest
+  target: $[j<count rest; j _ rest; "/"]
+  a: hp?"@"
+  if[a<count hp; hp: (a+1) _ hp]
+  k: hp?":"
+  host: k#hp
+  port: $[k<count hp; `int$(k+1)_hp; $[scheme~"https"; 443; 80]]
+  if[0=count host; signal "http: no host in ",u]
+  `scheme`host`port`target!(scheme;host;port;target)}
+
+// open a connection to a parsed URL. https goes through tlsConnect, which verifies the chain, the
+// hostname and CertificateVerify before it returns (src/neant/crypto/tls.nt) — so this signals
+// rather than connecting when verification fails, and tlsclient.nt has to be loaded for it at all.
+httpConnect: {[u]
+  if[u[`scheme]~"https"; :httpTls tlsConnect[u`host; u`port]]
+  if[u[`scheme]~"http"; :httpPlain hopen (u[`host],":",string u`port)]
+  signal "http: unsupported scheme ",u`scheme}
+httpOpen: {[url] httpConnect urlParse url}
+
+// send one request on an open connection. `target` is the path and query as they go on the wire.
+httpRequest: {[c;method;target;hdrs;body]
+  body: $[`byte=@body; body; `byte$httpStr body]
+  rl: (httpStr method)," ",(httpStr target)," HTTP/1.1"
+  head: "\r\n" sv (enlist rl),(httpLines hdrs),(enlist "")
+  (c 1)[(`byte$head,"\r\n"),body]}
+
+// read one response.  `method` decides only whether a body is expected at all (HEAD has none).
+// -> `status`reason`headers`body!(int; string; dict keyed by lowercased symbol; bytes)
+httpResponse: {[c;method]
+  rd: c 0
+  r: httpUntil[rd; 0x; HTTPEND]
+  if[r[0]<0; signal "http: connection closed before the response headers"]
+  buf: r[1]
+  ls: vs["\r\n"; `char$buf[til r[0]]]
+  sl: vs[" "; ls 0]
+  if[(count sl)<2; signal "http: malformed status line"]
+  status: `int$sl 1
+  hdrs: httpHdrs 1_ls
+  rest: (r[0]+4)_buf
+  ch: httpChunked hdrs
+  cl: $[httpHas[hdrs;HTTPCL]; `int$httpStr hdrs HTTPCL; -1]
+  // RFC 9112 §6.3: these never carry a body, whatever the headers say
+  none: $[(httpStr method)~"HEAD"; 1b; $[status in 204 304; 1b; status<200]]
+  body: 0x
+  if[not none
+    if[ch; body: first httpDechunk[rd;rest]]
+    if[$[ch; 0b; not cl<0]; body: cl#httpAtLeast[rd;rest;cl]]
+    if[$[ch; 0b; cl<0]; body: httpToEnd[rd;rest]]]
+  `status`reason`headers`body!(status; " " sv 2_sl; hdrs; body)}
+
+// one request/response on an open connection — this is the reusable form, so a second fetch to the
+// same host pays no second handshake.
+httpExchange: {[c;u;method;target;hdrs;body]
+  h: hdrs
+  if[not `host in key h; h[`host]: $[u[`port] in 80 443; u`host; (u`host),":",string u`port]]
+  if[not (`$"content-length") in key h; if[count body; h[`$"content-length"]: count $[`byte=@body; body; `byte$httpStr body]]]
+  httpRequest[c;method;target;h;body]
+  httpResponse[c;method]}
+
+// resolve a Location against the URL it came from: absolute, host-relative, or path-relative
+httpAbs: {[base;loc]
+  loc: httpStr loc
+  if[count loc ss "://"; :loc]
+  u: urlParse base
+  root: (u`scheme),"://",(u`host),$[u[`port] in 80 443; ""; ":",string u`port]
+  if[loc[0]="/"; :root,loc]
+  t: u`target
+  root,((1+last 0,t ss "/")#t),loc}
+
+// open, exchange, close.  httpGet follows up to `n` redirects; httpFetch does the one exchange.
+httpFetchN: {[url;method;hdrs;body;n]
+  u: urlParse url
+  c: httpConnect u
+  r: @[{[a] httpExchange[a 0; a 1; a 2; a 3; a 4; a 5]}; (c;u;method;u`target;hdrs;body); {[e] (`httperr;e)}]
+  (c 2)[]
+  if[not `dict=@r; signal last r]
+  loc: httpStr httpVal[r`headers; `location; ""]
+  moved: $[(r`status) in 301 302 303 307 308; 0<count loc; 0b]
+  if[$[moved; n>0; 0b]; :httpFetchN[httpAbs[url;loc]; $[(r`status) in 301 302 303; "GET"; method]; hdrs; $[(r`status) in 301 302 303; ""; body]; n-1]]
+  r}
+httpFetch: {[url;method;hdrs;body] httpFetchN[url;method;hdrs;body;0]}
+httpGet: {[url] httpFetchN[url;"GET";()!();"";5]}
+httpPost: {[url;hdrs;body] httpFetchN[url;"POST";hdrs;body;5]}
+
+// ---- server
+/// Blocks for one full request on connection h (a handle, or a transport triple): reads until the
+// header/body boundary, then reads exactly Content-Length more if present, or dechunks. `path` is
+// the percent-decoded path without its query string, which is `query`, a dict of strings keyed by
+// symbol (src/neant/stdlib/encode.nt's qparse; `target` is the raw request-target as sent);
+// `headers` is a dict keyed by lowercased symbol; `body` is bytes.
 httpRecv: {[h]
-  buf: ""; pos: ()
-  while[0=count pos
-    c: hrecv[h;4096]
-    if[0=count c; signal "http: connection closed before headers"]
-    buf,: `char$c
-    pos: buf ss "\r\n\r\n"]
-  i: first pos
-  head: buf[til i]
-  rest: buf[(i+4)+til (count buf)-(i+4)]
-  lines: vs["\r\n";head]
-  rl: vs[" ";lines[0]]
-  hp: httpHdr each 1_lines
-  hdrs: (first each hp) ! (last each hp)
-  clKey: `$"content-length"
-  len: $[clKey in key hdrs; `int$hdrs clKey; 0]
-  body: rest
-  while[(count body)<len
-    c: hrecv[h; len-count body]
-    if[0=count c; signal "http: connection closed before body"]
-    body,: `char$c]
+  c: httpConn h
+  rd: c 0
+  r: httpUntil[rd; 0x; HTTPEND]
+  if[r[0]<0; signal "http: connection closed before headers"]
+  buf: r[1]
+  ls: vs["\r\n"; `char$buf[til r[0]]]
+  rl: vs[" "; ls 0]
+  if[(count rl)<3; signal "http: malformed request line"]
+  hdrs: httpHdrs 1_ls
+  rest: (r[0]+4)_buf
+  ch: httpChunked hdrs
+  cl: $[httpHas[hdrs;HTTPCL]; `int$httpStr hdrs HTTPCL; 0]
+  body: 0x
+  if[ch; body: first httpDechunk[rd;rest]]
+  if[$[ch; 0b; cl>0]; body: cl#httpAtLeast[rd;rest;cl]]
   q: (rl 1)?"?"
-  `method`target`path`query`version`headers`body ! (rl 0; rl 1; urldec q#rl 1; qparse (q+1)_rl 1; rl 2; hdrs; $[0=len;"";len#body])}
+  `method`target`path`query`version`headers`body ! (rl 0; rl 1; urldec q#rl 1; qparse (q+1)_rl 1; rl 2; hdrs; body)}
 
 /// Writes a response: status (int), reason (string), headers (dict, any key type stringifies),
 // body (string or bytes — sent as-is after the headers).
 httpSend: {[h;status;reason;headers;body]
-  hl: {x,": ",y}'[string each key headers; string each value headers]
-  statusLine: "HTTP/1.1 ",(string status)," ",reason
-  head: sv["\r\n"; (enlist statusLine),hl,(enlist "")]
-  hsend[h; head,"\r\n",body]}
+  c: httpConn h
+  body: $[`byte=@body; body; `byte$httpStr body]
+  statusLine: "HTTP/1.1 ",(string status)," ",httpStr reason
+  head: sv["\r\n"; (enlist statusLine),(httpLines headers),(enlist "")]
+  (c 1)[(`byte$head,"\r\n"),body]}
 
 /// `httpServe[l;handler]`: accepts forever, one spawned worker per connection. `handler` is
 // `req -> (status;reason;headers;body)`, called with `httpRecv`'s dict.
