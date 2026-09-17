@@ -152,15 +152,20 @@ derOidOf: {[v]
   if[not any v>127
     f: v[0]
     :"." sv string each ($[f<40; 0,f; f<80; 1,f-40; 2,f-80]),1_v]
-  arcs: (); acc: 0; k: 0; i: 0
-  while[i<n
-    c: v[i]
-    if[(k=0) & c=128; signal "der: non-minimal OBJECT IDENTIFIER subidentifier"]
-    if[k>8; signal "der: OBJECT IDENTIFIER subidentifier too large"]   // 9*7 = 63 bits, exact
-    acc: (128*acc)+c band 127
-    k+:1
-    if[c<128; arcs,: acc; acc: 0; k: 0]
-    i+:1]
+  // the general form, without a step per octet. A subidentifier ends at every octet below 128, so
+  // `where` gives the arc boundaries; each octet is worth 128^(its arc's last index - its own), so
+  // one shift gives every weight at once; and the arcs are the differences of a running sum. The
+  // OIDs that take this path — rsaEncryption, the ECDSA and SHA families, authorityInfoAccess —
+  // are the ones an algorithm identifier and an extension are made of, half a dozen per
+  // certificate, and the loop this replaces was 15 us of the 550 a certificate used to cost.
+  hi: v>127
+  ends: where not hi
+  lead: (-1),ends
+  if[any 9<deltas lead; signal "der: OBJECT IDENTIFIER subidentifier too large"]  // 9*7 = 63 bits
+  if[any 128=v[0,1+-1_ends]; signal "der: non-minimal OBJECT IDENTIFIER subidentifier"]
+  arcIx: sums 0,-1_`int$not hi
+  cs: sums (v band 127)*1 shl 7*ends[arcIx]-til n
+  arcs: cs[ends]-0,-1_cs[ends]
   f: arcs[0]
   "." sv string each ($[f<40; 0,f; f<80; 1,f-40; 2,f-80]),1_arcs}
 
@@ -197,8 +202,8 @@ derTimeOf: {[t;s]
   n: $[t=DERUTC; 13; 15]
   if[not n=count s; signal "der: ",(derTagName t)," must be ",(string n)," characters"]
   if[not "Z"=s[n-1]; signal "der: ",(derTagName t)," must end in Z"]
-  g: "0123456789"?(n-1)#s
-  if[any g=10; signal "der: ",(derTagName t)," has a non-digit"]
+  g: -48+`code$(n-1)#s                       // a find over a ten-character table is 1.5 us; this is
+  if[any (g<0)|g>9; signal "der: ",(derTagName t)," has a non-digit"]   // the same answer for free
   y: 0
   if[t=DERUTC; y: (10*g[0])+g[1]; y+: $[y<50; 2000; 1900]]
   if[t=DERGEN; y: 0 {(10*x)+y}/ g[til 4]]
@@ -387,18 +392,37 @@ dsBool: {[s;k]
   if[not v in 0 255; signal "der: BOOLEAN must be 0x00 or 0xff in DER"]
   v=255}
 dsOid: {[s;k] dsWant[s;k;DEROID;0b]; derOidOf dsVi[s;k]}
+// the octets of an OBJECT IDENTIFIER, with every structural rejection derOidOf makes but without
+// the dotted string: what a caller wants when it is going to compare against a known OID rather
+// than print one. The minimality and length checks only bite when a subidentifier is more than one
+// octet, which for the 2.5.4.x and 2.5.29.x a name and an extension are made of it never is.
+dsOidB: {[s;k]
+  dsWant[s;k;DEROID;0b]
+  b: dsV[s;k]
+  n: count b
+  if[0=n; signal "der: empty OBJECT IDENTIFIER"]
+  v: `int$b
+  if[127<v[n-1]; signal "der: OBJECT IDENTIFIER ends inside a subidentifier"]
+  if[any v>127
+    hi: v>127
+    ends: where not hi
+    lead: (-1),ends
+    if[any 9<deltas lead; signal "der: OBJECT IDENTIFIER subidentifier too large"]
+    if[any 128=v[0,1+-1_ends]; signal "der: non-minimal OBJECT IDENTIFIER subidentifier"]]
+  b}
 dsStr: {[s;k]
   if[not 0=(s`cls)[k]
     signal "der: expected a string, got a ",(string DERCLS[(s`cls)[k]])," tag"]
   if[(s`cons)[k]; signal "der: a DER string must be primitive"]
   t: (s`tag)[k]
   if[not t in DERSTRTAGS; signal "der: ",(derTagName t)," is not a string type this reader models"]
-  w: dsVi[s;k]
+  b: dsV[s;k]                                  // one slice: `int$ of it costs a nanosecond a byte
+  w: `int$b
   if[0<count w
     if[(t=DERPRINT) & not all DERPRINTOKT[w]
       signal "der: PrintableString has a character outside its set"]
     if[(t=DERIA5) & any 127<w; signal "der: IA5String is not ASCII"]]
-  $[t=DERT61; `char$derLatin1 w; `char$dsV[s;k]]}
+  $[t=DERT61; `char$derLatin1 w; `char$b]}
 dsTime: {[s;k]
   if[not 0=(s`cls)[k]
     signal "der: expected a time, got a ",(string DERCLS[(s`cls)[k]])," tag"]

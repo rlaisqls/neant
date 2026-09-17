@@ -430,18 +430,45 @@ x509Parse: {[der]
 // x509ParseMany catches that (and anything else) and falls back to x509Parse, so the strict reader
 // is still what decides whether an odd certificate is legal.
 x509cStr: {[s;k] (0=(s`cls)[k]) & (s`tag)[k] in DERSTRTAGS}
+// An AttributeType is 2.5.4.x in every name a certificate actually carries, and both strings a name
+// needs of it — the RFC 2253 short name and the canonical dotted form, each with its "=" — depend
+// on nothing but that last octet. So they are a table, built once, rather than an OID decode and
+// two joins per attribute: 1.3 us of the 17 an attribute costs, 1168 times over the trust store.
+x509AttrPfx: {[which]
+  out: (); i: 0
+  while[i<128
+    o: "2.5.4.",string i
+    j: X509ATTROIDS?o
+    out,: enlist $[which; o,"="; ($[j<count X509ATTROIDS; X509ATTRNAMES[j]; o]),"="]
+    i+:1]
+  out}
+X509ATTRP: x509AttrPfx 0b
+X509ATTRC: x509AttrPfx 1b
 // the prelude's `lower` is `x in upperc`, a 26-element membership test per character; A..Z is a
 // range, so a comparison does the same work. 0.9 us on an attribute value against 2.0, and the
 // same answer — both leave every codepoint outside A..Z alone.
 x509Lower: {[s] v: `code$s; `char$v+32*(v>64) & v<91}
-// the RFC 2253 value and the canonical value together, because they read the same octets and
-// decoding a DirectoryString twice is 5 us of the 33 an attribute used to cost
+// the RFC 2253 value and the canonical value together. They read the same octets, so the string is
+// decoded once rather than twice; and they ask overlapping questions of it — does anything need
+// escaping, is there a control character, a leading or trailing space, a doubled space — so the
+// comparisons are made once here and both fast paths read the answers. An attribute cost 33 us
+// when every one of those was a pass of its own.
 x509cDnPair: {[s;k]
   if[not x509cStr[s;k]
     rw: dsRaw[s;k]
     :("#",upper hex rw; "#",hex rw)]
   w: dsStr[s;k]
-  (x509DnEsc w; x509Ws x509Lower w)}
+  n: count w
+  if[0=n; :("";"")]
+  v: `code$w
+  ctl: any v<32                               // a control character: \XX in one, a space in the other
+  sp: v=32
+  esc: $[ctl; 1b; any w in X509DNESC]
+  edge: (w[0] in " #") | " "=w[n-1]
+  dbl: $[n>1; any (1_sp) & -1_sp; 0b]
+  p: $[esc|edge; x509DnEsc w; w]
+  c: $[ctl|dbl|sp[0]|sp[n-1]; x509Ws x509Lower w; `char$v+32*(v>64) & v<91]
+  (p;c)}
 
 x509cName: {[s;k]
   dsWant[s;k;DERSEQ;1b]
@@ -458,11 +485,19 @@ x509cName: {[s;k]
       v1: $[o1=-1; -1; (s`ns)[o1]]
       if[v1=-1; signal "x509: an AttributeTypeAndValue is a type and a value"]
       if[-1<(s`ns)[v1]; signal "x509: an AttributeTypeAndValue is a type and a value"]
-      o: dsOid[s;o1]
-      j: X509ATTROIDS?o
+      ob: dsOidB[s;o1]
+      pfx: ""; cfx: ""
+      if[(3=count ob) & (0x5504 ~ 2#ob) & 128>`int$ob[2]
+        ii: `int$ob[2]
+        pfx: X509ATTRP[ii]; cfx: X509ATTRC[ii]]
+      if[0=count cfx
+        o: derOidOf `int$ob
+        j: X509ATTROIDS?o
+        pfx: ($[j<count X509ATTROIDS; X509ATTRNAMES[j]; o]),"="
+        cfx: o,"="]
       pc: x509cDnPair[s;v1]
-      ps: x509Cons[ps; ($[j<count X509ATTROIDS; X509ATTRNAMES[j]; o]),"=",pc[0]]
-      cs: x509Cons[cs; o,"=",pc[1]]
+      ps: x509Cons[ps; pfx,pc[0]]
+      cs: x509Cons[cs; cfx,pc[1]]
       a: (s`ns)[a]]
     // an RDN holds one attribute unless someone went out of their way: the sort and the join are
     // 1.4 us that the common shape does not need
@@ -668,8 +703,9 @@ x509ParseAt: {[s;top]
 // — drops the whole batch back onto x509Parse, which is the reader that decides.
 x509ParseMany: {[ds]
   if[0=count ds; :()]
-  r: @[{[ds] s: derScan ds; x509ParseAt[s;] each s`root}; ds; {[e] `x509fallback}]
+  r: @[x509ParseBatch; ds; {[e] `x509fallback}]
   $[`x509fallback ~ r; x509Parse each ds; r]}
+x509ParseBatch: {[ds] s: derScan ds; x509ParseAt[s;] each s`root}
 
 // ---- PEM
 // text -> the DER of every CERTIFICATE block in it. Anything outside the BEGIN/END lines is

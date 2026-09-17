@@ -219,22 +219,29 @@ x509Link: {[c;spki]
 // certificate in a system bundle takes down every connection, and dropping a root only ever makes
 // the store trust less. `skipped` is there so a caller can notice.
 //
-// Measured on this machine, /etc/ssl/certs/ca-certificates.crt, 146 roots:
-//   pemLoad (read0 + base64)  134 ms      x509Parse of all 146   97 ms      231 ms in total
+// Measured on this machine, /etc/ssl/certs/ca-certificates.crt, 146 roots (tests/x509bench.nt):
+//   pemLoad  9 ms      x509ParseMany of all 146  46 ms      55 ms in total, 377 us a certificate
 // Everything is parsed up front. Indexing by subject and parsing a root only when a chain reached
-// it could save at most that 97 ms — the base64 has to be decoded before there is a subject to
+// it could save at most that 46 ms — the base64 has to be decoded before there is a subject to
 // index by at all — and parsing eagerly is what makes a malformed root a load-time problem instead
-// of a mid-handshake one. 231 ms once per process is not worth trading that away for.
+// of a mid-handshake one. 55 ms once per process is not worth trading that away for.
 X509CAPATH: "/etc/ssl/certs/ca-certificates.crt"
+// The whole bundle goes through x509ParseMany, which reads all 146 in one derScan. A root this
+// build cannot read is still dropped rather than refused — but the batch reader is all-or-nothing,
+// so one unreadable root costs the batch and the store is re-read a certificate at a time.
 x509LoadRoots: {[path]
   ds: pemLoad path
-  sj: (); cs: (); bad: 0; i: 0
-  while[i<count ds
-    c: @[x509Parse; ds[i]; {`x509bad}]
+  if[0=count ds; :`subjects`certs`skipped!(();();0)]
+  cs: @[x509ParseMany; ds; {[e] ,`x509bad}]
+  if[(1=count cs) & `x509bad ~ cs[0]
+    cs: {[d] @[x509Parse; d; {[e] `x509bad}]} each ds]
+  sj: (); out: (); bad: 0; i: 0
+  while[i<count cs
+    c: cs[i]
     if[`x509bad ~ c; bad+:1]
-    if[not `x509bad ~ c; sj,: `$c`subjectCanon; cs,: enlist c]
+    if[not `x509bad ~ c; sj,: `$c`subjectCanon; out,: enlist c]
     i+:1]
-  `subjects`certs`skipped!(sj;cs;bad)}
+  `subjects`certs`skipped!(sj;out;bad)}
 x509SystemRoots: {[] x509LoadRoots X509CAPATH}
 // every root with this subject: a rollover can put two keys under one name, and the right one is
 // whichever verifies, so all of them are tried rather than the first
