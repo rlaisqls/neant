@@ -1,0 +1,272 @@
+// ECDSA verification on a short-Weierstrass curve y^2 = x^3 - 3x + b over a prime field (RFC 6090 /
+// FIPS 186-4), in neant, on the general modular arithmetic in src/neant/crypto/bignum.nt and on
+// der.nt for the signature's encoding. Not part of the boot image — load all three:
+//   load "src/neant/crypto/bignum.nt"   load "src/neant/crypto/der.nt"
+//   load "src/neant/crypto/ec.nt"
+// and then one curve: src/neant/crypto/p256.nt or src/neant/crypto/p384.nt, which is what a caller
+// actually names. Nothing here knows which curve it is on.
+//
+// WHY THIS FILE EXISTS. It was p256.nt, and it was one curve. The public web's intermediates are
+// ecdsa-with-SHA384 over P-384, so a second curve was needed; and because every value below is a
+// bignum.nt limb list rather than a fixed-width P-256 word, the arithmetic needed nothing
+// curve-specific to become general. Every function here takes the curve record `C` as its first
+// argument, and the only difference between P-256 and P-384 in this file is the contents of that
+// record — not one line of the group law, the ladder or the checks is written twice. p256.nt's
+// exported names are still the ones tests/p256.nt and verify.nt call; they are thin wrappers now.
+//
+//   ecCurve[(p;n;b;gx;gy;dgst)] -> C   the domain parameters as hex strings, plus the digest
+//                                      length in octets this curve's signatures are verified with
+//   ecdsaVerify[C;pub;digest;r;s]      -> 1b / 0b
+//   ecdsaVerifyDer[C;pub;digest;sig]   -> 1b / 0b   sig is DER SEQUENCE { INTEGER r, INTEGER s },
+//                                                   which is what a certificate's signatureValue
+//                                                   and a TLS CertificateVerify carry
+//
+// `pub` is the SEC 1 point x509.nt's `spki`point hands you; r and s are big-endian magnitudes.
+// `digest` is the already-computed hash of the signed message and must be exactly `C`dgst` octets:
+// a curve here is paired with ONE hash — P-256 with SHA-256, P-384 with SHA-384 — so a digest of
+// any other length is refused rather than truncated or left-padded into something that would
+// verify against the wrong hash. FIPS 186-4 6.4 does define a truncation (the leftmost
+// min(bitlen(hash), bitlen(n)) bits) for a mismatched pair, and it is deliberately not implemented:
+// it is one more thing to get subtly wrong in a verifier whose job is to say no, and the pairings
+// above are the only ones certificates in the wild actually use.
+//
+// Both verifiers are total, exactly like rsaVerifyPkcs1: every malformed input — a point that is
+// not on the curve, an r or s out of range, DER that does not parse — comes back 0b, because
+// saying no is the whole job and a signal is an answer the caller has to remember to catch.
+// Verification only: there is no signing here, and nothing is constant-time, which is what a
+// verifier's all-public inputs allow.
+//
+// WHAT IS CHECKED, because each one missing is a real forgery:
+//   * r and s are both in [1, n-1] — s = 0 would make s^-1 meaningless and r = 0 lets an attacker
+//     drop the public key out of the equation entirely
+//   * the public key is a point ON the curve, both coordinates canonically below p, and not the
+//     point at infinity — an off-curve "key" lands in a group where the discrete log is easy
+//   * the recovered R is not the point at infinity
+//   * the final test is (R.x mod n) = r, with the reduction ACTUALLY DONE. R.x is a value mod p
+//     and r a value mod n, and on both NIST curves here p - n is tiny against the field — 127 bits
+//     against 256 for P-256, 190 against 384 for P-384 — so a signature whose R.x reaches n turns
+//     up about once in 2^129 and once in 2^194 respectively. That is what makes a missing
+//     reduction so easy to ship: every vector openssl will ever hand you has R.x < n already, and
+//     the bare comparison agrees with the right answer on all of them. tests/data/p256-rx-ge-n.py
+//     and tests/data/p384-rx-ge-n.py build the cases that do not agree, and tests/p256.nt and
+//     tests/p384.nt assert them.
+// Both curves here have cofactor 1, so every point on them is in the prime-order group and there
+// is no separate subgroup check to do; on a curve with a cofactor there would be, and ecCurve does
+// not take one because nothing here would know what to do with it.
+//
+// COMPRESSED POINTS (SEC 1 0x02/0x03) ARE REFUSED. RFC 5480 2.2 requires uncompressed support and
+// makes compressed optional; nothing on the public web ships one in a certificate, and recovering
+// y from x is a square root mod p whose sign choice is one more thing to get wrong in a verifier
+// whose job is to say no. `pub` must be the uncompressed 0x04 || X || Y form or it is not a key.
+
+// ---- the curve record. The parameters go in as the hex the standards print (`openssl ecparam
+// -name <curve> -param_enc explicit -text` prints exactly them), and come out as bignum.nt limbs
+// with b and G already in Montgomery form, because that is the form every field operation below
+// multiplies in. a is not stored: it is p-3 on both curves here and ecDbl's fast doubling assumes
+// exactly that, so a curve with any other a does not belong in this file at all.
+//   `p `np `r2       the field, and what bnMontMul needs to reduce in it
+//   `pm2 `nm2        p-2 and n-2, the Fermat exponents the two inversions run to
+//   `n               the group order, which the final comparison reduces against
+//   `b `gx `gy       the curve constant and the base point, in Montgomery form
+//   `one             R mod p, the Montgomery form of 1, which is also the Z of an affine point
+//   `oct             a coordinate's width in octets: 32 for P-256, 48 for P-384
+//   `bits `limbs     the scalar width in bits, and the bignum limbs that holds
+//   `dgst            the digest length in octets this curve's signatures carry: see the header
+// Limb exactness, the constraint every bignum in this tree is written against: bnMontMul forms one
+// column of a schoolbook product as min(na;nb) products of 26-bit limbs, each < 2^52, so a column
+// stays under limbs*2^52 — 2^55.4 at 10 limbs (P-256) and 2^55.9 at 15 (P-384), both far under the
+// 2^62 an i64 column has to stay inside, with bnMontMul's carry (< 2^33) room on top.
+// One list argument, not six: a call written over several lines is one statement per line here,
+// so `f[a\n  ; b]` would hand f an empty argument per newline, while a `( ... )` list spanning
+// lines is exactly the list it looks like. Five hex strings do not fit on one line.
+//   (p; n; b; Gx; Gy; digest octets)
+ecCurve: {[a]
+  ph: a[0]; nh: a[1]; bh: a[2]; gxh: a[3]; gyh: a[4]; dgst: a[5]
+  P: bnFromBytes unhex ph
+  N: bnFromBytes unhex nh
+  np: bnMontInv P[0]                                      // -p^-1 mod 2^26, for bnMontMul
+  r2: bnMod[((2*count P)#0), 1; P]                        // R^2 mod p, R = 2^(26*count P)
+  nb: count unhex ph
+  k: `p`np`r2`pm2`n`nm2`b`gx`gy`one`oct`bits`limbs`dgst
+  v: (P; np; r2; bnSub[P; ,2]; N; bnSub[N; ,2]
+    ; bnMontMul[bnFromBytes unhex bh; r2; P; np]
+    ; bnMontMul[bnFromBytes unhex gxh; r2; P; np]
+    ; bnMontMul[bnFromBytes unhex gyh; r2; P; np]
+    ; bnMontMul[,1; r2; P; np]
+    ; nb; 8*nb; ceiling (8*nb) % BNB; dgst)
+  k!v}
+
+// ---- the field mod p. Every value below is a limb list in MONTGOMERY FORM (the stored limbs are
+// x*R mod p), because that is the form bnMontMul multiplies in; efTo and efFrom are the only two
+// places the distinction shows. bnMontMul, bnAdd and bnSub all return trimmed canonical limbs, so
+// `~` is a valid equality on field elements and efAdd/efSub keep every value in [0, p).
+efMul:  {[C;a;b] bnMontMul[a;b;C`p;C`np]}
+efSqr:  {[C;a] bnMontMul[a;a;C`p;C`np]}
+efTo:   {[C;x] bnMontMul[x; C`r2; C`p; C`np]}             // x -> xR
+efFrom: {[C;x] bnMontMul[x; ,1; C`p; C`np]}               // xR -> x
+efAdd:  {[C;a;b] r: bnAdd[a;b]; $[0 > bnCmp[r;C`p]; r; bnSub[r;C`p]]}
+efSub:  {[C;a;b] $[0 > bnCmp[a;b]; bnSub[bnAdd[a;C`p];b]; bnSub[a;b]]}
+// a^-1 as a^(p-2): p is prime, so this is the inverse for every a but zero, and zero inverts to
+// zero — which is only ever reached through a Z of zero, and ecToAffine refuses that first.
+// Fermat rather than a binary extended Euclid: Euclid would take roughly 2*bitlen iterations of
+// shifts and conditional subtracts, fewer elementary operations than the bitlen squarings here,
+// but each iteration is an interpreted loop body with branches and bignum.nt has no signed
+// representation to run it in. p256.nt's header counts what that would and would not buy.
+efInv: {[C;a] efTo[C; bnModExpL[efFrom[C;a]; C`pm2; C`p]]}
+
+// ---- the group, in Jacobian coordinates (X;Y;Z) standing for the affine (X/Z^2, Y/Z^3). The
+// point of Jacobian is that neither the doubling nor the addition inverts: the one inversion a
+// verification pays is at the very end, in ecToAffine, instead of once per ladder step — one
+// inversion per scalar bit saved, and each one is a bitlen-squaring exponentiation.
+// Z = 0 is the point at infinity; X and Y are then arbitrary and the doubling below leaves it
+// alone, which is why no formula here needs a neutral-element special case of its own.
+ecInf: {[C] (C`one; C`one; BNZERO)}
+ecIsInf: {[P] bnIsZero P[2]}
+
+// dbl-2001-b (hyperelliptic.org's EFD), 3M + 5S, which is the fast one only because a = -3:
+//   alpha = 3(X-Z^2)(X+Z^2) is the factorisation of 3X^2 + aZ^4 that a = -3 allows, and it costs
+//   one multiply instead of two squarings and a multiply.
+ecDbl: {[C;P]
+  if[bnIsZero P[2]; :P]
+  d: efSqr[C;P[2]]                                        // delta = Z^2
+  g: efSqr[C;P[1]]                                        // gamma = Y^2
+  bt: efMul[C;P[0];g]                                     // beta = X*gamma
+  al: efMul[C; efSub[C;P[0];d]; efAdd[C;P[0];d]]
+  al: efAdd[C; al; efAdd[C;al;al]]                        // alpha = 3(X-delta)(X+delta)
+  b4: efAdd[C;bt;bt]; b4: efAdd[C;b4;b4]                  // 4*beta
+  x3: efSub[C; efSqr[C;al]; efAdd[C;b4;b4]]               // alpha^2 - 8*beta
+  z3: efSub[C; efSub[C; efSqr[C; efAdd[C;P[1];P[2]]]; g]; d]     // (Y+Z)^2 - gamma - delta
+  g8: efSqr[C;g]; g8: efAdd[C;g8;g8]; g8: efAdd[C;g8;g8]; g8: efAdd[C;g8;g8]
+  y3: efSub[C; efMul[C; al; efSub[C;b4;x3]]; g8]          // alpha(4beta - X3) - 8*gamma^2
+  (x3;y3;z3)}
+
+// madd-2007-bl: Jacobian P plus AFFINE A, 7M + 4S — cheaper than the 12M + 4S a second Jacobian
+// point would cost, which is why the two-scalar table below is converted to affine once up front.
+// The two degenerate cases are the ones a verifier must not get wrong: equal points need the
+// doubling formula (the addition would divide by zero and hand back (0;0;0)), and a point plus its
+// own negation is the point at infinity.
+ecMAdd: {[C;P;A]
+  if[bnIsZero P[2]; :(A[0]; A[1]; C`one)]
+  zz: efSqr[C;P[2]]                                       // Z1Z1
+  u2: efMul[C; A[0]; zz]
+  s2: efMul[C; A[1]; efMul[C;P[2];zz]]
+  h: efSub[C; u2; P[0]]
+  rr: efSub[C; s2; P[1]]
+  if[bnIsZero h
+    if[bnIsZero rr; :ecDbl[C;P]]
+    :ecInf C]
+  rr: efAdd[C;rr;rr]                                      // r = 2(S2 - Y1)
+  hh: efSqr[C;h]
+  ii: efAdd[C;hh;hh]; ii: efAdd[C;ii;ii]                  // I = 4*HH
+  jj: efMul[C;h;ii]                                       // J = H*I
+  v: efMul[C; P[0]; ii]
+  x3: efSub[C; efSub[C; efSqr[C;rr]; jj]; efAdd[C;v;v]]
+  t: efMul[C; P[1]; jj]
+  y3: efSub[C; efMul[C; rr; efSub[C;v;x3]]; efAdd[C;t;t]]
+  z3: efSub[C; efSub[C; efSqr[C; efAdd[C;P[2];h]]; zz]; hh]      // (Z1+H)^2 - Z1Z1 - HH
+  (x3;y3;z3)}
+
+// Jacobian -> (x;y) in Montgomery form, or () for the point at infinity. This is the one inversion.
+ecToAffine: {[C;P]
+  if[bnIsZero P[2]; :()]
+  zi: efInv[C;P[2]]
+  z2: efSqr[C;zi]
+  (efMul[C;P[0];z2]; efMul[C;P[1]; efMul[C;z2;zi]])}
+
+// a scalar as `bits` bits, most significant first — the order the ladder below consumes them in.
+// `limbs` 26-bit limbs hold a few more bits than that (260 for P-256, 390 for P-384) and every
+// scalar here is already reduced mod n < 2^bits, so the bits dropped off the top are zero.
+ecBits: {[C;v] reverse (C`bits) # raze {(x shr til BNB) band 1} each bnPad[v; C`limbs]}
+
+// Shamir's trick, the same shape as ed25519.nt's edMul2: both scalars are consumed together over a
+// three-entry table, so one doubling serves both and a verification costs `bits` doublings rather
+// than twice that. A1 and A2 are affine; the table entry for A1+A2 is built once and made affine so
+// that every addition in the loop is the cheap mixed one. A1+A2 can be the point at infinity (an
+// attacker is free to send Q = -G), and () is how that entry says so: adding infinity is a no-op,
+// so the loop simply skips it.
+ecShamir: {[C;b1;A1;b2;A2]
+  T: (A1; A2; ecToAffine[C; ecMAdd[C; (A1[0];A1[1];C`one); A2]])
+  R: ecInf C
+  i: 0; n: count b1
+  while[i<n
+    R: ecDbl[C;R]
+    j: (b1[i]) + 2*b2[i]
+    if[j>0
+      e: T[j-1]
+      if[0 < count e; R: ecMAdd[C;R;e]]]
+    i+:1]
+  R}
+
+// ---- the public key. SEC 1 2.3.4: 0x04 || X || Y, `oct` octets each. -> the affine point in
+// Montgomery form, or () for anything that is not a key: the wrong length, a compressed or hybrid
+// prefix, a coordinate at or above p (two encodings of one number is exactly the ambiguity a
+// verifier must not have), or a pair that does not satisfy y^2 = x^3 - 3x + b.
+ecPoint: {[C;b]
+  nb: C`oct
+  if[not (1 + 2*nb) = count b; :()]
+  if[not 4 = `int$ b[0]; :()]
+  x: bnFromBytes b[1+til nb]
+  y: bnFromBytes b[(1+nb)+til nb]
+  if[not 0 > bnCmp[x;C`p]; :()]
+  if[not 0 > bnCmp[y;C`p]; :()]
+  X: efTo[C;x]; Y: efTo[C;y]
+  l: efSqr[C;Y]
+  r: efAdd[C; efSub[C; efMul[C; X; efSqr[C;X]]; efAdd[C; X; efAdd[C;X;X]]]; C`b]
+  if[not l ~ r; :()]
+  (X;Y)}
+
+// ---- the signature, in the DER both a certificate and a TLS CertificateVerify carry it in:
+//   Ecdsa-Sig-Value ::= SEQUENCE { r INTEGER, s INTEGER }   (RFC 3279 2.2.3)
+// der.nt does the strict part — a non-minimal INTEGER, a non-minimal length, a truncated element
+// or a byte after the SEQUENCE all signal there — so this only has to reject a negative value and
+// strip the 0x00 that DER puts in front of a magnitude with its top bit set. Curve-independent:
+// the encoding of an ECDSA signature does not depend on which curve made it.
+ecPos: {[b]
+  if[127 < `int$ b[0]; signal "ec: a negative value in an ECDSA signature"]
+  $[(1 < count b) & 0 = `int$ b[0]; 1_b; b]}
+ecSigRS: {[sig]
+  nd: derParse sig
+  derWant[nd;DERSEQ;1b]
+  k: derKids nd
+  if[not 2 = count k; signal "ec: an ECDSA signature is exactly two INTEGERs"]
+  (ecPos derInt k[0]; ecPos derInt k[1])}
+
+// ---- ECDSA verification (FIPS 186-4 6.4.2). e is the digest as an integer; the truncation the
+// standard asks for is the leftmost min(bitlen(hash), bitlen(n)) bits, and with the one hash each
+// curve here is paired with that is the whole digest, so there is nothing to truncate — the
+// reduction mod n below is the ordinary one every later step works under.
+//
+// ECDSA IS MALLEABLE: if (r,s) verifies then so does (r, n-s), because negating s negates both u1
+// and u2 and so negates R, and -R has the same x. That is not a flaw this verifier can or should
+// paper over — the signature still commits to the same message under the same key, and a
+// certificate or a CertificateVerify is authenticated by exactly that. Anything that needs a
+// signature to be a unique token of a transaction has to say so itself.
+ecVerify: {[a]
+  C: a[0]; pub: a[1]; digest: a[2]; rb: a[3]; sb: a[4]
+  if[not (C`dgst) = count digest; :0b]                    // one curve, one hash: see the header
+  rv: bnFromBytes rb
+  sval: bnFromBytes sb
+  if[bnIsZero rv; :0b]                                    // r and s both in [1, n-1]
+  if[bnIsZero sval; :0b]
+  if[not 0 > bnCmp[rv;C`n]; :0b]
+  if[not 0 > bnCmp[sval;C`n]; :0b]
+  Q: ecPoint[C;pub]
+  if[0 = count Q; :0b]
+  e: bnMod[bnFromBytes digest; C`n]
+  w: bnModExpL[sval; C`nm2; C`n]                          // s^-1 mod n; n is prime, so Fermat
+  u1: bnMod[bnMul[e;w]; C`n]
+  u2: bnMod[bnMul[rv;w]; C`n]
+  G: (C`gx; C`gy)
+  R: ecShamir[C; ecBits[C;u1]; G; ecBits[C;u2]; Q]
+  if[bnIsZero R[2]; :0b]                                  // u1*G + u2*Q is the point at infinity
+  xy: ecToAffine[C;R]
+  (bnMod[efFrom[C;xy[0]]; C`n]) ~ rv}                     // mod n, never a bare compare: see above
+
+// The two exports. The trap is belt and braces over the explicit checks above: bignum.nt signals
+// on an operand wider than it can multiply exactly, and a certificate does not get to turn that
+// into an exception the caller has to catch. A signal from anywhere below is an answer of no.
+ecdsaVerify: {[C;pub;digest;r;s] @[ecVerify; (C;pub;digest;r;s); {0b}]}
+ecdsaVerifyDer: {[C;pub;digest;sig]
+  rs: @[ecSigRS; sig; {()}]
+  if[0 = count rs; :0b]
+  ecdsaVerify[C; pub; digest; rs[0]; rs[1]]}

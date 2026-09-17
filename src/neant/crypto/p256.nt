@@ -1,44 +1,18 @@
-// ECDSA signature verification on NIST P-256 (secp256r1, RFC 6090 / FIPS 186-4) in neant, on the
-// general modular arithmetic in src/neant/crypto/bignum.nt and on der.nt for the signature's
-// encoding. Not part of the boot image — load all three:
+// NIST P-256 (secp256r1, FIPS 186-4 D.1.2.3) as an instance of the curve-generic ECDSA verifier in
+// src/neant/crypto/ec.nt. Not part of the boot image — load all four:
 //   load "src/neant/crypto/bignum.nt"   load "src/neant/crypto/der.nt"
-//   load "src/neant/crypto/p256.nt"
+//   load "src/neant/crypto/ec.nt"       load "src/neant/crypto/p256.nt"
 //
 //   ecdsaVerifyP256[pub;digest;r;s]    -> 1b / 0b   pub is the SEC 1 point x509.nt's `spki`point
 //                                                   hands you; r and s are big-endian magnitudes
-//   ecdsaVerifyP256Der[pub;digest;sig] -> 1b / 0b   sig is DER SEQUENCE { INTEGER r, INTEGER s },
-//                                                   which is what both a certificate's
-//                                                   signatureValue and a TLS CertificateVerify carry
+//   ecdsaVerifyP256Der[pub;digest;sig] -> 1b / 0b   sig is DER SEQUENCE { INTEGER r, INTEGER s }
 //
 // `digest` is the already-computed hash of the signed message and must be exactly 32 bytes: this
-// verifier is ECDSA-with-SHA-256 and nothing else, so a digest of any other length is refused
-// rather than truncated or left-padded into something that would verify against the wrong hash.
-//
-// Both verifiers are total, exactly like rsaVerifyPkcs1: every malformed input — a point that is
-// not on the curve, an r or s out of range, DER that does not parse — comes back 0b, because
-// saying no is the whole job and a signal is an answer the caller has to remember to catch.
-// Verification only: there is no signing here, and nothing is constant-time, which is what a
-// verifier's all-public inputs allow.
-//
-// WHAT IS CHECKED, because each one missing is a real forgery:
-//   * r and s are both in [1, n-1] — s = 0 would make s^-1 meaningless and r = 0 lets an attacker
-//     drop the public key out of the equation entirely
-//   * the public key is a point ON the curve, both coordinates canonically below p, and not the
-//     point at infinity — an off-curve "key" lands in a group where the discrete log is easy
-//   * the recovered R is not the point at infinity
-//   * the final test is (R.x mod n) = r, with the reduction ACTUALLY DONE. R.x is a value mod p
-//     and r a value mod n, and p - n is 0x4319055358e8617b0c46353d039cdaae — 127 bits against a
-//     256-bit field, so a signature whose R.x reaches n turns up about once in 2^129. That is what
-//     makes a missing reduction so easy to ship: every vector openssl will ever hand you has
-//     R.x < n already, and the bare comparison agrees with the right answer on all of them.
-//     tests/data/p256-rx-ge-n.py builds the case that does not agree, and tests/p256.nt asserts it
-// P-256's cofactor is 1, so every point on the curve is in the prime-order group and there is no
-// separate subgroup check to do; on a curve with a cofactor there would be.
-//
-// COMPRESSED POINTS (SEC 1 0x02/0x03) ARE REFUSED. RFC 5480 2.2 requires uncompressed support and
-// makes compressed optional; nothing on the public web ships one in a certificate, and recovering
-// y from x is a square root mod p whose sign choice is one more thing to get wrong in a verifier
-// whose job is to say no. `pub` must be the 65-octet 0x04 || X || Y form or it is not a key here.
+// verifier is ECDSA-with-SHA-256 and nothing else. ec.nt's header is where every check, every
+// refusal and the reasoning behind them is written down; this file is the domain parameters and
+// the names. The arithmetic below is ec.nt's, wrapped so that P256C never has to be spelled at a
+// call site and so that fpMul, p256Dbl and the rest go on meaning what they meant when this file
+// WAS the arithmetic — tests/p256.nt and verify.nt call them by those names.
 //
 // ---- the field, and why this reuses bignum.nt instead of folding the special prime
 // p = 2^256 - 2^224 + 2^192 + 2^96 - 1 is a Solinas prime, and the textbook reduction for it (FIPS
@@ -60,16 +34,18 @@
 // So the dedicated reduction comes out level with the general one, because the extra six
 // multiply-accumulate passes that 16-bit limbs cost are worth more than the division the fold
 // saves — and bnMontMul saves no division either, REDC is the whole point of it. Level means
-// reuse: this file adds no arithmetic of its own, and bignum.nt's Montgomery form is what every
-// field element below is in.
+// reuse: neither this file nor ec.nt adds arithmetic of its own, and bignum.nt's Montgomery form is
+// what every field element is in. It is also what made a SECOND curve nearly free: see p384.nt.
 //
-// ---- what it costs, measured on this machine (src/main.rs, mod p256 and mod rsa)
-//   ECDSA P-256 verification    178 ms
-//   RSA-2048 PKCS#1 v1.5         7.4 ms
+// ---- what it costs, measured on this machine (src/main.rs, mod p256, mod p384 and mod rsa, by
+// `cargo test --release -- --nocapture`)
+//   ECDSA P-256 verification    180 ms
+//   ECDSA P-384 verification    380 ms   the same code, a longer curve record: see p384.nt
+//   RSA-2048 PKCS#1 v1.5        7.8 ms
 // A verification is one inversion mod n, 256 Jacobian doublings and about 192 mixed additions over
 // Shamir's trick, and one inversion mod p to come back to affine: roughly 4900 modular
-// multiplications, against the twenty an RSA-2048 exponentiation with e = 65537 costs. Twenty-four
-// times the work for twenty-four times the time is the whole explanation — and it is the reverse of
+// multiplications, against the twenty an RSA-2048 exponentiation with e = 65537 costs. Twenty-odd
+// times the work for twenty-odd times the time is the whole explanation — and it is the reverse of
 // the ratio a compiled implementation shows, where P-256 beats RSA-2048 handily, because there each
 // modular multiplication is a handful of instructions and here it is a dozen interpreted vector
 // operations on ten-element lists. Nothing about the algorithm is at fault; the constant is.
@@ -83,196 +59,54 @@
 //     equation in ECDSA a verifier must not get subtly wrong. 5% is not worth it.
 //
 // ---- inversion: Fermat, not extended Euclid
-// fpInv and the s^-1 mod n below both go through bnModExpL to the p-2 / n-2 power: 255 squarings
+// efInv and the s^-1 mod n in ec.nt both go through bnModExpL to the p-2 / n-2 power: 255 squarings
 // and one multiply per set bit — p-2 has 128 of them and n-2 about 160, so 384 and 415 modular
-// multiplications. A binary extended Euclid would take
-// roughly 512 iterations of shifts and conditional subtracts — fewer elementary operations, but
-// each iteration is an interpreted loop body with branches, and bignum.nt has no signed
-// representation to run it in, so it would mean new arithmetic in a file this task may not
-// restructure. The two inversions are ~800 of the ~4900 modular multiplications a verification
-// costs, 16% of it: halving them would buy 8%, which is not worth a second modular-arithmetic
-// path in a verifier that has to be read before it is trusted.
+// multiplications. A binary extended Euclid would take roughly 512 iterations of shifts and
+// conditional subtracts — fewer elementary operations, but each iteration is an interpreted loop
+// body with branches, and bignum.nt has no signed representation to run it in, so it would mean new
+// arithmetic in a file this task may not restructure. The two inversions are ~800 of the ~4900
+// modular multiplications a verification costs, 16% of it: halving them would buy 8%, which is not
+// worth a second modular-arithmetic path in a verifier that has to be read before it is trusted.
 
 // ---- the domain parameters (FIPS 186-4 D.1.2.3; `openssl ecparam -name prime256v1
-// -param_enc explicit -text` prints exactly these). a = p-3, which is what the doubling below
-// assumes; the cofactor is 1.
-P256P:  bnFromBytes unhex "ffffffff00000001000000000000000000000000ffffffffffffffffffffffff"
-P256N:  bnFromBytes unhex "ffffffff00000000ffffffffffffffffbce6faada7179e84f3b9cac2fc632551"
-P256NP: bnMontInv P256P[0]                                // -p^-1 mod 2^26, for bnMontMul
-P256R2: bnMod[((2*count P256P)#0), 1; P256P]              // R^2 mod p, R = 2^260
-P256PM2: bnSub[P256P; ,2]
-P256NM2: bnSub[P256N; ,2]
+// -param_enc explicit -text` prints exactly these). a = p-3, which is what ec.nt's doubling
+// assumes; the cofactor is 1; the digest is 32 octets, because this is ECDSA-with-SHA-256.
+P256C: ecCurve ("ffffffff00000001000000000000000000000000ffffffffffffffffffffffff"
+  ; "ffffffff00000000ffffffffffffffffbce6faada7179e84f3b9cac2fc632551"
+  ; "5ac635d8aa3a93e7b3ebbd55769886bc651d06b0cc53b0f63bce3c3e27d2604b"
+  ; "6b17d1f2e12c4247f8bce6e563a440f277037d812deb33a0f4a13945d898c296"
+  ; "4fe342e2fe1a7f9b8ee7eb4a7c0f9e162bce33576b315ececbb6406837bf51f5"; 32)
 
-// ---- the field mod p. Every value below is a limb list in MONTGOMERY FORM (the stored limbs are
-// x*R mod p), because that is the form bnMontMul multiplies in; fpTo and fpFrom are the only two
-// places the distinction shows. bnMontMul, bnAdd and bnSub all return trimmed canonical limbs, so
-// `~` is a valid equality on field elements and fpAdd/fpSub keep every value in [0, p).
-fpMul: {[a;b] bnMontMul[a;b;P256P;P256NP]}
-fpSqr: {[a] bnMontMul[a;a;P256P;P256NP]}
-fpTo:   {[x] bnMontMul[x; P256R2; P256P; P256NP]}         // x -> xR
-fpFrom: {[x] bnMontMul[x; ,1; P256P; P256NP]}             // xR -> x
-fpAdd: {[a;b] r: bnAdd[a;b]; $[0 > bnCmp[r;P256P]; r; bnSub[r;P256P]]}
-fpSub: {[a;b] $[0 > bnCmp[a;b]; bnSub[bnAdd[a;P256P];b]; bnSub[a;b]]}
-// a^-1 as a^(p-2): p is prime, so this is the inverse for every a but zero, and zero inverts to
-// zero — which is only ever reached through a Z of zero, and p256ToAffine refuses that first.
-fpInv: {[a] fpTo bnModExpL[fpFrom a; P256PM2; P256P]}
-
+// the same names this file exported when the parameters were spelled out one global at a time
+P256P:   P256C`p
+P256N:   P256C`n
+P256NP:  P256C`np                                         // -p^-1 mod 2^26, for bnMontMul
+P256R2:  P256C`r2                                         // R^2 mod p, R = 2^260
+P256PM2: P256C`pm2
+P256NM2: P256C`nm2
 FP0: BNZERO
-FP1: fpTo (,1)                                            // R mod p, the Montgomery form of 1
-FPB: fpTo bnFromBytes unhex "5ac635d8aa3a93e7b3ebbd55769886bc651d06b0cc53b0f63bce3c3e27d2604b"
-P256G: (fpTo bnFromBytes unhex "6b17d1f2e12c4247f8bce6e563a440f277037d812deb33a0f4a13945d898c296"
-  ; fpTo bnFromBytes unhex "4fe342e2fe1a7f9b8ee7eb4a7c0f9e162bce33576b315ececbb6406837bf51f5")
+FP1: P256C`one                                            // R mod p, the Montgomery form of 1
+FPB: P256C`b
+P256G: (P256C`gx; P256C`gy)
+P256INF: ecInf P256C
 
-// ---- the group, in Jacobian coordinates (X;Y;Z) standing for the affine (X/Z^2, Y/Z^3). The
-// point of Jacobian is that neither the doubling nor the addition inverts: the one inversion a
-// verification pays is at the very end, in p256ToAffine, instead of once per ladder step — 255
-// inversions saved, and each one is a 384-multiplication exponentiation.
-// Z = 0 is the point at infinity; X and Y are then arbitrary and the doubling below leaves it
-// alone, which is why no formula here needs a neutral-element special case of its own.
-P256INF: (FP1; FP1; FP0)
-p256IsInf: {[P] bnIsZero P[2]}
+// ---- the field mod p, and the group in Jacobian coordinates: ec.nt's, with the curve bound.
+// Every value is in Montgomery form; fpTo and fpFrom are the only two places that shows.
+fpMul: {[a;b] efMul[P256C;a;b]}
+fpSqr: {[a] efSqr[P256C;a]}
+fpTo:  {[x] efTo[P256C;x]}                                // x -> xR
+fpFrom:{[x] efFrom[P256C;x]}                              // xR -> x
+fpAdd: {[a;b] efAdd[P256C;a;b]}
+fpSub: {[a;b] efSub[P256C;a;b]}
+fpInv: {[a] efInv[P256C;a]}
+p256IsInf:    {[P] ecIsInf P}
+p256Dbl:      {[P] ecDbl[P256C;P]}
+p256MAdd:     {[P;A] ecMAdd[P256C;P;A]}
+p256ToAffine: {[P] ecToAffine[P256C;P]}
+p256Bits:     {[v] ecBits[P256C;v]}
+p256Shamir:   {[b1;A1;b2;A2] ecShamir[P256C;b1;A1;b2;A2]}
+p256Point:    {[b] ecPoint[P256C;b]}
 
-// dbl-2001-b (hyperelliptic.org's EFD), 3M + 5S, which is the fast one only because a = -3:
-//   alpha = 3(X-Z^2)(X+Z^2) is the factorisation of 3X^2 + aZ^4 that a = -3 allows, and it costs
-//   one multiply instead of two squarings and a multiply.
-p256Dbl: {[P]
-  if[bnIsZero P[2]; :P]
-  d: fpSqr P[2]                                           // delta = Z^2
-  g: fpSqr P[1]                                           // gamma = Y^2
-  bt: fpMul[P[0];g]                                       // beta = X*gamma
-  al: fpMul[fpSub[P[0];d]; fpAdd[P[0];d]]
-  al: fpAdd[al; fpAdd[al;al]]                             // alpha = 3(X-delta)(X+delta)
-  b4: fpAdd[bt;bt]; b4: fpAdd[b4;b4]                      // 4*beta
-  x3: fpSub[fpSqr al; fpAdd[b4;b4]]                       // alpha^2 - 8*beta
-  z3: fpSub[fpSub[fpSqr fpAdd[P[1];P[2]]; g]; d]          // (Y+Z)^2 - gamma - delta
-  g8: fpSqr g; g8: fpAdd[g8;g8]; g8: fpAdd[g8;g8]; g8: fpAdd[g8;g8]
-  y3: fpSub[fpMul[al; fpSub[b4;x3]]; g8]                  // alpha(4beta - X3) - 8*gamma^2
-  (x3;y3;z3)}
-
-// madd-2007-bl: Jacobian P plus AFFINE A, 7M + 4S — cheaper than the 12M + 4S a second Jacobian
-// point would cost, which is why the two-scalar table below is converted to affine once up front.
-// The two degenerate cases are the ones a verifier must not get wrong: equal points need the
-// doubling formula (the addition would divide by zero and hand back (0;0;0)), and a point plus its
-// own negation is the point at infinity.
-p256MAdd: {[P;A]
-  if[bnIsZero P[2]; :(A[0]; A[1]; FP1)]
-  zz: fpSqr P[2]                                          // Z1Z1
-  u2: fpMul[A[0]; zz]
-  s2: fpMul[A[1]; fpMul[P[2]; zz]]
-  h: fpSub[u2; P[0]]
-  rr: fpSub[s2; P[1]]
-  if[bnIsZero h
-    if[bnIsZero rr; :p256Dbl P]
-    :P256INF]
-  rr: fpAdd[rr;rr]                                        // r = 2(S2 - Y1)
-  hh: fpSqr h
-  ii: fpAdd[hh;hh]; ii: fpAdd[ii;ii]                      // I = 4*HH
-  jj: fpMul[h;ii]                                         // J = H*I
-  v: fpMul[P[0]; ii]
-  x3: fpSub[fpSub[fpSqr rr; jj]; fpAdd[v;v]]
-  t: fpMul[P[1]; jj]
-  y3: fpSub[fpMul[rr; fpSub[v;x3]]; fpAdd[t;t]]
-  z3: fpSub[fpSub[fpSqr fpAdd[P[2];h]; zz]; hh]           // (Z1+H)^2 - Z1Z1 - HH
-  (x3;y3;z3)}
-
-// Jacobian -> (x;y) in Montgomery form, or () for the point at infinity. This is the one inversion.
-p256ToAffine: {[P]
-  if[bnIsZero P[2]; :()]
-  zi: fpInv P[2]
-  z2: fpSqr zi
-  (fpMul[P[0];z2]; fpMul[P[1]; fpMul[z2;zi]])}
-
-// a scalar as 256 bits, most significant first — the order the ladder below consumes them in.
-// Ten 26-bit limbs are 260 bits and every scalar here is already reduced mod n < 2^256, so the
-// four bits dropped off the top are zero.
-p256Bits: {[v] reverse 256 # raze {(x shr til BNB) band 1} each bnPad[v;10]}
-
-// Shamir's trick, the same shape as ed25519.nt's edMul2: both scalars are consumed together over a
-// three-entry table, so one doubling serves both and a verification costs 256 doublings rather
-// than 512. A1 and A2 are affine; the table entry for A1+A2 is built once and made affine so that
-// every addition in the loop is the cheap mixed one. A1+A2 can be the point at infinity (an
-// attacker is free to send Q = -G), and () is how that entry says so: adding infinity is a no-op,
-// so the loop simply skips it.
-p256Shamir: {[b1;A1;b2;A2]
-  T: (A1; A2; p256ToAffine p256MAdd[(A1[0];A1[1];FP1); A2])
-  R: P256INF
-  i: 0; n: count b1
-  while[i<n
-    R: p256Dbl R
-    j: (b1[i]) + 2*b2[i]
-    if[j>0
-      e: T[j-1]
-      if[0 < count e; R: p256MAdd[R;e]]]
-    i+:1]
-  R}
-
-// ---- the public key. SEC 1 2.3.4: 0x04 || X || Y, 32 octets each. -> the affine point in
-// Montgomery form, or () for anything that is not a key: the wrong length, a compressed or hybrid
-// prefix, a coordinate at or above p (two encodings of one number is exactly the ambiguity a
-// verifier must not have), or a pair that does not satisfy y^2 = x^3 - 3x + b.
-p256Point: {[b]
-  if[not 65 = count b; :()]
-  if[not 4 = `int$ b[0]; :()]
-  x: bnFromBytes b[1+til 32]
-  y: bnFromBytes b[33+til 32]
-  if[not 0 > bnCmp[x;P256P]; :()]
-  if[not 0 > bnCmp[y;P256P]; :()]
-  X: fpTo x; Y: fpTo y
-  l: fpSqr Y
-  r: fpAdd[fpSub[fpMul[X; fpSqr X]; fpAdd[X; fpAdd[X;X]]]; FPB]
-  if[not l ~ r; :()]
-  (X;Y)}
-
-// ---- the signature, in the DER both a certificate and a TLS CertificateVerify carry it in:
-//   Ecdsa-Sig-Value ::= SEQUENCE { r INTEGER, s INTEGER }   (RFC 3279 2.2.3)
-// der.nt does the strict part — a non-minimal INTEGER, a non-minimal length, a truncated element
-// or a byte after the SEQUENCE all signal there — so this only has to reject a negative value and
-// strip the 0x00 that DER puts in front of a magnitude with its top bit set.
-p256Pos: {[b]
-  if[127 < `int$ b[0]; signal "p256: a negative value in an ECDSA signature"]
-  $[(1 < count b) & 0 = `int$ b[0]; 1_b; b]}
-p256SigRS: {[sig]
-  nd: derParse sig
-  derWant[nd;DERSEQ;1b]
-  k: derKids nd
-  if[not 2 = count k; signal "p256: an ECDSA signature is exactly two INTEGERs"]
-  (p256Pos derInt k[0]; p256Pos derInt k[1])}
-
-// ---- ECDSA verification (FIPS 186-4 6.4.2). e is the digest as an integer; the truncation the
-// standard asks for is the leftmost min(bitlen(hash), bitlen(n)) bits, and with SHA-256 against a
-// 256-bit n that is the whole digest, so there is nothing to truncate — the reduction mod n below
-// is the ordinary one every later step works under.
-//
-// ECDSA IS MALLEABLE: if (r,s) verifies then so does (r, n-s), because negating s negates both u1
-// and u2 and so negates R, and -R has the same x. That is not a flaw this verifier can or should
-// paper over — the signature still commits to the same message under the same key, and a
-// certificate or a CertificateVerify is authenticated by exactly that. Anything that needs a
-// signature to be a unique token of a transaction has to say so itself.
-p256Verify: {[a]
-  pub: a[0]; digest: a[1]; rb: a[2]; sb: a[3]
-  if[not 32 = count digest; :0b]                          // SHA-256 or nothing: see the header
-  rv: bnFromBytes rb
-  sval: bnFromBytes sb
-  if[bnIsZero rv; :0b]                                    // r and s both in [1, n-1]
-  if[bnIsZero sval; :0b]
-  if[not 0 > bnCmp[rv;P256N]; :0b]
-  if[not 0 > bnCmp[sval;P256N]; :0b]
-  Q: p256Point pub
-  if[0 = count Q; :0b]
-  e: bnMod[bnFromBytes digest; P256N]
-  w: bnModExpL[sval; P256NM2; P256N]                      // s^-1 mod n; n is prime, so Fermat
-  u1: bnMod[bnMul[e;w]; P256N]
-  u2: bnMod[bnMul[rv;w]; P256N]
-  R: p256Shamir[p256Bits u1; P256G; p256Bits u2; Q]
-  if[bnIsZero R[2]; :0b]                                  // u1*G + u2*Q is the point at infinity
-  xy: p256ToAffine R
-  (bnMod[fpFrom xy[0]; P256N]) ~ rv}                      // mod n, never a bare compare: see above
-
-// The two exports. The trap is belt and braces over the explicit checks above: bignum.nt signals
-// on an operand wider than it can multiply exactly, and a certificate does not get to turn that
-// into an exception the caller has to catch. A signal from anywhere below is an answer of no.
-ecdsaVerifyP256: {[pub;digest;r;s] @[p256Verify; (pub;digest;r;s); {0b}]}
-ecdsaVerifyP256Der: {[pub;digest;sig]
-  rs: @[p256SigRS; sig; {()}]
-  if[0 = count rs; :0b]
-  ecdsaVerifyP256[pub; digest; rs[0]; rs[1]]}
+// ---- the two exports, total: every malformed input comes back 0b. ec.nt's header says why.
+ecdsaVerifyP256:    {[pub;digest;r;s] ecdsaVerify[P256C;pub;digest;r;s]}
+ecdsaVerifyP256Der: {[pub;digest;sig] ecdsaVerifyDer[P256C;pub;digest;sig]}
