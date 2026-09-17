@@ -16,6 +16,7 @@ load "tests/http.nt"
 load "tests/x86.nt"
 load "tests/p256.nt"
 load "tests/p384.nt"
+load "tests/x509.nt"
 load "tests/verify.nt"
 load "tests/batch.nt"
 ntFailures: treport[]
