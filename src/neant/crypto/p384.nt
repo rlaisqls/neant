@@ -1,0 +1,63 @@
+// NIST P-384 (secp384r1, FIPS 186-4 D.1.2.4) as a second instance of the curve-generic ECDSA
+// verifier in src/neant/crypto/ec.nt. Not part of the boot image — load all four:
+//   load "src/neant/crypto/bignum.nt"   load "src/neant/crypto/der.nt"
+//   load "src/neant/crypto/ec.nt"       load "src/neant/crypto/p384.nt"
+//
+//   ecdsaVerifyP384[pub;digest;r;s]    -> 1b / 0b   pub is the SEC 1 point x509.nt's `spki`point
+//                                                   hands you; r and s are big-endian magnitudes
+//   ecdsaVerifyP384Der[pub;digest;sig] -> 1b / 0b   sig is DER SEQUENCE { INTEGER r, INTEGER s }
+//
+// `digest` must be exactly 48 bytes: this verifier is ECDSA-with-SHA-384 and nothing else, which
+// is the pairing every certificate signed `ecdsa-with-SHA384` on the public web actually uses.
+// ec.nt's header is where every check and every refusal is written down.
+//
+// WHY THIS FILE IS THIRTY LINES AND NOT THREE HUNDRED. p256.nt made one choice that decided this:
+// it reused bignum.nt's Montgomery arithmetic on variable-length 26-bit limbs instead of folding
+// P-256's Solinas prime into fixed-width words, because measuring said the two were level (the
+// numbers are in p256.nt's header). A fixed-width fold would have had to be written again here,
+// over a different prime, with its own carry analysis; a limb list did not. Moving the group law
+// out of p256.nt into ec.nt and passing the curve as an argument is the whole of the work that
+// second curve cost — the doubling, the mixed addition, Shamir's ladder, the point decoding and
+// every range check are the same code running on a longer list. Nothing was copied.
+//
+// The same question p256.nt asked about its own prime, asked here and answered the same way, but
+// NOT re-measured — this is an argument from the limb widths, which are facts, not a timing:
+// p = 2^384 - 2^128 - 2^96 + 2^32 - 1 is Solinas too, and FIPS 186-4 D.2.4's reduction for it is
+// ten 32-bit-word terms. Every exponent is again a multiple of 32, so a word basis that makes
+// those terms limb permutations has to divide 32, and an exact i64 column caps a limb at 16 bits:
+// 24 limbs of 16 bits against the 15 limbs of 26 bits below, 24 multiply-accumulate passes against
+// 15. P-256's measurement had that ratio at 16 against 10 and came out level; at 24 against 15 the
+// general arithmetic is if anything further ahead, so there is nothing here to trade.
+//
+// WHAT IT COSTS. A P-384 verification is ~2.4x the modular multiplications of a P-256 one (384
+// doublings and ~288 mixed additions rather than 256 and ~192, and two Fermat inversions to the
+// 383rd power rather than the 255th), and each one is on 15 limbs rather than 10 — bnMontMul is
+// quadratic in the limb count, so 2.25x the work per multiplication. The measured numbers are in
+// src/main.rs (mod p384) and in README.md; they are read off this machine, not predicted here.
+
+// ---- the domain parameters (FIPS 186-4 D.1.2.4; `openssl ecparam -name secp384r1
+// -param_enc explicit -text` prints exactly these). a = p-3, which is what ec.nt's doubling
+// assumes; the cofactor is 1; the digest is 48 octets, because this is ECDSA-with-SHA-384.
+P384C: ecCurve ("fffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffeffffffff0000000000000000ffffffff"
+  ; "ffffffffffffffffffffffffffffffffffffffffffffffffc7634d81f4372ddf581a0db248b0a77aecec196accc52973"
+  ; "b3312fa7e23ee7e4988e056be3f82d19181d9c6efe8141120314088f5013875ac656398d8a2ed19d2a85c8edd3ec2aef"
+  ; "aa87ca22be8b05378eb1c71ef320ad746e1d3b628ba79b9859f741e082542a385502f25dbf55296c3a545e3872760ab7"
+  ; "3617de4a96262c6f5d9e98bf9292dc29f8f41dbd289a147ce9da3113b5f0b8c00a60b1ce1d7e819d7a431d7c90ea0e5f"; 48)
+
+// the names tests/p384.nt checks the field and the group law by, the same shape p256.nt exports
+P384P: P384C`p
+P384N: P384C`n
+P384G: (P384C`gx; P384C`gy)
+P384INF: ecInf P384C
+fp384To:   {[x] efTo[P384C;x]}
+fp384From: {[x] efFrom[P384C;x]}
+p384Dbl:      {[P] ecDbl[P384C;P]}
+p384MAdd:     {[P;A] ecMAdd[P384C;P;A]}
+p384ToAffine: {[P] ecToAffine[P384C;P]}
+p384Bits:     {[v] ecBits[P384C;v]}
+p384Shamir:   {[b1;A1;b2;A2] ecShamir[P384C;b1;A1;b2;A2]}
+p384Point:    {[b] ecPoint[P384C;b]}
+
+// ---- the two exports, total: every malformed input comes back 0b. ec.nt's header says why.
+ecdsaVerifyP384:    {[pub;digest;r;s] ecdsaVerify[P384C;pub;digest;r;s]}
+ecdsaVerifyP384Der: {[pub;digest;sig] ecdsaVerifyDer[P384C;pub;digest;sig]}

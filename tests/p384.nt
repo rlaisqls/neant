@@ -1,0 +1,173 @@
+// ECDSA P-384 in src/neant/crypto/p384.nt on the curve-generic arithmetic in ec.nt: the field, the
+// group law against computed multiples of the base point, and every way a signature can be wrong.
+// Both are loaded on demand (neither is in the boot image), exactly as a program would load them.
+// What stays in Rust (mod p384 in src/main.rs) is only the one thing that needs the host: the timing.
+//
+// This file is deliberately tests/p256.nt's shape, case for case, because the code under it is
+// literally the same code with a different curve record — so a case that passes for P-256 and fails
+// here is a case where the generalisation leaked, which is the whole risk of having done it.
+//
+// The vectors are made from tests/data/pki-p384-leaf.key, which is committed, so these regenerate
+// exactly — except (r,s) itself: ECDSA signing picks a random k, so re-running the signature
+// command below gives a *different* pair that verifies just as well against the same key and the
+// same digest. The pair pinned here is the one this machine produced.
+//   printf 'neant p384 vector' > v.bin
+//   openssl dgst -sha384 -binary v.bin                                        -> QVDG
+//   openssl dgst -sha384 -sign tests/data/pki-p384-leaf.key -out v.sig v.bin  -> QVSIG
+//   openssl ec -in tests/data/pki-p384-leaf.key -pubout -outform DER | tail -c 97   -> QVPUB
+//   openssl ec -in tests/data/pki-p384-leaf.key -pubout -outform DER -conv_form compressed \
+//     | tail -c 49                                                            -> QVPUBC
+// (OpenSSL 3.6.2.)
+tsection "p384"
+{load "src/neant/crypto/",x} each ("bignum.nt";"der.nt";"ec.nt";"p384.nt")
+
+QVPUB:  unhex "0401fcb79a963bd5815d8f49cd64138db29b0771d1624f56a8bda75fb8bbf8ed317dc0f8d7f8752b907e69a9f644049dee5456cbfe1060afdbb146c274803cab07d1a83f31f6912ffcab4bb2f45d622a5ae65b2b53cd6467038b022ce205dd3efe"
+QVPUBC: unhex "0201fcb79a963bd5815d8f49cd64138db29b0771d1624f56a8bda75fb8bbf8ed317dc0f8d7f8752b907e69a9f644049dee"
+QVDG:   unhex "66101a247503bc96b1bb16792721965500ceba764c4dc1131595933366225ec7099a5d722ccff591439f041453317839"
+QVSIG:  unhex "30640230392fde917a8a81e7a35e7263d0dbc317177d5e73823535aa2ca845e39a80e6569f996a776786489b5181b2775c779a0402306ebb460609c568f9319f3210b8c6524bb70e2b46887d7a55d29477bfaa0b48f6da00a6d39785423e0b0b1b9ff2953577"
+QVR:    unhex "392fde917a8a81e7a35e7263d0dbc317177d5e73823535aa2ca845e39a80e6569f996a776786489b5181b2775c779a04"
+QVS:    unhex "6ebb460609c568f9319f3210b8c6524bb70e2b46887d7a55d29477bfaa0b48f6da00a6d39785423e0b0b1b9ff2953577"
+QVNB:   unhex "ffffffffffffffffffffffffffffffffffffffffffffffffc7634d81f4372ddf581a0db248b0a77aecec196accc52973"   // n
+QVPB:   unhex "fffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffeffffffff0000000000000000ffffffff"   // p
+
+// ---- the field. Montgomery form in, Montgomery form out, so every value is checked by going back
+// through fp384From rather than by looking at the limbs. The operations are ec.nt's, with P384C
+// passed in: there is no P-384 field arithmetic anywhere, and that is the point being asserted.
+qvHex: {[v] hex bnBytesN[fp384From v; 48]}
+qvNum: {[h] fp384To bnFromBytes unhex h}
+QM1: "fffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffeffffffff0000000000000000fffffffe"
+QF1: P384C`one
+QF0: BNZERO
+qvField: (("fp384To/fp384From round-trip"
+    ; qvHex qvNum "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+    ; "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef")
+  ;("fp384From undoes fp384To on 1"; qvHex QF1; (95#"0"),"1")
+  // R = 2^390 for fifteen 26-bit limbs, so the stored form of 1 is 2^390 mod p and not 2^384 mod p:
+  // a limb count that did not cover 384 bits would show up here and nowhere else
+  ;("the stored form of 1 really is R mod p, R = 2^390"; hex bnBytesN[QF1;48]
+    ; "00000000000000000000000000000000000000000000000000000000000000400000003fffffffffffffffc000000040")
+  ;("efAdd wraps at p"; qvHex efAdd[P384C; qvNum QM1; QF1]; 96#"0")
+  ;("efSub borrows p"; qvHex efSub[P384C; QF0; QF1]; QM1)
+  ;("efAdd of p-1 and p-1"; qvHex efAdd[P384C; qvNum QM1; qvNum QM1]
+    ; "fffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffeffffffff0000000000000000fffffffd")
+  ;("efInv is the inverse"; qvHex efMul[P384C; qvNum "07"; efInv[P384C; qvNum "07"]]; qvHex QF1)
+  ;("efInv of 1 is 1"; qvHex efInv[P384C;QF1]; qvHex QF1))
+{[t] teq["field: ",t[0]; t[1]; t[2]]} each qvField
+
+// ---- the group. 2G and 3G below are not published in FIPS 186-4 the way P-256's are, so they were
+// computed with a textbook affine double-and-add in python3 over the same parameters — the same
+// reference tests/data/p384-rx-ge-n.py carries — and they are what a reader should re-derive rather
+// than trust. nG = infinity is the assertion that says the base point really has the order the
+// standard claims, and so that every scalar below was reduced against the right n.
+qvAff: {[P] a: p384ToAffine P; $[0=count a; "infinity"; (qvHex a[0]),"/",qvHex a[1]]}
+QVG: (P384G[0]; P384G[1]; QF1)
+QVGB: 0x04, (bnBytesN[fp384From P384G[0];48]), bnBytesN[fp384From P384G[1];48]   // G as SEC 1 bytes
+teq["G is on the curve"; 0 < count p384Point QVGB; 1b]
+QV2G: "08d999057ba3d2d969260045c55b97f089025959a6f434d651d207d19fb96e9e4fe0e86ebe0e64f85b96a9c75295df61/8e80f1fa5b1b3cedb7bfe8dffd6dba74b275d875bc6cc43e904e505f256ab4255ffd43e94d39e22d61501e700a940e80"
+QV3G: "077a41d4606ffa1464793c7e5fdc7d98cb9d3910202dcd06bea4f240d3566da6b408bbae5026580d02d7e5c70500c831/c995f7ca0b0c42837d0bbe9602a9fc998520b41c85115aa5f7684c0edc111eacc24abd6be4b5d298b65f28600a2f1df1"
+teq["2G, by doubling"; qvAff p384Dbl QVG; QV2G]
+// the addition law has to agree with the doubling on equal points, which is exactly the degenerate
+// case madd-2007-bl cannot compute and ecMAdd hands to ecDbl instead
+teq["G+G is 2G"; qvAff p384MAdd[QVG; P384G]; QV2G]
+teq["3G"; qvAff p384MAdd[p384Dbl QVG; P384G]; QV3G]
+teq["G + (-G) is the point at infinity"; qvAff p384MAdd[QVG; (P384G[0]; efSub[P384C; QF0; P384G[1]])]; "infinity"]
+teq["doubling the point at infinity leaves it there"; qvAff p384Dbl P384INF; "infinity"]
+teq["infinity + G is G"; qvAff p384MAdd[P384INF; P384G]; qvAff QVG]
+qvMulG: {[k] p384Shamir[p384Bits k; P384G; p384Bits BNZERO; P384G]}
+teq["1G"; qvAff qvMulG bnFromBytes 0x01; qvAff QVG]
+teq["2G, through the ladder"; qvAff qvMulG bnFromBytes 0x02; qvAff p384Dbl QVG]
+teq["nG is the point at infinity"; qvAff qvMulG P384N; "infinity"]
+QVNEGG: (qvHex P384G[0]),"/",qvHex efSub[P384C; QF0; P384G[1]]
+teq["(n-1)G is -G"; qvAff qvMulG bnSub[P384N; ,1]; QVNEGG]
+// 384 bits of scalar, not 256: a ladder that kept P-256's width would still produce a point, and it
+// would be the wrong one. ecBits derives the width from the curve, and this is what says so.
+teq["a scalar is 384 bits wide here"; count p384Bits P384N; 384]
+
+// ---- the point encoding. Anything that is not the 97-octet uncompressed SEC 1 form is not a key.
+teq["a real point parses"; 0 < count p384Point QVPUB; 1b]
+qvBadPts: (("a compressed point, which this build refuses"; QVPUBC)
+  ;("the point at infinity's encoding"; 0x00)
+  ;("96 bytes with the 0x04 left off"; 1_QVPUB)
+  ;("one byte too many"; QVPUB,0x00)
+  ;("a hybrid 0x06 prefix"; 0x06, 1_QVPUB)
+  ;("y off the curve by one bit"; (96#QVPUB), bnot QVPUB[96])
+  ;("x at p, which is not a canonical coordinate"; (0x04, QVPB), 48#QVPUB[49+til 48])
+  ;("y at p"; (0x04, 48#QVPUB[1+til 48]), QVPB)
+  ;("all zeroes: (0,0) is not on this curve"; 0x04, 96#0x00)
+  // a P-256 point is 65 octets, so it is refused on length before anything looks at the curve —
+  // which is what keeps one curve's key from ever being checked against the other's group
+  ;("a P-256 point, which is the wrong length here"; 0x04, 64#0x01))
+{[t] teq["point: ",t[0]; count p384Point t[1]; 0]} each qvBadPts
+
+// ---- the signature itself
+teq["the openssl vector verifies"; ecdsaVerifyP384[QVPUB; QVDG; QVR; QVS]; 1b]
+teq["and through its DER"; ecdsaVerifyP384Der[QVPUB; QVDG; QVSIG]; 1b]
+// ECDSA IS MALLEABLE and this is NOT a bug: (r, n-s) is a second, genuinely valid signature by the
+// same key over the same message. tests/p256.nt says the rest; asserting 0b here would assert a bug.
+QVNS: bnBytes bnSub[bnFromBytes QVNB; bnFromBytes QVS]                      // n - s
+teq["(r, n-s) is a second valid signature and must verify"; ecdsaVerifyP384[QVPUB; QVDG; QVR; QVNS]; 1b]
+
+// ---- the final comparison, the single most likely thing to be wrong in a from-scratch ECDSA
+// verifier, and the reason this file exists at all: ec.nt does the (R.x mod n) reduction once for
+// both curves, so a regression there breaks P-256 and P-384 together and has to be caught on both.
+// For P-384 p - n is 0x389cb27e0bc8d21fa7e5f24cb74f58851313e696333ad68c, 190 bits against a 384-bit
+// field, so a signature whose R.x actually reaches n turns up about once in 2^194 — even further
+// out of reach of sampling than P-256's 2^129. The vector below is built rather than sampled, by
+// tests/data/p384-rx-ge-n.py, which picks a curve point with x >= n and then solves for the key and
+// the signature that recover it. (r has twenty-four leading zero bytes because r = R.x - n is below
+// p - n, and always will be.) Checked the same way tests/p256.nt's twin was: against a copy of
+// ec.nt with the bnMod taken out of ecVerify's last line, which answers 1b to the openssl vector
+// above and 0b to this one, so this case really is the one that catches a missing reduction.
+QVXPUB: unhex "04e1d16afa3d445d81499844c135750d86daebcca274f917d833c6dc3b01c6c60940780e8156db5bea53486e3e53a07afbd370e7f895ab5f2761d2e0f0496aeee76a4ba81a6cc87c44085d8b1d0218eb584ed73c70efbfe7f9f4b67210bbc7f287"
+QVXDG:  unhex "d57be34a95a0bfcd9c895c8fa5845a3343570424449df17ba422e669f8d0ca14653fd5ecd7d6d39fd1fc61533d7f48a3"
+QVXR:   unhex "0000000000000000000000000000000000000000000000001d3f0a6c2e58b91477c0fe3ab526d84c9f01a7e33b6cd215"
+QVXS:   unhex "b6b23fecc0c1bd0202262cd5aaf82a3b23188be560ef06a49d34d56000b0ba8855e34feab22ab05a47e41c9ea7df5ff2"
+QVXRX:  unhex "ffffffffffffffffffffffffffffffffffffffffffffffffe4a257ee228fe6f3cfdb0becfdd77fc78bedc14e0831fb88"   // R.x itself
+teq["R.x >= n: the reduction is done, so it verifies"; ecdsaVerifyP384[QVXPUB; QVXDG; QVXR; QVXS]; 1b]
+// and the other half of the same mistake: R.x itself is not a legal r, because it is >= n
+teq["R.x >= n: R.x itself is out of range for an r"; ecdsaVerifyP384[QVXPUB; QVXDG; QVXRX; QVXS]; 0b]
+teq["R.x >= n: and it is genuinely a different number from r"; QVXR ~ QVXRX; 0b]
+
+// ---- and every way it can be wrong. r and s out of [1, n-1] first: each of these is a forgery
+// against a verifier that skips the range check.
+qvBadSig: (("r = 0"; 0x00; QVS)
+  ;("s = 0"; QVR; 0x00)
+  ;("r empty"; 0x; QVS)
+  ;("s empty"; QVR; 0x)
+  ;("r = n"; QVNB; QVS)
+  ;("s = n"; QVR; QVNB)
+  ;("r = n+1"; bnBytes bnAdd[bnFromBytes QVNB; ,1]; QVS)
+  ;("s = n+1"; QVR; bnBytes bnAdd[bnFromBytes QVNB; ,1])
+  ;("r and s swapped"; QVS; QVR)
+  ;("a flipped bit in r"; (47#QVR), bnot QVR[47]; QVS)
+  ;("a flipped bit in s"; QVR; (47#QVS), bnot QVS[47]))
+{[t] teq["sig: ",t[0]; ecdsaVerifyP384[QVPUB; QVDG; t[1]; t[2]]; 0b]} each qvBadSig
+teq["sig: a flipped digest bit"; ecdsaVerifyP384[QVPUB; (47#QVDG), bnot QVDG[47]; QVR; QVS]; 0b]
+// the digest length is the hash this curve is paired with, and nothing else. A 32-byte digest is a
+// SHA-256 one: left-padding it to 48 would verify it against the wrong hash, so it is refused.
+teq["sig: a 47-byte digest"; ecdsaVerifyP384[QVPUB; 47#QVDG; QVR; QVS]; 0b]
+teq["sig: a 49-byte digest"; ecdsaVerifyP384[QVPUB; QVDG,0x00; QVR; QVS]; 0b]
+teq["sig: a 32-byte SHA-256 digest"; ecdsaVerifyP384[QVPUB; 32#QVDG; QVR; QVS]; 0b]
+teq["sig: an empty digest"; ecdsaVerifyP384[QVPUB; 0x; QVR; QVS]; 0b]
+teq["sig: a key that is not on the curve"; ecdsaVerifyP384[(96#QVPUB), bnot QVPUB[96]; QVDG; QVR; QVS]; 0b]
+teq["sig: a compressed key"; ecdsaVerifyP384[QVPUBC; QVDG; QVR; QVS]; 0b]
+teq["sig: the wrong key, G itself"; ecdsaVerifyP384[QVGB; QVDG; QVR; QVS]; 0b]
+
+// ---- the DER wrapper. der.nt is what is strict here; these check that ecdsaVerifyP384Der really
+// goes through it and really turns its signals into an answer of no rather than letting them out.
+qvInt: {[m] b: $[127 < `int$ m[0]; 0x00,m; m]; 0x02, (`byte$ count b), b}
+qvSeq: {[b] 0x30, (`byte$ count b), b}
+qvBadDer: (("truncated in the middle of s"; (-1)_QVSIG)
+  ;("truncated to nothing"; 0x)
+  ;("one byte after the SEQUENCE"; QVSIG,0x00)
+  ;("a length that claims more than is there"; (0x30, 0x7f), 2_QVSIG)
+  ;("a non-minimal INTEGER: a second 0x00 that is not needed"
+    ; qvSeq (0x02, (`byte$ 2+count QVR), 0x0000, QVR), qvInt QVS)
+  ;("three INTEGERs"; qvSeq (qvInt QVR), (qvInt QVS), qvInt QVR)
+  ;("one INTEGER"; qvSeq qvInt QVR)
+  ;("a SET where the SEQUENCE should be"; 0x31, 1_QVSIG)
+  ;("an OCTET STRING holding the two INTEGERs"; 0x04, 1_QVSIG)
+  ;("an indefinite length, which is BER and not DER"; (0x30, 0x80), 2_QVSIG))
+{[t] teq["der: ",t[0]; ecdsaVerifyP384Der[QVPUB; QVDG; t[1]]; 0b]} each qvBadDer
+// the same bytes rebuilt by hand still verify, so the cases above fail for the reason they name
+teq["der: rebuilt by hand, it still verifies"; ecdsaVerifyP384Der[QVPUB; QVDG; qvSeq (qvInt QVR), qvInt QVS]; 1b]
