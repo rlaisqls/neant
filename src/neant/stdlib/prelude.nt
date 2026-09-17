@@ -35,8 +35,23 @@ upper: {`char$(`code$x)-32*x in lowerc}
 lower: {`char$(`code$x)+32*x in upperc}
 trim: {i: &not x in " \t\r\n"; $[#i; x[(first i)+til 1+(last i)-first i]; ""]}
 // positions where p occurs in s
-ss: {[s;p] p: $[`char=@p; ,p; p]; n: #p; if[n>#s; :()]; c: & {[s;p;i] s[i+til count p]~p}[s;p] each til 1+(#s)-n
-  $[1<#c; {[n;a;i] $[i<n+last a; a; a,i]}[n]/[,first c; 1_c]; c]}
+// positions where p occurs in s, non-overlapping.  A one-character pattern is the common case and
+// is a single vector compare — "\n" ss on a 215KB buffer is 4ms that way against 95ms for a slice
+// and a match at every position.  A longer pattern narrows to the positions whose first character
+// matches and then checks only those, so the per-position work is paid once per candidate rather
+// than once per byte.
+ss: {[s;p] p: $[`char=@p; ,p; p]; n: #p
+  if[n>#s; :()]
+  if[0=n; :ssAll[s;p]]
+  c: & s=first p
+  if[0=#c; :c]
+  c: c[&not c>(#s)-n]
+  if[1=n; :c]
+  if[0=#c; :c]
+  c: c[&{[s;p;n;i] p~s[i+til n]}[s;p;n] each c]
+  $[1<#c; ssTrim[n;c]; c]}
+ssAll: {[s;p] & {[s;p;i] s[i+til count p]~p}[s;p] each til 1+(#s)-count p}
+ssTrim: {[n;c] {[n;a;i] $[i<n+last a; a; a,i]}[n]/[,first c; 1_c]}
 // split s on sep -> list of strings;  join strings with sep.  With an int left argument vs/sv are the
 // numeric base forms instead (vsnum/svnum below):  "," vs "a,b" -> ("a";"b")   2 vs 13 -> 1 1 0 1
 vss: {[sep;s] p: s ss sep; st: 0, p+#sep; en: p, #s; {[s;a;b] s[a+til b-a]}[s]'[st;en]}

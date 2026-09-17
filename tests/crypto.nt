@@ -41,3 +41,50 @@ teq["a point plus its negation is zero"; (edEncode edAdd[EDB;edNeg EDB]) ~ edEnc
 teq["scalar 2 is a double"; (edEncode edMul[253#scBits scFromBytes 0x02,31#0x00; EDB]) ~ edEncode edDbl EDB; 1b]
 teq["L reduces to zero"; scMod bitsBE unhex "1000000000000000000000000000000014def9dea2f79cd65812631a5cf5d3ed"; 12#0]
 teq["one reduces to one"; scMod bitsBE (31#0x00),0x01; 1,11#0]
+
+// ---- the compiled kernels in src/neant/crypto/crypto.nt against the vector forms they replaced.
+// shaBlocksL, chachaXorL, polyBlocksL, fcarryL and fmulL are scalar loops the whole-function JIT
+// tier compiles; shaBlockV, chachaBlockV, poly1305V, fcarryV and fmulV are the column forms that were
+// there before, kept for exactly this. Every case below is the same arithmetic written twice, so a
+// disagreement is a bug in the rewrite and not a missing test vector — the published vectors are
+// in tests/lang.nt, and this is what stands behind them.
+tsection "crypto kernels"
+rseed 20260918
+cbytes: {[n] `byte$ n rand 256}
+
+// every length across two padding boundaries, and a few long ones: shaPad puts the length in the
+// 56th byte of the last block, so 55/56 and 119/120 are where a block gets added
+cshaLens: (til 130), 200 1000 4096 5555
+teq["sha256 kernel agrees with the column form on 134 lengths"; (distinct {[n] m: cbytes n; (sha256 m) ~ sha256V m} each cshaLens); ,1b]
+teq["sha256 of the empty message still needs a whole padding block"; (sha256 0x) ~ sha256V 0x; 1b]
+
+// chacha: the tail of the last block is guarded rather than trimmed, so every length mod 64 matters
+cckey: cbytes 32
+ccnon: cbytes 12
+ccRef: {[cnt;n] (raze chachaBlockV[cckey;;ccnon] each cnt+til ceiling n%64)[til n]}
+ccLens: 1 2 63 64 65 127 128 129 191 192 193 255 256 1000
+teq["chacha20 keystream agrees with the block form on 14 lengths"; (distinct {[n] (chacha20[cckey;1;ccnon;n#0x00]) ~ `byte$ccRef[1;n]} each ccLens); ,1b]
+teq["chacha20 xors rather than replaces"; (distinct {[n] m: cbytes n; (chacha20[cckey;1;ccnon;m]) ~ m bxor `byte$ccRef[1;n]} each ccLens); ,1b]
+// the counter advances per block and starts where it is told: 0, 1 and a value that carries
+teq["chacha20 counter 0 and 200 advance per block"; (distinct {[c] (chacha20[cckey;c;ccnon;200#0x00]) ~ `byte$ccRef[c;200]} each 0 1 200 65535); ,1b]
+teq["chachaBlock is 64 bytes of the keystream"; (chachaBlock[cckey;7;ccnon]) ~ chachaBlockV[cckey;7;ccnon]; 1b]
+teq["chacha20 of nothing is nothing"; chacha20[cckey;1;ccnon;0x]; 0x]
+
+// poly1305: the kernel runs the full 16-byte blocks and p5/p5mul the short last one, so the seam
+// is every length either side of a multiple of 16
+cpkey: cbytes 32
+cpLens: (til 50), 100 255 256 257 1000
+teq["poly1305 agrees with the block form on 55 lengths"; (distinct {[n] m: cbytes n
+  (poly1305[cpkey;m]) ~ poly1305V[cpkey;m]} each cpLens); ,1b]
+teq["poly1305 of the empty message is just s"; (poly1305[cpkey;0x]) ~ cpkey[16+til 16]; 1b]
+
+// the 2^255-19 field: random limbs at full width, including the carry-heavy all-ones case
+cfRand: {[] `int$ 12 rand 4194304}
+teq["fmul agrees with the column form on 200 random pairs"; (distinct {[i] a: cfRand[]; b: cfRand[]; (fmulL[F0;FACC;a;b;M22]) ~ fmulV[a;b]} each til 200); ,1b]
+teq["fmul agrees on the widest limbs there are"; (fmulL[F0;FACC;12#4194303;12#4194303;M22]) ~ fmulV[12#4194303;12#4194303]; 1b]
+teq["fcarry agrees with the column form on 200 random vectors"; (distinct {[i] a: `int$ 12 rand 1000000000; (fcarryL[a;M22]) ~ fcarryV a} each til 200); ,1b]
+teq["fsq is fmul with itself"; (distinct {[i] a: cfRand[]; (fsq a) ~ fmul[a;a]} each til 50); ,1b]
+// and the whole curve still round-trips: a*(b*G) = b*(a*G), which no single vector would catch
+cka: cbytes 32
+ckb: cbytes 32
+teq["x25519 is commutative on random scalars"; (x25519[cka; x25519[ckb;X25519BASE]]) ~ x25519[ckb; x25519[cka;X25519BASE]]; 1b]

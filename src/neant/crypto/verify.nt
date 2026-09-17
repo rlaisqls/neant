@@ -34,12 +34,16 @@
 //   * the leaf is valid for the host: SAN dNSNames, or SAN iPAddresses for an address literal
 //
 // WHAT IS NOT, and what that costs you:
-//   * six signature algorithms can be checked and no more: RSASSA-PKCS1-v1_5 and RSASSA-PSS over
-//     SHA-256 or SHA-384, ECDSA-SHA256 on P-256 and ECDSA-SHA384 on P-384. SHA-512 is out because
-//     rsa.nt's DigestInfo table stops at SHA-384 and nothing dispatches it here; SHA-1 is out
-//     because it is broken; P-521 is out because there is no p521.nt; Ed25519 is out because
-//     ed25519.nt is not wired in here. Every one of them is refused BY NAME — the algorithm, and
-//     for an EC key the curve — rather than skipped.
+//   * nine signature algorithms can be checked and no more: RSASSA-PKCS1-v1_5 and RSASSA-PSS over
+//     SHA-256, SHA-384 or SHA-512, ECDSA-SHA256 on P-256, ECDSA-SHA384 on P-384, and Ed25519.
+//     SHA-1 is out because it is broken; P-521 is out because there is no p521.nt; ecdsaSha512 is
+//     out for the curve-pairing reason below, not for want of the hash. Every one of them is
+//     refused BY NAME — the algorithm, and for an EC key the curve — rather than skipped.
+//   * Ed25519 needs ed25519.nt, which tlsclient.nt loads for exactly this reason. A program that
+//     assembles the modules by hand and leaves it out gets an `undefined: ed25519Verify` rather
+//     than a refusal, which is the one place this file assumes its dependency rather than checking
+//     it: the alternative, dispatching on whether the global happens to exist, would make a
+//     verifier's answer depend on what else the program loaded.
 //   * an ECDSA algorithm is paired with exactly ONE curve here: ecdsaSha256 means a P-256 key and
 //     ecdsaSha384 means a P-384 key. The pairing is not a rule of X.509 — a P-256 key may sign
 //     with SHA-384 — but verifying that combination means FIPS 186-4 6.4's digest truncation, the
@@ -151,15 +155,19 @@ x509CheckHost: {[c;host]
 // even if rsa.nt knew it. Everything unlisted — Ed25519, SHA-512, P-521, an OID x509.nt could not
 // name — is refused by name below rather than skipped, because a verifier that shrugs at an
 // algorithm it cannot check accepts every certificate that uses it.
-X509V15SIGS: `rsaPkcs1Sha256`rsaPkcs1Sha384
-X509PSSSIGS: `rsaPssSha256`rsaPssSha384
+X509V15SIGS: `rsaPkcs1Sha256`rsaPkcs1Sha384`rsaPkcs1Sha512
+X509PSSSIGS: `rsaPssSha256`rsaPssSha384`rsaPssSha512
 X509RSASIGS: X509V15SIGS,X509PSSSIGS
 X509ECSIGS:  `ecdsaSha256`ecdsaSha384
+X509EDSIGS:  ,`ed25519
 X509SHA384SIGS: `rsaPkcs1Sha384`rsaPssSha384`ecdsaSha384
-x509SigOk: {[c] (c`sigAlg) in X509RSASIGS,X509ECSIGS}
-// the hash an algorithm names, and the digest over the bytes that were signed
-x509Digest: {[a;b] $[a in X509SHA384SIGS; sha384 b; sha256 b]}
-x509SigHash: {[a] $[a in X509SHA384SIGS; `sha384; `sha256]}
+X509SHA512SIGS: `rsaPkcs1Sha512`rsaPssSha512
+x509SigOk: {[c] (c`sigAlg) in X509RSASIGS,X509ECSIGS,X509EDSIGS}
+// the hash an algorithm names, and the digest over the bytes that were signed.  Ed25519 names no
+// hash at all: RFC 8032 signs the message itself and does its own SHA-512 inside, so it takes the
+// tbs span rather than a digest of it and never reaches these two.
+x509Digest: {[a;b] $[a in X509SHA512SIGS; sha512 b; a in X509SHA384SIGS; sha384 b; sha256 b]}
+x509SigHash: {[a] $[a in X509SHA512SIGS; `sha512; a in X509SHA384SIGS; `sha384; `sha256]}
 // and, for ECDSA, the one curve this build pairs that algorithm with: see the header on why the
 // pairing is fixed rather than free.
 x509SigCurve: {[a] $[a ~ `ecdsaSha384; `p384; `p256]}
@@ -176,6 +184,11 @@ x509KeyWhy: {[c;spki]
     if[not `rsa ~ spki`alg
       m: "x509: ",(c`subject)," is signed with ",(string a)," but ",(c`issuer)
       :m,"'s key is not an RSA key"]
+    :""]
+  if[a in X509EDSIGS
+    if[not `ed25519 ~ spki`alg
+      m: "x509: ",(c`subject)," is signed with ",(string a)," but ",(c`issuer)
+      :m,"'s key is not an Ed25519 key"]
     :""]
   if[a in X509ECSIGS
     if[not `ec ~ spki`alg
@@ -197,6 +210,9 @@ x509SigVerify: {[c;spki]
   if[a in X509PSSSIGS; :rsaVerifyPss[spki`n; spki`e; h; d; c`sig]]
   if[a ~ `ecdsaSha256; :ecdsaVerifyP256Der[spki`point; d; c`sig]]
   if[a ~ `ecdsaSha384; :ecdsaVerifyP384Der[spki`point; d; c`sig]]
+  // Ed25519 signs the tbs span itself, not a digest of it (RFC 8032 §5.1.7 hashes internally), so
+  // this is the one branch that ignores `d`
+  if[a in X509EDSIGS; :ed25519Verify[spki`pub; c`tbs; c`sig]]
   0b}
 // one link: c, signed by the key in spki, which belongs to the name c claims issued it
 x509Link: {[c;spki]
@@ -219,22 +235,29 @@ x509Link: {[c;spki]
 // certificate in a system bundle takes down every connection, and dropping a root only ever makes
 // the store trust less. `skipped` is there so a caller can notice.
 //
-// Measured on this machine, /etc/ssl/certs/ca-certificates.crt, 146 roots:
-//   pemLoad (read0 + base64)  134 ms      x509Parse of all 146   97 ms      231 ms in total
+// Measured on this machine, /etc/ssl/certs/ca-certificates.crt, 146 roots (tests/x509bench.nt):
+//   pemLoad  9 ms      x509ParseMany of all 146  46 ms      55 ms in total, 377 us a certificate
 // Everything is parsed up front. Indexing by subject and parsing a root only when a chain reached
-// it could save at most that 97 ms — the base64 has to be decoded before there is a subject to
+// it could save at most that 46 ms — the base64 has to be decoded before there is a subject to
 // index by at all — and parsing eagerly is what makes a malformed root a load-time problem instead
-// of a mid-handshake one. 231 ms once per process is not worth trading that away for.
+// of a mid-handshake one. 55 ms once per process is not worth trading that away for.
 X509CAPATH: "/etc/ssl/certs/ca-certificates.crt"
+// The whole bundle goes through x509ParseMany, which reads all 146 in one derScan. A root this
+// build cannot read is still dropped rather than refused — but the batch reader is all-or-nothing,
+// so one unreadable root costs the batch and the store is re-read a certificate at a time.
 x509LoadRoots: {[path]
   ds: pemLoad path
-  sj: (); cs: (); bad: 0; i: 0
-  while[i<count ds
-    c: @[x509Parse; ds[i]; {`x509bad}]
+  if[0=count ds; :`subjects`certs`skipped!(();();0)]
+  cs: @[x509ParseMany; ds; {[e] ,`x509bad}]
+  if[(1=count cs) & `x509bad ~ cs[0]
+    cs: {[d] @[x509Parse; d; {[e] `x509bad}]} each ds]
+  sj: (); out: (); bad: 0; i: 0
+  while[i<count cs
+    c: cs[i]
     if[`x509bad ~ c; bad+:1]
-    if[not `x509bad ~ c; sj,: `$c`subjectCanon; cs,: enlist c]
+    if[not `x509bad ~ c; sj,: `$c`subjectCanon; out,: enlist c]
     i+:1]
-  `subjects`certs`skipped!(sj;cs;bad)}
+  `subjects`certs`skipped!(sj;out;bad)}
 x509SystemRoots: {[] x509LoadRoots X509CAPATH}
 // every root with this subject: a rollover can put two keys under one name, and the right one is
 // whichever verifies, so all of them are tried rather than the first

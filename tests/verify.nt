@@ -173,12 +173,14 @@ teq["sig: a P-521 key, named"; x509KeyWhy[vfyP "pki-p384-leaf"; vfyP521]; vfyP52
 vfyUnk: `alg`curve`oid`point!(`ec; `unknown; "1.3.36.3.3.2.8.1.1.7"; 0x04, 64#0x00)
 vfyUnkmsg: "x509: ",vfyL," is signed with ecdsaSha256 by a key on the unnamed curve 1.3.36.3.3.2.8.1.1.7; this build checks ecdsaSha256 on P-256 only"
 teq["sig: a curve x509.nt could not name"; x509KeyWhy[vfyP "pki-ec-leaf"; vfyUnk]; vfyUnkmsg]
-// SHA-512 and SHA-1 have no dispatch here, so a certificate signed with one is refused by algorithm
-// before any key is looked at — x509.nt names them, and naming is not checking
+// SHA-1 has no dispatch here, so a certificate signed with it is refused by algorithm before any
+// key is looked at — x509.nt names it, and naming is not checking. ecdsaSha512 is refused for the
+// curve-pairing reason rather than the hash: SHA-512 itself is now checked, over RSA.
 teq["sig: ecdsaSha512 is not a thing this build checks"; x509SigOk (enlist `sigAlg)!enlist `ecdsaSha512; 0b]
-teq["sig: nor rsaPkcs1Sha512"; x509SigOk (enlist `sigAlg)!enlist `rsaPkcs1Sha512; 0b]
 teq["sig: nor rsaPkcs1Sha1"; x509SigOk (enlist `sigAlg)!enlist `rsaPkcs1Sha1; 0b]
-teq["sig: nor ed25519"; x509SigOk (enlist `sigAlg)!enlist `ed25519; 0b]
+teq["sig: RSA over SHA-512 is checked"; x509SigOk (enlist `sigAlg)!enlist `rsaPkcs1Sha512; 1b]
+teq["sig: and RSASSA-PSS over SHA-512"; x509SigOk (enlist `sigAlg)!enlist `rsaPssSha512; 1b]
+teq["sig: and Ed25519"; x509SigOk (enlist `sigAlg)!enlist `ed25519; 1b]
 
 // a flipped bit in an ECDSA signature is refused the same way a flipped RSA bit is
 vfyEcBad: {[] c: vfyP "pki-ec-leaf"; n: count c`sig; c[`sig]: ((n-1)#c`sig),bnot (c`sig)[n-1]
@@ -349,3 +351,23 @@ vfyCh: clientHello["a.test"; 32#0x01; 32#0x02; 32#0x03]
 vfySa: findExt[wdrop[47+`int$vfyCh[38]; vfyCh]; 13]
 // lp16 over 1027 (0x0403), 1283 (0x0503), 2052 (0x0804), 2053 (0x0805), 1025 (0x0401), 1281 (0x0501)
 teq["ClientHello: signature_algorithms, the two ECDSA schemes first"; hex vfySa; "000c040305030804080504010501"]
+
+// ---- Ed25519 and SHA-512 chains (tests/data/pki-ed-gen.sh builds both fixture PKIs).
+// Ed25519 is the one algorithm here that names no digest: RFC 8032 signs the message and hashes it
+// internally, so verify.nt hands ed25519Verify the tbs span rather than a digest of it.
+vfyEdRoots: x509LoadRoots "tests/data/pki-ed-root.pem"
+vfy5Roots: x509LoadRoots "tests/data/pki-sha512-root.pem"
+teq["ed25519: the leaf names id-Ed25519"; (vfyP "pki-ed-leaf")`sigAlg; `ed25519]
+teq["ed25519: and the root's key is one"; ((vfyP "pki-ed-root")`spki)`alg; `ed25519]
+teq["ed25519: an Ed25519 chain verifies"; x509VerifyChain[enlist vfyP "pki-ed-leaf"; vfyEdRoots; "leaf.neant.test"; vfyNow]; 1b]
+teq["sha512: the leaf names sha512WithRSAEncryption"; (vfyP "pki-sha512-leaf")`sigAlg; `rsaPkcs1Sha512]
+teq["sha512: a PKCS#1 SHA-512 chain verifies"; x509VerifyChain[enlist vfyP "pki-sha512-leaf"; vfy5Roots; "leaf.neant.test"; vfyNow]; 1b]
+teq["sha512: the PSS leaf's parameters are read"; (vfyP "pki-pss512-leaf")`sigParams; `hash`mgfHash`saltLen!(`sha512;`sha512;64)]
+teq["sha512: and it is named rsaPssSha512"; (vfyP "pki-pss512-leaf")`sigAlg; `rsaPssSha512]
+teq["sha512: an RSASSA-PSS SHA-512 chain verifies"; x509VerifyChain[enlist vfyP "pki-pss512-leaf"; vfy5Roots; "leaf.neant.test"; vfyNow]; 1b]
+// the key still has to match the algorithm: an Ed25519 signature checked against an RSA key is
+// refused by name, not attempted
+teq["ed25519: an RSA key cannot carry an Ed25519 signature"; x509KeyWhy[vfyP "pki-ed-leaf"; (vfyP "pki-root")`spki]; "x509: ",vfyL," is signed with ed25519 but ",((vfyP "pki-ed-leaf")`issuer),"'s key is not an Ed25519 key"]
+// and the hash naming this depends on: x509.nt's OID table had the SHA-512 entry spliced in as
+// characters rather than as one string, so every SHA-512 hash read back `unknown
+teq["sha512: x509.nt can name the hash at all"; count X509HASHOIDS; 4]

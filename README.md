@@ -304,12 +304,43 @@ qparse "a=1&b=x+y"           // `a`b!("1";"x y")     qbuild inverts it
 
 ## HTTP
 
-`src/neant/net/http.nt` (loadable, not in the boot image): `httpRecv`/`httpSend` parse a request and write a
-response over an `hopen`/`accept` handle; `httpServe` wraps the accept-loop-plus-`spawn` pattern shown earlier (`hlisten`/`accept`, "Rust
-builtins" above) into one call.
+`src/neant/net/http.nt` (loadable, not in the boot image) is a client and a server. A connection is
+a triple of functions — `(read; write; close)`, where `read[]` gives the next bytes and empty means
+end of stream — so `httpPlain h` puts it on an `hopen`/`accept` handle and `httpTls h` on a
+`tlsConnect` one, and everything else is written against the triple. That is the whole of what
+HTTPS needed: `tlsSend`/`tlsRecv` ("Bytes and crypto") already have the shape `hsend`/`hrecv` have.
 
 ```
+load "src/neant/crypto/tlsclient.nt"       // only for https:// — it is what verifies the chain
 load "src/neant/net/http.nt"
+r: httpGet "https://example.com/"
+r`status                                    // 200
+`char$r`body                                // the body; bodies are BYTES, not text
+```
+
+`httpGet` follows up to five redirects; `httpFetch[url;method;headers;body]` does the one exchange
+and hands the `Location` back instead. `httpPost[url;headers;body]` posts. Bodies are bytes in both
+directions, because a response may be gzip or an image and decoding that as UTF-8 corrupts it.
+
+A connection is reusable, which is what makes a verifying TLS client usable at all — the handshake
+is the expensive part and nothing about it needs repeating:
+
+```
+c: httpOpen "https://example.com/"; u: urlParse "https://example.com/"
+httpExchange[c; u; "GET"; "/a"; ()!(); ""]      // handshake ~1.4s, this exchange ~60ms
+httpExchange[c; u; "GET"; "/b"; ()!(); ""]      // ~60ms
+(c 2)[]                                          // close
+```
+
+Those two numbers are the shape of the thing rather than a fixed cost: ~95% of a first request is
+the handshake, and nearly all of that is signature verification (`p256.nt`/`p384.nt`), which is
+being worked on — so the handshake figure is expected to move by an order of magnitude and the
+~60ms, which is a network round trip, is not.
+
+The server is `httpRecv`/`httpSend` plus `httpServe`, which wraps the accept-loop-plus-`spawn`
+pattern shown earlier (`hlisten`/`accept`, "Rust builtins" above) into one call:
+
+```
 l: hlisten "0.0.0.0:8080"
 httpServe[l; {[req] (200; "OK"; (`$"content-type")!(,"text/plain"); "you asked for ",req[`path])}]
 ```
@@ -319,11 +350,29 @@ query string split off into `query`, a dict of strings keyed by symbol (`target`
 headers keyed by lowercased symbol (build
 one with `` `$"content-length" ``, not a literal `` `content-length `` — a hyphen in a *literal*
 symbol token is the `-` verb, not part of the name; casting a string with `` `$ `` has no such
-limit). A handler returns `(status; reason; headers; body)`. No chunked transfer-encoding, no
-keep-alive (`hclose` after every response), and no HTTPS *here*: `src/neant/crypto/tls.nt` is a
-verifying TLS 1.3 client ("Bytes and crypto"), so an outbound HTTPS request is a matter of writing
-`httpRecv`/`httpSend` over `tlsSend`/`tlsRecv` instead of `hsend`/`hrecv`, but nothing does that
-yet and there is no TLS server side for `httpServe` to sit behind.
+limit). A handler returns `(status; reason; headers; body)`.
+
+`httpServe` serves requests on a connection until either side is done with it: HTTP/1.1 keeps it
+open, 1.0 closes unless it asks not to, `Connection: close` from either the request or the handler
+ends it, and so does end of stream or a malformed request. A reply on a connection that stays open
+has to say where it ends, so `httpSend` fills in a `Content-Length` the handler did not set. What
+makes any of this work is that a connection carries a `pending` buffer: finding the end of a header
+block means reading past it, and those bytes belong to the next message — without somewhere to put
+them a second request loses its first bytes, which is the same reason the client can reuse a
+connection at all.
+
+Chunked transfer-encoding is decoded on both sides, including chunk extensions and trailer fields —
+the real web needs it, and `example.com` is already one of the sites that answers that way. A
+response with neither a `Content-Length` nor chunking is read to the close, and `204`/`304`/`1xx`
+and a `HEAD` reply never take a body whatever their headers claim.
+
+What is missing: pipelining (a request is answered before the next is read), multipart, cookies,
+proxies, compression — nothing sends `Accept-Encoding`, and a server that gzips anyway hands back
+bytes this does not decode — and a TLS server side for `httpServe` to sit behind, which is
+`src/neant/crypto/tls.nt`'s missing half.
+
+`tests/http.nt` is the suite, all of it against sockets this process opens; `tests/data/live-http.nt`
+is the one that goes out to the network, run by hand.
 
 ## Bytes and crypto
 
@@ -336,10 +385,12 @@ key bxor data                // the bit verbs on two byte operands give bytes
 ```
 
 `src/neant/crypto/crypto.nt` is pure neant on those: `sha256 hmac hkdfExtract hkdfExpand chacha20 poly1305
-aeadEncrypt aeadDecrypt x25519`, all checked against the RFC vectors (SHA-256 ~0.12ms/block,
-ChaCha20-Poly1305 ~16ms per 10KB, X25519 ~42ms). 32-bit words live in ints masked after each sum;
-the 2^255-19 and 2^130-5 fields use 22- and 26-bit limbs so products stay exact in an int, and
-carries run as vector passes.
+aeadEncrypt aeadDecrypt x25519`, all checked against the RFC vectors (measured on this machine:
+SHA-256 **1.0ms** per 64KB, ChaCha20-Poly1305 **2.45ms** per 64KB, X25519 **3.05ms**). 32-bit words
+live in ints masked after each sum; the 2^255-19 and 2^130-5 fields use 22- and 26-bit limbs so
+products stay exact in an int. Every hot kernel is a scalar loop over indices that the
+whole-function JIT tier compiles — see "The hash and the stream cipher run as compiled scalar
+loops" under "Performance", and the file's own header for the three things that used to stop it.
 
 `src/neant/crypto/sha512.nt` and `src/neant/crypto/ed25519.nt` (loadable, not in the boot image) add
 **SHA-512, SHA-384 and Ed25519 verification** on top of that field — FIPS 180-4 and RFC 8032
@@ -390,7 +441,8 @@ reusing `bignum.nt`'s Montgomery reduction instead of folding P-256's special pr
 `crypto.nt` folds 2^255-19 — a measured decision, not an omission: every exponent in
 p = 2^256-2^224+2^192+2^96-1 is a multiple of 32, so the Solinas fold is a limb permutation only at
 a limb width dividing 32, and an exact i64 column caps that at 16 — sixteen multiply-accumulate
-passes against `bignum.nt`'s ten. Measured per modular multiplication: `bnMontMul` 25µs, the
+passes against `bignum.nt`'s ten. Measured per modular multiplication at the time: `bnMontMul` 25µs
+(1.9µs now), the
 16-bit Solinas multiply-and-fold 19µs *before* it brings a result in (-4p, 6p) back under 2^256,
 which is about 5µs more. Level, so reuse won. A fixed-width fold would have had to be written again
 over P-384's prime with its own carry analysis; a variable-length limb list did not have to be
@@ -398,11 +450,13 @@ written at all. P-384's own Solinas fold is ten 32-bit terms, so it would want 2
 against the 15 of 26 bits used here — a worse ratio than P-256's 16-against-10, which came out
 level, so there was nothing to trade and nothing was re-measured.
 
-**One P-256 verification is ~180ms and one P-384 verification is ~380ms**, against ~7.8ms for
-RSA-2048 — the reverse of the compiled ratio, because P-256 needs ~4900 modular multiplications
-where RSA-2048 with e=65537 needs twenty, and here each one is a dozen interpreted vector operations.
-The 2.1x between the curves is 384 doublings against 256 and 15-limb multiplications against 10-limb
-ones, and it is measured in the same VM by the same loop rather than predicted.
+**One P-256 verification is ~21.5ms**, against ~0.50ms for RSA-2048 — the reverse of the compiled
+ratio, because P-256 needs ~4900 modular multiplications where RSA-2048 with e=65537 needs twenty.
+Both were an order of magnitude slower until the arithmetic stopped being interpreted vector
+operations and became compiled scalar loops over limbs (["the bignum arithmetic runs as compiled
+scalar loops"](#the-bignum-arithmetic-runs-as-compiled-scalar-loops)); P-384 is measured by the same
+loop in the same VM rather than predicted, and its ratio to P-256 is 384 doublings against 256 and
+15-limb multiplications against 10-limb ones.
 
 An ECDSA algorithm is paired with exactly **one** curve here: `ecdsaSha256` means a P-256 key and
 `ecdsaSha384` means a P-384 key. X.509 does not require that — a P-256 key may sign with SHA-384 —
@@ -410,6 +464,72 @@ but verifying a mismatched pair means FIPS 186-4 6.4's digest truncation, one mo
 subtly wrong in a verifier whose job is to say no, so a mismatch is refused with both the algorithm
 and the curve named. In all seven public chains measured below, every `ecdsaSha384` signature is
 checked against a P-384 key and every `ecdsaSha256` one against a P-256 key.
+
+`src/neant/crypto/batch.nt` (loadable, not in the boot image) verifies **many P-256 signatures in
+one call**, on `ec.nt`'s arithmetic — the single-signature path is untouched:
+
+```
+load "src/neant/crypto/batch.nt"
+batchVerifyP256[keys; digests; sigs]        // 1b / 0b        sigs are (r;s) pairs
+batchVerifyP256Bad[keys; digests; sigs]     // the indices that failed
+batchVerifyP256DerWho[keys; digests; sigs]  // one boolean each, signatures as DER
+batchVerifyP256Par[keys; digests; sigs; 20] // the same answers, over 20 OS threads
+```
+
+**The batch answer is per signature and it is exact** — it agrees with `ecdsaVerifyP256` signature by
+signature, so a failing batch names which one rather than returning one bit. That is because this is
+*not* the random-linear-combination batch of the literature, and it cannot be: that test needs the
+point `R`, and an ECDSA signature carries only `r = x(R) mod n`. Lifting `r` back costs a square root
+mod p and then hands you `(x, ±y)` — and the sign is not recoverable even in principle, because
+`(r,s)` and `(r,n-s)` are both valid signatures of the same message under the same key and differ by
+exactly that sign. A batch of N would have 2^N sign assignments. This is why Cheon–Yi and Karati–Das
+state ECDSA batch verification for ECDSA\*, the variant that transmits `R`; secp256k1's recovery byte
+is the same missing bit. The cost of not having it is real — a Pippenger bucket sum over the 2N+1
+points would cut the ~4900 modular multiplications a verification takes here to roughly 900 — and the
+gain is that there is no 2^-k soundness error to argue about and no bisection to find the bad one.
+
+What the batch *does* exploit is that this is an array language. A field element for the whole batch
+is laid out **lane-major**: `limbs` int vectors, one per 26-bit limb, each holding that limb of every
+signature. The same schoolbook multiply then runs on vectors N times longer, and a ten-element vector
+operation is almost all dispatch — measured here, `c + a*b` is 27.5 ns/element at length 10 and
+1.41 ns/element at length 5120. `bnMontMul` costs 25.0µs one signature at a time and 0.651µs per
+signature at 512 lanes, **38x**. Two things really are batch algorithms: one modular inversion for the
+whole batch (Montgomery's trick as a binary product tree, replacing a Fermat `s^-1 mod n` per
+signature), and a projective final comparison `X = r·Z²` — or `(r+n)·Z²`, the case `ec.nt`'s header
+warns about — which removes the inversion mod p entirely.
+
+Measured on this machine by `tests/bench.nt`, against the 512 real openssl signatures in
+`tests/data/p256-batch.txt` (repeated to fill the 2048-lane row), with other work running on the
+machine at the time — a re-run lands within about 15% either way:
+
+| N | 1 thread, ms/sig | 1 thread, verify/s | 20 threads, ms/sig | 20 threads, verify/s |
+|---:|---:|---:|---:|---:|
+| 1 | 739.0 | 1.4 | 80.25 | 12.5 |
+| 8 | 94.04 | 10.6 | 10.99 | 91.0 |
+| 64 | 16.21 | 61.7 | 1.622 | 616.6 |
+| 512 | 4.875 | 205.1 | 0.449 | 2225.1 |
+| 2048 | 3.549 | 281.8 | 0.314 | 3180.6 |
+
+against `ecdsaVerifyP256` one at a time at **180.9ms** (5.5 verify/s) and `openssl speed -seconds 3
+ecdsap256` at **38.9µs** (25684 verify/s), both one core, both measured the same day. **So this does
+not beat OpenSSL**: at its best — 2048 signatures in one call across 20 cores — it is 8x short of
+OpenSSL's *single* core and about 160x short of OpenSSL on all twenty. What it does is close the gap
+from 4650x to 8x, 577x more signatures per second out of the same machine, with no new Rust
+primitive. It is also 4.1x *slower* than `ecdsaVerifyP256` for a single signature: the crossover is
+at about four.
+
+The twenty-thread column found something worth naming. `spawn` forks a snapshot of globals, and a
+global holding a function holds the same `Arc<FnCode>` in every thread — and `FnCode` keeps the
+tracing JIT's per-loop-header state behind a `Mutex` that the interpreter takes on **every backward
+jump**. Twenty threads in the same hot loop queue on one lock: a batch of 64 across 20 threads runs
+at 224 verify/s that way and at **611** when each thread re-`load`s the module first and gets its own
+`FnCode`, which is what `batchVerifyP256Par` does. The fix that would make that unnecessary is in the
+VM: `Compiled` and `Rejected` are write-once, so the hot path need not take the mutex at all.
+Splitting *one* batch across threads is a different and much weaker idea: k threads means k times
+fewer lanes to amortise the dispatch over, and it measures that way — 512 signatures take 2512ms in
+one thread, 1818ms split four ways (1.38x) and 1967ms split twenty (1.29x), so four threads beat
+twenty. `batchVerifyP256Par` is for a caller who has one batch and wants it sooner; the throughput
+column above is twenty *independent* batches, which is the shape that scales.
 
 `src/neant/crypto/der.nt` and `src/neant/crypto/x509.nt` (loadable, not in the boot image) read
 **ASN.1 DER and X.509 certificates** — parsing only, no signature check and no chain building:
@@ -431,6 +551,76 @@ the top-level element all signal rather than being guessed at. `x509Parse` retur
 keys documented at the top of x509.nt; an unrecognised *critical* extension is reported in
 `` `critUnknown `` rather than dropped, since silently ignoring one is how a verifier gets fooled.
 
+**Two readers, held to each other.** `derTLV` builds a dict per element and `derKids` walks the
+children one at a time; `derScan` reads every element of every buffer in one breadth-first sweep and
+returns columns — `off hlen len tag cls cons par fc ns doc`, a node being an index into them. The
+frontier starts as one position per buffer, each step parses the headers at all of them with
+whole-vector operations (one gather for the identifier octet, one for the first length octet, four
+for the long-form length, and `any` over the vector where the scalar reader had an `if` per
+element), and a parsed element hands the next step both its first child and its next sibling, so the
+frontier is wide almost at once: the 146-root system trust store is 9387 elements and derScan reads
+it in 34 steps rather than 9387. `x509ParseMany` parses a whole bundle out of those columns, and
+falls back to `x509Parse` for anything the columnar reader will not take — the high-tag-number form,
+or any rejection at all — so the strict reader is still what decides every odd case and still
+produces every message. `tests/x509.nt` is what says the speed was not bought by checking less: it
+compares the two element for element and octet for octet over every certificate in the repository,
+field for field over the same, and asserts that everything either must refuse, both still refuse.
+
+It is a *batch* reader, and says so in its numbers: one
+certificate costs 540 us through `x509ParseMany` against 485 through `x509Parse`, because derScan's
+whole-vector steps have a fixed cost that one certificate does not amortise; three certificates — a
+TLS chain — already come out ahead, 1295 us against 1520; 146 come out 2.6x ahead. `x509Parse` is
+still the entry point for one, and still what `tls.nt` calls.
+
+**What that cost, measured** (`tests/x509bench.nt`, `/etc/ssl/certs/ca-certificates.crt`, 146 roots,
+155,984 octets of DER, 9387 elements, 64 to a certificate):
+
+| | before | after |
+| --- | --- | --- |
+| PEM decode (`read0` + base64) | 128 ms | 5 ms |
+| parse all 146 | 98 ms | 46 ms |
+| **`x509LoadRoots`, end to end** | **231 ms — 1582 us/cert** | **54 ms — 370 us/cert** |
+
+Most of the PEM win was one line: `pemDecode` split 215 KB with `"\n" vs`, which is 101 of those
+128 ms. `read0` has already split the file into lines, so `pemLines` takes them as they came, finds
+the BEGIN/END markers by line length (3610 lines down to ~320 candidates before the first `~`), and
+decodes *every block's base64 in one pass* — each block is a whole number of 4-character groups, so
+the groups of the concatenation are the groups of the blocks. It carries its own decoder rather than
+calling `unb64` because `b64chars?s` is 2.6 ms over the store's 208 KB of base64 where a 256-entry
+gather is 0.2 ms.
+
+**Where the remaining 54 ms is**, and it is not where it was:
+
+| | ms | us/cert |
+| --- | --- | --- |
+| `pemLines` | 5 | 34 |
+| `derScan`, all 9387 elements | 1 | 7 |
+| issuer and subject, RFC 2253 and canonical | 19 | 130 |
+| extensions | 8 | 55 |
+| SubjectPublicKeyInfo | 5 | 34 |
+| validity, algorithm identifiers, the four byte slices | 5 | 34 |
+| the per-certificate dict and loop around all of it | 11 | 76 |
+
+**OpenSSL does the same work in 2.8 ms — 19 us a certificate — and this does not beat it.** The
+walk is no longer the cost: it was 31 ms of the old 98 and it is 1 ms now. What is left is a floor
+the language sets, and it is worth writing down exactly. Measured in this VM: an indexed read of an
+int vector costs ~0.16 us, a call ~0.25 us, and a whole-vector operation on a short vector ~0.3 us,
+dispatch and allocation rather than work. 19 us a certificate is about 70 of those operations, and a
+certificate is 64 DER elements and 7 name attributes — so nothing written *per certificate* can fit,
+whatever it does. Only a parser vectorised **across** certificates in every phase could, the way
+`derScan` already is; the part that resists it is the name pipeline, where RFC 2253 escaping,
+canonical lowercasing and whitespace collapse, and the joins are per-attribute string work.
+
+The JIT would otherwise close that gap and cannot, for a reason worth recording. A scalar loop over
+int vectors is exactly what the tiers want — an int-returning loop with nine parameters and three
+nested levels compiles and runs at 10-20 ns an iteration against 300 interpreted. But **a function
+that produces a vector is compiled by neither tier**: the same loop returning the buffer it filled
+stays at 300 ns, and so does one that hands the buffer out through a global with `::` or through
+`sset`. Parameters are by value, so a filled buffer has no other way out. Parsing is entirely
+vector-producing, so none of it can be compiled — which is also why the three compiled name passes
+written for this were removed again: correct, and slower than the vector code they replaced. A tier
+that accepted a vector return would be worth more to this file than any further rewriting of it.
+
 `src/neant/crypto/verify.nt` and `src/neant/crypto/tls.nt` (loadable, not in the boot image) are a
 **TLS 1.3 client that authenticates the server** — x25519, `TLS_CHACHA20_POLY1305_SHA256`, and a
 certificate path validator written on the files above:
@@ -443,7 +633,7 @@ tlsRecv h                                 // one application-data record, 0x at 
 tlsClose h
 
 x509CheckHost[cert; "a.example.com"]      // RFC 6125: SAN dNSNames and iPAddresses, never the CN
-roots: x509LoadRoots "/etc/ssl/certs/ca-certificates.crt"        // 146 roots in ~280ms
+roots: x509LoadRoots "/etc/ssl/certs/ca-certificates.crt"        // 146 roots in ~54ms
 x509VerifyChain[chain; roots; host; (now`date; now`time)]        // 1b, or signals why not
 ```
 
@@ -487,29 +677,37 @@ Measured from this checkout against the system trust store, wall clock so the ne
 
 | host | certs | handshake | the chain above the leaf |
 | --- | --- | --- | --- |
-| `www.google.com` | 3 | 1.07 s | ecdsaSha256/P-256, then ecdsaSha384/P-384 |
-| `cloudflare.com` | 3 | 0.96 s | the same shape |
-| `github.com` | 3 | 0.95 s | the same shape |
-| `example.com` | 4 | 1.41 s | ecdsaSha256/P-256, then ecdsaSha384/P-384 twice |
-| `www.wikipedia.org` | 4 | 1.77 s | ecdsaSha384/P-384 all the way up |
-| `news.ycombinator.com` | 4 | 1.88 s | the same shape |
-| `www.amazon.com` | 3 | 0.28 s | RSA-2048 PKCS#1-SHA256, which always verified |
+| `www.google.com` | 3 | 0.45 s | ecdsaSha256/P-256, then ecdsaSha384/P-384 |
+| `cloudflare.com` | 3 | 0.30 s | the same shape |
+| `github.com` | 3 | 0.30 s | the same shape |
+| `example.com` | 4 | 0.42 s | ecdsaSha256/P-256, then ecdsaSha384/P-384 twice |
+| `www.wikipedia.org` | 4 | 0.71 s | ecdsaSha384/P-384 all the way up |
+| `news.ycombinator.com` | 4 | 0.73 s | the same shape |
+| `www.amazon.com` | 3 | 0.26 s | RSA-2048 PKCS#1-SHA256, which always verified |
 
 All seven complete a verified handshake and return an HTTP response. The offline half of that is
 `tests/data/chain-google.pem`, the capture that named the gap: both of its links verify, and the
-whole chain verifies to the system trust store at a pinned `now` in ~545ms.
+whole chain verifies to the system trust store at a pinned `now` in ~62ms.
 
-**What it costs.** One RSA-2048 verification is ~7.8ms, one P-256 ~180ms and one P-384 ~380ms, so a
-two-link RSA chain is ~23ms, a one-link P-384 chain ~365ms and the Google chain — two ECDSA
-signatures, one of each curve — ~545ms with the trust store already loaded. A process also pays
-~280ms once for `x509SystemRoots[]`, which `tlsRoots` caches. Those are the numbers a reader
-deciding whether to use this deserves up front rather than as a surprise; `p256.nt`'s header counts
-out where they go and which two optimisations were measured and rejected.
+**What it costs.** One RSA-2048 verification is ~0.50ms, one P-256 ~21.5ms and one P-384 ~38ms, so a
+two-link RSA chain is ~8ms, a one-link P-384 chain ~38ms and the Google chain — two ECDSA
+signatures, one of each curve — ~62ms with the trust store already loaded. A process also pays
+~54ms once for `x509SystemRoots[]` (it was ~231ms before the columnar reader), which `tlsRoots`
+caches; that one is parsing, not arithmetic. Every signature number above was an order of magnitude
+worse until the bignum arithmetic became compiled scalar loops (["the bignum arithmetic runs as
+compiled scalar loops"](#the-bignum-arithmetic-runs-as-compiled-scalar-loops)); `p256.nt`'s header
+counts out where what is left goes and which two optimisations were measured and rejected.
+
+RSA over SHA-512 (PKCS#1 and PSS) and Ed25519 in a chain are checked as of `tests/data/pki-ed-gen.sh`'s
+fixtures. Ed25519 is the one algorithm here that names no digest: RFC 8032 signs the message and
+hashes it internally, so `verify.nt` hands `ed25519Verify` the tbs span rather than a digest of it.
+It needs `ed25519.nt`, which `tlsclient.nt` therefore loads — 21ms on a 542ms load, chosen over
+dispatching on whether the global happens to exist, which would have made a verifier's answer depend
+on what else the program had loaded.
 
 What is still **not** checked, plainly: **P-521**, refused with the curve named, because there is no
-`p521.nt`; **SHA-512**, refused by algorithm, because `rsa.nt`'s DigestInfo table stops at SHA-384
-and nothing dispatches it; **SHA-1**, refused because it is broken; **Ed25519** in a chain, which
-`ed25519.nt` can verify but nothing wires into `verify.nt`'s dispatch; **revocation**, no CRL and no
+`p521.nt`; **ecdsaSha512**, refused for the curve-pairing reason below rather than for want of the
+hash; **SHA-1**, refused because it is broken; **revocation**, no CRL and no
 OCSP, so a certificate revoked this morning still verifies; **name constraints** and certificate
 policies; and **extendedKeyUsage**, which is parsed and ignored, so a certificate issued for e-mail
 will serve a web request. There are **no client certificates and no TLS server side**. A mismatched
@@ -555,6 +753,17 @@ already joined. The one exception to lock-free is `shared x`, an explicit mutabl
 read and overwrite it, but only `supd[s;f]` is atomic — it holds the lock for the whole call to `f`, so
 concurrent `supd`s on the same cell serialize instead of losing an update the way `sset[s; f sget s]`
 would if two threads interleaved between the get and the set.
+
+**What it costs.** "No lock" is true and is not the same as free. `Value` held an `Rc` before `spawn`
+existed, and crossing a thread needs `Send`, so every refcount became an atomic read-modify-write
+instead of a plain increment. Refcount traffic through the operand stack is about 35% of samples
+("Performance"), and making that traffic 2–3x dearer per operation costs **~13% of single-threaded
+throughput**: the same 64KB SHA-256 measures 196ms at `c49736a` and 221ms at its child `fbdeb99`, the
+commit that did the conversion, and is flat from there to today. That is the price of the whole
+concurrency story above, paid by every program whether it spawns anything or not. It is not cheaply
+recoverable — reverting loses threads and biased refcounting is a pile of `unsafe` — and the lever
+that does work is making fewer `Value` clones rather than cheaper ones, which is what the JIT does by
+never touching a `Value` at all inside compiled code.
 
 ## Gotchas (shared with q)
 
@@ -677,19 +886,61 @@ moved where compiled recursion overflows a 2MiB stack from ~2000 levels to ~1800
 construct a vector. This language has no indexing opcode: a vector applied to an int just *is*
 indexing (`compile.nt`'s `app` node), through the same `Op::Call` a plain application emits. So
 `jitClassifySlots` walks the bytecode once and accepts a slot only if *every* appearance of it is
-one of exactly two shapes — `LoadL(s)` immediately consumed by `Call(1)` (a read), or the literal
-3-op run `TakeL(s); Amend(1); StoreL(s)` that `iassign` always emits back to back (a write). Any
-other appearance disqualifies it; there is no partial typing.
+one of exactly three shapes — `LoadL(s)` immediately consumed by `Call(1)` (a read), the literal
+3-op run `TakeL(s); Amend(1); StoreL(s)` that `iassign` always emits back to back (a write), or a
+bare `LoadL(s)` at the very end of the body or immediately before a `Ret` (the vector is the
+result, below). Any other appearance disqualifies it; there is no partial typing.
 
-The access itself is the one thing not inlined as machine code but called through a trampoline
-(`jit_vec_get`/`jit_vec_set`), deliberately: a write needs the exact copy-on-write discipline
-`Op::Amend`/`scatter` (`src/prims.rs`) already use — `Arc::make_mut`, cloning only if the vector
-isn't uniquely owned, so a second live reference never observes the write — and hand-rolling that as
-pointer arithmetic against `Arc`'s internal layout would trade a real safety property for a
-memory-layout assumption this project has no reason to make. At entry the slot's value must be
-`Ints`; a clone lives in a side table (`vecbuf`) for the call's duration and the slot's register
-holds a pointer into it. The trampolines bounds-check and deopt like every other guarded point.
-Numbers for both tiers are together at the end of Stage 2b.
+**The access is inlined — no call.** `buf` (`src/jit.rs`) is the locals area followed by one
+descriptor word per classified slot, its element count; the slot's own word is the element *data
+pointer*. A read is then a load of that count, one unsigned compare that catches a negative index
+and an out-of-range one together, and a scaled `ldr` off the slot's own register; a write is the
+same with an `str`. Nothing about `Arc`'s layout is assumed, because Rust still does all of it — at
+entry `bind_vec` clones the value into the `vecbuf` side table and, for a slot the body *writes*,
+calls `Arc::make_mut` on that clone straight away. That is the same copy-on-write
+`Op::Amend`/`scatter` (`src/prims.rs`) perform and the same one `jit_vec_set` used to perform on the
+first write, only hoisted to entry, which is what makes the elements' address stable for the rest of
+the call: a read-only slot is an `Arc` this frame holds a reference to and nothing may mutate, a
+written one is uniquely ours and cannot be reallocated. A second live reference to an amended vector
+still never sees the write, which `tests/jit.nt` asserts. The trampolines stay in `src/jit.rs` for
+the x86-64 backend, which has not been taught this yet.
+
+**A compiled function can return the vector it filled.** Locals are never written back, so until
+this everything a compiled body did to a vector was invisible to its caller and the only worthwhile
+shape was one that reduces to a scalar — which is why `src/neant/crypto/bignum.nt` could not put a
+whole schoolbook product inside one compiled call. Now a body whose last op is a bare `LoadL` of a
+classified slot returns that slot's vector: the machine code's x0 is a placeholder and `try_run`
+hands back the `Value` the slot was bound to, which the inlined stores have been filling all along.
+Every return has to agree — a function returning an int down one path and the vector down another
+is refused outright, since there would be no single answer for `src/jit.rs` to believe — and a
+vector-returning callee cannot be entered through `jit_call`, whose whole point is that a result is
+an int in a register, so that one call deopts.
+
+**The bit builtins are instructions, not calls.** `x band y` is an ordinary two-argument call to a
+global holding a `Value::Prim`, so without this every limb mask and every shift inside a compiled
+loop was a `blr` through `jit_call` — and limb arithmetic is nothing but masks and shifts.
+`src/jit.rs` resolves `badd band bor bxor shl shr` to their global slots, hands them to the codegen,
+and records which primitive each slot held; a body that inlined one carries an entry guard that the
+slot still holds that exact primitive, because these are ordinary globals and rebinding `band` is
+legal. The two shifts deopt unless the count is in [0;64): AArch64 reads it mod 64 where `ib_shl`/
+`ib_shr` truncate to u32 and answer 0, so outside that range the machine and the interpreter
+genuinely differ. All six work on the raw 64-bit pattern and so may *produce* the int-null sentinel
+where `+ - *` may not, and the result is checked for it exactly as an arithmetic one is.
+
+**The virtual operand stack.** A value's physical register used to be its depth — entry *i* lived in
+x9+*i*, so a `LoadL` of a local that already had a register of its own still emitted a `mov`, and a
+literal always cost a `movz`. Each entry now records where the value actually *is*: a register, or a
+constant not yet loaded into one. So a local feeds an add out of its own register, `i+1` is one
+`add` with a 12-bit immediate, and a comparison whose result is immediately consumed by a `Jmpf` is
+one `cmp` and one conditional branch instead of a `cmp`, a `cset` and a `cbz`. What makes it safe is
+that an entry is *materialised* — moved into x9+*i*, where it would always have been — whenever
+anything could invalidate it: before every branch and at every branch target, so both halves of a
+merge agree where a value lives; before a local's register is written, since an entry aliasing that
+register holds the old value; and before a `do` counter is decremented in place. Materialising is a
+`mov` the old scheme emitted unconditionally, so the worst case is what it used to cost. On the
+measured scalar loop this removes eight instructions of twenty-one and changes nothing at all, which
+is itself the finding: that loop is bound by its four branches, not by its instructions. Numbers for
+both tiers are together at the end of Stage 2b.
 
 #### The x86-64 backend (compiled, never executed)
 
@@ -881,9 +1132,10 @@ iteration than the original, so each number is a few percent optimistic.
   time. The same speed as the loop with no call in it, which is what inlining should mean.
 - **~112x** — a `do` loop (`manual_trace_do_perf_measurement`): 6.4ms against 725ms, 5M iterations.
   One compare-branch-decrement per iteration more than the `while` form, which shows.
-- **~73x** — `x[i]` inside a compiled loop (`manual_vector_perf_measurement`): below the scalar
-  loop because every access is still a `blr` plus the operand-stack spill around it, but the cost
-  it removes (interpreter dispatch, `Value` boxing per element) still dominates that.
+- **~200x** — `x[i]` inside a compiled loop (`manual_vector_perf_measurement`). Two reads, a
+  multiply and an accumulate per iteration now run at 0.9–1.0ns against 2.7ns when each access was
+  a `blr` plus the operand-stack spill around it: level with the scalar loop, which is what an
+  inlined bounds check and a scaled load should mean.
 - **~3.5x** — recursive calls, `fib 27` (`manual_recursive_perf_measurement`). A call costs far more
   than a loop iteration even with the lock and the allocation gone: marshalling arguments, the depth
   guard, resolving the callee.
@@ -923,12 +1175,34 @@ There is no external oracle left, so the front end is pinned by fixpoints and by
 What this gives up relative to the oracle: a bug that the compiler introduces *and* reproduces
 consistently is no longer caught by construction — it is caught only if a language case exercises it.
 
+#### What the null-sentinel checks cost, measured
+
+Every `+ - *` on two ints emits `cmp` against the null sentinel and a branch, because two ordinary
+ints can wrap to exactly it and the interpreter would then propagate a null. In the inner loop of a
+schoolbook multiply that is four checks of about thirty instructions. Two ways to make them cheaper
+were built and measured against the same loop:
+
+- **One branch per basic block instead of one per op.** Each check increments x4 with `cinc` (no
+  branch, no flags left behind) and a single `cbnz` at the end of the straight-line stretch acts on
+  the lot, flushed before every branch, call and return so a poisoned value cannot escape the block
+  it was made in. Correct, and **12% slower**: the accumulator is a loop-carried dependency where
+  the branches were free, being never taken and perfectly predicted. Reverted.
+- **Removing them entirely** (unsound — measured only as a ceiling): the multiply-accumulate loop
+  goes 0.96ns → 0.80ns per limb product and an RSA-2048 verification 0.50ms → 0.46ms. So perfect
+  elimination is worth 17% of the inner loop and **8% of the verification**, which is the budget any
+  range analysis on this has to fit inside. It is not where the remaining distance to OpenSSL is.
+
 ### Performance
 
 - `x,: y` compiles to Take+join so appends are in place — 20k appends, 444ms → 1ms.
 - Globals are interned to slots at load, so `LoadG` is an index, not a hash. Execution stacks are pooled.
 - `?` `distinct` `group` hash atoms — 200k ints over 1000 keys: distinct 159ms → 6ms, group 198ms → 10ms.
   Nested keys fall back to a scan.
+- `ss` narrows to the positions whose first character matches and checks only those, instead of
+  taking a slice and matching at every position; a one-character pattern is a single vector compare
+  and no slicing at all. Splitting a 215KB buffer on `"\n"`: 103ms → 10ms, and `ss` alone 95ms → 5ms.
+  This is the shape a PEM file, a header block or a CSV is read with, so it is `vs`, `ssr`, `like`
+  and everything built on them.
 - Atom lookup in a typed vector scans the raw elements instead of boxing the vector. (`x in y` is a
   `?` over `Syms`, and the boot compiler's ``k in `const`verb...`` dispatch chains run it per AST node.)
 - Two int atoms through `+ - * & | < > =` skip the shape/broadcast machinery, and through
@@ -948,15 +1222,164 @@ Poly1305 61 → 34, the AEAD 198 → 103; X25519 76ms → 42, and a TLS 1.3 hand
 169ms → 97ms. Allocation went from ~34% of samples to under 1%; what is left is the dispatch loop
 itself and `Value` clone/drop.
 
+Those absolute figures are **not reproducible on the machine this is developed on** and should be
+read as ratios only. `crypto.nt` has not changed since (only the move into `src/neant/crypto/`), and
+checking out that same commit here measures SHA-256 at 195ms per 64KB rather than 119ms — so the
+numbers above came from different hardware. Measured here on that same code: SHA-256 **233ms** per 64KB,
+ChaCha20-Poly1305 **21.6ms** per 10KB, X25519 **47.5ms** — all three are now 1.0ms, 0.38ms and
+3.05ms, on the compiled kernels below. The 196ms → 221ms between that
+commit and now is real, and it is one commit: `fbdeb99`, which converted `Value` from `Rc` to `Arc`
+so that `spawn` could exist. Everything after it is flat. See "Concurrency" for the trade — it is the
+price of threads, not a regression anyone can take back.
+
 Runtime errors carry a line table, which costs ~10% of compile throughput. A frame is named by its
 caller's `LoadG`, so the bytecode carries positions but no names.
+
+#### The bignum arithmetic runs as compiled scalar loops
+
+`src/neant/crypto/bignum.nt` was written as vector column operations — `acc[i+til nb] +: a[i]*b`,
+one per limb of `a`, which is the fastest shape an *interpreter* has. Every one of them allocates
+intermediates and makes several passes over memory, and none of them is a loop the JIT can take.
+With `x[i]` inlined, a written vector uniquely owned at entry, a vector as a return value and the
+bit builtins as instructions, the same arithmetic is expressible as plain scalar loops over limbs
+that the whole-function tier compiles: `bnMulL` is the schoolbook double loop, `bnRedcL` the
+Montgomery reduction, `bnMsubL`/`bnAddBackL` Knuth D's multiply-subtract and add-back,
+`bnCarryL` one sequential carry pass instead of repeated vector rounds, and `bnCmpL`, `bnAddL`,
+`bnSubL`, `bnAddModL`, `bnSubModL`, `bnMontFinL`, `bnTrimL`, `bnPackL`, `bnUnpackL` the operations
+around them that a ten-limb field spends most of its time in. The vector forms stay in the file as
+`bnMulV`, `bnMontMulV` and `bnCarryV`, and `tests/bignum.nt` checks thousands of random operands
+against them — plus `u = q*v + r` for the division and a plain multiply-and-reduce for Montgomery,
+which are stronger statements than agreeing with another of my own loops. Every crypto vector in
+`tests/crypto.nt`, `tests/p256.nt`, `tests/p384.nt` and `tests/verify.nt` is exact and unchanged.
+
+The tier compiles a function after 64 calls, and one RSA-2048 verification makes about twenty, so
+`bnWarm[]` at the bottom of the file calls each kernel eighty times with two-limb operands. That is
+~19ms of one-time compilation at load (the file's own parse is ~80ms, and was ~27ms before it grew),
+and without it the first verification would run the whole schoolbook product on the interpreter,
+which is far slower than the vector form it replaced.
+
+Measured on this machine against b093293, every number the minimum of five runs:
+
+| | before | after |
+|---|---|---|
+| `bnMul`, 2048×2048 bits | 13.5–15.1 ns per limb-multiply | **1.60 ns** |
+| `bnMontMul`, 2048 bits | 15.4–16.8 ns per limb-multiply | **1.12 ns** |
+| RSA-2048 verify (e=65537) | 6.9–7.8 ms | **0.50 ms** |
+| ECDSA P-256 verify | 181 ms | **21.5 ms** |
+| `x[i]*y[i]` in a compiled loop | 2.70 ns/iteration | **0.90–1.00 ns** |
+| a compiled scalar loop | 0.90 ns/iteration | 0.90–0.95 ns |
+| SHA-256 over 64KB, trust-store parse | 236 ms, 218 ms | 224 ms, 219 ms (untouched) |
+
+Against OpenSSL on the same core, RSA-2048 goes from 580x to **39x** (12.7µs) and ECDSA P-256 from
+4600x to **550x** (38.9µs). The compiled scalar loop is unchanged because it is bound by its four
+branches rather than its instruction count — see the null-sentinel measurement above.
+
+What is left is not one thing. Of 0.50ms for an RSA verification, ~0.36ms is the twenty modular
+multiplications and ~0.30ms of that is the two compiled kernels, so the verification is now ~70%
+inner loop and the honest gap divides in two. **Six of the remaining 39x is the limb width**: a
+product must stay exact in an i64, which caps a limb at 26 bits against OpenSSL's 64, and (2048/26)²
+is six times (2048/64)². That is a property of the *language* — an i64 is what a number is here —
+not of the compiler, and closing it needs either a 128-bit product or Karatsuba, which is fewer
+products rather than cheaper ones. The other ~7x is that a compiled limb product takes about four
+cycles against the one hand-written assembly gets: three inlined loads with their bounds checks, a
+multiply, an add, two counter increments and their null checks, and nine branches an iteration. For
+P-256 the split is different again — ten limbs is 200 products per modular multiplication, ~0.26µs
+of arithmetic inside a 1.9µs operation, so it is dominated by what surrounds each call (a fresh
+`Ints` per result, the entry marshalling, `bnTrim`) rather than by the arithmetic.
+
+**A wider limb was measured and does not pay.** 32 bits is not available at all — a 32×32 product is
+2^64, which is not exact in an i64 — and 26 is already the widest the *column* form allows, since a
+column is min(na;nb)·2^(2b) and at 27 bits an RSA-4096 reduction would reach 2^62.25 and overflow.
+What a wider limb would buy has to be bought with a carry settled on every product instead, and that
+was timed as the same loop with `band`/`shr` in it: 1.84ns per limb product against 1.12ns. At 2048
+bits that is 4489 products at 1.84ns = 8.3µs against 6241 at 1.12ns = 7.0µs — 19% *worse*, because
+64% more work per product does not pay for 28% fewer of them. Fewer products has to come from
+Karatsuba, not from the radix.
+
+#### The hash and the stream cipher run as compiled scalar loops
+
+`src/neant/crypto/crypto.nt` got the same treatment `bignum.nt` did, for the same reason and with
+the same recipe. `shaBlock` was written as a vector schedule grown by append, `chachaBlock` as four
+column vectors through `qround`, `p5mul` and `fmul` as `acc[i+til n] +: a[i]*b` — the fastest shape
+an interpreter has, and the three things a JIT cannot take. Every one of them was disqualified at
+least twice over, and none of the disqualifiers needed a compiler change to remove. Measured one
+cause at a time, 2M iterations of a `while` body, after the tier had taken the function:
+
+| the body | cost | |
+|---|---|---|
+| `n: n+i` | 3ms | the baseline |
+| `n: (n+i) band 65535` | 2ms | compiles since the bit builtins became instructions |
+| `n: n+t[i band 63]`, `t` a **parameter** | 1ms | compiles |
+| `w[i]: i`, `w` a **parameter** | 2ms | compiles |
+| `n: n+G`, `G` a global int | **240ms** | a global read is not in the subset |
+| `n: n+W[i mod 3]`, `W` a global vector | **652ms** | nor is indexing one |
+| `n: n+w[i band 3]`, `w` a **scratch local** vector | **400ms** | only a parameter or capture is classifiable |
+| `n: rr[n;3]+i`, `rr` a pure int helper | **209ms** | compiles, but a trampoline call is ~45ns |
+
+So `M32`, `shaK`, `M26` and `M22` became parameters (`msk`, `k`), the message schedule, the ChaCha
+state and both product accumulators became parameters allocated once as module-level scratch, and
+`rotr32`/`rotl32`/`add32`/`qround` were written out by hand inside the kernels rather than called.
+(`bnot` is not one of the six inlined builtins, so `msk bxor x` stands in for it on a masked word.)
+The kernels are `shaBlocksL` — the whole message, every block, in one call — `chachaXorL`, which
+produces the keystream and xors it in the same pass, `polyBlocksL` for the full 16-byte blocks, and
+`fcarryL`/`fmulL` for the 2^255-19 field. The column forms stay in the file as `shaBlockV`,
+`sha256V`, `chachaBlockV`, `poly1305V`, `fcarryV` and `fmulV`, and `tests/crypto.nt` checks the two
+against each other across every length either side of a block boundary and on random field
+elements. Every published vector in `tests/lang.nt` is unchanged and exact.
+
+**A boot file may not warm its own kernels at load, and failing quietly is the whole trap.** The
+tier compiles after 64 calls; one `sha256` of any size is *one* call to `shaBlocksL`, so a TLS
+handshake's thirty hashes would never reach the threshold and `bnWarm`'s trick is needed here too.
+But `crypto.nt` is `BOOT_FILES[9]` and `src/neant/jit/arm64.nt` is `BOOT_FILES[10]`: a kernel driven
+past 64 calls while the image is still loading finds no `jitCompile` global to call, `jit::compile`
+returns `None`, and `FnCode`'s `OnceLock` settles that as "never compile this" for the life of the
+process. Nothing fails — every test still passes, the hash is simply eight times slower than it
+should be, and the only symptom is a number. So each family warms on first *use* instead
+(`shaWarm`, `chachaWarm`, `polyWarm`, `fieldWarm`), which costs ~8ms once on the first hash of a
+process and nothing at startup.
+
+X25519 is the exception that proves the rule and was worth measuring rather than assuming: one key
+exchange is ~2800 calls to `fmulL`, so it tiers up 2% into its own first run whether or not anything
+warmed it — 17ms cold against 3.05ms warm. The warm-up there buys only that 14ms of first-run
+interpretation, not the compilation itself.
+
+Measured on this machine against `8f04ace`, each the minimum of five runs of twenty-plus operations:
+
+| per operation | before | after | |
+|---|---|---|---|
+| `sha256`, 64KB | 233.2 ms | **1.00 ms** | 233x |
+| `sha256`, 4KB | 14.90 ms | **0.090 ms** | 166x |
+| `hmac`, 32 bytes | 0.895 ms | **0.015 ms** | 60x |
+| `chacha20`, 64KB | 95.2 ms | **1.70 ms** | 56x |
+| `poly1305`, 64KB | 43.8 ms | **0.30 ms** | 146x |
+| `aeadEncrypt`, 64KB | 138.2 ms | **2.45 ms** | 56x |
+| `aeadEncrypt`, 10KB | 21.6 ms | **0.38 ms** | 57x |
+| `x25519` | 47.5 ms | **3.05 ms** | 15.6x |
+| verified TLS 1.3 handshake, www.google.com | 394–462 ms | **223–265 ms** | 1.8x |
+
+Against OpenSSL 3.6.2 on the same core (`openssl speed -elapsed`, 2.46 GB/s for both at 16KB and
+44355 X25519/s), SHA-256 over 64KB goes from 8760x to **38x** (26.6µs), ChaCha20-Poly1305 from
+5180x to **92x** (26.7µs) and X25519 from 2110x to **135x** (22.5µs).
+
+What is left is no longer the arithmetic. Of the ~240ms handshake, ~140ms is two network round trips
+and ~80ms is three ECDSA verifications; `crypto.nt` is now a few milliseconds of it. Inside `x25519`
+the 3.05ms is ~2550 `fmulL` calls at 0.7µs each and ~2000 `fadd`/`fsub`/`fmuls` at 0.4–0.5µs, where
+the add still builds a twelve-element vector interpreted before handing it to the compiled carry;
+folding a whole ladder step into one kernel would remove that, and cannot be done by calling the
+field kernels from inside another compiled function — a callee that returns a vector deopts the
+caller, so it would mean writing the nine multiplications out by hand.
 
 ### Next
 
 For the JIT: int/float promotion inside a trace, so `1.0*i` compiles; side traces for a branch that
 flips for good, which currently bails on every iteration and runs the rest of it interpreted (no
-cliff, but no gain either); and a rewind-free exit for a branch inside an inlined callee, which
-needs the interpreter to be able to resume inside a frame it never entered.
+cliff, but no gain either); a rewind-free exit for a branch inside an inlined callee, which needs
+the interpreter to be able to resume inside a frame it never entered; and **a vector return**. A
+function whose result is a vector is compiled by neither tier, and since parameters are by value a
+filled buffer has no other way out — `::` to a global and `sset` are refused too. That is what keeps
+every byte-building loop in the language interpreted: certificate parsing, base64, the formatter.
+The same loop returning an int compiles and runs 20 to 100 times faster ("Bytes and crypto" has the
+measurement); `not` and `break` in a loop body also hand it back, and so does a tenth parameter.
 
 A register-style calling convention was tried and reverted — it measured slower, and the profile
 said frame setup is ~5% while `Value` clone/drop and small-list allocation are ~35%. The allocation
@@ -983,12 +1406,13 @@ the whole of the second curve. The decision that paid for that was made one chan
 measuring an optimisation and declining to write it.
 
 What is missing, then: **P-521**, another curve record and nothing else, wanted by nobody yet;
-**SHA-512** in a chain, three table entries in `rsa.nt` and a dispatch line; **Ed25519** in a chain,
-which only needs `ed25519.nt` wired into `verify.nt`'s dispatch; **revocation**, which means OCSP or
+**revocation**, which means OCSP or
 CRL fetching and so an HTTP client over TLS first — now possible, since the TLS client can reach a
 real responder; **name constraints** and **extendedKeyUsage** enforcement; client certificates; and a
-server side. The other open item is still speed: one P-384 verification is ~380ms and one P-256
-~180ms against RSA-2048's ~7.8ms, and `p256.nt`'s header counts out why and what does not help.
+server side. Speed is a smaller open item than it was: one P-384 verification is ~38ms and one P-256
+~21.5ms against RSA-2048's ~0.50ms, an order of magnitude off each of the old numbers, and what is
+left is counted out in ["the bignum arithmetic runs as compiled scalar
+loops"](#the-bignum-arithmetic-runs-as-compiled-scalar-loops).
 
 `tlsConnect` used to draw the x25519 private key from `rand`, and then the ClientHello random from it
 too. That random goes out in the clear, xorshift64 is linear and invertible, and 32 bytes of it are
@@ -999,7 +1423,7 @@ Ed25519 is in (`src/neant/crypto/ed25519.nt`), which took one runtime primitive 
 change. RSA-PKCS#1 and RSA-PSS followed (`bignum.nt`, `rsa.nt`), on the general modular reduction
 that real certificates need — Montgomery, not the special-prime folding the 2^255-19 field gets away
 with. RSA *verification* stays cheap because the exponent is 65537: 16 squarings and 2 multiplies,
-~7.8ms at 2048 bits. ECDSA P-256 (`p256.nt`) went on top of that same bignum arithmetic, over a
+0.50ms at 2048 bits. ECDSA P-256 (`p256.nt`) went on top of that same bignum arithmetic, over a
 curve rather than a modulus, and needed no new primitive either — the one thing it did need was
 measuring the special-prime fold before writing it, and finding it level with what was already
 there. Not every language addition is code that gets written. SHA-384 and P-384 (`sha512.nt`,

@@ -1,0 +1,526 @@
+// Verifying MANY ECDSA P-256 signatures at once, in neant, on the curve arithmetic in
+// src/neant/crypto/ec.nt and p256.nt. Not part of the boot image — load all five:
+//   load "src/neant/crypto/bignum.nt"   load "src/neant/crypto/der.nt"
+//   load "src/neant/crypto/ec.nt"       load "src/neant/crypto/p256.nt"
+//   load "src/neant/crypto/batch.nt"
+//
+//   batchVerifyP256[keys;digests;sigs]     -> 1b / 0b      every signature valid?
+//   batchVerifyP256Who[keys;digests;sigs]  -> a boolean per signature
+//   batchVerifyP256Bad[keys;digests;sigs]  -> the indices that failed
+//   batchVerifyP256Der[keys;digests;sigs]     the first two again, with each signature the DER
+//   batchVerifyP256DerWho[keys;digests;sigs]  SEQUENCE { INTEGER r, INTEGER s } that a certificate
+//                                             and a TLS CertificateVerify carry
+//   batchVerifyP256Par[keys;digests;sigs;k] -> a boolean per signature, over k OS threads
+//
+// `keys` are SEC 1 uncompressed points, `digests` are 32-byte SHA-256 digests, and `sigs` are
+// (r;s) pairs of big-endian magnitudes — exactly the arguments ecdsaVerifyP256 takes, one list
+// each. Every entry point is total: a key that is not a point, an r or s outside [1,n-1], a digest
+// of the wrong length or DER that does not parse is that signature answered 0b, never a signal and
+// never a verdict on its neighbours. THE ANSWER IS PER SIGNATURE AND IT IS EXACT: these agree with
+// ecdsaVerifyP256, signature by signature, on every input. ec.nt's single-signature path is
+// untouched and is still what x509.nt and verify.nt call.
+//
+// ---- what a batch buys, measured on this machine, and what it does not
+// (Cortex-X925, 20 cores; ./target/release/neant; the 512 real signatures in
+// tests/data/p256-batch.txt, made by openssl, with the corpus repeated to fill the 1024- and
+// 2048-lane rows. tests/bench.nt re-runs exactly this. Other agents were building on this machine
+// while it ran, and a re-run lands within about 15% either way, so read these as a floor.)
+//
+//               one thread                          twenty threads, twenty independent batches
+//   N      ms/signature   verify/s              ms/signature   verify/s   thread scaling
+//      1      739.0           1.4                  80.25          12.5        8.9x
+//      8       94.04         10.6                  10.99          91.0        8.6x
+//     64       16.21         61.7                   1.622        616.6       10.0x
+//    512        4.875       205.1                   0.449       2225.1       10.8x
+//   1024        4.012       249.3                   0.363       2757.9       11.1x
+//   2048        3.549       281.8                   0.314       3180.6       11.3x
+//
+// against, on the same machine and measured the same day:
+//   ecdsaVerifyP256, one signature at a time     180.9 ms        5.5 verify/s    one core
+//   openssl speed -seconds 3 ecdsap256            38.9 us    25684.0 verify/s    one core
+//
+// SO: THIS DOES NOT BEAT OPENSSL, and the terms matter more than the number. At its best — 2048
+// signatures in one call, twenty OS threads, twenty cores — it verifies 3181 signatures a second
+// against OpenSSL's 25684 on ONE core, which is 8x short; against OpenSSL on all twenty cores it
+// is about 160x short. What it does do is close the gap from 4650x to 8x: one signature at a time
+// this language is 180.9 ms against 38.9 us, and a batch across the machine is 0.314 ms of
+// wall-clock per signature. That is 577x more signatures per second out of the same machine, and
+// none of it is a new Rust primitive — bignum.nt, ec.nt and p256.nt are untouched.
+// The batch is also SLOWER than ec.nt for a single signature: 739 ms against 180.9 ms, 4.1x worse,
+// because the lane machinery below is all overhead when there is one lane to amortise it over. The
+// crossover is at about four signatures. A caller with one signature should call ecdsaVerifyP256.
+//
+// ---- why this is not the batch verification the literature means, and why that is not a choice
+// The batch verification of the textbooks — Naccache–M'Raïhi–Vaudenay–Raphaeli, Bellare–Garay–Rabin
+// — checks N signatures with one multi-scalar multiplication: draw random coefficients a_i and test
+//   SUM_i a_i*(u1_i*G + u2_i*Q_i - R_i)  =  O
+// which is the point at infinity iff every term is, up to the chance that a forged set cancels,
+// which is 2^-k for k-bit coefficients. That is a genuinely different algorithm and it is worth
+// several-fold. IT IS NOT AVAILABLE FOR ECDSA, and not because of anything in this file.
+//
+// The sum above needs the POINT R_i. An ECDSA signature does not carry it: it carries
+// r = x(R) mod n and nothing else. Lifting r back to a point costs a square root mod p — one
+// exponentiation to (p+1)/4, about 384 modular multiplications, 8% of a verification, affordable —
+// and then hands you the PAIR (x, ±y), because a square root has two. The sign is not recoverable
+// from the signature, and not merely "not implemented here": (r,s) and (r,n-s) are BOTH valid
+// signatures of the same message under the same key, because negating s negates u1 and u2 and so
+// negates R, and x(-R) = x(R) = r. The two differ by exactly the sign that is wanted. So there is
+// no function of (key, digest, r, s) that returns it, a batch of N has 2^N sign assignments, and a
+// wrong guess makes a batch of honest signatures fail. Picking "even y" by convention would reject
+// about half of all valid signatures. That is why every published ECDSA batch-verification
+// algorithm — Cheon–Yi, Karati–Das — is stated for ECDSA* / ECDSA', the variant that transmits R
+// instead of r; secp256k1's recovery byte is the same missing bit. Certificates and TLS carry
+// plain ECDSA, so this file verifies plain ECDSA.
+//
+// Two consequences, both good, and both the opposite of what a randomised batch gives you:
+//   * THERE IS NO SOUNDNESS ERROR. A randomised batch accepts a bad set with probability 2^-k and
+//     needs its coefficients from `urand` rather than `rand` precisely because an attacker who can
+//     predict them can build a set that cancels. Nothing below is randomised, so there is nothing
+//     to predict and no 2^-k to argue about: each lane is decided by its own equation over its own
+//     key and its own digest, and a lane that is wrong is wrong on its own.
+//   * A FAILING BATCH SAYS WHICH ONE. A randomised batch returns one bit and a caller then has to
+//     bisect or fall back to verifying individually; batchVerifyP256Bad returns the indices
+//     outright, for the same price as the yes/no, because the per-lane answers were computed anyway.
+// What was traded for that is the multi-scalar multiplication's saving, which is real: a Pippenger
+// bucket sum over the 2N+1 points would cut the ~4900 modular multiplications a verification costs
+// here to roughly 900. It is the single biggest thing left on the table, and it is behind one bit
+// that the wire format does not have.
+//
+// ---- what it does instead: the array language, not the group theory
+// The saving below is not in the number of modular multiplications — ec.nt pays about 4960 per
+// verification (256 doublings at 8, ~192 mixed additions at 11, two Fermat inversions at ~800) and
+// this pays about 4870 (256 doublings, 256 mixed additions because every lane adds at every step,
+// and almost nothing for the inversion) — it is in what one of them costs. bnMontMul on 10 limbs of 26 bits is
+// a dozen interpreted operations on ten-element vectors, and a ten-element vector operation is
+// almost entirely dispatch: measured here, `c + a*b` costs 275 ns at length 10 and 7.2 us at length
+// 5120, which is 27.5 ns per element against 1.41. So the batch is laid out LANE-MAJOR: a field
+// element for the whole batch is `limbs` int vectors, one per 26-bit limb, each holding that limb
+// of every signature. Every operation then runs the same schoolbook it always ran, on vectors N
+// times longer, and the dispatch is amortised over N signatures instead of paid per signature:
+//   bnMontMul, one signature at a time                        25.0 us
+//   bfMul, per signature, at 16 / 256 / 512 / 1024 lanes   7.45 / 0.95 / 0.651 / 0.501 us
+// 38x at 512 lanes, and that ratio is the whole of the table above. Nothing here is SIMD in the
+// hardware sense and nothing was written in Rust; it is the same interpreter running the same
+// primitives over longer vectors.
+//
+// Two things really are batch ALGORITHMS, and they are the ones an array language can hold:
+//   * ONE MODULAR INVERSION FOR THE WHOLE BATCH (Montgomery's trick, bfInvAll). Each verification
+//     needs s^-1 mod n, which ec.nt pays for with a Fermat exponentiation — about 415 modular
+//     multiplications, and transliterated that would be 415 FULL-WIDTH batched multiplications, 9%
+//     of the ladder, for something a batch need not pay per signature at all. Instead the lanes are
+//     multiplied together up a binary tree (N/2 lanes, then N/4, ...), the one product at the root
+//     is inverted once, and the inverse is pushed back down. About three full-width multiplications
+//     plus one scalar inversion for the whole batch, and the tree is lane-halving, which is an
+//     index operation here, not a copy.
+//   * NO INVERSION MOD p AT ALL. ec.nt finishes by inverting Z to get the affine x, reducing it mod
+//     n and comparing to r. This compares projectively instead: X = r*Z^2 mod p, or X = (r+n)*Z^2
+//     when r+n is still below p. Those are exactly the two solutions of x mod n = r in [0,p),
+//     because n < p < 2n on this curve, which is the case ec.nt's header warns is easy to get wrong
+//     — it is handled here rather than skipped, and it costs three multiplications instead of an
+//     inversion. tests/batch.nt asserts it on tests/data/p256-rx-ge-n.py's vectors.
+//
+// ---- the security argument
+// Every check ec.nt makes, this makes, and a lane that fails one never reaches the arithmetic:
+// bqLane refuses an r or s outside [1,n-1], a digest that is not 32 octets, and a public key that
+// is not an on-curve uncompressed point with both coordinates below p — by calling ec.nt's own
+// ecPoint, so there is one copy of that check in the tree. A refused lane is answered 0b and filled
+// with a stand-in (r = s = e = 1, Q = G) so that the lanes around it still step together; the
+// stand-in cannot change any other lane's answer, because no lane's arithmetic reads another lane.
+// The ladder is Shamir's trick, ec.nt's, transliterated: 256 doublings and a mixed addition per
+// step, over the same three-entry table (G, Q, G+Q). Two places need lane care and get it:
+//   * dbl-2001-b needs no special case for the point at infinity — with Z = 0 it returns Z3 = 0 —
+//     so bpDbl is uniform and ec.nt's `if` is an optimisation this file does not need.
+//   * madd-2007-bl has two degenerate cases. A running total that is still the point at infinity is
+//     selected past, lane by lane, and so is a step with nothing to add; the case it CANNOT compute
+//     is equal points, where the formula divides by zero. bpMAdd returns a mask of the lanes that
+//     hit it and bqVerify answers those with ecdsaVerify — ec.nt's own scalar verifier — rather
+//     than with a number it computed wrongly. For honest signatures that mask is empty (it needs
+//     the running total to land exactly on a table entry mid-ladder); for hostile ones the fallback
+//     is what makes it not matter.
+// Verification only, no signing, and NOTHING HERE IS CONSTANT-TIME — same as ec.nt, and for the
+// same reason: every input a verifier sees is public. The lane layout makes that more visible, not
+// less: the table lookup below is an index, so which entry a lane takes is a memory access pattern.
+// There is no secret for it to leak.
+//
+// ---- the traps in the arithmetic, which are the same ones bignum.nt is written against
+// A limb is 26 bits, so a product is < 2^52 and a column of `limbs` of them is < 2^55.4; the REDC
+// loop adds at most another `limbs` products to a column, so a column stays under 2^56.4 and an
+// exact i64 column has 2^62. bfMul masks T[i] to 26 bits before multiplying by np, which is the
+// same m mod 2^26 the scalar code computes but without the intermediate that overflows. Every value
+// below is fully reduced into [0,p) so that a limbwise comparison is a value comparison — bfIsZero
+// and bfEq depend on it, and dropping the conditional subtraction after a multiplication would buy
+// about 13% and cost that.
+
+// ---- lane-major values -------------------------------------------------------------------------
+// A batched value is `limbs` int vectors: column j holds limb j of every lane, so lane l's number is
+// {col[l]} each cols and an operation on all the lanes' limb j is one vector operation. Everything
+// below carries its modulus in a context record with bignum.nt's names — `p the modulus in limbs,
+// `np its -N^-1 mod 2^26, `r2 R^2 mod N and `one R mod N — so the same arithmetic runs mod p for
+// the curve and mod n for the scalars. P256C is already such a record; bfCtx builds the one for n.
+bfCtx: {[M]
+  np: bnMontInv M[0]
+  r2: bnMod[((2*count M)#0), 1; M]
+  `p`np`r2`one!(M; np; r2; bnMontMul[,1; r2; M; np])}
+
+bfLanes: {[A] count A[0]}
+bfLift:  {[C;xs] nl: count C`p; + {bnPad[x;nl]} each xs}     // a list of limb lists -> the columns
+bfLane:  {[A;i] bnTrim {x[i]} each A}                        // and one lane back out
+bfCast:  {[C;v;n] nl: count C`p; {[w;k] n#w[k]}[bnPad[v;nl]] each til nl}   // one value in n lanes
+bfPick:  {[A;idx] {[ix;col] col[ix]}[idx] each A}            // the lanes idx names, in that order
+bfCat:   {[A;B] {[u;v] u,v}'[A;B]}                           // A's lanes then B's
+
+// ---- lane-major modular arithmetic -------------------------------------------------------------
+// Every value is fully reduced into [0,N): bfIsZero and bfEq compare limbs, and that is only a
+// comparison of values when the representation is canonical. Leaving a multiplication's result
+// unreduced (it is below 2N, and below 4N the next multiplication would still be exact) would save
+// about 13% and cost exactly that.
+//
+// One carry pass, low column to high, each limb down to 26 bits. The columns may hold anything an
+// i64 can: bfMul's are under 2^56.4. Unlike bnCarry this does not iterate — one pass over columns
+// that carry a scalar upward settles it, because the carry out of a column is at most 2^38 and the
+// column above has 2^62 of room.
+bfCarryCols: {[T]
+  k: count T; c: 0; i: 0
+  while[i<k; t: T[i]+c; T[i]: t band BNM; c: t shr BNB; i+:1]
+  T,,c}
+
+// One conditional subtraction of the modulus: R is nl carried columns plus a 0/1 top column, and
+// the value is below 2N. The borrow chain runs to the end whatever the lanes hold — t band BNM is
+// the right limb for a negative t too, two's complement being what band reads — and then the sign
+// of the last borrow against the top column picks, per lane, between R and R-N.
+bfCondSub: {[C;R;top]
+  nl: count C`p; P: C`p
+  D: R
+  b: 0; j: 0
+  while[j<nl; t: (R[j]-P[j])-b; D[j]: t band BNM; b: `int$ t<0; j+:1]
+  s: `int$ not (top-b) < 0
+  j: 0
+  while[j<nl; R[j]: R[j] + s*D[j]-R[j]; j+:1]
+  R}
+
+bfAdd: {[C;A;B]
+  nl: count C`p
+  T: A; c: 0; j: 0
+  while[j<nl; t: (A[j]+B[j])+c; T[j]: t band BNM; c: t shr BNB; j+:1]
+  bfCondSub[C;T;c]}
+
+// A-B: the borrow chain leaves (A-B) mod 2^(26*nl) in D and a borrow of 1 when A < B. Adding N back
+// in exactly those lanes is right because the addition carries out past 2^(26*nl) again, and the
+// carry out is what is dropped: (A-B+2^(26*nl)) + N is A-B+N below that modulus.
+bfSub: {[C;A;B]
+  nl: count C`p; P: C`p
+  D: A; b: 0; j: 0
+  while[j<nl; t: (A[j]-B[j])-b; D[j]: t band BNM; b: `int$ t<0; j+:1]
+  c: 0; j: 0
+  while[j<nl; t: (D[j] + b*P[j])+c; D[j]: t band BNM; c: t shr BNB; j+:1]
+  D}
+
+// A*B*R^-1 mod N, lane by lane: bnMontMul's schoolbook and REDC, one vector operation per pair of
+// limbs instead of one per limb. A column takes nl products under 2^52 from the multiply and at most
+// nl more from the reduction, so it stays under 2^56.4 and an exact i64 column has 2^62. The mask
+// before np is what bnMontMul leaves to i64 wrap-around: only m mod 2^26 matters, and masking T[i]
+// first keeps the product under 2^52 instead of over 2^81.
+bfMul: {[C;A;B]
+  nl: count C`p; P: C`p; np: C`np
+  T: ((2*nl)+1)#,0*A[0]
+  i: 0
+  while[i<nl
+    a: A[i]; j: 0
+    while[j<nl; T[i+j]: T[i+j] + a*B[j]; j+:1]
+    i+:1]
+  i: 0
+  while[i<nl
+    m: BNM band np * BNM band T[i]
+    j: 0
+    while[j<nl; T[i+j]: T[i+j] + m*P[j]; j+:1]
+    T[i+1]: T[i+1] + T[i] shr BNB
+    i+:1]
+  R: bfCarryCols (nl+1) # nl _ T
+  bfCondSub[C; nl#R; R[nl]]}
+
+bfSqr: {[C;A] bfMul[C;A;A]}
+
+// 1 in the lanes where the value is zero, 0 elsewhere. Every value here is fully reduced, so a
+// zero value is all-zero limbs and a limb comparison is a value comparison.
+bfIsZero: {[A]
+  s: A[0]; j: 1; nl: count A
+  while[j<nl; s: s + A[j]; j+:1]
+  `int$ s=0}
+bfEq: {[A;B]
+  e: `int$ A[0]=B[0]; j: 1; nl: count A
+  while[j<nl; e: e * `int$ A[j]=B[j]; j+:1]
+  e}
+// per lane: s -> A, else B
+bfSel: {[s;A;B] {[m;a;b] b + m*a-b}[s]'[A;B]}
+
+// ---- one modular inversion for the whole batch -------------------------------------------------
+// Montgomery's trick as a binary product tree. Lanes are multiplied pairwise up the tree — N/2
+// lanes, then N/4, down to one — the single product at the root is inverted once with bignum.nt's
+// Fermat exponentiation, and the inverse is pushed back down, each level's inverse times the other
+// half giving this half's. About three full-width batched multiplications and one scalar inversion
+// for the whole batch, against one 415-multiplication exponentiation per signature; and halving a
+// lane vector is an index, not a copy. The lanes are padded up to a power of two with 1, which
+// inverts to 1 and cannot disturb anything. EVERY LANE MUST BE NONZERO: bqPrep has already refused
+// s = 0 and filled that lane with 1.
+bfInvAll: {[C;A]
+  n0: bfLanes A
+  k: 1
+  while[k<n0; k: 2*k]
+  if[k>n0; A: bfCat[A; bfCast[C; C`one; k-n0]]]
+  levels: ,A
+  cur: A
+  while[1 < bfLanes cur
+    h: (bfLanes cur) div 2
+    cur: bfMul[C; bfPick[cur; til h]; bfPick[cur; h+til h]]
+    levels,: ,cur]
+  tot: bnMontMul[bfLane[cur;0]; ,1; C`p; C`np]
+  iv: bnMontMul[bnModExpL[tot; bnSub[C`p; ,2]; C`p]; C`r2; C`p; C`np]
+  inv: bfLift[C; ,iv]
+  i: (count levels) - 2
+  while[not i<0
+    cur: levels[i]
+    h: (bfLanes cur) div 2
+    inv: bfCat[bfMul[C; inv; bfPick[cur; h+til h]]; bfMul[C; inv; bfPick[cur; til h]]]
+    i: i-1]
+  bfPick[inv; til n0]}
+
+// ---- the group, one lane per signature ---------------------------------------------------------
+bp3Sel: {[s;A;B] {[m;a;b] bfSel[m;a;b]}[s]'[A;B]}
+
+bpDbl: {[C;R]
+  d: bfSqr[C;R[2]]
+  g: bfSqr[C;R[1]]
+  bt: bfMul[C;R[0];g]
+  al: bfMul[C; bfSub[C;R[0];d]; bfAdd[C;R[0];d]]
+  al: bfAdd[C; al; bfAdd[C;al;al]]
+  b4: bfAdd[C;bt;bt]; b4: bfAdd[C;b4;b4]
+  x3: bfSub[C; bfSqr[C;al]; bfAdd[C;b4;b4]]
+  z3: bfSub[C; bfSub[C; bfSqr[C; bfAdd[C;R[1];R[2]]]; g]; d]
+  g8: bfSqr[C;g]; g8: bfAdd[C;g8;g8]; g8: bfAdd[C;g8;g8]; g8: bfAdd[C;g8;g8]
+  y3: bfSub[C; bfMul[C; al; bfSub[C;b4;x3]]; g8]
+  (x3;y3;z3)}
+
+// Jacobian R plus affine (Ax;Ay), in the lanes where dd is 1. Returns the point and the mask of
+// lanes that hit the equal-points case madd-2007-bl cannot compute: see the header.
+bpMAdd: {[C;R;Ax;Ay;dd]
+  nn: bfLanes Ax
+  one: bfCast[C; C`one; nn]
+  zer: bfCast[C; BNZERO; nn]
+  zz: bfSqr[C;R[2]]
+  u2: bfMul[C;Ax;zz]
+  s2: bfMul[C;Ay; bfMul[C;R[2];zz]]
+  h:  bfSub[C;u2;R[0]]
+  rr: bfSub[C;s2;R[1]]
+  zinf: bfIsZero R[2]
+  hz: bfIsZero h
+  rz: bfIsZero rr
+  r2v: bfAdd[C;rr;rr]
+  hh: bfSqr[C;h]
+  ii: bfAdd[C;hh;hh]; ii: bfAdd[C;ii;ii]
+  jj: bfMul[C;h;ii]
+  vv: bfMul[C;R[0];ii]
+  x3: bfSub[C; bfSub[C; bfSqr[C;r2v]; jj]; bfAdd[C;vv;vv]]
+  tt: bfMul[C;R[1];jj]
+  y3: bfSub[C; bfMul[C;r2v; bfSub[C;vv;x3]]; bfAdd[C;tt;tt]]
+  z3: bfSub[C; bfSub[C; bfSqr[C; bfAdd[C;R[2];h]]; zz]; hh]
+  O: (x3;y3;z3)
+  O: bp3Sel[hz; (one;one;zer); O]
+  O: bp3Sel[zinf; (Ax;Ay;one); O]
+  O: bp3Sel[dd; O; R]
+  (O; dd * hz * rz * 1-zinf)}
+
+// ---- Shamir's trick, every lane stepping together ----------------------------------------------
+// The three-entry table is laid out flat, entry-fastest, so the table lookup for a whole batch is
+// one index per limb instead of a per-lane branch: lane l's entry j sits at 3*l+j.
+bpFlat: {[U;V;W]
+  nn: count U[0]
+  i0: 3*til nn
+  nl: count U
+  F: nl#,0
+  k: 0
+  while[k<nl
+    f: (3*nn)#0
+    f[i0]: U[k]; f[i0+1]: V[k]; f[i0+2]: W[k]
+    F[k]: f
+    k+:1]
+  F}
+bpGather: {[F;idx] {[ix;col] col[ix]}[idx] each F}
+
+// b1 and b2 are `bits` lane vectors of 0/1, most significant first. t3inf marks the lanes whose
+// G+Q is the point at infinity, which is an addition to skip rather than an addition to make.
+bpShamir: {[C;b1;b2;T1;T2;T3;t3inf]
+  nn: bfLanes T1[0]
+  FX: bpFlat[T1[0];T2[0];T3[0]]
+  FY: bpFlat[T1[1];T2[1];T3[1]]
+  b0: 3*til nn
+  R: (bfCast[C; C`one; nn]; bfCast[C; C`one; nn]; bfCast[C; BNZERO; nn])
+  deg: nn#0
+  i: 0; nb: count b1
+  while[i<nb
+    R: bpDbl[C;R]
+    jj: b1[i] + 2*b2[i]
+    jp: `int$ jj>0
+    dd: jp * 1 - t3inf * `int$ jj=3
+    idx: b0 + jj - jp
+    md: bpMAdd[C; R; bpGather[FX;idx]; bpGather[FY;idx]; dd]
+    R: md[0]
+    deg: deg | md[1]
+    i+:1]
+  (R;deg)}
+
+// ---- the batch verifier ------------------------------------------------------------------------
+// bit i of every lane at once, least significant first, off lane-major limbs
+bfBit: {[U;i] 1 band U[i div BNB] shr i mod BNB}
+
+// The per-signature checks that are decisions rather than arithmetic: r and s in [1,n-1], the
+// digest the right length, the public key an on-curve uncompressed point with both coordinates
+// below p — ec.nt's own ecPoint, so there is one copy of that check in the tree. () is no, for
+// every reason, exactly as ec.nt's ecVerify answers 0b for every reason. One list argument because
+// `@` below applies it to one, and `@` is here for the same belt-and-braces ec.nt wraps its own
+// exports in: bignum.nt signals on an operand wider than it can multiply exactly, and a signature
+// does not get to turn that into an exception the caller has to catch.
+bqLane: {[a]
+  C: a[0]; k: a[1]; dg: a[2]; sg: a[3]
+  if[not (C`dgst) = count dg; :()]
+  rv: bnFromBytes sg[0]
+  sd: bnFromBytes sg[1]
+  if[bnIsZero rv; :()]
+  if[bnIsZero sd; :()]
+  if[not 0 > bnCmp[rv; C`n]; :()]
+  if[not 0 > bnCmp[sd; C`n]; :()]
+  Q: ecPoint[C; k]
+  if[0 = count Q; :()]
+  (rv; sd; bnMod[bnFromBytes dg; C`n]; Q[0]; Q[1])}
+
+// A lane that bqLane refused is answered 0b without the batch ever seeing it, and is filled with a
+// well-formed stand-in — r = s = e = 1 and Q = G — so that the lanes around it still step
+// together. The stand-in cannot change any other lane's answer: no lane's arithmetic reads another
+// lane, and its own answer was already decided here.
+bqPrep: {[C;keys;digests;sigs]
+  nn: count sigs
+  ok: nn#0; rl: (); sl: (); el: (); qx: (); qy: ()
+  i: 0
+  while[i<nn
+    v: @[bqLane; (C; keys[i]; digests[i]; sigs[i]); {()}]
+    good: 0 < count v
+    ok[i]: `int$ good
+    if[not good; v: (,1; ,1; ,1; C`gx; C`gy)]
+    rl,: ,(v[0])
+    sl,: ,(v[1])
+    el,: ,(v[2])
+    qx,: ,(v[3])
+    qy,: ,(v[4])
+    i+:1]
+  `ok`r`s`e`qx`qy!(ok;rl;sl;el;qx;qy)}
+
+// r as a field element, and r+n when that is still below p: x mod n = r has exactly these two
+// solutions in [0,p), because n < p < 2n on both NIST curves here. Checking X against r*Z^2 and
+// (r+n)*Z^2 is what lets the batch finish with no inversion mod p at all.
+bqTargets: {[C;rs]
+  a: {[C;v] efTo[C; v]}[C] each rs
+  hi: {[C;v] w: bnAdd[v; C`n]; $[0 > bnCmp[w; C`p]; efTo[C;w]; BNZERO]}[C] each rs
+  m: `int$ {[C;v] 0 > bnCmp[bnAdd[v; C`n]; C`p]}[C] each rs
+  (a; hi; m)}
+
+// G+Q per lane, affine, plus the mask of lanes where it is the point at infinity (Q = -G). The one
+// inversion this needs is the batch one. G+G is the other degenerate case: 2G is a constant.
+bqTable: {[C;T1;T2]
+  nn: bfLanes T1[0]
+  one: bfCast[C; C`one; nn]
+  md: bpMAdd[C; (T1[0];T1[1];one); T2[0]; T2[1]; nn#1]
+  J: md[0]
+  zinf: bfIsZero J[2]
+  Zs: bfSel[zinf; one; J[2]]
+  zi: bfInvAll[C; Zs]
+  z2: bfSqr[C;zi]
+  ax: bfMul[C; J[0]; z2]
+  ay: bfMul[C; J[1]; bfMul[C;z2;zi]]
+  dg: ecToAffine[C; ecDbl[C; (C`gx; C`gy; C`one)]]
+  ax: bfSel[md[1]; bfCast[C; dg[0]; nn]; ax]
+  ay: bfSel[md[1]; bfCast[C; dg[1]; nn]; ay]
+  ((ax;ay); zinf * 1 - md[1])}
+
+// The whole batch, as one answer per signature. The order is: the per-signature refusals, then the
+// scalars (one inversion mod n for the batch, then u1 = e*w and u2 = r*w and their bits), then the
+// table, then the ladder, then the projective comparison — and finally the handful of lanes, if
+// any, that the mixed addition could not compute, answered by ec.nt's scalar verifier.
+bqVerify: {[C;keys;digests;sigs]
+  nn: count sigs
+  if[nn=0; :()]
+  pp: bqPrep[C;keys;digests;sigs]
+  Cn: bfCtx C`n
+  r2n: bfCast[Cn; Cn`r2; nn]
+  onen: bfCast[Cn; ,1; nn]
+  Sm: bfMul[Cn; bfLift[Cn; pp`s]; r2n]
+  W: bfInvAll[Cn; Sm]
+  U1: bfMul[Cn; bfMul[Cn; bfMul[Cn; bfLift[Cn; pp`e]; r2n]; W]; onen]
+  U2: bfMul[Cn; bfMul[Cn; bfMul[Cn; bfLift[Cn; pp`r]; r2n]; W]; onen]
+  nb: C`bits
+  b1: {[U;i] bfBit[U;i]}[U1] each reverse til nb
+  b2: {[U;i] bfBit[U;i]}[U2] each reverse til nb
+  T1: (bfCast[C; C`gx; nn]; bfCast[C; C`gy; nn])
+  T2: (bfLift[C; pp`qx]; bfLift[C; pp`qy])
+  t3: bqTable[C; T1; T2]
+  sh: bpShamir[C; b1; b2; T1; T2; t3[0]; t3[1]]
+  R: sh[0]
+  tg: bqTargets[C; pp`r]
+  Z2: bfSqr[C; R[2]]
+  c1: bfEq[R[0]; bfMul[C; bfLift[C; tg[0]]; Z2]]
+  c2: (tg[2]) * bfEq[R[0]; bfMul[C; bfLift[C; tg[1]]; Z2]]
+  res: (pp`ok) * (1 - bfIsZero R[2]) * c1 | c2
+  // a lane that hit the equal-points case is answered by ec.nt's own verifier instead
+  bad: where 0 < sh[1]
+  i: 0
+  while[i < count bad
+    k: bad[i]
+    res[k]: `int$ ecdsaVerify[C; keys[k]; digests[k]; sigs[k][0]; sigs[k][1]]
+    i+:1]
+  res}
+
+// ---- the exports -------------------------------------------------------------------------------
+// A DER signature that does not parse is a lane answered 0b, exactly as ecdsaVerifyP256Der answers
+// it: the zero r below fails bqLane's range check and nothing about it reaches the arithmetic.
+bqDerSplit: {[sigs] {[d] rs: @[ecSigRS; d; {()}]; $[2 = count rs; rs; (0x00;0x00)]} each sigs}
+
+batchVerifyP256:    {[keys;digests;sigs] all 0 < bqVerify[P256C;keys;digests;sigs]}
+batchVerifyP256Who: {[keys;digests;sigs] 0 < bqVerify[P256C;keys;digests;sigs]}
+batchVerifyP256Bad: {[keys;digests;sigs] where 0 = bqVerify[P256C;keys;digests;sigs]}
+batchVerifyP256Der:    {[keys;digests;sigs] batchVerifyP256[keys;digests; bqDerSplit sigs]}
+batchVerifyP256DerWho: {[keys;digests;sigs] batchVerifyP256Who[keys;digests; bqDerSplit sigs]}
+
+// ---- across cores ------------------------------------------------------------------------------
+// One OS thread per chunk, each with its own batch. `Value` is Arc-refcounted and copy-on-write, so
+// the lanes cross the thread boundary with no copy and no lock, and the chunks are disjoint, so
+// there is nothing for `shared` to be needed on.
+//
+// THE ONE THING THAT IS SHARED, AND IT COSTS 2.7x. A spawned thread forks a snapshot of the
+// caller's globals, and a global holding a function holds an `Arc<FnCode>` — the same FnCode object
+// in every thread. FnCode carries the tracing JIT's per-loop-header state behind a `Mutex`
+// (src/value.rs, `loop_action`), and the interpreter takes that mutex on EVERY backward jump. The
+// loops below run hundreds of millions of backward jumps, so twenty threads running the same hot
+// loop queue on one lock. Measured on this machine, a batch of 64 across 20 threads:
+//   the forked snapshot, one shared FnCode      224 verify/s    3.6x over one thread
+//   each thread re-`load`s this file first      611 verify/s   10.9x over one thread
+// so the spawned body re-loads the module, which gives that thread its own FnCode objects and
+// nothing to queue on. BATCHNT is where it is loaded from; a caller running from somewhere other
+// than the repository root sets it. A load that fails is not fatal — the batch is still correct,
+// it is only back to sharing the lock — which is why it goes through `@`.
+// The fix that would make this unnecessary is in the VM rather than here: the two states that
+// matter on a hot loop, `Compiled` and `Rejected`, are write-once, so they could be read without
+// taking the mutex at all. That file belongs to the JIT work, not to this one.
+BATCHNT: "src/neant/crypto/batch.nt"
+
+// Threads cost lanes, too: a batch split k ways has k times fewer lanes per vector operation, and
+// the dispatch is amortised over those lanes, so splitting ONE batch k ways is worth far less than
+// k. Measured on the 512-signature corpus: 2512 ms in one thread, 1818 ms split four ways (1.38x),
+// 1967 ms split twenty (1.29x) — four threads beat twenty. This entry point is for a caller who has
+// one batch and wants it sooner; twenty INDEPENDENT batches is the shape that scales, and that is
+// the twenty-thread column in the header's table.
+batchVerifyP256Par: {[keys;digests;sigs;nthr]
+  nn: count sigs
+  if[nn=0; :0#1b]
+  per: 1 | ceiling (0.0+nn) % 1 | nthr
+  parts: `int$ per cut til nn
+  hs: {[keys;digests;sigs;ix]
+    spawn {@[load; BATCHNT; {0}]; batchVerifyP256Who[keys[ix]; digests[ix]; sigs[ix]]}}[keys;digests;sigs] each parts
+  raze {join x} each hs}

@@ -1,0 +1,171 @@
+// src/neant/net/http.nt — the client, the server, and the framing between them.
+// Everything here runs against a socket this file opens: no test reaches the network, and none
+// needs TLS, because the transport is a triple of functions and a plain socket exercises the same
+// code an https:// URL does. tests/data/live-http.nt is the one that does go out.
+tsection "http"
+load "src/neant/net/http.nt"
+
+teq["urlParse full"; urlParse "https://host:8443/a/b?x=1"; `scheme`host`port`target!("https";"host";8443;"/a/b?x=1")]
+teq["urlParse bare host"; urlParse "example.com"; `scheme`host`port`target!("http";"example.com";80;"/")]
+teq["urlParse default https port"; (urlParse "https://example.com")`port; 443]
+teq["urlParse drops userinfo"; (urlParse "http://u:p@example.com/x")`host; "example.com"]
+terrLike["urlParse needs a host"; {[] urlParse "http:///x"}; "http: no host"]
+
+teq["httpFind hit"; httpFind[`byte$"hello world"; `byte$"wor"]; 6]
+teq["httpFind miss"; httpFind[`byte$"hello"; `byte$"zz"]; -1]
+teq["httpHex"; httpHex "1a"; 26]
+teq["httpHex trims"; httpHex " ff "; 255]
+terrLike["httpHex rejects junk"; {[] httpHex "1g"}; "http: bad chunk size"]
+
+teq["httpAbs host-relative"; httpAbs["https://a.com/x/y?q=1"; "/z"]; "https://a.com/z"]
+teq["httpAbs path-relative"; httpAbs["https://a.com/x/y"; "w"]; "https://a.com/x/w"]
+teq["httpAbs absolute"; httpAbs["https://a.com/x/y"; "http://b.com/"]; "http://b.com/"]
+teq["httpAbs keeps a nonstandard port"; httpAbs["http://a.com:8080/x"; "/z"]; "http://a.com:8080/z"]
+
+// ---- against a real socket.  httpRaw answers one request with a fixed byte string, so a response
+// this client has to parse can be written out exactly as it goes on the wire.
+// a fixed base would collide with a leftover listener from an interrupted run, and src/prims.rs has
+// no way to ask a listener which port it got, so the base is randomised instead
+httpPort: 18000+first 1 rand 40000
+httpNext: {[] httpPort:: httpPort+1; "127.0.0.1:",string httpPort}
+httpRaw: {[addr;resp] l: hlisten addr; spawn {c: accept l; hrecv[c;65536]; hsend[c;resp]; hclose c; hclose l; 0}}
+httpOne: {[resp] a: httpNext[]; h: httpRaw[a;resp]; r: httpFetch["http://",a,"/"; "GET"; ()!(); ""]; join h; r}
+
+hr: httpOne "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n4\r\nWiki\r\n6;n=v\r\npedia \r\n0\r\n\r\n"
+teq["chunked, with a chunk extension"; `char$hr`body; "Wikipedia "]
+teq["chunked status"; hr`status; 200]
+
+hr: httpOne "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nfirst\r\n0\r\nX-Checksum: 7\r\nX-More: 8\r\n\r\n"
+teq["chunked with trailer fields"; `char$hr`body; "first"]
+
+hr: httpOne "HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nhello"
+teq["content-length body"; `char$hr`body; "hello"]
+teq["reason phrase"; hr`reason; "OK"]
+
+hr: httpOne "HTTP/1.1 200 OK\r\nConnection: close\r\n\r\nno length here"
+teq["close-delimited body"; `char$hr`body; "no length here"]
+
+hr: httpOne "HTTP/1.1 204 No Content\r\nContent-Length: 5\r\n\r\n"
+teq["204 never has a body"; count hr`body; 0]
+hr: httpOne "HTTP/1.1 304 Not Modified\r\nContent-Length: 5\r\n\r\n"
+teq["304 never has a body"; count hr`body; 0]
+
+// the response is built as bytes, because that is the point: 0xff is not valid UTF-8, so a client
+// that decoded bodies as text would hand back a replacement character instead of the byte
+hr: httpOne (`byte$"HTTP/1.1 200 OK\r\nContent-Length: 3\r\n\r\n"),0x00ff41
+teq["a body is bytes, not text"; hr`body; 0x00ff41]
+
+hr: httpOne "HTTP/1.1 500 Internal Server Error\r\nContent-Length: 0\r\n\r\n"
+teq["multi-word reason"; hr`reason; "Internal Server Error"]
+
+terrLike["a closed connection is an error, not an empty response"; {[] httpOne "HTTP/1.1 200 OK\r\n"}; "http: connection closed before the response headers"]
+
+// ---- redirects
+httpRedir: {[n]
+  a: httpNext[]
+  l: hlisten a
+  h: spawn {i: 0; while[i<n; c: accept l; hrecv[c;65536]; hsend[c; "HTTP/1.1 302 Found\r\nLocation: /hop",(string i),"\r\nContent-Length: 0\r\n\r\n"]; hclose c; i+:1]
+    c: accept l; q: hrecv[c;65536]; hsend[c; "HTTP/1.1 200 OK\r\nContent-Length: 4\r\n\r\ndone"]; hclose c; hclose l; `char$q}
+  (a; h)}
+rd: httpRedir 2
+r: httpGet "http://",(rd 0),"/start"
+teq["httpGet follows redirects"; `char$r`body; "done"]
+teq["and lands on the final target"; not 0=count (join rd 1) ss "GET /hop1 "; 1b]
+
+// httpFetch does the one exchange, so a one-response server is the whole of what it talks to
+hr: httpOne "HTTP/1.1 302 Found\r\nLocation: /elsewhere\r\nContent-Length: 0\r\n\r\n"
+teq["httpFetch does not follow"; hr`status; 302]
+teq["it hands the Location back instead"; (hr`headers)`location; "/elsewhere"]
+
+// ---- the server side, and a full round trip through both halves at once
+httpAddr: httpNext[]
+httpL: hlisten httpAddr
+httpS: spawn {c: accept httpL; q: httpRecv c; httpSend[c; 200; "OK"; (`$"content-type")!(,"text/plain"); "hi ",`char$q`body]; hclose c; q}
+httpR: httpFetch["http://",httpAddr,"/p%20q?a=1&b=2"; "POST"; (`$"content-type")!(,"text/plain"); "body!"]
+httpQ: join httpS
+hclose httpL
+teq["server: method"; httpQ`method; "POST"]
+teq["server: path is percent-decoded"; httpQ`path; "/p q"]
+teq["server: query is parsed"; httpQ`query; `a`b!(,"1";,"2")]
+teq["server: raw target is kept"; httpQ`target; "/p%20q?a=1&b=2"]
+teq["server: body"; `char$httpQ`body; "body!"]
+teq["server: the client sent a Host header"; (httpQ`headers)`host; httpAddr]
+teq["server: and a Content-Length"; `int$(httpQ`headers)`$"content-length"; 5]
+teq["client: status"; httpR`status; 200]
+teq["client: body"; `char$httpR`body; "hi body!"]
+teq["client: headers are keyed by lowercased symbol"; (httpR`headers)`$"content-type"; "text/plain"]
+
+// a chunked request body, decoded by the server half
+httpAddr: httpNext[]
+httpL: hlisten httpAddr
+httpS: spawn {c: accept httpL; q: httpRecv c; hclose c; hclose httpL; q}
+httpC: httpPlain hopen httpAddr
+(httpC 1)[`byte$"POST /x HTTP/1.1\r\nHost: h\r\nTransfer-Encoding: chunked\r\n\r\n3\r\nabc\r\n2\r\nde\r\n0\r\n\r\n"]
+httpQ: join httpS
+(httpC 2)[]
+teq["server dechunks a request body"; `char$httpQ`body; "abcde"]
+
+// ---- connection reuse: two exchanges, one connection
+httpAddr: httpNext[]
+httpL: hlisten httpAddr
+httpS: spawn {c: accept httpL; n: 0; while[n<2; q: httpRecv c; httpSend[c; 200; "OK"; (`$"content-length")!enlist 1; string n]; n+:1]; hclose c; hclose httpL; n}
+httpC: httpPlain hopen httpAddr
+httpU: urlParse "http://",httpAddr,"/"
+teq["reuse: first exchange"; `char$(httpExchange[httpC; httpU; "GET"; "/a"; ()!(); ""])`body; ,"0"]
+teq["reuse: second exchange on the same connection"; `char$(httpExchange[httpC; httpU; "GET"; "/b"; ()!(); ""])`body; ,"1"]
+teq["reuse: the server saw two requests"; join httpS; 2]
+(httpC 2)[]
+
+// ---- server keep-alive: several requests on one connection, and the ways it ends.
+// These serve ONE connection and then stop, rather than httpServe's endless accept loop, so the
+// listener is closed and the thread is joinable — a test that leaks a listener makes every later
+// run of this file fail on the port.
+httpKA: {[handler]
+  a: httpNext[]
+  l: hlisten a
+  h: spawn {c: httpConn accept l; n: httpServeConn[c;handler]; (c 2)[]; hclose l; n}
+  (a; h)}
+httpEcho: {[req] (200;"OK";()!();"got ",req`path)}
+
+ka: httpKA httpEcho
+httpC: httpPlain hopen ka 0
+httpU: urlParse "http://",(ka 0),"/"
+teq["keep-alive: request 1"; `char$(httpExchange[httpC; httpU; "GET"; "/a"; ()!(); ""])`body; "got /a"]
+teq["keep-alive: request 2 on the same connection"; `char$(httpExchange[httpC; httpU; "GET"; "/b"; ()!(); ""])`body; "got /b"]
+teq["keep-alive: request 3"; `char$(httpExchange[httpC; httpU; "GET"; "/c"; ()!(); ""])`body; "got /c"]
+teq["the server framed each reply with a Content-Length"; `int$((httpExchange[httpC; httpU; "GET"; "/dd"; ()!(); ""])`headers) HTTPCL; 7]
+(httpC 2)[]
+teq["the server loop ended when the client went away"; join ka 1; 0]
+
+// a body on one request must not be read as part of the next
+ka: httpKA {[req] (200;"OK";()!();(req`path),"=",`char$req`body)}
+httpC: httpPlain hopen ka 0
+httpU: urlParse "http://",(ka 0),"/"
+teq["a request body stays with its own request"; `char$(httpExchange[httpC; httpU; "POST"; "/p1"; ()!(); "one"])`body; "/p1=one"]
+teq["and the next request reads its own"; `char$(httpExchange[httpC; httpU; "POST"; "/p2"; ()!(); "twotwo"])`body; "/p2=twotwo"]
+(httpC 2)[]
+join ka 1
+
+// a request that asks to close gets the connection closed
+ka: httpKA httpEcho
+httpC: httpPlain hopen ka 0
+httpU: urlParse "http://",(ka 0),"/"
+teq["Connection: close is answered"; `char$(httpExchange[httpC; httpU; "GET"; "/x"; (,`connection)!(,"close"); ""])`body; "got /x"]
+teq["and then the connection really is closed"; 0=count (httpC 0)[]; 1b]
+(httpC 2)[]
+join ka 1
+
+// so does a handler that answers Connection: close
+ka: httpKA {[req] (200;"OK";(,`connection)!(,"close");"bye")}
+httpC: httpPlain hopen ka 0
+httpU: urlParse "http://",(ka 0),"/"
+teq["a handler can close the connection"; `char$(httpExchange[httpC; httpU; "GET"; "/y"; ()!(); ""])`body; "bye"]
+teq["and it is closed after that response"; 0=count (httpC 0)[]; 1b]
+(httpC 2)[]
+join ka 1
+
+// HTTP/1.0 closes unless it asks not to
+teq["1.1 keeps the connection"; httpKeep `version`headers!("HTTP/1.1"; ()!()); 1b]
+teq["1.1 closes when asked"; httpKeep `version`headers!("HTTP/1.1"; (,`connection)!(,"close")); 0b]
+teq["1.0 closes by default"; httpKeep `version`headers!("HTTP/1.0"; ()!()); 0b]
+teq["1.0 keeps when asked"; httpKeep `version`headers!("HTTP/1.0"; (,`connection)!(,"keep-alive")); 1b]

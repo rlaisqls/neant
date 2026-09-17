@@ -1,10 +1,191 @@
-// The limb layer under RSA: src/neant/crypto/bignum.nt — the two bignum tests that used to be in
-// mod rsa in src/main.rs. Neither needed Rust: every expected value came from python3, and a neant
-// expression compared against it reads the same here. bignum.nt is not in the boot image, so it is
-// loaded on demand, exactly as a program would. The verifier built on top of this is tests/rsa.nt.
+// src/neant/crypto/bignum.nt — the arbitrary-precision arithmetic, and in particular the scalar
+// limb kernels the whole-function JIT compiles (bnMulL, bnRedcL, bnMontFinL, bnMsubL, ...) against
+// the vector column forms they replaced. The crypto vectors in tests/crypto.nt, tests/p256.nt and
+// tests/verify.nt already pin exact answers on real certificates; what those cannot do is cover the
+// carry and borrow edges, because a handful of published signatures exercise a handful of shapes.
+// So the shape here is differential and random: thousands of operand pairs, every one checked
+// against an implementation that computes the same thing a different way.
+//
+// Two of those references are the originals, kept in bignum.nt for exactly this: bnMulV is the
+// vector `acc[i+til nb] +: a[i]*b` column product, bnMontMulV the REDC written the same way, and
+// bnCarryV the repeated-pass carry. The rest are checked by an identity instead — a quotient and a
+// remainder are checked by multiplying back, a subtraction by adding back — which is a stronger
+// statement than agreeing with another of my own loops.
+//
+// The JIT is what makes this worth doing twice over: bignum.nt warms its kernels at load, so every
+// case below runs compiled, and the interpreter only ever sees them if a kernel fails to compile.
+// tests/jit.nt is where the compiled-vs-interpreted comparison itself lives.
 tsection "bignum"
 load "src/neant/crypto/bignum.nt"
 
+rseed 20260917
+// a random value of up to k limbs, trimmed the way every bignum.nt result is
+bnrnd: {[k] bnTrim (1+first 1 rand k) rand BNBASE}
+// the same as a byte string, for the conversion round trip
+bnrndb: {[k] `byte$ (1+first 1 rand k) rand 256}
+
+// ---- multiply: the scalar kernel against the vector column form, over a wide spread of widths
+bnT1: 1b
+bnI: 0
+while[bnI<2000
+  bna: bnrnd 24
+  bnb: bnrnd 24
+  if[not (bnMul[bna;bnb]) ~ bnMulV[bna;bnb]; bnT1: 0b]
+  bnI: bnI+1]
+tok["bnMul: 2000 random pairs agree with the vector column form"; bnT1]
+
+// a*b = b*a, and a*(b+c) = a*b + a*c: independent of both implementations
+bnT2: 1b
+bnI: 0
+while[bnI<500
+  bna: bnrnd 12
+  bnb: bnrnd 12
+  bnc: bnrnd 12
+  if[not (bnMul[bna;bnb]) ~ bnMul[bnb;bna]; bnT2: 0b]
+  if[not (bnMul[bna;bnAdd[bnb;bnc]]) ~ bnAdd[bnMul[bna;bnb]; bnMul[bna;bnc]]; bnT2: 0b]
+  bnI: bnI+1]
+tok["bnMul: commutative and distributive over 500 triples"; bnT2]
+
+// ---- carry: the one-pass kernel against the repeated-pass form, on limbs far above the base
+bnT3: 1b
+bnI: 0
+while[bnI<500
+  bnv: (1+first 1 rand 20) rand 1000000000000000
+  if[not (bnTrim bnCarry bnv) ~ bnTrim bnCarryV bnv; bnT3: 0b]
+  bnI: bnI+1]
+tok["bnCarry: 500 uncarried vectors agree with the repeated-pass form"; bnT3]
+
+// ---- add, subtract, compare
+bnT4: 1b
+bnI: 0
+while[bnI<1000
+  bna: bnrnd 20
+  bnb: bnrnd 20
+  bns: bnAdd[bna;bnb]
+  if[not bna ~ bnSub[bns;bnb]; bnT4: 0b]                  // (a+b)-b = a
+  if[not bnb ~ bnSub[bns;bna]; bnT4: 0b]
+  if[not (bnCmp[bna;bnb]) = neg bnCmp[bnb;bna]; bnT4: 0b]
+  if[not 0 = bnCmp[bna;bna]; bnT4: 0b]
+  if[not 1 = bnCmp[bns;bna]; bnT4: 0b]                    // b is at least 1, so a+b > a
+  bnI: bnI+1]
+tok["bnAdd/bnSub/bnCmp: 1000 random pairs are consistent"; bnT4]
+teq["bnSub: going negative signals"; @[{[x] bnSub[(,1); 1 1]}; 0; {x}]; "bn: subtraction would go negative"]
+
+// ---- divide: u = q*v + r with r < v, which needs neither a reference nor a table
+bnT5: 1b
+bnI: 0
+while[bnI<1000
+  bnu: bnrnd 24
+  bnv: bnrnd 12
+  bnqr: bnDivMod[bnu;bnv]
+  if[not bnu ~ bnAdd[bnMul[bnqr[0]; bnv]; bnqr[1]]; bnT5: 0b]
+  if[not 0 > bnCmp[bnqr[1]; bnv]; bnT5: 0b]
+  bnI: bnI+1]
+tok["bnDivMod: 1000 random pairs satisfy u = q*v + r, r < v"; bnT5]
+// the shapes Knuth's D6 add-back exists for: a divisor whose top limbs are the largest possible,
+// which is what drives the estimated digit two too high
+bnT6: 1b
+bnI: 0
+while[bnI<300
+  bnv: bnTrim (BNM; BNM; first 1 rand BNBASE)
+  bnu: bnrnd 8
+  bnqr: bnDivMod[bnu;bnv]
+  if[not bnu ~ bnAdd[bnMul[bnqr[0]; bnv]; bnqr[1]]; bnT6: 0b]
+  if[not 0 > bnCmp[bnqr[1]; bnv]; bnT6: 0b]
+  bnI: bnI+1]
+tok["bnDivMod: 300 near-maximal divisors still satisfy it"; bnT6]
+teq["bnDivMod: dividing by zero signals"; @[{[x] bnDivMod[(,5); BNZERO]}; 0; {x}]; "bn: divide by zero"]
+
+// ---- Montgomery: the scalar reduction against the vector one, and against an ordinary modmul
+bnT7: 1b
+bnT8: 1b
+bnI: 0
+while[bnI<400
+  bnn: bnTrim (bnrnd 10) bor 1                            // odd, which REDC needs
+  if[1 < count bnn
+    bnnp: bnMontInv bnn[0]
+    bnr2: bnMod[((2*count bnn)#0),1; bnn]
+    bnx: bnMod[bnrnd 10; bnn]
+    bny: bnMod[bnrnd 10; bnn]
+    bnxm: bnMontMul[bnx;bnr2;bnn;bnnp]
+    bnym: bnMontMul[bny;bnr2;bnn;bnnp]
+    if[not (bnMontMul[bnxm;bnym;bnn;bnnp]) ~ bnMontMulV[bnxm;bnym;bnn;bnnp]; bnT7: 0b]
+    // out of Montgomery form it is just x*y mod n
+    bnp: bnMontMul[bnMontMul[bnxm;bnym;bnn;bnnp]; ,1; bnn; bnnp]
+    if[not bnp ~ bnMod[bnMul[bnx;bny]; bnn]; bnT8: 0b]]
+  bnI: bnI+1]
+tok["bnMontMul: 400 random moduli agree with the vector REDC"; bnT7]
+tok["bnMontMul: and with an ordinary multiply and reduce"; bnT8]
+
+// ---- modular add and subtract, against the add/compare/subtract they replaced
+bnT9: 1b
+bnI: 0
+while[bnI<1000
+  bnm: bnrnd 12
+  if[1 < bnBits bnm
+    bna: bnMod[bnrnd 12; bnm]
+    bnb: bnMod[bnrnd 12; bnm]
+    bnw: bnAdd[bna;bnb]
+    if[not (bnAddMod[bna;bnb;bnm]) ~ $[0 > bnCmp[bnw;bnm]; bnw; bnSub[bnw;bnm]]; bnT9: 0b]
+    if[not (bnSubMod[bna;bnb;bnm]) ~ $[0 > bnCmp[bna;bnb]; bnSub[bnAdd[bna;bnm];bnb]; bnSub[bna;bnb]]; bnT9: 0b]]
+  bnI: bnI+1]
+tok["bnAddMod/bnSubMod: 1000 random cases agree with add-compare-subtract"; bnT9]
+
+// ---- bytes in and out, including the widths where a limb straddles a byte boundary
+bnTA: 1b
+bnI: 0
+while[bnI<1000
+  bnbb: bnrndb 40
+  bnv: bnFromBytes bnbb
+  // bnBytes is minimal, so the comparison is against the input with its leading zeros gone
+  bnc: $[all bnbb=0x00; 0x; (first where not bnbb=0x00) _ bnbb]
+  if[not (bnBytes bnv) ~ bnc; bnTA: 0b]
+  if[not (bnBytesN[bnv; count bnbb]) ~ bnbb; bnTA: 0b]
+  bnI: bnI+1]
+tok["bnFromBytes/bnBytes: 1000 round trips"; bnTA]
+teq["bnBytesN: too narrow signals"; @[{[x] bnBytesN[bnFromBytes 0xffff; 1]}; 0; {x}]; "bn: value needs more than k bytes"]
+
+// ---- shifts, against a multiply and a divide by the same power of two
+bnTB: 1b
+bnI: 0
+while[bnI<400
+  bnv: bnrnd 12
+  bns: first 1 rand 80
+  bnp: bnShl[,1; bns]
+  if[not (bnShl[bnv;bns]) ~ bnMul[bnv;bnp]; bnTB: 0b]
+  if[not (bnShr[bnv;bns]) ~ (bnDivMod[bnv;bnp])[0]; bnTB: 0b]
+  bnI: bnI+1]
+tok["bnShl/bnShr: 400 cases agree with multiply and divide by 2^s"; bnTB]
+
+// ---- exponentiation end to end, against repeated multiplication
+bnTC: 1b
+bnI: 0
+while[bnI<120
+  bnn: bnTrim (bnrnd 6) bor 1
+  if[1 < bnBits bnn
+    bnb2: bnMod[bnrnd 6; bnn]
+    bne: first 1 rand 40
+    bnacc: (,1)
+    bnJ: 0
+    while[bnJ<bne; bnacc: bnMod[bnMul[bnacc;bnb2]; bnn]; bnJ: bnJ+1]
+    if[not (bnModExpL[bnb2; bnFromBytes bnBytes (,bne); bnn]) ~ bnacc; bnTC: 0b]]
+  bnI: bnI+1]
+tok["bnModExpL: 120 small exponents agree with repeated multiplication"; bnTC]
+
+// ---- the edges: zero, one, and a value that is exactly a power of the base
+teq["bnMul by zero"; bnMul[bnrnd 8; BNZERO]; BNZERO]
+teq["bnMul by one"; bnMul[1 2 3; (,1)]; 1 2 3]
+teq["bnAdd carries into a new limb"; bnAdd[(,BNM); (,1)]; 0 1]
+teq["bnSub borrows across a zero limb"; bnSub[(0;0;1); (,1)]; (BNM;BNM)]
+teq["bnCarry of a single huge limb"; bnTrim bnCarry (,(BNBASE*BNBASE)+5); (5;0;1)]
+teq["bnBytes of zero"; bnBytes BNZERO; 0x]
+teq["bnFromBytes of nothing"; bnFromBytes 0x; BNZERO]
+teq["bnModExp with an even modulus signals"; @[{[x] bnModExp[0x02;0x02;0x04]}; 0; {x}]; "bn: even modulus, Montgomery reduction needs an odd one"]
+
+// ---- and the fixed vectors: the limb layer against python3, which is where every one of these
+// expected values came from. This was bignum_arithmetic_matches_python / bnmodexp_matches_python_pow
+// in mod rsa in src/main.rs; neither needed Rust, so they read here as the neant they always were.
+// The differential cases above cover the shapes a published vector cannot; these cover the answers.
 // ---- 26-bit limbs in and out of big-endian bytes, and the four operations bnModExp is built from.
 // python3 -c "print(hex(<expr>))" for each.
 // the representation itself: 2^26 is one limb over, and zero has no bytes at all

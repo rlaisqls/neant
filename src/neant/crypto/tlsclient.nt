@@ -11,7 +11,7 @@
 //
 // The order is the dependency order and it matters: bignum before anything that multiplies, sha512
 // before rsa (which needs sha384 for the SHA-384 DigestInfo and MGF1), der before ec and x509,
-// ec before the two curves, and verify before tls.
+// ec before the two curves, ed25519 after sha512 which it needs, and verify before tls.
 load "src/neant/crypto/bignum.nt"
 load "src/neant/crypto/sha512.nt"
 load "src/neant/crypto/rsa.nt"
@@ -19,6 +19,7 @@ load "src/neant/crypto/der.nt"
 load "src/neant/crypto/ec.nt"
 load "src/neant/crypto/p256.nt"
 load "src/neant/crypto/p384.nt"
+load "src/neant/crypto/ed25519.nt"
 load "src/neant/crypto/x509.nt"
 load "src/neant/crypto/verify.nt"
 load "src/neant/crypto/tls.nt"
