@@ -332,6 +332,11 @@ httpExchange[c; u; "GET"; "/b"; ()!(); ""]      // ~60ms
 (c 2)[]                                          // close
 ```
 
+Those two numbers are the shape of the thing rather than a fixed cost: ~95% of a first request is
+the handshake, and nearly all of that is signature verification (`p256.nt`/`p384.nt`), which is
+being worked on — so the handshake figure is expected to move by an order of magnitude and the
+~60ms, which is a network round trip, is not.
+
 The server is `httpRecv`/`httpSend` plus `httpServe`, which wraps the accept-loop-plus-`spawn`
 pattern shown earlier (`hlisten`/`accept`, "Rust builtins" above) into one call:
 
@@ -371,8 +376,9 @@ key bxor data                // the bit verbs on two byte operands give bytes
 ```
 
 `src/neant/crypto/crypto.nt` is pure neant on those: `sha256 hmac hkdfExtract hkdfExpand chacha20 poly1305
-aeadEncrypt aeadDecrypt x25519`, all checked against the RFC vectors (SHA-256 ~0.12ms/block,
-ChaCha20-Poly1305 ~16ms per 10KB, X25519 ~42ms). 32-bit words live in ints masked after each sum;
+aeadEncrypt aeadDecrypt x25519`, all checked against the RFC vectors (measured on this machine:
+SHA-256 ~0.22ms/block, ChaCha20-Poly1305 ~22ms per 10KB, X25519 ~48ms — see "Performance" for why
+the older figures in this file read faster). 32-bit words live in ints masked after each sum;
 the 2^255-19 and 2^130-5 fields use 22- and 26-bit limbs so products stay exact in an int, and
 carries run as vector passes.
 
@@ -982,6 +988,14 @@ costs 26ns. On the crypto in `src/neant/crypto/crypto.nt`, per 64KB: SHA-256 284
 Poly1305 61 → 34, the AEAD 198 → 103; X25519 76ms → 42, and a TLS 1.3 handshake against OpenSSL
 169ms → 97ms. Allocation went from ~34% of samples to under 1%; what is left is the dispatch loop
 itself and `Value` clone/drop.
+
+Those absolute figures are **not reproducible on the machine this is developed on** and should be
+read as ratios only. `crypto.nt` has not changed since (only the move into `src/neant/crypto/`), and
+checking out that same commit here measures SHA-256 at 195ms per 64KB rather than 119ms — so the
+numbers above came from different hardware. Measured here today: SHA-256 **220ms** per 64KB
+(0.22ms/block), ChaCha20-Poly1305 **22ms** per 10KB, X25519 **48ms**. The 195ms → 220ms between that
+commit and now is a real 13% drift on this box, unexplained and not yet chased; it is small next to
+the gap to the figures above, which is hardware.
 
 Runtime errors carry a line table, which costs ~10% of compile throughput. A frame is named by its
 caller's `LoadG`, so the bytecode carries positions but no names.
