@@ -6,16 +6,27 @@
 // the TLS wire hand you. Inside, a number is a list of ints holding 26-bit limbs, least significant
 // first, the same shape poly1305 uses in crypto.nt. Leading zero limbs are trimmed; zero is `,0`.
 //
-// Why 26 bits: a limb product is < 2^52, and bnMul forms one column of the schoolbook product with
-// a single vectorised `acc[i+til nb] +: a[i]*b` exactly as fmul does — a column takes min(na;nb) of
-// those products, so it stays under min(na;nb)*2^52 with no carries in between. An int is an i64,
-// so 1023 products still fit under 2^62 and leave bnMontMul's carry (< 2^33) room on top; bnMul
-// refuses anything wider. 1023 limbs is 26598 bits, five times an RSA-4096 modulus. Carries are not
-// propagated per product: bnCarry runs them as vector passes afterwards, fmul's trick again.
+// Why 26 bits: a limb product is < 2^52, and a column of the schoolbook product accumulates
+// min(na;nb) of them with no carries in between, so it stays under min(na;nb)*2^52. An int is an
+// i64, so 1023 products still fit under 2^62 and leave bnMontMul's carry (< 2^33) room on top;
+// bnMul refuses anything wider. 1023 limbs is 26598 bits, five times an RSA-4096 modulus. Carries
+// are not propagated per product: bnCarryL runs them in one pass afterwards.
+//
+// EVERY INNER LOOP HERE IS A SCALAR LOOP OVER LIMBS, and that is deliberate — see README "Stage 2"
+// and "the bignum arithmetic runs as compiled scalar loops". This file used to be written as vector
+// column operations (`acc[i+til nb] +: a[i]*b`, one per limb of a), which is the fastest shape an
+// interpreter has and the slowest thing to hand a JIT: each one allocates intermediates and makes
+// several passes over memory, and none of them is a loop the whole-function tier can take. Written
+// as `while` loops over `x[i]` instead — with the index inlined, a written vector uniquely owned at
+// entry, a vector as a return value and `band`/`shr` as instructions — the same arithmetic compiles
+// to machine code and runs about ten times faster. The names ending in L are those kernels; bnMulV,
+// bnMontMulV and bnCarryV are the vector forms they replaced, kept because tests/bignum.nt checks
+// thousands of random operands against them. bnWarm at the bottom is why they are compiled before
+// the first caller needs them.
 //
 // Montgomery, not Barrett, for bnModExp: with e = 65537 a verification is 16 squarings and 2
-// multiplies, and REDC is n rounds of that same vectorised multiply-accumulate plus one scalar
-// carry, so a modmul is 2n vector ops and no division at all. Barrett would need two n-limb
+// multiplies, and REDC is n rounds of the same multiply-accumulate plus one scalar carry, so a
+// modmul is 2n^2 limb products and no division at all. Barrett would need two n-limb
 // multiplications per reduction *and* a mu = floor(b^2k / N) that only a general division can
 // produce. The division is written here anyway (bnDivMod, Knuth 4.3.1D) because R^2 mod N has to
 // come from somewhere and because bnMod should work for any modulus — but it runs twice per
