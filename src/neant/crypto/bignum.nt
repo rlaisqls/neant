@@ -30,7 +30,8 @@ BNBIAS: 4503599627370496            // 2^52, a base multiple: keeps bnMontInv's 
 BNZERO: ,0
 
 // ---- shape
-bnTrim: {[v] n: count v; while[(n>1) & 0 = v[n-1]; n: n-1]; n#v}
+bnTrimL: {[v;n] i: n; while[(1<i) & 0=v[i-1]; i: i-1]; i}   // the kept length, not the value
+bnTrim: {[v] (bnTrimL[v; count v])#v}
 bnPad:  {[v;n] $[n < count v; v; v, (n-count v)#0]}       // to at least n limbs; never truncates
 // carry pass over limbs that may hold anything up to ~2^59, e.g. straight out of bnMul's acc.
 // One pass moves each carry up one limb, so it repeats until nothing is left; the sum of the limbs
@@ -200,6 +201,58 @@ bnMul: {[a;b]
   bnTrim bnCarry bnMulL[(na+nb)#0; a; b; na; nb]}
 bnMulSmall: {[v;k] bnTrim bnCarry v*k}                    // k < 2^26, so every product is < 2^52
 
+// ---- add and subtract MOD m, for operands already below m: the shape a prime field wants, and
+// where the arithmetic is ten limbs wide the allocations of doing it as an add, a compare and a
+// subtract cost several times the arithmetic. `out` is n limbs, m is the modulus's n limbs.
+bnAddModL: {[out;a;b;m;na;nb;n;msk;sh]
+  c: 0
+  i: 0
+  while[i<n
+    x: c
+    if[i<na; x: x + a[i]]
+    if[i<nb; x: x + b[i]]
+    out[i]: x band msk
+    c: x shr sh
+    i: i+1]
+  r: $[0<c; 1; 0]                       // a carry off the top settles it without comparing
+  j: n
+  while[(0<j) & r=0
+    j: j-1
+    x: out[j]
+    y: m[j]
+    r: $[x<y; -1; y<x; 1; 0]]
+  if[r>-1
+    c: 0
+    i: 0
+    while[i<n
+      x: ((msk+1) + c) + (out[i]) - m[i]
+      out[i]: x band msk
+      c: (x shr sh) - 1
+      i: i+1]]
+  out}
+bnSubModL: {[out;a;b;m;na;nb;n;msk;sh]
+  base: msk+1
+  c: 0
+  i: 0
+  while[i<n
+    x: base + c
+    if[i<na; x: x + a[i]]
+    if[i<nb; x: x - b[i]]
+    out[i]: x band msk
+    c: (x shr sh) - 1
+    i: i+1]
+  if[c<0                                // went below zero: one m back
+    c: 0
+    i: 0
+    while[i<n
+      x: (c + out[i]) + m[i]
+      out[i]: x band msk
+      c: x shr sh
+      i: i+1]]
+  out}
+bnAddMod: {[a;b;m] n: count m; r: bnAddModL[n#0;a;b;m;count a;count b;n;BNM;BNB]; (bnTrimL[r;n])#r}
+bnSubMod: {[a;b;m] n: count m; r: bnSubModL[n#0;a;b;m;count a;count b;n;BNM;BNB]; (bnTrimL[r;n])#r}
+
 // ---- divide: Knuth 4.3.1 algorithm D. bnDivMod[u;v] -> (quotient; remainder).
 // The estimated digit is corrected by comparing qhat*v against the working slice outright rather
 // than by the two-limb test — a handful of extra vector ops on a loop that normally runs zero
@@ -307,38 +360,39 @@ bnMontMulV: {[a;b;N;np]
 // the result is under 2N, so comparing and taking N off at most once settles it. All three passes
 // are in one kernel because each is n steps and a separate call, slice and allocation for each is
 // what a ten-limb field spends most of a multiply on.
-bnMontFinL: {[t;N;n;msk;sh]
+bnMontFinL: {[out;t;N;n;msk;sh]
   hi: (2*n)+1
   c: 0
   i: n
   while[i<hi
     x: c + t[i]
-    t[i]: x band msk
+    out[i-n]: x band msk
     c: x shr sh
     i: i+1]
-  r: $[0<t[2*n]; 1; 0]
+  r: $[0<out[n]; 1; 0]
   j: n
   while[(0<j) & r=0
     j: j-1
-    x: t[n+j]
+    x: out[j]
     c: N[j]
     r: $[x<c; -1; c<x; 1; 0]]
   if[r>-1
     c: 0
     i: 0
     while[i<n
-      x: ((msk+1) + c) + (t[n+i]) - N[i]
-      t[n+i]: x band msk
+      x: ((msk+1) + c) + (out[i]) - N[i]
+      out[i]: x band msk
       c: (x shr sh) - 1
       i: i+1]]
-  t}
+  out}
 bnMontMul: {[a;b;N;np]
   n: count N
   // straight into the reduction: REDC wants limb i only mod 2^26 and shifts the rest up itself,
   // so the product never needs carrying or trimming first. An uncarried limb is under 2^58.3 and
   // the reduction adds n more products to it, which still leaves it under 2^59.4.
   t: bnRedcL[bnMulL[((2*n)+1)#0; a; b; count a; count b]; N; np; n; BNM; BNB]
-  bnTrim n # n _ bnMontFinL[t;N;n;BNM;BNB]}
+  r: bnMontFinL[(n+1)#0; t; N; n; BNM; BNB]
+  (bnTrimL[r;n])#r}
 // exponent bits most-significant-first with the leading zeros gone
 bnExpBits: {[e] k: bnBits e; $[k=0; (); reverse k # raze {(x shr til BNB) band 1} each e]}
 // base^exp mod N on limbs. N odd and > 1.
@@ -386,6 +440,9 @@ bnWarm: {[]
     bnCmpL[1 1; 1 1; 2; 2; 2]
     bnAddL[3#0; 1 1; 1 1; 2; 2; 3; BNM; BNB]
     bnSubL[3#0; 1 1; 1 1; 2; 2; 2; BNM; BNB]
-    bnMontFinL[5#0; 1 1; 2; BNM; BNB]]
+    bnMontFinL[3#0; 5#0; 1 1; 2; BNM; BNB]
+    bnTrimL[1 1; 2]
+    bnAddModL[2#0; 1 1; 1 0; 1 1; 2; 2; 2; BNM; BNB]
+    bnSubModL[2#0; 1 1; 1 0; 1 1; 2; 2; 2; BNM; BNB]]
   1b}
 bnWarm[]
