@@ -431,6 +431,70 @@ the top-level element all signal rather than being guessed at. `x509Parse` retur
 keys documented at the top of x509.nt; an unrecognised *critical* extension is reported in
 `` `critUnknown `` rather than dropped, since silently ignoring one is how a verifier gets fooled.
 
+**Two readers, held to each other.** `derTLV` builds a dict per element and `derKids` walks the
+children one at a time; `derScan` reads every element of every buffer in one breadth-first sweep and
+returns columns — `off hlen len tag cls cons par fc ns doc`, a node being an index into them. The
+frontier starts as one position per buffer, each step parses the headers at all of them with
+whole-vector operations (one gather for the identifier octet, one for the first length octet, four
+for the long-form length, and `any` over the vector where the scalar reader had an `if` per
+element), and a parsed element hands the next step both its first child and its next sibling, so the
+frontier is wide almost at once: the 146-root system trust store is 9387 elements and derScan reads
+it in 34 steps rather than 9387. `x509ParseMany` parses a whole bundle out of those columns, and
+falls back to `x509Parse` for anything the columnar reader will not take — the high-tag-number form,
+or any rejection at all — so the strict reader is still what decides every odd case and still
+produces every message. `tests/x509.nt` is what says the speed was not bought by checking less: it
+compares the two element for element and octet for octet over every certificate in the repository,
+field for field over the same, and asserts that everything either must refuse, both still refuse.
+
+**What that cost, measured** (`tests/x509bench.nt`, `/etc/ssl/certs/ca-certificates.crt`, 146 roots,
+155,984 octets of DER, 9387 elements, 64 to a certificate):
+
+| | before | after |
+| --- | --- | --- |
+| PEM decode (`read0` + base64) | 128 ms | 5 ms |
+| parse all 146 | 98 ms | 46 ms |
+| **`x509LoadRoots`, end to end** | **231 ms — 1582 us/cert** | **54 ms — 370 us/cert** |
+
+Most of the PEM win was one line: `pemDecode` split 215 KB with `"\n" vs`, which is 101 of those
+128 ms. `read0` has already split the file into lines, so `pemLines` takes them as they came, finds
+the BEGIN/END markers by line length (3610 lines down to ~320 candidates before the first `~`), and
+decodes *every block's base64 in one pass* — each block is a whole number of 4-character groups, so
+the groups of the concatenation are the groups of the blocks. It carries its own decoder rather than
+calling `unb64` because `b64chars?s` is 2.6 ms over the store's 208 KB of base64 where a 256-entry
+gather is 0.2 ms.
+
+**Where the remaining 54 ms is**, and it is not where it was:
+
+| | ms | us/cert |
+| --- | --- | --- |
+| `pemLines` | 5 | 34 |
+| `derScan`, all 9387 elements | 1 | 7 |
+| issuer and subject, RFC 2253 and canonical | 19 | 130 |
+| extensions | 8 | 55 |
+| SubjectPublicKeyInfo | 5 | 34 |
+| validity, algorithm identifiers, the four byte slices | 5 | 34 |
+| the per-certificate dict and loop around all of it | 11 | 76 |
+
+**OpenSSL does the same work in 2.8 ms — 19 us a certificate — and this does not beat it.** The
+walk is no longer the cost: it was 31 ms of the old 98 and it is 1 ms now. What is left is a floor
+the language sets, and it is worth writing down exactly. Measured in this VM: an indexed read of an
+int vector costs ~0.16 us, a call ~0.25 us, and a whole-vector operation on a short vector ~0.3 us,
+dispatch and allocation rather than work. 19 us a certificate is about 70 of those operations, and a
+certificate is 64 DER elements and 7 name attributes — so nothing written *per certificate* can fit,
+whatever it does. Only a parser vectorised **across** certificates in every phase could, the way
+`derScan` already is; the part that resists it is the name pipeline, where RFC 2253 escaping,
+canonical lowercasing and whitespace collapse, and the joins are per-attribute string work.
+
+The JIT would otherwise close that gap and cannot, for a reason worth recording. A scalar loop over
+int vectors is exactly what the tiers want — an int-returning loop with nine parameters and three
+nested levels compiles and runs at 10-20 ns an iteration against 300 interpreted. But **a function
+that produces a vector is compiled by neither tier**: the same loop returning the buffer it filled
+stays at 300 ns, and so does one that hands the buffer out through a global with `::` or through
+`sset`. Parameters are by value, so a filled buffer has no other way out. Parsing is entirely
+vector-producing, so none of it can be compiled — which is also why the three compiled name passes
+written for this were removed again: correct, and slower than the vector code they replaced. A tier
+that accepted a vector return would be worth more to this file than any further rewriting of it.
+
 `src/neant/crypto/verify.nt` and `src/neant/crypto/tls.nt` (loadable, not in the boot image) are a
 **TLS 1.3 client that authenticates the server** — x25519, `TLS_CHACHA20_POLY1305_SHA256`, and a
 certificate path validator written on the files above:
@@ -443,7 +507,7 @@ tlsRecv h                                 // one application-data record, 0x at 
 tlsClose h
 
 x509CheckHost[cert; "a.example.com"]      // RFC 6125: SAN dNSNames and iPAddresses, never the CN
-roots: x509LoadRoots "/etc/ssl/certs/ca-certificates.crt"        // 146 roots in ~280ms
+roots: x509LoadRoots "/etc/ssl/certs/ca-certificates.crt"        // 146 roots in ~54ms
 x509VerifyChain[chain; roots; host; (now`date; now`time)]        // 1b, or signals why not
 ```
 
@@ -502,7 +566,8 @@ whole chain verifies to the system trust store at a pinned `now` in ~545ms.
 **What it costs.** One RSA-2048 verification is ~7.8ms, one P-256 ~180ms and one P-384 ~380ms, so a
 two-link RSA chain is ~23ms, a one-link P-384 chain ~365ms and the Google chain — two ECDSA
 signatures, one of each curve — ~545ms with the trust store already loaded. A process also pays
-~280ms once for `x509SystemRoots[]`, which `tlsRoots` caches. Those are the numbers a reader
+~54ms once for `x509SystemRoots[]` (it was ~231ms before the columnar reader), which `tlsRoots`
+caches. Those are the numbers a reader
 deciding whether to use this deserves up front rather than as a surprise; `p256.nt`'s header counts
 out where they go and which two optimisations were measured and rejected.
 
@@ -955,8 +1020,13 @@ caller's `LoadG`, so the bytecode carries positions but no names.
 
 For the JIT: int/float promotion inside a trace, so `1.0*i` compiles; side traces for a branch that
 flips for good, which currently bails on every iteration and runs the rest of it interpreted (no
-cliff, but no gain either); and a rewind-free exit for a branch inside an inlined callee, which
-needs the interpreter to be able to resume inside a frame it never entered.
+cliff, but no gain either); a rewind-free exit for a branch inside an inlined callee, which needs
+the interpreter to be able to resume inside a frame it never entered; and **a vector return**. A
+function whose result is a vector is compiled by neither tier, and since parameters are by value a
+filled buffer has no other way out — `::` to a global and `sset` are refused too. That is what keeps
+every byte-building loop in the language interpreted: certificate parsing, base64, the formatter.
+The same loop returning an int compiles and runs 20 to 100 times faster ("Bytes and crypto" has the
+measurement); `not` and `break` in a loop body also hand it back, and so does a tenth parameter.
 
 A register-style calling convention was tried and reverted — it measured slower, and the profile
 said frame setup is ~5% while `Value` clone/drop and small-list allocation are ~35%. The allocation
