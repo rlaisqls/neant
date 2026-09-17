@@ -386,7 +386,8 @@ key bxor data                // the bit verbs on two byte operands give bytes
 
 `src/neant/crypto/crypto.nt` is pure neant on those: `sha256 hmac hkdfExtract hkdfExpand chacha20 poly1305
 aeadEncrypt aeadDecrypt x25519`, all checked against the RFC vectors (measured on this machine:
-SHA-256 **1.0ms** per 64KB, ChaCha20-Poly1305 **2.45ms** per 64KB, X25519 **3.05ms**). 32-bit words
+SHA-256 **1.0ms** per 64KB, ChaCha20 **1.7ms** and Poly1305 **0.34ms** over the same 64KB, X25519
+**3.0ms**). 32-bit words
 live in ints masked after each sum; the 2^255-19 and 2^130-5 fields use 22- and 26-bit limbs so
 products stay exact in an int. Every hot kernel is a scalar loop over indices that the
 whole-function JIT tier compiles — see "The hash and the stream cipher run as compiled scalar
@@ -757,13 +758,18 @@ would if two threads interleaved between the get and the set.
 **What it costs.** "No lock" is true and is not the same as free. `Value` held an `Rc` before `spawn`
 existed, and crossing a thread needs `Send`, so every refcount became an atomic read-modify-write
 instead of a plain increment. Refcount traffic through the operand stack is about 35% of samples
-("Performance"), and making that traffic 2–3x dearer per operation costs **~13% of single-threaded
-throughput**: the same 64KB SHA-256 measures 196ms at `c49736a` and 221ms at its child `fbdeb99`, the
-commit that did the conversion, and is flat from there to today. That is the price of the whole
-concurrency story above, paid by every program whether it spawns anything or not. It is not cheaply
-recoverable — reverting loses threads and biased refcounting is a pile of `unsafe` — and the lever
-that does work is making fewer `Value` clones rather than cheaper ones, which is what the JIT does by
-never touching a `Value` at all inside compiled code.
+("Performance"), and making that traffic 2–3x dearer per operation costs **~13% of interpreted
+throughput**: a 64KB SHA-256 through the interpreter measures 196ms at `c49736a` and 221ms at its
+child `fbdeb99`, the commit that did the conversion. Every program pays it, whether it spawns
+anything or not, and it is not cheaply recoverable — reverting loses threads and biased refcounting
+is a pile of `unsafe`.
+
+The lever that does work is making *fewer* `Value` clones rather than cheaper ones, and that is no
+longer an argument: the same SHA-256 is **1.0ms** today, because its inner loop became compiled code
+that touches no `Value` at all (["The hash and the stream cipher run as compiled scalar
+loops"](#the-hash-and-the-stream-cipher-run-as-compiled-scalar-loops)). The 13% is a tax on the
+interpreter, so it is paid in full by everything the JIT does not take and not at all by what it
+does — which is why that benchmark can no longer be used to measure it.
 
 ## Gotchas (shared with q)
 
@@ -1227,10 +1233,10 @@ read as ratios only. `crypto.nt` has not changed since (only the move into `src/
 checking out that same commit here measures SHA-256 at 195ms per 64KB rather than 119ms — so the
 numbers above came from different hardware. Measured here on that same code: SHA-256 **233ms** per 64KB,
 ChaCha20-Poly1305 **21.6ms** per 10KB, X25519 **47.5ms** — all three are now 1.0ms, 0.38ms and
-3.05ms, on the compiled kernels below. The 196ms → 221ms between that
-commit and now is real, and it is one commit: `fbdeb99`, which converted `Value` from `Rc` to `Arc`
-so that `spawn` could exist. Everything after it is flat. See "Concurrency" for the trade — it is the
-price of threads, not a regression anyone can take back.
+3.05ms, on the compiled kernels below. The 196ms → 221ms *within* the interpreted implementation is
+real, and it is one commit: `fbdeb99`, which converted `Value` from `Rc` to `Arc` so that `spawn`
+could exist; the interpreted figure was flat from there until the kernels replaced it. See
+"Concurrency" for the trade — it is the price of threads, not a regression anyone can take back.
 
 Runtime errors carry a line table, which costs ~10% of compile throughput. A frame is named by its
 caller's `LoadG`, so the bytecode carries positions but no names.
