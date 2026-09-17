@@ -1,0 +1,50 @@
+// The limb layer under RSA: src/neant/crypto/bignum.nt — the two bignum tests that used to be in
+// mod rsa in src/main.rs. Neither needed Rust: every expected value came from python3, and a neant
+// expression compared against it reads the same here. bignum.nt is not in the boot image, so it is
+// loaded on demand, exactly as a program would. The verifier built on top of this is tests/rsa.nt.
+tsection "bignum"
+load "src/neant/crypto/bignum.nt"
+
+// ---- 26-bit limbs in and out of big-endian bytes, and the four operations bnModExp is built from.
+// python3 -c "print(hex(<expr>))" for each.
+// the representation itself: 2^26 is one limb over, and zero has no bytes at all
+teq["bn: 2^26 is one limb over"; bnFromBytes 0x04000000; 0 1]
+teq["bn: leading zeros do not survive"; hex bnBytes bnFromBytes 0x000000deadbeef; "deadbeef"]
+teq["bn: zero has no bytes at all"; count bnBytes bnFromBytes 0x00; 0]
+teq["bn: bnBytesN pads to a width"; hex bnBytesN[bnFromBytes 0xff; 4]; "000000ff"]
+teq["bn: bnBits"; bnBits bnFromBytes 0x0100; 9]
+teq["bn: bnBits of zero"; bnBits bnFromBytes 0x; 0]
+teq["bn: bnCmp"; (bnCmp[bnFromBytes 0x02; bnFromBytes 0x0100]; bnCmp[bnFromBytes 0x02; bnFromBytes 0x02]); -1 0]
+// hex(0xffffffffffffffff * 0xffffffffffffffff)
+teq["bn: bnMul"; hex bnBytes bnMul[bnFromBytes 0xffffffffffffffff; bnFromBytes 0xffffffffffffffff]; "fffffffffffffffe0000000000000001"]
+// hex(0x100000000000000000000 - 1), a borrow through every limb
+teq["bn: bnSub borrows through every limb"; hex bnBytes bnSub[bnFromBytes 0x0100000000000000000000; bnFromBytes 0x01]; "ffffffffffffffffffff"]
+teq["bn: bnAdd carries through every limb"; hex bnBytes bnAdd[bnFromBytes 0xffffffffffffffffffff; bnFromBytes 0x01]; "0100000000000000000000"]
+teq["bn: bnShl"; hex bnBytes bnShl[bnFromBytes 0x01; 100]; "10000000000000000000000000"]
+teq["bn: bnShr"; hex bnBytes bnShr[bnFromBytes 0x10000000000000000000000000; 90]; "0400"]
+// divmod(0xdeadbeefcafebabe1337, 0x0123456789abcdef)
+bgnD: bnDivMod[bnFromBytes 0xdeadbeefcafebabe1337; bnFromBytes 0x0123456789abcdef]
+teq["bn: bnDivMod"; (hex bnBytes bgnD[0]; hex bnBytes bgnD[1]); ("c3b6b4";"ed8473ec7c5d2b")]
+teq["bn: bnMod"; hex bnBytes bnMod[bnFromBytes 0xdeadbeefcafebabe1337; bnFromBytes 0x0123456789abcdef]; "ed8473ec7c5d2b"]
+terrLike["bn: a subtraction that would go negative"; {[] bnBytes bnSub[bnFromBytes 0x01; bnFromBytes 0x02]}; "bn: subtraction would go negative"]
+
+// ---- bnModExp against python3 -c "print(pow(b,e,m))" — three small ones that exercise the odd
+// corners, then the RSA-2048 exponentiation an actual verification performs.
+teq["bnModExp: pow(5,3,13) = 8"; `int$bnModExp[0x05; 0x03; 0x0d]; enlist 8]
+teq["bnModExp: pow(2,10,1000000007)"; hex bnModExp[0x02; 0x0a; unhex "3b9aca07"]; "0400"]
+teq["bnModExp: pow(0xdeadbeef,65537,0xfffffffb)"; hex bnModExp[unhex "deadbeef"; 0x010001; unhex "fffffffb"]; "8e338be9"]
+teq["bnModExp: pow(0,5,97) = 0"; count bnModExp[0x; 0x05; 0x61]; 0]
+teq["bnModExp: an empty exponent is zero"; `int$bnModExp[0x03; 0x; 0x07]; enlist 1]
+terrLike["bnModExp: an even modulus"; {[] bnModExp[0x05; 0x03; 0x0c]}; "bn: even modulus, Montgomery reduction needs an odd one"]
+terrLike["bnModExp: a zero modulus"; {[] bnModExp[0x05; 0x03; 0x]}; "bn: modulus is zero"]
+
+// The RSA-2048 exponentiation itself, over the same throwaway key tests/rsa.nt verifies against:
+//   openssl genrsa -out rsa2048.pem 2048            (OpenSSL 3.6.2)
+//   openssl rsa -in rsa2048.pem -noout -modulus     — the exponent is the default 65537
+bgnN: unhex "d7252f153f75e2036073b54aa1d31ec5846375cefd29a6c7a33d58c1a977caac6e0594ac0962e09c7e59d2f3ec881227436cd323a4ee5de03d15041770b66fe399eee9eab885cbf7be0e90a13112780d6fe79d4dbb2a9f842d3eda4d2e559cbc163b4e71024bc3b62da4dc57ca3d3e34a4ee2f47bf37752fb397a1178b0fdba151fd1c9f311ec9bc7585a95078c3ed249883b4f5247d17cea4aa86398ff94aea8bc595dcc5ed637e9bcf9ad7a9f08b4d672507014f816da600247ea832e78522939654f56a11667dd17839264bd2fc9ec78da4b4b7c2d0d2fd3f2c3df5fa37de3d23365644ae2cc0bbf1ee7e55c161f7dfba2d3b9bb69e4db1c1533f2c6ceb11"
+// printf 'neant rsa test vector\n' > msg.txt && openssl dgst -sha256 -sign rsa2048.pem -out sig.bin msg.txt
+bgnSig: unhex "1078ecb416e3904023443b1dda9a5bc3bb1c01318d0db3878667893c6f1a6b1cdef9386255ebfff6e6884d03ab4475ffd41697589f10ee2f71828739cfce4e86b81ceba2e9602831ad13afa873cc5854491f1fb6a13290344dc7e35db547fbf4f2f8cb4b663396617d7355c7635acac2757f6511c572215fdd0b2983d8816fa34a9257247d158e80c5d2155dee8a1eb3085db19e17a82adf68ceb81c09ef7ff1143e64c2cf1b0b6d6f7cfcd81b6d64f59ba05211439f0b24313b4919b57f57a26e850b865bd45a4271152eb1a58cee78105c477665dff8093bda9152d3bde07a52aae9abf47c711ae87999e6e7fd0189328aebdf4ad3e80515447f6d65b80657"
+// python3 -c "print(hex(pow(<sig>, 65537, <n>)))" — the recovered PKCS#1 block, whose leading 0x00
+// is not in the minimal byte form bnModExp returns.
+bgnEm: "01ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff003031300d060960864801650304020105000420d4663dfa5e7a0c65e3c005537874a194dbd6735b382cc18a6c297908f1faef9d"
+teq["bnModExp: the RSA-2048 verification exponentiation"; hex bnModExp[bgnSig; 0x010001; bgnN]; bgnEm]

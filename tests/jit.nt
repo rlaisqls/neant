@@ -172,6 +172,9 @@ teq["traced float call and interpreted agree"; jtev "ff: {x*1.5}; g: {[k] s:0.0;
 // live on the stack while `f[i+1]`'s frame runs), but one entry in the entry guard: the
 teq["traced call with a scratch local and interpreted agree"; jtev "sq: {[x] t: x+1; t*t}; g: {[k] s:0; i:0; while[i<k; s: s+sq i; i: i+1]; s}; gSlow: {[k] s:0; i:0; while[i<k; s: s+(- - sq i); i: i+1]; s}; {[k] (g k)=gSlow k} each 63 64 65 200"; "1111b"]
 
+// global is checked once, not once per site (`Recorder::enter_frame`).
+teq["traced call at two sites and interpreted agree"; jtev "f: {x*2}; g: {[k] s:0; i:0; while[i<k; s: s+f[i]+f[i+1]; i: i+1]; s}; gSlow: {[k] s:0; i:0; while[i<k; s: s+(- - f[i])+f[i+1]; i: i+1]; s}; {[k] (g k)=gSlow k} each 63 64 65 200"; "1111b"]
+
 // kept running the old body would give the old answer.
 // Everything a call site can name that is *not* a plain lambda held by a global: a closure
 // (`Value::Closure`, not `Lambda`), a primitive (`Op::Call`'s own fast path — no frame is

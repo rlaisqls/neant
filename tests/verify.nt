@@ -211,6 +211,21 @@ teq["google: one flipped bit in THAT signature and it does not"; vfyGbad2[]; 0b]
 // which is x509VerifyChain's step 4 with the clock and the trust store left out
 teq["google: both links, through x509Link"; (x509Link[vfyG[0]; (vfyG[1])`spki]; x509Link[vfyG[1]; (vfyG[2])`spki]); 11b]
 
+// and the whole capture verified the way a browser would: both links AND the trust store AND a
+// clock. `now` is pinned inside the captured leaf's window (Sep 4 -- Nov 27 2026) so this keeps
+// meaning the same thing after the certificate expires; everything above checks the two signatures
+// on their own, with no clock and no store, so a missing system bundle only costs this case and
+// not those. Before P-384 the second link was refused by algorithm and there was no chain at all.
+vfySys: @[{[x] x509SystemRoots[]}; 0; {`none}]
+if[vfySys~`none; print "  (no system CA bundle on this machine, skipping the Google chain)"]
+vfyGnow: (2026.10.01; 12:00:00.000)
+vfyGevil: {[] x509VerifyChain[vfyG; vfySys; "www.evil.example"; vfyGnow]}
+if[~vfySys~`none
+  teq["google: the captured chain verifies to the system trust store"; x509VerifyChain[vfyG; vfySys; "www.google.com"; vfyGnow]; 1b]
+  // and the leaf must not be trusted for a name it does not carry
+  terrLike["google: nor for a host it does not carry"; vfyGevil; "x509: CN=www.google.com is not valid for"]]
+
+
 // the same certificate against the wrong key, with nothing else changed
 teq["sig: the wrong issuer's key"; x509SigVerify[vfyP "pki-leaf"; (vfyP "pki-root")`spki]; 0b]
 // and an RSA certificate offered an EC key to check it with, which is refused before any arithmetic
