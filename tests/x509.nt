@@ -158,8 +158,8 @@ x5pemOld: {[ls]
 x5pemF: {[f] ls: read0 "tests/data/",f,".pem"; (pemLines ls) ~ x5pemOld ls}
 teq["pemLines: the same DER as the line-at-a-time decoder, on every fixture"
   count where not x5pemF each X5FILES; 0]
-teq["x509Split: the same lines as \"\\n\" vs"
-  count where not {[f] t: "\n" sv read0 "tests/data/",f,".pem"; (x509Split t) ~ "\n" vs t} each X5FILES; 0]
+teq["pemDecode splits on newlines the way `vs` does"
+  count where not {[f] t: "\n" sv read0 "tests/data/",f,".pem"; (pemDecode t) ~ pemLines "\n" vs t} each X5FILES; 0]
 X5ONE: "-----BEGIN CERTIFICATE-----\nBQA=\n-----END CERTIFICATE-----"
 teq["pemDecode: anything outside the block is ignored"
   hex (pemDecode "junk\n",X5ONE,"\ntrailing junk")[0]; "0500"]

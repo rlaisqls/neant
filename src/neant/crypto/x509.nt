@@ -801,16 +801,7 @@ pemLines: {[ls]
                                               // bytes start at its group offset, not at its length
   {[der;a;b] der[a+til b]}[der;;] '[dof; dl]}
 
-pemDecode: {[text] pemLines x509Split text}
+pemDecode: {[text] pemLines ("\n" vs text)}
 // a file of PEM blocks -> their DER, for a trust store or an `openssl s_client -showcerts` capture
 pemLoad: {[path] pemLines read0 path}
 
-// "\n" vs text, without `vs`: 101 ms over the trust store becomes 6 ms, because one vectorised
-// compare finds the newlines and the lines are then slices rather than a scan per character.
-x509Split: {[text]
-  n: count text
-  if[0=n; :,""]
-  nlp: where text="\n"
-  a: 0,1+nlp
-  b: nlp,n
-  {[t;p;q] t[p+til q-p]}[text;;] '[a;b]}
