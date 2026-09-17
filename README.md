@@ -1068,6 +1068,15 @@ P-256 the split is different again — ten limbs is 200 products per modular mul
 of arithmetic inside a 1.9µs operation, so it is dominated by what surrounds each call (a fresh
 `Ints` per result, the entry marshalling, `bnTrim`) rather than by the arithmetic.
 
+**A wider limb was measured and does not pay.** 32 bits is not available at all — a 32×32 product is
+2^64, which is not exact in an i64 — and 26 is already the widest the *column* form allows, since a
+column is min(na;nb)·2^(2b) and at 27 bits an RSA-4096 reduction would reach 2^62.25 and overflow.
+What a wider limb would buy has to be bought with a carry settled on every product instead, and that
+was timed as the same loop with `band`/`shr` in it: 1.84ns per limb product against 1.12ns. At 2048
+bits that is 4489 products at 1.84ns = 8.3µs against 6241 at 1.12ns = 7.0µs — 19% *worse*, because
+64% more work per product does not pay for 28% fewer of them. Fewer products has to come from
+Karatsuba, not from the radix.
+
 ### Next
 
 For the JIT: int/float promotion inside a trace, so `1.0*i` compiles; side traces for a branch that

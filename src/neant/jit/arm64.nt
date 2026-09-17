@@ -37,11 +37,6 @@ jitCondHS: 2                        // unsigned >=: one branch catches both ends
 jitCondGE: 10
 jitCondLE: 13
 jitCondNE: 1
-// x4 accumulates the int-null collisions of a straight-line stretch (jitNullCheck), so that the
-// one branch that acts on them is per basic block rather than per arithmetic op. Free for this:
-// our own code only uses x0..x5 to marshal a trampoline's arguments, and every call flushes the
-// accumulator and re-zeroes it.
-jitBAD: 4
 // `buf` (src/jit.rs) is jitVECBASE local words followed by one *descriptor* word per classified
 // vector slot — that slot's element count, at jitVECBASE+k for the k'th entry of the slot list.
 // The slot's own word holds the element data pointer rather than a `*mut Value`, which is what
@@ -96,8 +91,6 @@ jitAndR: {[rd;rn;rm] (jitW 0x8A000000) bor (rm shl 16) bor (rn shl 5) bor rd}
 jitOrrR: {[rd;rn;rm] (jitW 0xAA000000) bor (rm shl 16) bor (rn shl 5) bor rd}
 jitEorR: {[rd;rn;rm] (jitW 0xCA000000) bor (rm shl 16) bor (rn shl 5) bor rd}
 jitLslv: {[rd;rn;rm] (jitW 0x9AC02000) bor (rm shl 16) bor (rn shl 5) bor rd}
-// CSINC Xd, Xn, Xn, !cond — `cinc Xd, Xn, cond`, an increment with no branch in it
-jitCinc: {[rd;rn;cond] (jitW 0x9A800400) bor (rn shl 16) bor ((cond bxor 1) shl 12) bor (rn shl 5) bor rd}
 jitLsrv: {[rd;rn;rm] (jitW 0x9AC02400) bor (rm shl 16) bor (rn shl 5) bor rd}
 
 // ---- float (Dn) encoders, for the tracing JIT (src/trace.rs) — a trace records *observed*
@@ -315,7 +308,7 @@ jitVecWrites: {[opcodes;opargs;n;vecSlots]
 // around-a-blr spills respectively).
 jitNewState: {[asm;lslots;lregs]
   ncs: (count lregs) & jitLCALLEE
-  `asm`depth`fixups`cbzRegs`deoptFixups`depthAt`pending`lslots`lregs`ncs`ncr`retvec`nvecret`nintret`tail`primslots`vregs`vconst`nnull`cmpcond!(asm;0;();()!();();()!();null;lslots;lregs;ncs;(count lregs)-ncs;null;0;0;0b;();0#0;0#0;0;null)}
+  `asm`depth`fixups`cbzRegs`deoptFixups`depthAt`pending`lslots`lregs`ncs`ncr`retvec`nvecret`nintret`tail`primslots`vregs`vconst`cmpcond!(asm;0;();()!();();()!();null;lslots;lregs;ncs;(count lregs)-ncs;null;0;0;0b;();0#0;0#0;null)}
 
 // ---- the virtual operand stack. A value's *physical* register used to be its depth: entry i
 // lived in x9+i, and a `LoadL` of a local that already has a register of its own still emitted a
@@ -363,23 +356,18 @@ jitMatAlias: {[st;r]
     i: i+1]
   st}
 
-// ---- deferred int-null checks. `+ - *` on two ordinary ints can land on exactly the null
-// sentinel, which the interpreter would propagate as a null and compiled code would not, so every
-// one of them is checked. The check itself is unavoidable; the *branch* is not. Each one instead
-// increments x4 with `cinc` (no branch, no flags left behind), and one `cbnz` per straight-line
-// stretch acts on the lot — flushed before every branch, call and return, so a poisoned value can
-// never escape the block it was made in or steer control flow. Deopting late is deopting: the
-// whole call re-runs on the interpreter and everything compiled code touched was its own.
+// `+ - *` on two ordinary ints can land on exactly the null sentinel, which the interpreter would
+// propagate as a null and compiled code would not, so every one of them is checked and deopts.
+// Both ways of making that branch cheaper were built and measured against this one; see README
+// "What the null-sentinel checks cost, measured". Folding a whole block's checks into one branch
+// through a `cinc` accumulator is *slower* — the accumulator is a loop-carried dependency where
+// these branches are free, being never taken and perfectly predicted — and removing them outright,
+// which is unsound and was measured only as a ceiling, is worth 17% of a multiply-accumulate loop
+// and 8% of an RSA-2048 verification. So this stays the obvious thing.
 jitNullCheck: {[st;dst]
   st: jitApp[st;jitCmpR[dst;jitNI]]
   st[`deoptFixups]: (st[`deoptFixups]),enlist ((count st[`asm]);null)
   st: jitApp[st;0]
-  st}
-jitFlushNull: {[st]
-  if[(st[`nnull])=0; :st]
-  st[`deoptFixups]: (st[`deoptFixups]),enlist ((count st[`asm]);`nz)
-  st: jitApp[st;0]
-  st[`nnull]: 0
   st}
 
 // ---- per-op handlers. Each takes the state dict (plus whatever else it needs) and returns the
@@ -424,7 +412,6 @@ jitOpPop: {[st]
 jitOpRet: {[st]
   if[(st[`depth])<1; :null]
   st: jitMat1[st; (st[`depth])-1]
-  st: jitFlushNull st
   asm: st[`asm]
   st[`asm]: 0#0
   st[`asm]: jitEmitReturn[asm; jitVR[st;(st[`depth])-1]; st[`ncs]]
@@ -494,7 +481,6 @@ jitOpDyad: {[st;consts;a;fuse]
 // and x4 clear. jitCompile does the same at every target for the path that falls into it.
 jitOpJmp: {[st;t]
   st: jitMatAll[st; st[`depth]]
-  st: jitFlushNull st
   st[`depthAt;t]: st[`depth]
   st[`fixups]: (st[`fixups]),enlist ((count st[`asm]);t;`b)
   st: jitApp[st;0]
@@ -515,7 +501,6 @@ jitOpJmpf: {[st;t]
   r: jitVR[st;(st[`depth])-1]
   st: jitVDrop[st;1]
   st: jitMatAll[st; st[`depth]]
-  st: jitFlushNull st
   st[`depthAt;t]: st[`depth]
   st[`cbzRegs;count st[`asm]]: r
   st[`fixups]: (st[`fixups]),enlist ((count st[`asm]);t;`cbz)
@@ -526,8 +511,8 @@ jitOpJmpf: {[st;t]
 // exit (depth-1 — the one thing the naive linear scan can't see, so it's recorded in depthAt).
 jitOpLoop: {[st;t]
   if[(st[`depth])<1; :null]
-  st: jitMatAll[st; st[`depth]]                         // the counter is decremented in place, so
-  st: jitFlushNull st                                   // it must not be some local's register
+  st: jitMatAll[st; st[`depth]]      // the counter is decremented in place, so it must not be
+                                     // some local's register
   r: jitSTACK+((st[`depth])-1)
   asm: st[`asm]
   st[`asm]: 0#0                        // sole owner: see jitApp
@@ -542,8 +527,7 @@ jitOpLoop: {[st;t]
 
 jitOpCall: {[st;consts;trampoline;slot;argc]
   if[(st[`depth])<argc; :null]
-  st: jitMatAll[st; st[`depth]]                         // x4 is an argument register here, and the
-  st: jitFlushNull st                                   // trampoline may clobber any caller-saved
+  st: jitMatAll[st; st[`depth]]      // the trampoline may clobber any caller-saved register
   live: (st[`depth])-argc
   asm: st[`asm]
   st[`asm]: 0#0
@@ -560,7 +544,6 @@ jitOpCall: {[st;consts;trampoline;slot;argc]
   st[`deoptFixups]: (st[`deoptFixups]),enlist ((count asm);jitSCRATCH)
   asm: asm,0
   asm: asm,jitMovR[jitSTACK+live; 0]
-  asm: jitLoadConst[asm; jitBAD; 0]
   st[`asm]: jitRestoreLive[asm; live; st[`ncr]]
   st: jitVDrop[st; (st[`depth])-live]
   st: jitVPush[st; jitSTACK+live; 0]
@@ -641,7 +624,6 @@ jitOpVecRet: {[st;slot;atEnd]
   if[not isnull st[`retvec]; if[not slot=st[`retvec]; :null]]
   st[`retvec]: slot
   st[`nvecret]: 1+st[`nvecret]
-  st: jitFlushNull st
   asm: st[`asm]
   st[`asm]: 0#0
   st[`asm]: jitEmitReturnVec[asm; st[`ncs]]
@@ -723,7 +705,6 @@ jitCompile: {[input;trampolines]
   asm: asm,jitMovR[jitVM;2]
   asm: asm,jitMovR[jitOK;1]
   asm: jitLoadConst[asm;jitNI;0N]
-  asm: jitLoadConst[asm;jitBAD;0]                       // the deferred null-check accumulator
   // buf -> the local registers, once (see the locals-in-registers comment above). Every one of
   // them, not just the params/captures: a scratch local's slot is the 0 `buf` was zeroed with,
   // exactly what an ldr through x19 would have read before its first StoreL.
@@ -741,9 +722,7 @@ jitCompile: {[input;trampolines]
   ipWord: (n+1)#0   // n+1: a jump target can be the position right after the last op (e.g. a `do` loop's exit)
   ip: 0
   while[ip<n
-    if[ip in targets
-      ; st: jitMatAll[st; st[`depth]]
-        st: jitFlushNull st]
+    if[ip in targets; st: jitMatAll[st; st[`depth]]]
     if[not isnull (st[`depthAt])[ip]
       ; st[`depth]: (st[`depthAt])[ip]
         st[`vregs]: jitSTACK+til st[`depth]
@@ -811,7 +790,6 @@ jitCompile: {[input;trampolines]
   if[(not lastOp=16) & not st[`tail]
     ; if[(st[`depth])<1; :null]
       st: jitMat1[st; (st[`depth])-1]
-      st: jitFlushNull st
       st[`nintret]: 1+st[`nintret]
       asm: st[`asm]
       st[`asm]: 0#0
@@ -840,7 +818,7 @@ jitCompile: {[input;trampolines]
     e: deoptFixups[i]
     word: e[0]; kind: e[1]
     delta: deoptAt-word
-    asm[word]: $[isnull kind; jitBcond[jitCondEQ;delta]; (`hs)~kind; jitBcond[jitCondHS;delta]; (`nz)~kind; jitCbnz[jitBAD;delta]; jitCbz[kind;delta]]
+    asm[word]: $[isnull kind; jitBcond[jitCondEQ;delta]; (`hs)~kind; jitBcond[jitCondHS;delta]; jitCbz[kind;delta]]
     i: i+1]
 
   // (code; the classified slots; which of them are written; which one is returned, as an index
