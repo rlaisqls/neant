@@ -1,14 +1,15 @@
 // Certificate path validation: hostname matching, chain verification and the trust store in
 // src/neant/crypto/verify.nt, and the two TLS 1.3 handshake messages in tls.nt that use them.
-// None of the six modules is in the boot image, so they are loaded on demand here exactly as a
+// None of the seven modules is in the boot image, so they are loaded on demand here exactly as a
 // program would load them. What stays in Rust (mod verify in src/main.rs) is only what needs the
-// host: an `openssl s_server` to handshake against, and the two timings.
+// host: an `openssl s_server` to handshake against, and the timings.
 //
-// The fixture PKI is built by tests/data/pki-gen.sh, which records the exact openssl commands and
-// pins every date, so pki-expired.pem stays expired and pki-leaf.pem stays valid. Every certificate
-// in it is one specific way a chain can be wrong.
+// The fixture PKI is built by tests/data/pki-gen.sh (RSA) and tests/data/pki-ec-gen.sh (ECDSA),
+// which record the exact openssl commands and pin every date, so pki-expired.pem stays expired and
+// pki-leaf.pem stays valid. Every certificate in them is one specific way a chain can be wrong.
+// The ECDSA arithmetic itself is tested in tests/p256.nt; this file is about the wiring.
 tsection "verify"
-{load "src/neant/crypto/",x} each ("bignum.nt";"rsa.nt";"der.nt";"x509.nt";"verify.nt";"tls.nt")
+{load "src/neant/crypto/",x} each ("bignum.nt";"rsa.nt";"der.nt";"p256.nt";"x509.nt";"verify.nt";"tls.nt")
 
 vfyP: {[f] x509Parse (pemLoad "tests/data/",f,".pem")[0]}
 vfyRoots: x509LoadRoots "tests/data/pki-root.pem"          // the fixture root, and nothing else
@@ -102,14 +103,55 @@ vfyBad: (("the chain in an order the server should not have sent"
   ;("an empty chain"; {[] vfyChain[(); "leaf.neant.test"]}; "x509: an empty certificate chain"))
 {[t] terrLike["chain: ",t[0]; t[1]; t[2]]} each vfyBad
 
-// A real chain off the public web, refused for the one reason that matters here: nothing in this
-// build verifies ECDSA, so it says no by name instead of waving the chain through. Verifying this
-// chain is what ECDSA P-256 would buy, and until then servers like it are unreachable, not trusted.
+// ---- the ECDSA fixture PKI (tests/data/pki-ec-gen.sh): a P-256 leaf under a P-256 root, both
+// signed with ecdsa-with-SHA256, which is what src/neant/crypto/p256.nt was written for.
+vfyEcRoots: x509LoadRoots "tests/data/pki-ec-root.pem"
+vfyEcChain: {[c;h] x509VerifyChain[c; vfyEcRoots; h; vfyNow]}
+teq["chain: an ECDSA P-256 leaf under an ECDSA P-256 root"; vfyEcChain[enlist vfyP "pki-ec-leaf"; "leaf.neant.test"]; 1b]
+teq["chain: the same one with the root sent too"; vfyEcChain[(vfyP "pki-ec-leaf"; vfyP "pki-ec-root"); "leaf.neant.test"]; 1b]
+teq["chain: the same one by address"; vfyEcChain[enlist vfyP "pki-ec-leaf"; "127.0.0.1"]; 1b]
+teq["sig: the EC root signed itself, and it checks out"; x509SigVerify[vfyP "pki-ec-root"; (vfyP "pki-ec-root")`spki]; 1b]
+teq["sig: a self-signed P-256 certificate from elsewhere"; x509SigVerify[vfyP "selfsigned-ec"; (vfyP "selfsigned-ec")`spki]; 1b]
+// P-384 and P-521 are still out, and the refusal has to say WHICH curve: pki-ec384-leaf carries
+// ecdsaSha256, an algorithm this build knows, signed by a key on a curve it does not. A verifier
+// that read "an EC key" as one thing would either accept this or refuse it as a bad signature.
+vfyEc384: x509LoadRoots "tests/data/pki-ec384-root.pem"
+vfyEc384msg: "x509: ",vfyL," is signed with ecdsaSha256 by a key on p384, and P-256 is the only curve this build verifies"
+vfyEc384f: {[] x509VerifyChain[enlist vfyP "pki-ec384-leaf"; vfyEc384; "leaf.neant.test"; vfyNow]}
+terrLike["chain: an ECDSA curve this build cannot check"; vfyEc384f; vfyEc384msg]
+vfyEc384v: x509SigVerify[vfyP "pki-ec384-leaf"; (vfyP "pki-ec384-root")`spki]
+teq["sig: a P-384 key answers 0b rather than signalling out of x509SigVerify"; vfyEc384v; 0b]
+// a flipped bit in an ECDSA signature is refused the same way a flipped RSA bit is
+vfyEcBad: {[] c: vfyP "pki-ec-leaf"; n: count c`sig; c[`sig]: ((n-1)#c`sig),bnot (c`sig)[n-1]
+  vfyEcChain[enlist c; "leaf.neant.test"]}
+vfyEcBmsg: "x509: the signature on ",vfyL," does not verify with CN=neant fixture ec root"
+terrLike["chain: a flipped bit in an ECDSA signature"; vfyEcBad; vfyEcBmsg]
+
+// ---- a real chain off the public web. tests/data/chain-google.pem is leaf, WE2, GTS Root R4 and
+// the GlobalSign cross-signature; the leaf is P-256 and signed ecdsa-with-SHA256, so THAT link is
+// one this build now checks and it checks out. The link above it is not: WE2 is signed
+// ecdsa-with-SHA384 by a P-384 key, so both the hash and the curve are out of reach, and it is
+// refused by name. Nothing here is checked against a clock — the captured leaf has since expired —
+// so these verify the SIGNATURES directly rather than going through x509VerifyChain.
 vfyG: x509Parse each pemLoad "tests/data/chain-google.pem"
-vfyGmsg: "x509: CN=www.google.com is signed with ecdsaSha256 (1.2.840.10045.4.3.2), which this build cannot verify"
-terrLike["chain: an algorithm this build cannot check"; {[] x509VerifyChain[2#vfyG; vfyRoots; "www.google.com"; vfyNow]}; vfyGmsg]
+teq["google: the leaf really is ECDSA-SHA256 on P-256"; ((vfyG[0])`sigAlg; ((vfyG[1])`spki)`curve); (`ecdsaSha256; `p256)]
+teq["google: www.google.com is signed by WE2, and it verifies"; x509SigVerify[vfyG[0]; (vfyG[1])`spki]; 1b]
+vfyGbad: {[] c: vfyG[0]; n: count c`sig; c[`sig]: ((n-1)#c`sig),bnot (c`sig)[n-1]
+  x509SigVerify[c; (vfyG[1])`spki]}
+teq["google: one flipped bit in that signature and it does not"; vfyGbad[]; 0b]
+teq["google: the leaf against the root two links up"; x509SigVerify[vfyG[0]; (vfyG[2])`spki]; 0b]
+// and the link this build still cannot check, refused by the algorithm rather than skipped
+teq["google: WE2 is signed ecdsa-with-SHA384 by a P-384 key"; ((vfyG[1])`sigAlg; ((vfyG[2])`spki)`curve); (`ecdsaSha384; `p384)]
+teq["google: which x509SigOk refuses outright"; x509SigOk vfyG[1]; 0b]
+vfyGmsg: "x509: CN=WE2,O=Google Trust Services,C=US is signed with ecdsaSha384 (1.2.840.10045.4.3.3), which this build cannot verify"
+terrLike["google: and x509Link says which algorithm it was"; {[] x509Link[vfyG[1]; (vfyG[2])`spki]}; vfyGmsg]
+
 // the same certificate against the wrong key, with nothing else changed
 teq["sig: the wrong issuer's key"; x509SigVerify[vfyP "pki-leaf"; (vfyP "pki-root")`spki]; 0b]
+// and an RSA certificate offered an EC key to check it with, which is refused before any arithmetic
+vfyRsaEc: "x509: ",vfyL," is signed with rsaPkcs1Sha256 but ",vfyI,"'s key is not an RSA key"
+teq["sig: an RSA signature against an EC key"; x509SigVerify[vfyP "pki-leaf"; (vfyP "pki-ec-root")`spki]; 0b]
+teq["sig: and x509KeyWhy says so in as many words"; x509KeyWhy[vfyP "pki-leaf"; (vfyP "pki-ec-root")`spki]; vfyRsaEc]
 
 // ---- the trust store itself
 vfyRgot: (count vfyRoots`certs; vfyRoots`skipped; count x509Find[vfyRoots; (vfyP "pki-root")`subjectCanon])
@@ -156,18 +198,49 @@ vfyK: (vfyP "pki-leaf")`spki
 vfySig: unhex "22ae9f0797d06c6829e68dc4d35bd7ae62c7ff0da23c275f9869699aa5882c1a73c9269b32a7c73461be198f5fac0c58b7df96558601b15a0ed595b1add83bb909bc4af14338eb10b99d542b384aeded45729e8c2a0c80043b4c531c3ead88ee750412fed374e28a6626b8cccdaf2cec2a70bca0ec6fc33d62df58f7938c3b627768538794eca66cbc026ce00a5e2d5f47f29e9804a1baa41ff7f0a769cf7fc4bb9f9ce535277f6e99b9c9ef2f2a55864d425ff49cf618b447abb3466e7a262e2d12e3baced09f999ab96d5fa426550f14b7fe69c489ed5b5060582a523182b0620d5c6d97f83a64167c18218a05a42a00e07c7cc4a70fed45188802e3234e46"
 vfyTh: `byte$til 32
 teq["CertificateVerify: openssl's rsa_pss_rsae_sha256"; certVerify[(vfyK; 2052; vfySig; vfyTh)]; 1b]
-// 1027 is ecdsa_secp256r1_sha256; 1025 is rsa_pkcs1_sha256, which 4.4.3 forbids in a handshake
-// signature whoever holds the key — those code points are for certificates only
-vfyCvBad: (("ecdsa_secp256r1_sha256"; {[] certVerify[(vfyK; 1027; vfySig; vfyTh)]}
-    ;"tls: CertificateVerify uses signature scheme 1027, which this build cannot verify")
-  ;("rsa_pkcs1_sha256"; {[] certVerify[(vfyK; 1025; vfySig; vfyTh)]}
+// The same content signed with the fixture's ECDSA key, which is scheme 1027:
+//   openssl dgst -sha256 -sign tests/data/pki-ec-leaf.key -out cvec.sig cv.bin     (OpenSSL 3.6.2)
+// ECDSA picks a random k, so re-running gives a different signature that verifies just as well.
+vfyEcK: (vfyP "pki-ec-leaf")`spki
+vfyEcSig: unhex "304502200796b915539397ad993d00f06ff44b5432d8e3faf988658f48152d78a400480c022100f15843c85b1b5eff25fccba0ddac93c3276c3c6b393c14e77bae0c62bc7f6a2b"
+teq["CertificateVerify: openssl's ecdsa_secp256r1_sha256"; certVerify[(vfyEcK; 1027; vfyEcSig; vfyTh)]; 1b]
+// 1025 is rsa_pkcs1_sha256, which 4.4.3 forbids in a handshake signature whoever holds the key —
+// those code points are for certificates only. Everything else here is a signature that is simply
+// wrong, or a key of a kind the scheme the server picked cannot be checked with.
+vfyCvBad: (("rsa_pkcs1_sha256, which 4.4.3 forbids here"; {[] certVerify[(vfyK; 1025; vfySig; vfyTh)]}
     ;"tls: CertificateVerify uses signature scheme 1025, which this build cannot verify")
+  ;("ed25519"; {[] certVerify[(vfyK; 2055; vfySig; vfyTh)]}
+    ;"tls: CertificateVerify uses signature scheme 2055, which this build cannot verify")
+  ;("ecdsa_secp384r1_sha384"; {[] certVerify[(vfyEcK; 1283; vfyEcSig; vfyTh)]}
+    ;"tls: CertificateVerify uses signature scheme 1283, which this build cannot verify")
   ;("a different transcript"; {[] certVerify[(vfyK; 2052; vfySig; 32#0x00)]}
     ;"tls: the server's CertificateVerify did not verify")
   ;("a flipped signature bit"; {[] certVerify[(vfyK; 2052; (255#vfySig),bnot vfySig[255]; vfyTh)]}
     ;"tls: the server's CertificateVerify did not verify")
   ;("the wrong server's key"; {[] certVerify[((vfyP "pki-int")`spki; 2052; vfySig; vfyTh)]}
     ;"tls: the server's CertificateVerify did not verify")
-  ;("a key that is not RSA"; {[] certVerify[((vfyP "selfsigned-ec")`spki; 2052; vfySig; vfyTh)]}
-    ;"tls: the server's key is not RSA, which is the only kind this build verifies"))
+  ;("an ECDSA one against a different transcript"; {[] certVerify[(vfyEcK; 1027; vfyEcSig; 32#0x00)]}
+    ;"tls: the server's CertificateVerify did not verify")
+  ;("an ECDSA one with a flipped signature bit"
+    ;{[] n: count vfyEcSig; certVerify[(vfyEcK; 1027; ((n-1)#vfyEcSig),bnot vfyEcSig[n-1]; vfyTh)]}
+    ;"tls: the server's CertificateVerify did not verify")
+  ;("an ECDSA one against the wrong EC key"
+    ;{[] certVerify[((vfyP "pki-ec-root")`spki; 1027; vfyEcSig; vfyTh)]}
+    ;"tls: the server's CertificateVerify did not verify")
+  ;("a PSS scheme with a key that is not RSA"; {[] certVerify[(vfyEcK; 2052; vfySig; vfyTh)]}
+    ;"tls: CertificateVerify uses signature scheme 2052, but the server's key is not an RSA key")
+  ;("1027 with a key that is not EC"; {[] certVerify[(vfyK; 1027; vfyEcSig; vfyTh)]}
+    ;"tls: CertificateVerify uses ecdsa_secp256r1_sha256, but the server's key is not an EC key")
+  ;("1027 with an EC key on the wrong curve"
+    ;{[] certVerify[((vfyP "pki-ec384-root")`spki; 1027; vfyEcSig; vfyTh)]}
+    ;"tls: CertificateVerify uses ecdsa_secp256r1_sha256, but the server's key is on p384"))
 {[t] terrLike["CertificateVerify: ",t[0]; t[1]; t[2]]} each vfyCvBad
+
+// ---- the ClientHello. ecdsa_secp256r1_sha256 is offered again, and first: it is what the public
+// web serves, and every scheme in the list is one certVerify above can actually check.
+// the body is 0x01 lp24 [ version(2) random(32) lp8 session_id cipher_suites(lp16) compression(2)
+// lp16 extensions ], so with a 32-byte session id the extensions start at 4+2+32+1+32+4+2+2 = 79
+vfyCh: clientHello["a.test"; 32#0x01; 32#0x02; 32#0x03]
+vfySa: findExt[wdrop[47+`int$vfyCh[38]; vfyCh]; 13]
+// lp16 over 1027 (0x0403), 2052 (0x0804), 1025 (0x0401)
+teq["ClientHello: signature_algorithms, ECDSA P-256 first"; hex vfySa; "0006040308040401"]

@@ -1,9 +1,9 @@
 // Certificate path validation in neant: hostname matching (RFC 6125), chain verification
-// (RFC 5280 6.1) and a PEM trust store, on src/neant/crypto/{bignum,rsa,der,x509}.nt.
-// Not part of the boot image — load all five, in this order:
+// (RFC 5280 6.1) and a PEM trust store, on src/neant/crypto/{bignum,rsa,der,p256,x509}.nt.
+// Not part of the boot image — load all six, in this order:
 //   load "src/neant/crypto/bignum.nt"    load "src/neant/crypto/rsa.nt"
-//   load "src/neant/crypto/der.nt"       load "src/neant/crypto/x509.nt"
-//   load "src/neant/crypto/verify.nt"
+//   load "src/neant/crypto/der.nt"       load "src/neant/crypto/p256.nt"
+//   load "src/neant/crypto/x509.nt"      load "src/neant/crypto/verify.nt"
 //
 //   x509CheckHost[cert;host]              -> 1b / 0b
 //   x509LoadRoots[path]                   -> a trust store over a PEM bundle
@@ -30,10 +30,11 @@
 //   * the leaf is valid for the host: SAN dNSNames, or SAN iPAddresses for an address literal
 //
 // WHAT IS NOT, and what that costs you:
-//   * only RSASSA-PKCS1-v1_5-SHA256 and RSASSA-PSS-SHA256 signatures can be checked — rsa.nt's
-//     DigestInfo table and PSS verifier are SHA-256 only, and no ECDSA or Ed25519 verifier is
-//     wired in. Every other algorithm is refused BY NAME rather than skipped. An ECDSA chain,
-//     which is most of the public web, does not verify here; it is rejected, not accepted.
+//   * three signature algorithms can be checked and no more: RSASSA-PKCS1-v1_5-SHA256,
+//     RSASSA-PSS-SHA256 and ECDSA-SHA256 on P-256. SHA-384 and SHA-512 are out because rsa.nt's
+//     DigestInfo table and PSS verifier are SHA-256 only; P-384 and P-521 are out because p256.nt
+//     is one curve; Ed25519 is out because ed25519.nt is not wired in here. Every one of them is
+//     refused BY NAME — the algorithm, and for an EC key the curve — rather than skipped.
 //   * revocation: no CRL, no OCSP. A certificate revoked this morning still verifies.
 //   * name constraints, policy constraints, policy mapping, inhibitAnyPolicy (RFC 5280 6.1.4's
 //     policy machinery) are not implemented — but a critical extension nobody models is refused,
@@ -135,17 +136,40 @@ x509CheckHost: {[c;host]
   ok}
 
 // ---- signatures
-// rsa.nt verifies SHA-256 with PKCS#1 v1.5 or PSS and nothing else, so those two are the whole
-// list. SHA-1 would be refused even if rsa.nt knew it. Everything unlisted — ECDSA, Ed25519,
-// SHA-384/512, an OID x509.nt could not name — is refused by name below rather than skipped,
-// because a verifier that shrugs at an algorithm it cannot check accepts every certificate
-// that uses it.
-x509SigOk: {[c] (c`sigAlg) in `rsaPkcs1Sha256`rsaPssSha256}
+// rsa.nt verifies SHA-256 with PKCS#1 v1.5 or PSS, and p256.nt verifies ECDSA-SHA256 on P-256:
+// those three are the whole list. SHA-1 would be refused even if rsa.nt knew it. Everything
+// unlisted — Ed25519, SHA-384/512, an OID x509.nt could not name — is refused by name below rather
+// than skipped, because a verifier that shrugs at an algorithm it cannot check accepts every
+// certificate that uses it.
+x509SigOk: {[c] (c`sigAlg) in `rsaPkcs1Sha256`rsaPssSha256`ecdsaSha256}
+// and the algorithm is only half of it: the ISSUER'S KEY has to be one this build can check that
+// signature with. An RSA signature needs an RSA key; ecdsaSha256 needs an EC key on P-256, and
+// P-384, P-521 and a curve x509.nt could not name are each refused with their own sentence naming
+// the curve — "p384" read as "some elliptic curve, near enough" is how a verifier stops verifying.
+// -> "" when the key fits, otherwise the reason it does not.
+x509KeyWhy: {[c;spki]
+  a: c`sigAlg
+  if[a in `rsaPkcs1Sha256`rsaPssSha256
+    if[not `rsa ~ spki`alg
+      m: "x509: ",(c`subject)," is signed with ",(string a)," but ",(c`issuer)
+      :m,"'s key is not an RSA key"]
+    :""]
+  if[a ~ `ecdsaSha256
+    if[not `ec ~ spki`alg
+      m: "x509: ",(c`subject)," is signed with ecdsaSha256 but ",(c`issuer)
+      :m,"'s key is not an EC key"]
+    if[not `p256 ~ spki`curve
+      m: "x509: ",(c`subject)," is signed with ecdsaSha256 by a key on "
+      m,: $[`unknown ~ spki`curve; "the unnamed curve ",spki`oid; string spki`curve]
+      :m,", and P-256 is the only curve this build verifies"]
+    :""]
+  ""}
 x509SigVerify: {[c;spki]
-  if[not `rsa ~ spki`alg; :0b]
+  if[0 < count x509KeyWhy[c;spki]; :0b]                // the wrong kind of key never gets a chance
   d: sha256 c`tbs                                      // the span as it arrived, not a re-encoding
   if[`rsaPkcs1Sha256 ~ c`sigAlg; :rsaVerifyPkcs1[spki`n; spki`e; `sha256; d; c`sig]]
   if[`rsaPssSha256 ~ c`sigAlg; :rsaVerifyPss[spki`n; spki`e; d; c`sig]]
+  if[`ecdsaSha256 ~ c`sigAlg; :ecdsaVerifyP256Der[spki`point; d; c`sig]]
   0b}
 // one link: c, signed by the key in spki, which belongs to the name c claims issued it
 x509Link: {[c;spki]
@@ -153,6 +177,8 @@ x509Link: {[c;spki]
     m: "x509: ",(c`subject)," is signed with ",string c`sigAlg
     m,: " (",(c`sigAlgOid),"), which this build cannot verify"
     signal m]
+  why: x509KeyWhy[c;spki]
+  if[0 < count why; signal why]
   if[not x509SigVerify[c;spki]
     m: "x509: the signature on ",(c`subject)," does not verify with "
     signal m,(c`issuer),"'s key"]

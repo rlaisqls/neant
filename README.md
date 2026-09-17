@@ -357,6 +357,33 @@ extended coordinates with the complete addition law, and Shamir's trick does bot
 of 253 doublings. Scalars reduce mod L one bit at a time. Verification only: no signing, and nothing
 is constant-time, which is what a verifier's all-public inputs allow.
 
+`src/neant/crypto/p256.nt` (loadable, not in the boot image) adds **ECDSA P-256 verification**, the
+signature most of the public web actually uses, on `bignum.nt`'s modular arithmetic and `der.nt`'s
+reader:
+
+```
+{load "src/neant/crypto/",x} each ("bignum.nt";"der.nt";"p256.nt")
+ecdsaVerifyP256[pub; digest; r; s]      // pub is the 65-byte SEC 1 point 0x04 || X || Y
+ecdsaVerifyP256Der[pub; digest; sig]    // sig is the DER SEQUENCE { r, s } a certificate carries
+```
+
+Both are total: an r or s outside [1, n-1], a public key not on the curve or with a coordinate at or
+above p, a compressed point (refused on purpose — RFC 5480 makes it optional and nothing ships one),
+a digest that is not 32 bytes, or DER that does not parse all come back `0b`, never a signal. The
+final test is `(R.x mod n) = r` with the reduction actually done. Points are Jacobian so the scalar
+multiplication inverts once at the end rather than once per step, both inversions are Fermat through
+`bnModExp`, and Shamir's trick does the two scalars in one pass of 256 doublings.
+
+The field reuses `bignum.nt`'s Montgomery reduction rather than folding the special prime the way
+`crypto.nt` folds 2^255-19, and that is a measured decision, not an omission: every exponent in
+p = 2^256-2^224+2^192+2^96-1 is a multiple of 32, so the Solinas fold is a limb permutation only at
+a limb width dividing 32, and an exact i64 column caps that at 16 — sixteen multiply-accumulate
+passes against `bignum.nt`'s ten. Measured per modular multiplication: `bnMontMul` 25µs, the
+16-bit Solinas multiply-and-fold 19µs *before* it brings a result in (-4p, 6p) back under 2^256,
+which is about 5µs more. Level, so reuse wins. **One verification is ~178ms** against ~7.4ms for
+RSA-2048 — the reverse of the compiled ratio, because P-256 needs ~4900 modular multiplications
+where RSA-2048 with e=65537 needs twenty, and here each one is a dozen interpreted vector operations.
+
 `src/neant/crypto/der.nt` and `src/neant/crypto/x509.nt` (loadable, not in the boot image) read
 **ASN.1 DER and X.509 certificates** — parsing only, no signature check and no chain building:
 
@@ -382,7 +409,7 @@ keys documented at the top of x509.nt; an unrecognised *critical* extension is r
 certificate path validator written on the four files above:
 
 ```
-{load "src/neant/crypto/",x} each ("bignum.nt";"rsa.nt";"der.nt";"x509.nt";"verify.nt";"tls.nt")
+{load "src/neant/crypto/",x} each ("bignum.nt";"rsa.nt";"der.nt";"p256.nt";"x509.nt";"verify.nt";"tls.nt")
 h: tlsConnect["example.com"; 443]        // verifies, or signals with the reason and closes
 tlsSend[h; "GET / HTTP/1.0\r\n\r\n"]
 tlsRecv h                                 // one application-data record, 0x at end of stream
@@ -397,24 +424,47 @@ x509VerifyChain[chain; roots; host; (now`date; now`time)]        // 1b, or signa
 the handshake transcript (RFC 8446 4.4.3), verifies the chain to the trust store and matches the
 hostname; any one failing closes the connection and signals. Verification is the default and the
 opt-out — `tlsConnectOpts[host;port;(enlist `verify)!enlist 0b]` — has to be written at the call
-site. A two-link chain costs ~22ms, which is two RSA-2048 verifications at ~11ms each.
+site. A two-link RSA chain costs ~22ms, two RSA-2048 verifications at ~7.4ms each; an ECDSA link
+costs ~178ms, which is what the section above explains.
 
 What `x509VerifyChain` checks, each with its own refusal message: the names chain, the signature
 over every `tbs`, every validity window including the anchor's, basicConstraints `cA` and
 `pathLenConstraint` on everything above the leaf, `keyUsage` `keyCertSign`, that no certificate
 carries a critical extension the parser does not model, that the chain reaches the trust store, and
 that the leaf covers the host — a wildcard only as the whole leftmost label, standing for exactly
-one label. What it does **not** check: **ECDSA and Ed25519** signatures anywhere (RSA-SHA256, PKCS#1
-v1.5 or PSS, is the whole list), **revocation** (no CRL, no OCSP), name constraints and certificate
-policies, and extendedKeyUsage. There is **no client certificate and no TLS server side**.
+one label.
 
-The ECDSA gap is the price of the verification, and it is a large one: Google, Cloudflare and most
-modern CDNs serve ECDSA-only chains, and the ClientHello no longer offers
-`ecdsa_secp256r1_sha256` — so **this client cannot reach those servers at all**. They are
-unreachable rather than silently unverified, which is the right way round, but nothing here should
-be read as broad compatibility; ECDSA P-256 verification is what would buy it back. This is a
-verifier written from scratch to be read, not a substitute for a reviewed TLS stack, and nothing in
-it is constant-time.
+Three signature algorithms can be checked, and that is the whole list: RSA-PKCS#1-v1_5-SHA256,
+RSA-PSS-SHA256 and **ECDSA-SHA256 on P-256**. The ClientHello offers exactly those three schemes,
+`ecdsa_secp256r1_sha256` first. An all-P-256/SHA-256 chain verifies end to end, chain signatures and
+CertificateVerify both — the ECDSA handshake test does exactly that against a real `openssl
+s_server`.
+
+**That is not yet the public web, and the README should not pretend otherwise.** Connecting to real
+hosts from this checkout: `www.amazon.com` (an RSA chain) verifies; `www.google.com`,
+`cloudflare.com`, `example.com`, `github.com`, `www.wikipedia.org` and `news.ycombinator.com` are
+all still refused, every one of them at the same place —
+
+```
+x509: CN=WE2,O=Google Trust Services,C=US is signed with ecdsaSha384 (1.2.840.10045.4.3.3),
+which this build cannot verify
+```
+
+— because their *leaf* is ECDSA-SHA256 on P-256, which now verifies, while the *intermediate* above
+it is ecdsa-with-SHA384 signed by a P-384 root. So P-256 bought the leaf link of those chains and
+not the chain. What the rest of it needs is **SHA-384** (a DigestInfo entry in `rsa.nt` and a second
+hash beside `sha256` in `crypto.nt`) and **P-384** (a second curve in `p256.nt`'s shape) — additions,
+not a rewrite, but they are the difference between verifying a link and reaching a server.
+
+What is still **not** checked, plainly: **P-384 and P-521**, refused with the curve named;
+**SHA-384 and SHA-512**, refused by algorithm; **Ed25519**, which `ed25519.nt` can verify but nothing
+wires into `verify.nt`'s dispatch; **revocation**, no CRL and no OCSP, so a certificate revoked this
+morning still verifies; **name constraints** and certificate policies; and **extendedKeyUsage**,
+which is parsed and ignored, so a certificate issued for e-mail will serve a web request. There is
+**no client certificate and no TLS server side**. Every one of those refusals names the algorithm
+or the curve rather than skipping the check — refusing is still being unable to talk to the server,
+and none of this should be read as broad compatibility. This is a verifier written from scratch to
+be read, not a substitute for a reviewed TLS stack, and nothing in it is constant-time.
 
 ## Errors
 
@@ -863,12 +913,21 @@ clone/drop — Rc traffic through the operand stack — so the remaining levers 
 into neant-generated specialised code, and a user-function call, which still costs ~37ns of frame
 setup on top of its body.
 
-For TLS, the client now verifies the server: DER, X.509, RSA verification, a trust store, chain
-validation and hostname matching are in (`der.nt`, `x509.nt`, `rsa.nt`, `verify.nt`). What is
-missing is **ECDSA P-256 verification**, which most public chains need and which every refusal
-message currently names by algorithm; **revocation**, which means OCSP or CRL fetching and so an
-HTTP client over TLS first; client certificates; and a server side. SHA-384/512 would come with
-ECDSA — `rsa.nt`'s DigestInfo table and PSS verifier are SHA-256 only today.
+For TLS, the client now verifies the server, and ECDSA is no longer a blank wall: DER, X.509, RSA
+and ECDSA P-256 verification, a trust store, chain validation and hostname matching are in
+(`der.nt`, `x509.nt`, `rsa.nt`, `p256.nt`, `verify.nt`). The lesson of adding P-256 is worth writing
+down, because it was not the one expected: the README used to say ECDSA P-256 was what stood between
+this client and Google or Cloudflare, and it was not. Their leaves are P-256/SHA-256 and verify now;
+their intermediates are ecdsa-with-SHA384 over P-384, so those hosts are still refused. The gap was
+never one algorithm.
+
+What is missing, then: **SHA-384/512**, a DigestInfo entry in `rsa.nt` and a second hash beside
+`sha256` in `crypto.nt`, which is what every ECDSA chain on the public web actually stops on;
+**P-384 and P-521**, a second curve in `p256.nt`'s shape; **Ed25519** in the chain, which only needs
+`ed25519.nt` wired into `verify.nt`'s dispatch; **revocation**, which means OCSP or CRL fetching and
+so an HTTP client over TLS first; **name constraints** and **extendedKeyUsage** enforcement; client
+certificates; and a server side. The other open item is speed: one P-256 verification is ~178ms
+against RSA-2048's ~7.4ms, and `p256.nt`'s header counts out why and what does not help.
 
 `tlsConnect` used to draw the x25519 private key from `rand`, and then the ClientHello random from it
 too. That random goes out in the clear, xorshift64 is linear and invertible, and 32 bytes of it are
@@ -879,5 +938,7 @@ Ed25519 is in (`src/neant/crypto/ed25519.nt`), which took one runtime primitive 
 change. RSA-PKCS#1 and RSA-PSS followed (`bignum.nt`, `rsa.nt`), on the general modular reduction
 that real certificates need — Montgomery, not the special-prime folding the 2^255-19 field gets away
 with. RSA *verification* stays cheap because the exponent is 65537: 16 squarings and 2 multiplies,
-~11ms at 2048 bits. ECDSA P-256 is the one left, and it needs that same bignum arithmetic over a
-curve rather than a modulus.
+~7.4ms at 2048 bits. ECDSA P-256 (`p256.nt`) went on top of that same bignum arithmetic, over a
+curve rather than a modulus, and needed no new primitive either — the one thing it did need was
+measuring the special-prime fold before writing it, and finding it level with what was already
+there. Not every language addition is code that gets written.

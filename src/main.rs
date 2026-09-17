@@ -381,17 +381,17 @@ mod tls {
         let mut v = tls_vm();
         let got = v.eval("ch: clientHello[\"a.b\"; 32#0x01; 32#0x02; 32#0x03]; (count ch; hex 6#ch; hex ch[71+til 5])").unwrap();
         // 0x01 ClientHello, 24-bit length, then 0x0303; cipher_suites is the one suite 0x1303.
-        // 158 bytes, not the 160 this asserted before src/neant/crypto/verify.nt existed:
-        // signature_algorithms dropped ecdsa_secp256r1_sha256, because nothing here can verify an
-        // ECDSA signature and offering a scheme you cannot check only buys you a chain you then
-        // have to refuse. The two remaining entries are asserted on their own below.
-        assert_eq!(got.fmt(), "(158;\"0100009a0303\";\"0002130301\")");
-        // the signature_algorithms extension (13) in full: 2052 rsa_pss_rsae_sha256, which signs
-        // the CertificateVerify, and 1025 rsa_pkcs1_sha256, which only ever signs a certificate
-        // the extensions start at 79: 4 bytes of handshake header, version(2), random(32),
+        // 160 bytes: signature_algorithms is back to three entries now that src/neant/crypto/
+        // p256.nt can check an ECDSA P-256 signature, so ecdsa_secp256r1_sha256 is offered again.
+        // Every scheme in the list is one verify.nt can verify; the list is asserted in full below.
+        assert_eq!(got.fmt(), "(160;\"0100009c0303\";\"0002130301\")");
+        // the signature_algorithms extension (13) in full, most preferred first: 1027
+        // ecdsa_secp256r1_sha256, 2052 rsa_pss_rsae_sha256 -- either of which signs the
+        // CertificateVerify -- and 1025 rsa_pkcs1_sha256, which only ever signs a certificate.
+        // The extensions start at 79: 4 bytes of handshake header, version(2), random(32),
         // a 32-byte session_id behind its length byte, cipher_suites(2+2), compression(1+1) and
         // the extensions' own 2-byte length
-        assert_eq!(tests::ev(&mut v, "hex findExt[wdrop[79;ch]; 13]"), "\"000408040401\"");
+        assert_eq!(tests::ev(&mut v, "hex findExt[wdrop[79;ch]; 13]"), "\"0006040308040401\"");
     }
 }
 
@@ -974,20 +974,58 @@ mod rsa {
     }
 }
 
+/// ECDSA P-256 verification (src/neant/crypto/p256.nt), for the one thing that needs the host: how
+/// long one signature takes. Everything else -- the field, the group law against published multiples
+/// of the base point, the openssl vector, and every malformed point, scalar and DER encoding that
+/// must come back 0b -- is pure neant and lives in tests/p256.nt, which tests::nt_tests runs.
+#[cfg(test)]
+mod p256 {
+    use super::*;
+    fn p256_vm() -> vm::Vm {
+        let mut v = boot_vm();
+        for m in ["bignum", "der", "p256"] {
+            let f = format!("src/neant/crypto/{m}.nt");
+            v.eval(&std::fs::read_to_string(&f).unwrap()).unwrap_or_else(|e| panic!("{f}: '{}", e.0));
+        }
+        v
+    }
+    /// The vector is tests/p256.nt's, made from the committed tests/data/pki-ec-leaf.key; the same
+    /// comment there carries the openssl commands.
+    const PUB: &str = "04d80beadaa91bcac982be71619c25106a5d257a6537d2233e689e2c72e6615843873e23bee15467e76c55be95400a63d44cc891a45adbcf74785bf675ebc7da45";
+    const DG: &str = "ddf5bf46337c63b4cef6f1dbfac137cb3e0a8a6e00313db0f98d3d8f9872782d";
+    const SIG: &str = "3046022100b561094b230ffe88c2f54eeb4dea56d3ddc4c0c0086ad91939a667e88be6373c022100f090ab3512ae71e1c2af3ca720f081e79bb11deb367652e23a8e5fd7e804e8b4";
+
+    /// A verification is one inversion mod n, 256 Jacobian doublings and about 192 mixed additions
+    /// over Shamir's trick, and one inversion mod p to come back to affine -- roughly 4900 modular
+    /// multiplications, against the twenty an RSA-2048 exponentiation with e = 65537 costs. That
+    /// ratio is the whole story and the number in the log is the point; the bound is loose.
+    #[test]
+    fn p256_verification_time() {
+        let mut v = p256_vm();
+        let setup = format!("pk: unhex \"{PUB}\"; dg: unhex \"{DG}\"; sg: unhex \"{SIG}\"\n");
+        assert_eq!(tests::ev(&mut v, &format!("{setup}ecdsaVerifyP256Der[pk;dg;sg]")), "1b");
+        let src = format!("{setup}t0: now`time; do[5; ecdsaVerifyP256Der[pk;dg;sg]]; `int$now[`time]-t0");
+        let ms: f64 = tests::ev(&mut v, &src).parse().unwrap();
+        eprintln!("ECDSA P-256 verification: {:.1}ms", ms / 5.0);
+        assert!(ms < 5000.0, "a P-256 verification took {}ms", ms / 5.0);
+    }
+}
+
 /// src/neant/crypto/verify.nt and the TLS 1.3 wiring in tls.nt, for the part of them that needs
-/// the host: a real `openssl s_server` to handshake against, and two timings. Everything that is
+/// the host: a real `openssl s_server` to handshake against, and the timings. Everything that is
 /// pure neant -- hostname matching, every bad chain and its reason, the Certificate and
 /// CertificateVerify messages -- lives in tests/verify.nt, which tests::nt_tests runs.
 ///
-/// The fixture PKI is built by tests/data/pki-gen.sh, which records the exact `openssl` (3.6.2)
-/// commands and pins every date. Nothing here reaches the network: every server is on 127.0.0.1.
+/// The fixture PKI is built by tests/data/pki-gen.sh (RSA) and tests/data/pki-ec-gen.sh (ECDSA),
+/// which record the exact `openssl` (3.6.2) commands and pin every date. Nothing here reaches the
+/// network: every server is on 127.0.0.1.
 #[cfg(test)]
 mod verify {
     use super::*;
 
     fn verify_vm() -> vm::Vm {
         let mut v = boot_vm();
-        for m in ["bignum", "rsa", "der", "x509", "verify", "tls"] {
+        for m in ["bignum", "rsa", "der", "p256", "x509", "verify", "tls"] {
             let f = format!("src/neant/crypto/{m}.nt");
             v.eval(&std::fs::read_to_string(&f).unwrap()).unwrap_or_else(|e| panic!("{f}: '{}", e.0));
         }
@@ -1041,7 +1079,8 @@ mod verify {
     /// the handshake. Killed on drop, so a failing assertion still cleans up.
     struct Server(std::process::Child, u16);
     impl Drop for Server { fn drop(&mut self) { let _ = self.0.kill(); let _ = self.0.wait(); } }
-    fn s_server(cert: &str) -> Server {
+    fn s_server(cert: &str) -> Server { s_server_with(cert, "pki-leaf.key", "pki-int.pem") }
+    fn s_server_with(cert: &str, key: &str, chain: &str) -> Server {
         // src/prims.rs has no way to ask a listener its bound port and openssl has none either, so
         // a probe listener picks a free one and is dropped (the same accepted TOCTOU race as the
         // accept-workers test in mod tls).
@@ -1050,8 +1089,9 @@ mod verify {
         drop(probe);
         let child = std::process::Command::new("openssl")
             .args(["s_server", "-accept", &format!("127.0.0.1:{port}"),
-                   "-cert", &format!("tests/data/{cert}.pem"), "-key", "tests/data/pki-leaf.key",
-                   "-cert_chain", "tests/data/pki-int.pem", "-tls1_3", "-groups", "x25519",
+                   "-cert", &format!("tests/data/{cert}.pem"),
+                   "-key", &format!("tests/data/{key}"),
+                   "-cert_chain", &format!("tests/data/{chain}"), "-tls1_3", "-groups", "x25519",
                    "-ciphersuites", "TLS_CHACHA20_POLY1305_SHA256", "-rev", "-quiet"])
             .stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null())
@@ -1091,6 +1131,32 @@ mod verify {
         // iPAddress entry and never against a name
         assert_eq!(talk(&mut v, srv.1, "127.0.0.1", "RS"), "(2;\"slt olleh\n\")");
     }
+    /// The same thing with an ECDSA certificate, which is the whole point of src/neant/crypto/
+    /// p256.nt: the leaf and the root are both P-256 signed with ecdsa-with-SHA256, the server picks
+    /// ecdsa_secp256r1_sha256 for its CertificateVerify because the ClientHello now offers it, and
+    /// nothing in this handshake goes anywhere near rsa.nt. Before p256.nt this server could not be
+    /// talked to at all.
+    #[test]
+    fn an_ecdsa_handshake_verifies_and_data_round_trips() {
+        let srv = s_server_with("pki-ec-leaf", "pki-ec-leaf.key", "pki-ec-root.pem");
+        let mut v = verify_vm();
+        let store = "x509LoadRoots \"tests/data/pki-ec-root.pem\"";
+        assert_eq!(talk(&mut v, srv.1, "127.0.0.1", store), "(2;\"slt olleh\n\")");
+    }
+    /// And how long that costs: two P-256 signature checks (the chain link and the
+    /// CertificateVerify) rather than two RSA-2048 exponentiations.
+    #[test]
+    fn ecdsa_chain_verification_time() {
+        let mut v = verify_vm();
+        let src = "t0: now`time; do[5; x509VerifyChain[enlist P \"pki-ec-leaf\"; \
+                   x509LoadRoots \"tests/data/pki-ec-root.pem\"; \"leaf.neant.test\"; NOW]]; \
+                   `int$now[`time]-t0";
+        let ms: f64 = tests::ev(&mut v, src).parse().unwrap();
+        eprintln!("chain verification (P-256 leaf + P-256 root, one ECDSA signature): {:.1}ms",
+                  ms / 5.0);
+        assert!(ms < 10000.0, "a one-link ECDSA chain took {}ms", ms / 5.0);
+    }
+
     /// The same server, refused before a byte of application data moves.
     #[test]
     fn a_root_the_store_does_not_hold_is_refused() {
