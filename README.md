@@ -411,6 +411,67 @@ subtly wrong in a verifier whose job is to say no, so a mismatch is refused with
 and the curve named. In all seven public chains measured below, every `ecdsaSha384` signature is
 checked against a P-384 key and every `ecdsaSha256` one against a P-256 key.
 
+`src/neant/crypto/batch.nt` (loadable, not in the boot image) verifies **many P-256 signatures in
+one call**, on `ec.nt`'s arithmetic — the single-signature path is untouched:
+
+```
+load "src/neant/crypto/batch.nt"
+batchVerifyP256[keys; digests; sigs]        // 1b / 0b        sigs are (r;s) pairs
+batchVerifyP256Bad[keys; digests; sigs]     // the indices that failed
+batchVerifyP256DerWho[keys; digests; sigs]  // one boolean each, signatures as DER
+batchVerifyP256Par[keys; digests; sigs; 20] // the same answers, over 20 OS threads
+```
+
+**The batch answer is per signature and it is exact** — it agrees with `ecdsaVerifyP256` signature by
+signature, so a failing batch names which one rather than returning one bit. That is because this is
+*not* the random-linear-combination batch of the literature, and it cannot be: that test needs the
+point `R`, and an ECDSA signature carries only `r = x(R) mod n`. Lifting `r` back costs a square root
+mod p and then hands you `(x, ±y)` — and the sign is not recoverable even in principle, because
+`(r,s)` and `(r,n-s)` are both valid signatures of the same message under the same key and differ by
+exactly that sign. A batch of N would have 2^N sign assignments. This is why Cheon–Yi and Karati–Das
+state ECDSA batch verification for ECDSA\*, the variant that transmits `R`; secp256k1's recovery byte
+is the same missing bit. The cost of not having it is real — a Pippenger bucket sum over the 2N+1
+points would cut the ~4900 modular multiplications a verification takes here to roughly 900 — and the
+gain is that there is no 2^-k soundness error to argue about and no bisection to find the bad one.
+
+What the batch *does* exploit is that this is an array language. A field element for the whole batch
+is laid out **lane-major**: `limbs` int vectors, one per 26-bit limb, each holding that limb of every
+signature. The same schoolbook multiply then runs on vectors N times longer, and a ten-element vector
+operation is almost all dispatch — measured here, `c + a*b` is 27.5 ns/element at length 10 and
+1.41 ns/element at length 5120. `bnMontMul` costs 25.0µs one signature at a time and 0.651µs per
+signature at 512 lanes, **38x**. Two things really are batch algorithms: one modular inversion for the
+whole batch (Montgomery's trick as a binary product tree, replacing a Fermat `s^-1 mod n` per
+signature), and a projective final comparison `X = r·Z²` — or `(r+n)·Z²`, the case `ec.nt`'s header
+warns about — which removes the inversion mod p entirely.
+
+Measured on this machine, against the 512 real openssl signatures in `tests/data/p256-batch.txt`:
+
+| N | 1 thread, ms/sig | 1 thread, verify/s | 20 threads, ms/sig | 20 threads, verify/s |
+|---:|---:|---:|---:|---:|
+| 1 | 739.0 | 1.4 | 80.25 | 12.5 |
+| 8 | 94.04 | 10.6 | 10.99 | 91.0 |
+| 64 | 16.21 | 61.7 | 1.622 | 616.6 |
+| 512 | 4.875 | 205.1 | 0.449 | 2225.1 |
+| 2048 | 3.549 | 281.8 | 0.314 | 3180.6 |
+
+against `ecdsaVerifyP256` one at a time at **180.9ms** (5.5 verify/s) and `openssl speed -seconds 3
+ecdsap256` at **38.9µs** (25684 verify/s), both one core, both measured the same day. **So this does
+not beat OpenSSL**: at its best — 2048 signatures in one call across 20 cores — it is 8x short of
+OpenSSL's *single* core and about 160x short of OpenSSL on all twenty. What it does is close the gap
+from 4650x to 8x, 577x more signatures per second out of the same machine, with no new Rust
+primitive. It is also 4.1x *slower* than `ecdsaVerifyP256` for a single signature: the crossover is
+at about four.
+
+The twenty-thread column found something worth naming. `spawn` forks a snapshot of globals, and a
+global holding a function holds the same `Arc<FnCode>` in every thread — and `FnCode` keeps the
+tracing JIT's per-loop-header state behind a `Mutex` that the interpreter takes on **every backward
+jump**. Twenty threads in the same hot loop queue on one lock: a batch of 64 across 20 threads runs
+at 224 verify/s that way and at **611** when each thread re-`load`s the module first and gets its own
+`FnCode`, which is what `batchVerifyP256Par` does. The fix that would make that unnecessary is in the
+VM: `Compiled` and `Rejected` are write-once, so the hot path need not take the mutex at all.
+Splitting *one* batch across threads is a different and worse idea — k threads means k times fewer
+lanes to amortise over — and 512 split twenty ways measured slower than 512 in one thread.
+
 `src/neant/crypto/der.nt` and `src/neant/crypto/x509.nt` (loadable, not in the boot image) read
 **ASN.1 DER and X.509 certificates** — parsing only, no signature check and no chain building:
 
