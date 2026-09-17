@@ -1,5 +1,40 @@
 // Crypto primitives in neant, on the byte type and the bit verbs (band bor bxor shl shr bnot).
 // 32-bit words live in ints and are masked with M32 after every sum.   hex sha256 `byte$"abc"
+//
+// EVERY HOT KERNEL HERE IS A SCALAR LOOP OVER INDICES, for the same reason src/neant/crypto/
+// bignum.nt's limb kernels are — see that file's header and README "Stage 2". The whole-function
+// JIT tier compiles a function whose every op is integer arithmetic over its own locals, where
+// `x[i]` and `x[i]:v` on an `Ints` PARAMETER (or capture) are an inlined bounds check and one
+// scaled load or store, where `band bor bxor badd shl shr` are instructions rather than calls,
+// and where a body ending in a bare parameter name hands that vector back to its caller. What it
+// refuses is everything else — and the three things it refuses that a hash is otherwise made of:
+//
+//   * a global read. `M32`, `shaK`, `M26`, `M22` were all globals, and a global that is not an
+//     immediately-called function is not in the subset. They are parameters now (`msk`, `k`).
+//   * a scratch local vector. Nothing in the subset can build a vector, so only a parameter or a
+//     capture can be indexed. The message schedule `w`, the ChaCha state `s`, poly1305's product
+//     accumulator and the field's are parameters, allocated once as globals and passed in.
+//   * a call. A call that stays inside the tier still costs ~45ns through the trampoline, which is
+//     thirty times an inlined instruction, so `rotr32`/`rotl32`/`add32`/`qround` are written out
+//     by hand inside the kernels. (`bnot` is not one of the six inlined builtins either: `msk bxor
+//     x` is the same thing on a masked word and stays in the subset.)
+//
+// A vector a kernel writes is copy-on-write cloned at entry, so passing a global as the `out` or
+// accumulator parameter hands the kernel a private buffer and leaves the global untouched — that
+// is why `SHAW`, `CHS`, `POLYACC`, `FACC`, `F0` can be shared module-level scratch with no
+// aliasing hazard, and why `shaBlocksL[shaH0;...]` does not clobber the IV.
+//
+// The shaWarm/chachaWarm/polyWarm/fieldWarm calls are why the kernels are compiled before the
+// first caller needs them: the tier compiles after 64 CALLS, and one sha256 of any size is ONE
+// call to shaBlocksL, so without them a TLS handshake's thirty hashes would all run interpreted.
+// x25519 is the exception that proves the rule — one key exchange is ~2800 calls to fmulL, so it
+// tiers up 2% into its own first run whether or not anything warmed it (17ms cold against 3.1ms
+// warm, measured). Each warms on first use rather than at load, and THAT IS NOT A STYLE CHOICE:
+// this file is a boot file and src/neant/jit/arm64.nt is a LATER one, so a kernel driven past 64
+// calls while the image is still loading finds no `jitCompile` to call, and `src/jit.rs` settles
+// its one-shot cache to "never compile this" for the life of the process. Warming at the top of
+// the file costs the kernel its compilation permanently and silently — the tests all still pass,
+// the hash is simply eight times slower.
 M32: 4294967295
 rotr32: {[x;n] M32 band (x shr n) bor x shl 32-n}
 // bytes <-> big-endian 32-bit words
@@ -9,28 +44,62 @@ be32bytes: {`byte$ raze {(x shr 24 16 8 0) band 255} each x}
 // ---- SHA-256 (FIPS 180-4)
 shaK: be32 unhex "428a2f9871374491b5c0fbcfe9b5dba53956c25b59f111f1923f82a4ab1c5ed5d807aa9812835b01243185be550c7dc372be5d7480deb1fe9bdc06a7c19bf174e49b69c1efbe47860fc19dc6240ca1cc2de92c6f4a7484aa5cb0a9dc76f988da983e5152a831c66db00327c8bf597fc7c6e00bf3d5a7914706ca63511429296727b70a852e1b21384d2c6dfc53380d13650a7354766a0abb81c2c92e92722c85a2bfe8a1a81a664bc24b8b70c76c51a3d192e819d6990624f40e3585106aa07019a4c1161e376c082748774c34b0bcb5391c0cb34ed8aa4a5b9cca4f682e6ff3748f82ee78a5636f84c878148cc7020890befffaa4506cebbef9a3f7c67178f2"
 shaH0: be32 unhex "6a09e667bb67ae853c6ef372a54ff53a510e527f9b05688c1f83d9ab5be0cd19"
+SHAW: 64#0                              // the message schedule, passed in because a scratch local cannot be indexed
 // message, 0x80, zeros to 56 mod 64, then the bit length as 8 big-endian bytes
 shaPad: {[b] n: count b; b, 0x80, (((55-n) mod 64)#0x00), be32bytes ((8*n) shr 32 0) band M32}
-shaBlock: {[h;blk]
-  w: be32 blk; i: 16
-  while[i<64
-    s0: (rotr32[w[i-15];7]) bxor (rotr32[w[i-15];18]) bxor w[i-15] shr 3
-    s1: (rotr32[w[i-2];17]) bxor (rotr32[w[i-2];19]) bxor w[i-2] shr 10
-    w,: M32 band w[i-16]+s0+w[i-7]+s1; i+:1]
-  a: h[0]; b: h[1]; c: h[2]; d: h[3]; e: h[4]; f: h[5]; g: h[6]; hh: h[7]; i: 0
-  while[i<64
-    S1: (rotr32[e;6]) bxor (rotr32[e;11]) bxor rotr32[e;25]
-    ch: (e band f) bxor (M32 band bnot e) band g
-    t1: M32 band hh+S1+ch+shaK[i]+w[i]
-    S0: (rotr32[a;2]) bxor (rotr32[a;13]) bxor rotr32[a;22]
-    maj: (a band b) bxor (a band c) bxor b band c
-    t2: M32 band S0+maj
-    hh: g; g: f; f: e; e: M32 band d+t1; d: c; c: b; b: a; a: M32 band t1+t2
-    i+:1]
-  M32 band h+(a;b;c;d;e;f;g;hh)}
-sha256: {[b] p: shaPad b; h: shaH0; i: 0; while[i<count p; h: shaBlock[h; p[i+til 64]]; i+:64]; be32bytes h}
+// the whole message, every block, in one compiled call: h is the eight state words (cloned on the
+// way in, handed back on the way out), w the schedule, k the round constants, p the padded message
+// one byte per int. The rotations are rotr32 written out — the shift counts are constants, so each
+// is two shifts, an or and a mask with no call. `(msk bxor ee) band gg` is `bnot`'s half of `ch`.
+shaBlocksL: {[h;w;k;p;nblk;msk]
+  blk: 0
+  o: 0
+  while[blk<nblk
+    i: 0
+    while[i<16
+      w[i]: (((p[o] shl 24) bor (p[o+1] shl 16)) bor (p[o+2] shl 8)) bor p[o+3]
+      o: o+4
+      i: i+1]
+    while[i<64
+      x: w[i-15]
+      s0: msk band (((x shr 7) bor x shl 25) bxor ((x shr 18) bor x shl 14)) bxor x shr 3
+      y: w[i-2]
+      s1: msk band (((y shr 17) bor y shl 15) bxor ((y shr 19) bor y shl 13)) bxor y shr 10
+      w[i]: msk band (w[i-16]) + s0 + (w[i-7]) + s1
+      i: i+1]
+    aa: h[0]; bb: h[1]; cc: h[2]; dd: h[3]; ee: h[4]; ff: h[5]; gg: h[6]; hh: h[7]
+    i: 0
+    while[i<64
+      S1: msk band (((ee shr 6) bor ee shl 26) bxor ((ee shr 11) bor ee shl 21)) bxor (ee shr 25) bor ee shl 7
+      ch: (ee band ff) bxor (msk bxor ee) band gg
+      t1: msk band hh + S1 + ch + (k[i]) + w[i]
+      S0: msk band (((aa shr 2) bor aa shl 30) bxor ((aa shr 13) bor aa shl 19)) bxor (aa shr 22) bor aa shl 10
+      maj: ((aa band bb) bxor aa band cc) bxor bb band cc
+      t2: msk band S0+maj
+      hh: gg; gg: ff; ff: ee; ee: msk band dd+t1; dd: cc; cc: bb; bb: aa; aa: msk band t1+t2
+      i: i+1]
+    h[0]: msk band (h[0])+aa
+    h[1]: msk band (h[1])+bb
+    h[2]: msk band (h[2])+cc
+    h[3]: msk band (h[3])+dd
+    h[4]: msk band (h[4])+ee
+    h[5]: msk band (h[5])+ff
+    h[6]: msk band (h[6])+gg
+    h[7]: msk band (h[7])+hh
+    blk: blk+1]
+  h}
+// 64 empty calls (no blocks, so the body does no work at all) take shaBlocksL over the tier's
+// call threshold, on the first hash rather than at load — see the header for why not at load.
+shaWarmed: 0b
+shaWarm: {[] shaWarmed:: 1b; do[64; shaBlocksL[8#0; SHAW; shaK; 64#0; 0; M32]]; 1b}
+sha256: {[b]
+  if[not shaWarmed; shaWarm[]]
+  p: `int$ shaPad b
+  be32bytes shaBlocksL[shaH0; SHAW; shaK; p; (count p) shr 6; M32]}
 
-// ---- ChaCha20 (RFC 8439). The 16-word state is worked as 4 column vectors, so a quarter round is 4 columns at once.
+// ---- ChaCha20 (RFC 8439). One compiled call does the whole keystream and the xor: the sixteen
+// state words are a parameter vector, and the eight quarter rounds of a double round are driven
+// off CHQI, the (a;b;c;d) index quadruples, so the quarter round is written once.
 add32: {M32 band x+y}
 rotl32: {[x;n] M32 band (x shl n) bor x shr 32-n}
 // bytes <-> little-endian 32-bit words
@@ -40,19 +109,60 @@ qround: {[a;b;c;d]
   a: add32[a;b]; d: rotl32[d bxor a;16]; c: add32[c;d]; b: rotl32[b bxor c;12]
   a: add32[a;b]; d: rotl32[d bxor a;8];  c: add32[c;d]; b: rotl32[b bxor c;7]
   (a;b;c;d)}
-chachaBlock: {[key;counter;nonce]
-  s0: (le32 `byte$"expand 32-byte k"), (le32 key), counter, le32 nonce
-  s: s0
-  do[10
-    r: qround[s[0 1 2 3]; s[4 5 6 7]; s[8 9 10 11]; s[12 13 14 15]]
-    s[0 1 2 3]: r[0]; s[4 5 6 7]: r[1]; s[8 9 10 11]: r[2]; s[12 13 14 15]: r[3]
-    r: qround[s[0 1 2 3]; s[5 6 7 4]; s[10 11 8 9]; s[15 12 13 14]]
-    s[0 1 2 3]: r[0]; s[5 6 7 4]: r[1]; s[10 11 8 9]: r[2]; s[15 12 13 14]: r[3]]
-  le32bytes add32[s;s0]}
+CHS:  16#0                                                        // the working state
+CHQI: 0 4 8 12  1 5 9 13  2 6 10 14  3 7 11 15  0 5 10 15  1 6 11 12  2 7 8 13  3 4 9 14
+chachaState: {[key;counter;nonce] (le32 `byte$"expand 32-byte k"), (le32 key), counter, le32 nonce}
+// out and dat are n bytes one per int; s0 is the sixteen-word block state, whose counter word this
+// advances per block. The last block's tail is guarded rather than trimmed afterwards, so nothing
+// past n is ever written.
+chachaXorL: {[out;dat;n;s;s0;qi;msk]
+  pos: 0
+  while[pos<n
+    i: 0
+    while[i<16; s[i]: s0[i]; i: i+1]
+    do[10
+      j: 0
+      while[j<32
+        ia: qi[j]; ib: qi[j+1]; ic: qi[j+2]; id: qi[j+3]
+        va: s[ia]; vb: s[ib]; vc: s[ic]; vd: s[id]
+        va: msk band va+vb
+        vd: vd bxor va
+        vd: msk band (vd shl 16) bor vd shr 16
+        vc: msk band vc+vd
+        vb: vb bxor vc
+        vb: msk band (vb shl 12) bor vb shr 20
+        va: msk band va+vb
+        vd: vd bxor va
+        vd: msk band (vd shl 8) bor vd shr 24
+        vc: msk band vc+vd
+        vb: vb bxor vc
+        vb: msk band (vb shl 7) bor vb shr 25
+        s[ia]: va; s[ib]: vb; s[ic]: vc; s[id]: vd
+        j: j+4]]
+    i: 0
+    while[i<16
+      t: msk band (s[i]) + s0[i]
+      q: pos + 4*i
+      if[q<n; out[q]: (dat[q]) bxor t band 255]
+      q: q+1
+      if[q<n; out[q]: (dat[q]) bxor (t shr 8) band 255]
+      q: q+1
+      if[q<n; out[q]: (dat[q]) bxor (t shr 16) band 255]
+      q: q+1
+      if[q<n; out[q]: (dat[q]) bxor t shr 24]
+      i: i+1]
+    s0[12]: (s0[12])+1
+    pos: pos+64]
+  out}
 // chacha20[key;counter;nonce;data]: xor data with the keystream from block `counter`; encrypt and decrypt are the same call
+chachaWarmed: 0b
+chachaWarm: {[] chachaWarmed:: 1b; do[64; chachaXorL[0#0; 0#0; 0; CHS; 16#0; CHQI; M32]]; 1b}
 chacha20: {[key;counter;nonce;data]
-  n: count data; ks: raze chachaBlock[key;;nonce] each counter+til ceiling n%64
-  data bxor (`byte$ks)[til n]}
+  if[not chachaWarmed; chachaWarm[]]
+  n: count data
+  if[n=0; :0x]
+  `byte$ chachaXorL[n#0; `int$data; n; CHS; chachaState[key;counter;nonce]; CHQI; M32]}
+chachaBlock: {[key;counter;nonce] chacha20[key;counter;nonce;64#0x00]}   // the raw keystream block
 
 // ---- HMAC-SHA256 (RFC 2104), HKDF (RFC 5869)
 hmac: {[key;msg] k: 64#$[64<count key; sha256 key; key], 64#0x00; sha256 (k bxor 64#0x5c), sha256 (k bxor 64#0x36), msg}
@@ -61,16 +171,67 @@ hkdfExpand: {[prk;info;n] t: 0x; out: 0x; i: 1; while[(count out)<n; t: hmac[prk
 
 // ---- Poly1305 (RFC 8439 2.5): 130-bit arithmetic in 5 limbs of 26 bits, so every product fits an int exactly
 M26: 67108863
+POLYACC: 9#0                                                     // the 5x5 product columns
 // up to 16 little-endian bytes (and the 2^128 bit when the block is full) -> 5 limbs
 p5: {[b;hi] v: le32 b, (16-count b)#0x00
   (v[0] band M26; ((v[0] shr 26) bor v[1] shl 6) band M26; ((v[1] shr 20) bor v[2] shl 12) band M26; ((v[2] shr 14) bor v[3] shl 18) band M26; (v[3] shr 8) bor hi shl 24)}
 // carry chain mod 2^130-5: what overflows limb 4 wraps to limb 0 times 5
 p5carry: {[h] do[3; c: h shr 26; h: (h band M26) + 5 1 1 1 1 * -1 rotate c]; h}
 p5mul: {[h;r] acc: 9#0; i: 0; while[i<5; acc[i+til 5]+: h[i]*r; i+:1]; p5carry acc[til 5] + 5*acc[5+til 4],0}
+// the full 16-byte blocks, all of them, in one compiled call: decode, add to the accumulator,
+// multiply by r, fold what passes limb 4 back into limb 0 times five, carry. Same arithmetic as
+// p5/p5mul/p5carry above, which still run the one partial block a message may end with. The carry
+// chain walks DOWN so each limb still sees its neighbour's pre-carry value, which is what the
+// vector form's `-1 rotate` did.
+polyBlocksL: {[h;r;acc;msg;nb;msk]
+  o: 0
+  b: 0
+  while[b<nb
+    v0: ((((msg[o]) bor (msg[o+1]) shl 8) bor (msg[o+2]) shl 16) bor (msg[o+3]) shl 24)
+    v1: ((((msg[o+4]) bor (msg[o+5]) shl 8) bor (msg[o+6]) shl 16) bor (msg[o+7]) shl 24)
+    v2: ((((msg[o+8]) bor (msg[o+9]) shl 8) bor (msg[o+10]) shl 16) bor (msg[o+11]) shl 24)
+    v3: ((((msg[o+12]) bor (msg[o+13]) shl 8) bor (msg[o+14]) shl 16) bor (msg[o+15]) shl 24)
+    h[0]: (h[0]) + v0 band msk
+    h[1]: (h[1]) + ((v0 shr 26) bor v1 shl 6) band msk
+    h[2]: (h[2]) + ((v1 shr 20) bor v2 shl 12) band msk
+    h[3]: (h[3]) + ((v2 shr 14) bor v3 shl 18) band msk
+    h[4]: (h[4]) + 16777216 bor v3 shr 8
+    i: 0
+    while[i<9; acc[i]: 0; i: i+1]
+    i: 0
+    while[i<5
+      hi: h[i]
+      j: 0
+      kk: i
+      while[j<5
+        acc[kk]: (acc[kk]) + hi*r[j]
+        kk: kk+1
+        j: j+1]
+      i: i+1]
+    h[0]: (acc[0]) + 5*acc[5]
+    h[1]: (acc[1]) + 5*acc[6]
+    h[2]: (acc[2]) + 5*acc[7]
+    h[3]: (acc[3]) + 5*acc[8]
+    h[4]: acc[4]
+    do[3
+      ct: (h[4]) shr 26
+      h[4]: ((h[4]) band msk) + (h[3]) shr 26
+      h[3]: ((h[3]) band msk) + (h[2]) shr 26
+      h[2]: ((h[2]) band msk) + (h[1]) shr 26
+      h[1]: ((h[1]) band msk) + (h[0]) shr 26
+      h[0]: ((h[0]) band msk) + 5*ct]
+    o: o+16
+    b: b+1]
+  h}
+polyWarmed: 0b
+polyWarm: {[] polyWarmed:: 1b; do[64; polyBlocksL[5#0; 5#0; POLYACC; 0#0; 0; M26]]; 1b}
 poly1305: {[key;msg]
-  r: p5[key[til 16];0] band 67108863 67108611 67092735 66076671 1048575   // clamp r
-  h: 5#0; i: 0; n: count msg
-  while[i<n; blk: msg[i+til 16&n-i]; full: 16=count blk; if[not full; blk,: 0x01]; h: p5mul[h+p5[blk;full]; r]; i+:16]
+  if[not polyWarmed; polyWarm[]]
+  r: `int$ p5[key[til 16];0] band 67108863 67108611 67092735 66076671 1048575   // clamp r
+  n: count msg
+  nb: n shr 4
+  h: polyBlocksL[5#0; r; POLYACC; `int$msg; nb; M26]
+  if[n > 16*nb; h: p5mul[h + p5[((16*nb) _ msg), 0x01; 0]; r]]   // the short last block, padded with a 1 byte
   h: p5carry p5carry h
   g: h + 5 0 0 0 0; c: g shr 26; g: (g band M26) + 0,-1_c     // h >= 2^130-5 exactly when h+5 reaches 2^130
   if[g[4] shr 26; h: g band M26]
@@ -87,17 +248,64 @@ aeadEncrypt: {[key;nonce;aad;pt] ct: chacha20[key;1;nonce;pt]; (ct; aeadTag[key;
 aeadDecrypt: {[key;nonce;aad;ct;tag] if[not tag~aeadTag[key;nonce;aad;ct]; signal "aead: bad tag"]; chacha20[key;1;nonce;ct]}
 
 // ---- X25519 (RFC 7748). Field 2^255-19 in 12 limbs of 22 bits: products are < 2^45, a column of 12 is < 2^49,
-// and 2^264 = 9728 mod p folds the high columns back with room to spare in an int. Carries run as vector passes.
+// and 2^264 = 9728 mod p folds the high columns back with room to spare in an int.
 M22: 4194303
 F0: 12#0
 F1: 1,11#0
 FKP: 2 * 4184576, 11#4194303          // 2^10 * p in limbs: added before a subtraction so no limb goes negative
-fcarry: {[v] do[4; c: v shr 22; v: (v band M22) + 9728 1 1 1 1 1 1 1 1 1 1 1 * -1 rotate c]; v}
-fadd: {fcarry x+y}
-fsub: {fcarry (x+FKP)-y}
-fmul: {[a;b] acc: 23#0; i: 0; while[i<12; acc[i+til 12]+: a[i]*b; i+:1]; fcarry acc[til 12] + 9728*acc[12+til 11],0}
-fsq: {fmul[x;x]}
-fmuls: {[a;k] fcarry a*k}
+FACC: 23#0                            // the 12x12 product columns
+// the carry passes, scalar and downward so each limb reads its neighbour's pre-carry value — the
+// `-1 rotate c` of the vector form, which allocated four twelve-element intermediates a call.
+fcarryL: {[v;msk]
+  do[4
+    ct: (v[11]) shr 22
+    i: 11
+    while[0<i
+      v[i]: ((v[i]) band msk) + (v[i-1]) shr 22
+      i: i-1]
+    v[0]: ((v[0]) band msk) + 9728*ct]
+  v}
+// the schoolbook product, the 2^264 = 9728 fold and the carry in one compiled call: acc is the 23
+// columns, out the 12 limbs handed back. The carry is written out rather than calling fcarryL —
+// a callee that returns a vector cannot be entered through the JIT's call trampoline, so the call
+// would deopt this whole function back to the interpreter.
+fmulL: {[out;acc;a;b;msk]
+  i: 0
+  while[i<23; acc[i]: 0; i: i+1]
+  i: 0
+  while[i<12
+    ai: a[i]
+    j: 0
+    kk: i
+    while[j<12
+      acc[kk]: (acc[kk]) + ai*b[j]
+      kk: kk+1
+      j: j+1]
+    i: i+1]
+  i: 0
+  while[i<11
+    out[i]: (acc[i]) + 9728*acc[12+i]
+    i: i+1]
+  out[11]: acc[11]
+  do[4
+    ct: (out[11]) shr 22
+    i: 11
+    while[0<i
+      out[i]: ((out[i]) band msk) + (out[i-1]) shr 22
+      i: i-1]
+    out[0]: ((out[0]) band msk) + 9728*ct]
+  out}
+// x25519 would tier fmulL up 2% into its own first ladder anyway; this only saves the ~14ms that
+// first run spends on its own first sixty-four multiplications interpreted. src/neant/crypto/
+// ed25519.nt calls the field directly and reaches the threshold on its own volume the same way.
+fieldWarmed: 0b
+fieldWarm: {[] fieldWarmed:: 1b; do[64; fcarryL[F0; M22]; fmulL[F0; FACC; F0; F0; M22]]; 1b}
+fcarry: {[v] fcarryL[v;M22]}
+fadd: {fcarryL[x+y;M22]}
+fsub: {fcarryL[(x+FKP)-y;M22]}
+fmul: {[a;b] fmulL[F0;FACC;a;b;M22]}
+fsq: {fmulL[F0;FACC;x;x;M22]}
+fmuls: {[a;k] fcarryL[a*k;M22]}
 // canonical form in [0;p)
 freduce: {[v] v: fcarry v
   do[3; e: v[11] shr 13; v[11]: v[11] band 8191; v[0]+: 19*e; do[12; c: v shr 22; v: (v band M22) + 0,-1_c]]   // 2^255 = 19 mod p, then a full ripple
@@ -110,6 +318,7 @@ fencode: {[v] bits: raze {(x shr til 22) band 1} each freduce v; `byte$ {+/x*2^t
 finv: {[a] r: F1; i: 254; while[not i<0; r: fsq r; if[(i>4) | i in 0 1 3; r: fmul[r;a]]; i: i-1]; r}   // a^(p-2), p-2 = 2^255-21
 // x25519[scalar 32 bytes; u 32 bytes] -> 32 bytes. Montgomery ladder; ponytail: not constant-time (branches on key bits)
 x25519: {[k;u]
+  if[not fieldWarmed; fieldWarm[]]
   k: `int$k; k[0]: k[0] band 248; k[31]: (k[31] band 127) bor 64
   x1: fdecode u; x2: F1; z2: F0; x3: x1; z3: F1; swap: 0; t: 254
   while[not t<0
