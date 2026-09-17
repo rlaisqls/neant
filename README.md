@@ -352,15 +352,24 @@ one with `` `$"content-length" ``, not a literal `` `content-length `` — a hyp
 symbol token is the `-` verb, not part of the name; casting a string with `` `$ `` has no such
 limit). A handler returns `(status; reason; headers; body)`.
 
+`httpServe` serves requests on a connection until either side is done with it: HTTP/1.1 keeps it
+open, 1.0 closes unless it asks not to, `Connection: close` from either the request or the handler
+ends it, and so does end of stream or a malformed request. A reply on a connection that stays open
+has to say where it ends, so `httpSend` fills in a `Content-Length` the handler did not set. What
+makes any of this work is that a connection carries a `pending` buffer: finding the end of a header
+block means reading past it, and those bytes belong to the next message — without somewhere to put
+them a second request loses its first bytes, which is the same reason the client can reuse a
+connection at all.
+
 Chunked transfer-encoding is decoded on both sides, including chunk extensions and trailer fields —
 the real web needs it, and `example.com` is already one of the sites that answers that way. A
 response with neither a `Content-Length` nor chunking is read to the close, and `204`/`304`/`1xx`
 and a `HEAD` reply never take a body whatever their headers claim.
 
-What is missing: keep-alive on the *server* side (it still closes after one response, though the
-client reuses a connection happily), multipart, cookies, proxies, compression — nothing sends
-`Accept-Encoding`, and a server that gzips anyway hands back bytes this does not decode — and a TLS
-server side for `httpServe` to sit behind, which is `src/neant/crypto/tls.nt`'s missing half.
+What is missing: pipelining (a request is answered before the next is read), multipart, cookies,
+proxies, compression — nothing sends `Accept-Encoding`, and a server that gzips anyway hands back
+bytes this does not decode — and a TLS server side for `httpServe` to sit behind, which is
+`src/neant/crypto/tls.nt`'s missing half.
 
 `tests/http.nt` is the suite, all of it against sockets this process opens; `tests/data/live-http.nt`
 is the one that goes out to the network, run by hand.

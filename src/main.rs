@@ -427,7 +427,9 @@ mod http {
         std::thread::sleep(std::time::Duration::from_millis(100));
 
         let mut c = std::net::TcpStream::connect(("127.0.0.1", port)).unwrap();
-        c.write_all(b"GET /hello HTTP/1.1\r\nHost: h\r\n\r\n").unwrap();
+        // `Connection: close`, because this reads to EOF: httpServe keeps a 1.1 connection open
+        // otherwise, which is the point of it and would hang this read forever.
+        c.write_all(b"GET /hello HTTP/1.1\r\nHost: h\r\nConnection: close\r\n\r\n").unwrap();
         let mut resp = String::new();
         c.read_to_string(&mut resp).unwrap();
         assert!(resp.starts_with("HTTP/1.1 200 OK\r\n"), "{resp:?}");
@@ -436,7 +438,7 @@ mod http {
 
         let mut c = std::net::TcpStream::connect(("127.0.0.1", port)).unwrap();
         let body = "hi there";
-        c.write_all(format!("POST /echo HTTP/1.1\r\nHost: h\r\nContent-Length: {}\r\n\r\n{body}", body.len()).as_bytes()).unwrap();
+        c.write_all(format!("POST /echo HTTP/1.1\r\nHost: h\r\nConnection: close\r\nContent-Length: {}\r\n\r\n{body}", body.len()).as_bytes()).unwrap();
         let mut resp = String::new();
         c.read_to_string(&mut resp).unwrap();
         assert!(resp.ends_with("method=POST path=/echo body=hi there"), "{resp:?}");
