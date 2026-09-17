@@ -172,7 +172,7 @@ X509SIGSYMS: `rsaPkcs1Sha1`rsaPkcs1Sha256`rsaPkcs1Sha384`rsaPkcs1Sha512
 X509SIGSYMS,: `ecdsaSha256`ecdsaSha384`ecdsaSha512`ed25519
 X509RSAV15: `rsaPkcs1Sha1`rsaPkcs1Sha256`rsaPkcs1Sha384`rsaPkcs1Sha512
 X509HASHOIDS: ("1.3.14.3.2.26";"2.16.840.1.101.3.4.2.1";"2.16.840.1.101.3.4.2.2")
-X509HASHOIDS,: ("2.16.840.1.101.3.4.2.3")
+X509HASHOIDS,: enlist "2.16.840.1.101.3.4.2.3"   // enlist, not (...): parentheses round one string are that string, so this spliced 22 chars
 X509HASHSYMS: `sha1`sha256`sha384`sha512
 // a hash AlgorithmIdentifier: RFC 4055 lets the NULL parameter be present or absent, nothing else
 x509Hash: {[a]

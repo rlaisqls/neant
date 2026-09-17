@@ -697,10 +697,16 @@ worse until the bignum arithmetic became compiled scalar loops (["the bignum ari
 compiled scalar loops"](#the-bignum-arithmetic-runs-as-compiled-scalar-loops)); `p256.nt`'s header
 counts out where what is left goes and which two optimisations were measured and rejected.
 
+RSA over SHA-512 (PKCS#1 and PSS) and Ed25519 in a chain are checked as of `tests/data/pki-ed-gen.sh`'s
+fixtures. Ed25519 is the one algorithm here that names no digest: RFC 8032 signs the message and
+hashes it internally, so `verify.nt` hands `ed25519Verify` the tbs span rather than a digest of it.
+It needs `ed25519.nt`, which `tlsclient.nt` therefore loads — 21ms on a 542ms load, chosen over
+dispatching on whether the global happens to exist, which would have made a verifier's answer depend
+on what else the program had loaded.
+
 What is still **not** checked, plainly: **P-521**, refused with the curve named, because there is no
-`p521.nt`; **SHA-512**, refused by algorithm, because `rsa.nt`'s DigestInfo table stops at SHA-384
-and nothing dispatches it; **SHA-1**, refused because it is broken; **Ed25519** in a chain, which
-`ed25519.nt` can verify but nothing wires into `verify.nt`'s dispatch; **revocation**, no CRL and no
+`p521.nt`; **ecdsaSha512**, refused for the curve-pairing reason below rather than for want of the
+hash; **SHA-1**, refused because it is broken; **revocation**, no CRL and no
 OCSP, so a certificate revoked this morning still verifies; **name constraints** and certificate
 policies; and **extendedKeyUsage**, which is parsed and ignored, so a certificate issued for e-mail
 will serve a web request. There are **no client certificates and no TLS server side**. A mismatched
@@ -1325,8 +1331,7 @@ the whole of the second curve. The decision that paid for that was made one chan
 measuring an optimisation and declining to write it.
 
 What is missing, then: **P-521**, another curve record and nothing else, wanted by nobody yet;
-**SHA-512** in a chain, three table entries in `rsa.nt` and a dispatch line; **Ed25519** in a chain,
-which only needs `ed25519.nt` wired into `verify.nt`'s dispatch; **revocation**, which means OCSP or
+**revocation**, which means OCSP or
 CRL fetching and so an HTTP client over TLS first — now possible, since the TLS client can reach a
 real responder; **name constraints** and **extendedKeyUsage** enforcement; client certificates; and a
 server side. Speed is a smaller open item than it was: one P-384 verification is ~38ms and one P-256

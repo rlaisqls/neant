@@ -12,8 +12,7 @@
 // one place a hash is named: rsaDigestInfo, rsaHashLen and rsaHash are the three tables it indexes,
 // and adding a fourth hash is three entries and no caller change. An unknown symbol is 0b, never a
 // silently wrong answer. sha384WithRSAEncryption is common on the public web, which is why it is
-// here; SHA-1 is deliberately absent and SHA-512 is not here because verify.nt does not dispatch
-// it, and an entry no dispatch reaches is a claim this build does not make.
+// here; SHA-1 is deliberately absent. SHA-512 is here because verify.nt now dispatches it.
 //
 // Both verifiers are total: every malformed encoding returns 0b, because saying no is the whole job
 // and a signal would be an answer the caller has to remember to catch. Only a caller error — an
@@ -24,12 +23,16 @@
 // goes with it, and the hash itself for the one scheme (PSS) that has to hash inside the verifier.
 // An unknown symbol gives () / 0 / a signal, and every caller turns the first two into 0b; rsaHash
 // is only ever reached after rsaHashLen has already agreed the symbol is one of these.
+// The length byte is the check worth doing by hand: it is the AlgorithmIdentifier (15 octets, the
+// same for all three) plus the OCTET STRING header (2) plus the digest. 0x31 = 15+2+32, 0x41 =
+// 15+2+48, 0x51 = 15+2+64. A DigestInfo with the wrong one verifies nothing, quietly.
 rsaDigestInfo: {[h]
   if[h ~ `sha256; :unhex "3031300d060960864801650304020105000420"]
   if[h ~ `sha384; :unhex "3041300d060960864801650304020205000430"]
+  if[h ~ `sha512; :unhex "3051300d060960864801650304020305000440"]
   ()}
-rsaHashLen: {[h] $[h ~ `sha256; 32; h ~ `sha384; 48; 0]}
-rsaHash: {[h;b] $[h ~ `sha256; sha256 b; h ~ `sha384; sha384 b; signal "rsa: no such hash"]}
+rsaHashLen: {[h] $[h ~ `sha256; 32; h ~ `sha384; 48; h ~ `sha512; 64; 0]}
+rsaHash: {[h;b] $[h ~ `sha256; sha256 b; h ~ `sha384; sha384 b; h ~ `sha512; sha512 b; signal "rsa: no such hash"]}
 
 // ---- RSAVP1 (RFC 8017 5.2.2) with every structural check the standard puts around it, failing
 // closed as () rather than signalling: a signature that is not exactly k octets, a modulus that is
