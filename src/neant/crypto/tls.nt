@@ -1,9 +1,10 @@
 // TLS 1.3 client (RFC 8446) in neant, on src/neant/crypto/crypto.nt: x25519 key exchange,
 // TLS_CHACHA20_POLY1305_SHA256, no resumption, no client certificate.
-// Not part of the boot image. tlsConnect needs the verifier, so load all six, in this order:
+// Not part of the boot image. tlsConnect needs the verifier, so load all seven, in this order:
 //   load "src/neant/crypto/bignum.nt"    load "src/neant/crypto/rsa.nt"
-//   load "src/neant/crypto/der.nt"       load "src/neant/crypto/x509.nt"
-//   load "src/neant/crypto/verify.nt"    load "src/neant/crypto/tls.nt"
+//   load "src/neant/crypto/der.nt"       load "src/neant/crypto/p256.nt"
+//   load "src/neant/crypto/x509.nt"      load "src/neant/crypto/verify.nt"
+//   load "src/neant/crypto/tls.nt"
 // (the key schedule, the record layer and clientHello stand on their own; tlsConnect is what
 // reaches for the verifier.)
 //
@@ -14,16 +15,24 @@
 // tlsConnectOpts[host;port;(enlist `verify)!enlist 0b] is the opt-out, it has to be written at the
 // call site, and what it gives you is an encrypted channel to whoever answered the socket.
 //
-// What is NOT checked, because src/neant/crypto/verify.nt cannot check it: ECDSA and Ed25519
-// signatures anywhere in the chain or in CertificateVerify — RSA-SHA256 (PKCS#1 v1.5 or PSS) is the
-// whole list; certificate revocation (no CRL, no OCSP); name constraints and certificate policies.
-// There is no client certificate and no server side.
+// The ClientHello offers ecdsa_secp256r1_sha256, rsa_pss_rsae_sha256 and rsa_pkcs1_sha256, and
+// src/neant/crypto/verify.nt can check all three. A chain that is ECDSA-SHA256 on P-256 the whole
+// way up verifies here, and so does a CertificateVerify signed with that key — which is what
+// src/main.rs's ECDSA end-to-end handshake against a real openssl s_server proves.
 //
-// Be clear about what the ECDSA gap costs, since it is the price of the verification above and not
-// a detail: Google, Cloudflare and most modern CDNs serve ECDSA-only chains, and the ClientHello no
-// longer offers ecdsa_secp256r1_sha256, so this client cannot talk to them at all. They are
-// UNREACHABLE, not silently unverified — which is the right way round, but do not read any of this
-// as broad compatibility. ECDSA P-256 verification is what would buy it back.
+// BE PRECISE ABOUT WHAT THAT REACHES, because the version of this comment before ECDSA went in was
+// not. It said P-256 was what stood between this client and Google, Cloudflare and the modern CDNs.
+// It was not. Connecting to them from this checkout today still fails, and always at the same
+// place: their LEAF is ECDSA-SHA256 on P-256 and now verifies, and the INTERMEDIATE above it is
+// ecdsa-with-SHA384 signed by a P-384 root —
+//   x509: CN=WE2,O=Google Trust Services,C=US is signed with ecdsaSha384 (1.2.840.10045.4.3.3),
+//   which this build cannot verify
+// — so www.google.com, cloudflare.com, example.com, github.com, www.wikipedia.org and
+// news.ycombinator.com are all still refused, while www.amazon.com's RSA chain verifies. P-256
+// bought the leaf link of those chains, not the chain. SHA-384 and P-384 are what the rest needs.
+//
+// What is NOT checked at all: certificate revocation (no CRL, no OCSP), name constraints,
+// certificate policies and extendedKeyUsage. There is no client certificate and no server side.
 //
 // Everything here is a verifier written from scratch to be read rather than a reviewed TLS stack,
 // and the AEAD and the key exchange are not constant-time.
@@ -91,11 +100,12 @@ shKeyShare: {[b]
 clientHello: {[host;pub;rnd;sid]
   exts: wext[0; wlp16 0x00, wlp16 `byte$host]                   // server_name
   exts,: wext[10; wlp16 wu16 29]                                // supported_groups: x25519
-  // signature_algorithms: rsa_pss_rsae_sha256, then rsa_pkcs1_sha256 — which RFC 8446 4.4.3 allows
-  // only on a *certificate*, and which is why it is still offered. ecdsa_secp256r1_sha256 (1027) is
-  // deliberately not offered: verify.nt has no ECDSA verifier, and advertising a scheme you cannot
-  // check just means a server with both chains sends the one you have to refuse afterwards.
-  exts,: wext[13; wlp16 raze wu16 each 2052 1025]               // signature_algorithms
+  // signature_algorithms, most preferred first: ecdsa_secp256r1_sha256 (1027, and first because it
+  // is what the public web actually serves), rsa_pss_rsae_sha256 (2052), then rsa_pkcs1_sha256
+  // (1025) — which RFC 8446 4.4.3 allows only on a *certificate*, and which is why it is offered at
+  // all. Each of the three is one verify.nt can check; a scheme you cannot check is not advertised,
+  // because advertising it just means a server with a choice sends the one you have to refuse.
+  exts,: wext[13; wlp16 raze wu16 each 1027 2052 1025]          // signature_algorithms
   exts,: wext[43; wlp8 wu16 772]                                // supported_versions: TLS 1.3
   exts,: wext[51; wlp16 (wu16 29), wlp16 pub]                   // key_share
   body: 0x0303, rnd, (wlp8 sid), (wlp16 wu16 4867), 0x0100, wlp16 exts
@@ -143,19 +153,33 @@ parseCerts: {[body]
 // or one protocol version being replayed as a signature for another.
 TLSCVCTX: (64#0x20), (`byte$"TLS 1.3, server CertificateVerify"), 0x00
 // 2052 = rsa_pss_rsae_sha256, 2057 = rsa_pss_pss_sha256; both are PSS over SHA-256, which is what
-// rsa.nt verifies. rsa_pkcs1_* is refused here even though the ClientHello offers it, because 4.4.3
-// says those code points "are not defined for use in signed TLS handshake messages"; ecdsa_* and
-// ed25519 are refused because nothing here can check them.
+// rsa.nt verifies. 1027 = ecdsa_secp256r1_sha256, which p256.nt verifies, and whose signature is
+// the same DER SEQUENCE { r, s } a certificate carries. rsa_pkcs1_* is refused here even though the
+// ClientHello offers it, because 4.4.3 says those code points "are not defined for use in signed
+// TLS handshake messages"; ed25519 and every other scheme are refused because nothing here can
+// check them. The scheme decides which key is acceptable, never the other way round: a server does
+// not get to pick a scheme and then hand over a key of some other kind to check it with.
 certVerify: {[a]
   spki: a[0]; scheme: a[1]; sig: a[2]; thash: a[3]
-  if[not `rsa ~ spki`alg
-    signal "tls: the server's key is not RSA, which is the only kind this build verifies"]
-  if[not scheme in 2052 2057
-    m: "tls: CertificateVerify uses signature scheme ",string scheme
-    signal m,", which this build cannot verify"]
-  if[not rsaVerifyPss[spki`n; spki`e; sha256 TLSCVCTX, thash; sig]
-    signal "tls: the server's CertificateVerify did not verify"]
-  1b}
+  d: sha256 TLSCVCTX, thash
+  if[scheme in 2052 2057
+    if[not `rsa ~ spki`alg
+      m: "tls: CertificateVerify uses signature scheme ",string scheme
+      signal m,", but the server's key is not an RSA key"]
+    if[not rsaVerifyPss[spki`n; spki`e; d; sig]
+      signal "tls: the server's CertificateVerify did not verify"]
+    :1b]
+  if[scheme=1027
+    if[not `ec ~ spki`alg
+      signal "tls: CertificateVerify uses ecdsa_secp256r1_sha256, but the server's key is not an EC key"]
+    if[not `p256 ~ spki`curve
+      m: "tls: CertificateVerify uses ecdsa_secp256r1_sha256, but the server's key is on "
+      signal m,$[`unknown ~ spki`curve; "the unnamed curve ",spki`oid; string spki`curve]]
+    if[not ecdsaVerifyP256Der[spki`point; d; sig]
+      signal "tls: the server's CertificateVerify did not verify"]
+    :1b]
+  m: "tls: CertificateVerify uses signature scheme ",string scheme
+  signal m,", which this build cannot verify"}
 
 // chain + hostname, packaged as one argument so tlsConnect can trap it. Returns the leaf's key,
 // which is what CertificateVerify is checked against — binding the handshake to the chain.
