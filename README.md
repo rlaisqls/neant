@@ -1191,6 +1191,11 @@ were built and measured against the same loop:
 - Globals are interned to slots at load, so `LoadG` is an index, not a hash. Execution stacks are pooled.
 - `?` `distinct` `group` hash atoms — 200k ints over 1000 keys: distinct 159ms → 6ms, group 198ms → 10ms.
   Nested keys fall back to a scan.
+- `ss` narrows to the positions whose first character matches and checks only those, instead of
+  taking a slice and matching at every position; a one-character pattern is a single vector compare
+  and no slicing at all. Splitting a 215KB buffer on `"\n"`: 103ms → 10ms, and `ss` alone 95ms → 5ms.
+  This is the shape a PEM file, a header block or a CSV is read with, so it is `vs`, `ssr`, `like`
+  and everything built on them.
 - Atom lookup in a typed vector scans the raw elements instead of boxing the vector. (`x in y` is a
   `?` over `Syms`, and the boot compiler's ``k in `const`verb...`` dispatch chains run it per AST node.)
 - Two int atoms through `+ - * & | < > =` skip the shape/broadcast machinery, and through
