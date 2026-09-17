@@ -33,6 +33,13 @@ jitFRAME: 192
 jitCondLT: 11
 jitCondGT: 12
 jitCondEQ: 0
+jitCondHS: 2                        // unsigned >=: one branch catches both ends of a bounds check
+// `buf` (src/jit.rs) is jitVECBASE local words followed by one *descriptor* word per classified
+// vector slot — that slot's element count, at jitVECBASE+k for the k'th entry of the slot list.
+// The slot's own word holds the element data pointer rather than a `*mut Value`, which is what
+// lets `x[i]` be a bounds check and a scaled load instead of a call. Both numbers are src/jit.rs's
+// (`MAX_SLOTS`, and the same k it finds with `position`), and the two halves have to agree.
+jitVECBASE: 64
 
 // ---- tracing JIT registers (src/trace.rs / jitCompileTrace below): a compiled trace makes no
 // calls at all (a call in the loop is *inlined* by the recorder, never called — see "Calls are
@@ -72,6 +79,16 @@ jitStpPre: {[rt1;rt2;rn;immBytes] (jitW 0xA9800000) bor (((immBytes div 8) band 
 jitStpOff: {[rt1;rt2;rn;byteOff] (jitW 0xA9000000) bor (((byteOff div 8) band 0x7F) shl 15) bor (rt2 shl 10) bor (rn shl 5) bor rt1}
 jitLdpOff: {[rt1;rt2;rn;byteOff] (jitW 0xA9400000) bor (((byteOff div 8) band 0x7F) shl 15) bor (rt2 shl 10) bor (rn shl 5) bor rt1}
 jitLdpPost: {[rt1;rt2;rn;byteOff] (jitW 0xA8C00000) bor (((byteOff div 8) band 0x7F) shl 15) bor (rt2 shl 10) bor (rn shl 5) bor rt1}
+// LDR/STR (register): Xt <- [Xn + Xm*8] and back, the one addressing mode an inlined `x[i]` wants
+// (option=011 is LSL/UXTX, S=1 scales by the 8-byte access size).
+jitLdrReg: {[rt;rn;rm] (jitW 0xF8607800) bor (rm shl 16) bor (rn shl 5) bor rt}
+jitStrReg: {[rt;rn;rm] (jitW 0xF8207800) bor (rm shl 16) bor (rn shl 5) bor rt}
+// The bitwise and variable-shift forms the six bit builtins compile to (jitOpBit).
+jitAndR: {[rd;rn;rm] (jitW 0x8A000000) bor (rm shl 16) bor (rn shl 5) bor rd}
+jitOrrR: {[rd;rn;rm] (jitW 0xAA000000) bor (rm shl 16) bor (rn shl 5) bor rd}
+jitEorR: {[rd;rn;rm] (jitW 0xCA000000) bor (rm shl 16) bor (rn shl 5) bor rd}
+jitLslv: {[rd;rn;rm] (jitW 0x9AC02000) bor (rm shl 16) bor (rn shl 5) bor rd}
+jitLsrv: {[rd;rn;rm] (jitW 0x9AC02400) bor (rm shl 16) bor (rn shl 5) bor rd}
 
 // ---- float (Dn) encoders, for the tracing JIT (src/trace.rs) — a trace records *observed*
 // types, so unlike the whole-function JIT there's no static-typing problem to solve here, just
@@ -249,9 +266,15 @@ jitClassifySlots: {[opcodes;opargs;n;arity;nlocals]
     // And `(i+1)<n`, not `i+1<n` — no operator precedence here, `i+1<n` groups as `i+(1<n)`.
     isReadHead: $[(op=3) & ((i+1)<n); (opcodes[i+1]=7) & ((opargs[i+1])=1); 0b]
     isWriteHead: $[(not isReadHead) & (op=13) & ((i+2)<n); (opcodes[i+1]=15) & ((opargs[i+1])=1) & (opcodes[i+2]=4) & ((opargs[i+2])=a); 0b]
+    // A bare `LoadL(s)` that is the whole function's last op, or sits right before an explicit
+    // `Ret`, is the third legal appearance: the vector *is* the result. It neither qualifies a
+    // slot nor disqualifies it — `{[x] x}` returns a plain int local exactly as it always did, and
+    // only a slot already read or written as a vector becomes one, so this widens nothing except
+    // the one case it exists for (see jitOpVecRet).
+    isRetHead: $[(not isReadHead) & (not isWriteHead) & (op=3); $[(i+1)=n; 1b; (opcodes[i+1])=16]; 0b]
     if[isReadHead; readSlots: readSlots,a]
     if[isWriteHead; writeSlots: writeSlots,a]
-    if[(not isReadHead) & (not isWriteHead) & ((op=3)|(op=4)|(op=13)); intUseSlots: intUseSlots,a]
+    if[(not isReadHead) & (not isWriteHead) & (not isRetHead) & ((op=3)|(op=4)|(op=13)); intUseSlots: intUseSlots,a]
     i: i + $[isReadHead;2; isWriteHead;3; 1]]
   vecSlots: distinct readSlots,writeSlots
   bad: distinct intUseSlots
@@ -263,6 +286,19 @@ jitClassifySlots: {[opcodes;opargs;n;arity;nlocals]
     i: i+1]
   `int$cand}
 
+// Which of the classified slots the body actually writes (`x[i]:v`), by the same triple
+// jitClassifySlots recognises. src/jit.rs makes exactly those uniquely owned at entry, so an
+// inlined store can write straight into the elements; a read-only slot is never copied.
+jitVecWrites: {[opcodes;opargs;n;vecSlots]
+  w: ()
+  i: 0
+  while[i<n
+    a: opargs[i]
+    isWriteHead: $[((opcodes[i])=13) & ((i+2)<n); ((opcodes[i+1])=15) & ((opargs[i+1])=1) & ((opcodes[i+2])=4) & ((opargs[i+2])=a); 0b]
+    if[isWriteHead; if[a in vecSlots; w: w,a]]
+    i: i+1]
+  `int$distinct w}
+
 // State carried through the walk, as a dict so each op-case function can take/return it whole:
 // asm (word list), depth, fixups (list of (word;target;isCbz)), cbzRegs (dict word->reg),
 // deoptFixups (list of (word;kind), kind null=flags-based B.EQ, else a register for CBZ),
@@ -272,7 +308,7 @@ jitClassifySlots: {[opcodes;opargs;n;arity;nlocals]
 // around-a-blr spills respectively).
 jitNewState: {[asm;lslots;lregs]
   ncs: (count lregs) & jitLCALLEE
-  `asm`depth`fixups`cbzRegs`deoptFixups`depthAt`pending`lslots`lregs`ncs`ncr!(asm;0;();()!();();()!();null;lslots;lregs;ncs;(count lregs)-ncs)}
+  `asm`depth`fixups`cbzRegs`deoptFixups`depthAt`pending`lslots`lregs`ncs`ncr`retvec`nvecret`nintret`tail`primslots!(asm;0;();()!();();()!();null;lslots;lregs;ncs;(count lregs)-ncs;null;0;0;0b;())}
 
 // ---- per-op handlers. Each takes the state dict (plus whatever else it needs) and returns the
 // updated state dict, or null to reject the whole function — checked by the caller after every
@@ -310,6 +346,7 @@ jitOpPop: {[st]
 jitOpRet: {[st]
   if[(st[`depth])<1; :null]
   st[`asm]: jitEmitReturn[st[`asm]; jitSTACK+((st[`depth])-1); st[`ncs]]
+  st[`nintret]: 1+st[`nintret]
   st}
 
 jitOpDyad: {[st;consts;a]
@@ -398,63 +435,135 @@ jitOpCall: {[st;consts;trampoline;slot;argc]
   st[`pending]: null
   st}
 
-// x[i]: pop the index (top of the virtual stack), call `vecgetAddr(vp; idx; &ok) -> v`, push the
-// result. Same spill/restore shape as jitOpCall (jitSaveLive/jitRestoreLive: live operand values
-// below the consumed one, and the caller-saved local registers, survive the call in the frame,
-// since `blr` clobbers them) and the same deopt-on-zero-ok convention (out of range or,
-// defensively, wrong type). The vector pointer itself comes from the slot's register (or `buf`
-// for an overflow slot) — see the locals-in-registers comment above.
-jitOpVecGet: {[st;vecgetAddr;slot]
+// ---- vector access, inlined. Nothing here calls anything: at entry the slot's word in `buf` is
+// the element data pointer and the descriptor word beside it is the element count (jitVECBASE),
+// so `x[i]` is a load of the count, one unsigned compare that catches a negative index and an
+// out-of-range one together, and a scaled load. The elements cannot move underneath this: a
+// read-only slot is an `Arc` this call holds a reference to, and a written one was made uniquely
+// owned once at entry (`bind_vec`, src/jit.rs), which is the copy-on-write `jit_vec_set` used to
+// do on the first write and the reason the pointer is stable for the rest of the call. The
+// trampolines are still in src/jit.rs for the backend that has not been taught this yet; the
+// `vecgetAddr`/`vecsetAddr` addresses jitCompile is handed are simply unused here.
+//
+// A read consumes the index and produces the value, so the depth is unchanged and the index
+// register is also the destination.
+jitOpVecGet: {[st;vecSlots;slot]
   if[(st[`depth])<1; :null]
-  live: (st[`depth])-1
-  asm: jitSaveLive[st[`asm]; live; st[`ncr]]
-  asm: asm,jitMovR[1; jitSTACK+((st[`depth])-1)]
-  asm: jitLocalToReg[st;asm;0;slot]
-  asm: asm,jitAddImm[2;jitSP;jitCALLOK]
-  asm: jitLoadConst[asm;jitSCRATCH;vecgetAddr]
-  asm: asm,jitBlr[jitSCRATCH]
-  asm: asm,jitLdrImm[jitSCRATCH;jitSP;jitCALLOK]
-  st[`deoptFixups]: (st[`deoptFixups]),enlist ((count asm);jitSCRATCH)
+  idx: jitSTACK+((st[`depth])-1)
+  asm: st[`asm]
+  asm: asm,jitLdrImm[jitSCRATCH; jitLOC; 8*(jitVECBASE+(vecSlots?slot))]
+  asm: asm,jitCmpR[idx;jitSCRATCH]
+  st[`deoptFixups]: (st[`deoptFixups]),enlist ((count asm);`hs)
   asm: asm,0
-  asm: asm,jitMovR[jitSTACK+live; 0]
-  st[`asm]: jitRestoreLive[asm; live; st[`ncr]]
-  st[`depth]: live+1
+  // the slot's register *is* the data pointer, so it addresses the element directly; only an
+  // overflow slot still in `buf` needs a load first
+  r: jitLocalReg[st;slot]
+  if[isnull r; asm: asm,jitLdrImm[jitSCRATCH;jitLOC;slot*8]]
+  st[`asm]: asm,jitLdrReg[idx; $[isnull r; jitSCRATCH; r]; idx]
   st[`pending]: null
   st}
 
 // x[i]:v — pop index (top) and value (next; push order was `gen value; gen index`, so index ends
-// up on top), call `vecsetAddr(vp; idx; val; &ok)` (no return value — the trampoline mutates the
-// vector in place, copy-on-write, through the same pointer `vp` was loaded from, so the following
-// `StoreL` this always precedes is a no-op: nothing to store, the write already happened). Net
-// depth is -1, not -2: the interpreter's own `Op::StoreL` peeks rather than pops (`iassign`'s own
-// value — normally the amended vector — is left on the stack, same as `assign`/`gassign` leave
-// theirs, for a statement-level trailing `Pop` to discard). There's no real value to leave here —
-// compiled code has nothing to represent a vector with — but the slot still needs to exist so that
-// `Pop`'s depth bookkeeping lines up; nothing ever reads it (`jitClassifySlots` guarantees the
-// write triple is always immediately followed by exactly that `StoreL`+something-that-pops-it).
-jitOpVecSet: {[st;vecsetAddr;slot]
+// up on top). Net depth is -1, not -2: the interpreter's own `Op::StoreL` peeks rather than pops
+// (`iassign`'s own value — normally the amended vector — is left on the stack, same as `assign`/
+// `gassign` leave theirs, for a statement-level trailing `Pop` to discard). There's no real value
+// to leave here — compiled code has nothing to represent a vector with — but the slot still needs
+// to exist so that `Pop`'s depth bookkeeping lines up; nothing ever reads it (jitClassifySlots
+// guarantees the write triple is always immediately followed by exactly that `StoreL`+
+// something-that-pops-it).
+jitOpVecSet: {[st;vecSlots;slot]
   if[(st[`depth])<2; :null]
-  live: (st[`depth])-2
-  asm: jitSaveLive[st[`asm]; live; st[`ncr]]
-  asm: asm,jitMovR[1; jitSTACK+((st[`depth])-1)]
-  asm: asm,jitMovR[2; jitSTACK+((st[`depth])-2)]
-  asm: jitLocalToReg[st;asm;0;slot]
-  asm: asm,jitAddImm[3;jitSP;jitCALLOK]
-  asm: jitLoadConst[asm;jitSCRATCH;vecsetAddr]
-  asm: asm,jitBlr[jitSCRATCH]
-  asm: asm,jitLdrImm[jitSCRATCH;jitSP;jitCALLOK]
-  st[`deoptFixups]: (st[`deoptFixups]),enlist ((count asm);jitSCRATCH)
+  idx: jitSTACK+((st[`depth])-1)
+  val: jitSTACK+((st[`depth])-2)
+  asm: st[`asm]
+  asm: asm,jitLdrImm[jitSCRATCH; jitLOC; 8*(jitVECBASE+(vecSlots?slot))]
+  asm: asm,jitCmpR[idx;jitSCRATCH]
+  st[`deoptFixups]: (st[`deoptFixups]),enlist ((count asm);`hs)
   asm: asm,0
-  st[`asm]: jitRestoreLive[asm; live; st[`ncr]]
-  st[`depth]: live+1
+  r: jitLocalReg[st;slot]
+  if[isnull r; asm: asm,jitLdrImm[jitSCRATCH;jitLOC;slot*8]]
+  st[`asm]: asm,jitStrReg[val; $[isnull r; jitSCRATCH; r]; idx]
+  st[`depth]: (st[`depth])-1
   st[`pending]: (`vecwritedone;slot)
+  st}
+
+// ---- the vector a compiled function leaves behind. Locals are never written back (see the
+// locals-in-registers comment above), so until now everything a compiled body did to a vector was
+// invisible to its caller and the only shape worth compiling was one that reduces to a scalar.
+// A body whose last op is a bare `LoadL` of a classified slot returns that vector instead: the
+// value in x0 is a placeholder and src/jit.rs hands back the `Value` the slot was bound to, which
+// the inlined stores have been writing into all along. Every return has to agree — a function
+// that returns an int down one path and the vector down another would have no single answer for
+// src/jit.rs to believe — which is what the nvecret/nintret counters below are for.
+jitEmitReturnVec: {[asm;ncs]
+  asm: jitLoadConst[asm;0;0]
+  asm: jitLoadConst[asm;5;1]
+  asm: asm,jitStrImm[5;jitOK;0]
+  jitEmitEpilogue[asm;ncs]}
+jitOpVecRet: {[st;slot;atEnd]
+  if[not isnull st[`retvec]; if[not slot=st[`retvec]; :null]]
+  st[`retvec]: slot
+  st[`nvecret]: 1+st[`nvecret]
+  st[`asm]: jitEmitReturnVec[st[`asm]; st[`ncs]]
+  st[`pending]: $[atEnd; null; (`vecretdone;slot)]
+  st[`tail]: atEnd
+  st}
+
+// ---- the bit builtins, inlined. `x band y` is an ordinary two-argument call to a global holding
+// a `Value::Prim`, so without this every limb mask and every shift inside a compiled loop is a
+// `blr` through jit_call — and a limb-based bignum is nothing but masks and shifts. src/jit.rs
+// resolves the six names to their global slots and hands them over (`bitSlots`), and records the
+// primitive each slot held so entry can re-check it: these are globals and can be reassigned.
+// Kind: 0=badd 1=band 2=bor 3=bxor 4=shl 5=shr, matching `BIT_PRIMS` there.
+//
+// The two shifts deopt unless the count is in [0;64) — AArch64 reads it mod 64 and `ib_shl`/
+// `ib_shr` (src/prims.rs) truncate to u32 and answer 0, so outside that range the machine and the
+// interpreter genuinely differ and the honest thing is to let the interpreter have it. All six
+// work on the raw 64-bit pattern and so may *produce* the int-null sentinel where `+ - *` may not;
+// that would leave a register holding a value compiled arithmetic would then treat as an ordinary
+// int and the interpreter as a null, so the result is checked exactly as an arithmetic one is.
+jitOpBit: {[st;kind;slot]
+  if[(st[`depth])<2; :null]
+  x: jitSTACK+((st[`depth])-1)
+  y: jitSTACK+((st[`depth])-2)
+  dst: y
+  asm: st[`asm]
+  df: st[`deoptFixups]
+  if[kind>3
+    ; asm: asm,jitCmpImm[y;64]
+      df: df,enlist ((count asm);`hs)
+      asm: asm,0]
+  $[kind=0
+    ; asm: asm,jitAddR[dst;x;y]
+    ; kind=1
+    ; asm: asm,jitAndR[dst;x;y]
+    ; kind=2
+    ; asm: asm,jitOrrR[dst;x;y]
+    ; kind=3
+    ; asm: asm,jitEorR[dst;x;y]
+    ; kind=4
+    ; asm: asm,jitLslv[dst;x;y]
+    ; asm: asm,jitLsrv[dst;x;y]]
+  asm: asm,jitCmpR[dst;jitNI]
+  df: df,enlist ((count asm);null)
+  asm: asm,0
+  st[`asm]: asm
+  st[`deoptFixups]: df
+  st[`depth]: (st[`depth])-1
+  st[`primslots]: distinct (st[`primslots]),slot
+  st[`pending]: null
   st}
 
 jitCompile: {[input;trampolines]
   opcodes: input[0]; opargs: input[1]; consts: input[2]; arity: input[3]; nlocals: input[4]
   n: count opcodes
-  callAddr: trampolines[0]; vecgetAddr: trampolines[1]; vecsetAddr: trampolines[2]
+  callAddr: trampolines[0]
+  // The global slots of badd/band/bor/bxor/shl/shr, in that order, -1 for one that isn't bound to
+  // its primitive right now. Absent entirely (a caller that predates them, e.g. tests/x86.nt's
+  // stand-in addresses) means nothing is inlinable, which is only slower.
+  bitSlots: $[3<count trampolines; `int$trampolines[3]; 6#-1]
   vecSlots: jitClassifySlots[opcodes;opargs;n;arity;nlocals]
+  vecWrites: jitVecWrites[opcodes;opargs;n;vecSlots]
   lslots: jitLocalSlots[opcodes;opargs;n]
   // Register-resident or not, every slot is reached in `buf` through jitLdrImm/jitStrImm's 12-bit
   // scaled offset at least once (the prologue load below, or every access for an overflow slot).
@@ -493,6 +602,9 @@ jitCompile: {[input;trampolines]
     isVecSlot: a in vecSlots
     isCallHead: (op=7) & ((a=1)|(a=2))
     isAmendHead: (op=15) & (a=1)
+    // a bare LoadL of a vector slot at the tail, or right before an explicit Ret: the vector is
+    // the result (jitOpVecRet). jitClassifySlots recognises exactly the same shape.
+    isVecRetHead: $[(op=3) & isVecSlot; $[(ip+1)=n; 1b; (opcodes[ip+1])=16]; 0b]
     // `&`/`|` are eager (no short-circuit) in this language, so `pending[1]` can't sit inside one
     // alongside an `isnull pending` check — has to be a real branch (`$[...]`) instead, evaluating
     // it only once pending is already known to be a 2-element list.
@@ -504,13 +616,16 @@ jitCompile: {[input;trampolines]
              ; pendKind=`vecread; isCallHead
              ; pendKind=`vecwrite; isAmendHead
              ; pendKind=`vecwritedone; isStoreHead
+             ; pendKind=`vecretdone; op=16
              ; 0b]
     if[not okNext; :null]
 
     $[op=0; st: jitOpPush[st;ip;opcodes;consts;a]
+    ; isVecRetHead; st: jitOpVecRet[st;a;(ip+1)=n]
     ; (op=3) & isVecSlot; st[`pending]: (`vecread;a)
     ; op=3; st: jitOpLoadL[st;a]
     ; isStoreHead; st[`pending]: null
+    ; (pendKind=`vecretdone) & (op=16); st[`pending]: null
     ; op=4; st: jitOpStoreL[st;a]
     ; op=11; st: jitOpPop st
     ; op=16; st: jitOpRet st
@@ -522,9 +637,12 @@ jitCompile: {[input;trampolines]
     ; op=1
     ; $[not (`int)=type consts[a]; st: null
         ; st[`pending]: (`call;consts[a])]
-    ; (pendKind=`vecwrite) & isAmendHead; st: jitOpVecSet[st;vecsetAddr;pending[1]]
-    ; (pendKind=`call) & isCallHead; st: jitOpCall[st;consts;callAddr;pending[1];a]
-    ; (pendKind=`vecread) & isCallHead; st: jitOpVecGet[st;vecgetAddr;pending[1]]
+    ; (pendKind=`vecwrite) & isAmendHead; st: jitOpVecSet[st;vecSlots;pending[1]]
+    ; (pendKind=`call) & isCallHead
+    ; $[(a=2) & ((bitSlots?(pending[1]))<6)
+        ; st: jitOpBit[st; bitSlots?(pending[1]); pending[1]]
+        ; st: jitOpCall[st;consts;callAddr;pending[1];a]]
+    ; (pendKind=`vecread) & isCallHead; st: jitOpVecGet[st;vecSlots;pending[1]]
     ; st: null]
 
     if[isnull st; :null]
@@ -534,9 +652,12 @@ jitCompile: {[input;trampolines]
   ipWord[n]: count st[`asm]
 
   lastOp: $[n>0; opcodes[n-1]; -1]
-  if[not lastOp=16
+  if[(not lastOp=16) & not st[`tail]
     ; if[(st[`depth])<1; :null]
+      st[`nintret]: 1+st[`nintret]
       st[`asm]: jitEmitReturn[st[`asm]; jitSTACK+((st[`depth])-1); ncs]]
+  // every return has to be the same kind; see jitOpVecRet
+  if[(0<st[`nvecret]) & 0<st[`nintret]; :null]
 
   deoptAt: count st[`asm]
   asm: jitEmitDeopt[st[`asm]; ncs]
@@ -557,10 +678,14 @@ jitCompile: {[input;trampolines]
     e: deoptFixups[i]
     word: e[0]; kind: e[1]
     delta: deoptAt-word
-    asm[word]: $[isnull kind; jitBcond[jitCondEQ;delta]; jitCbz[kind;delta]]
+    asm[word]: $[isnull kind; jitBcond[jitCondEQ;delta]; (`hs)~kind; jitBcond[jitCondHS;delta]; jitCbz[kind;delta]]
     i: i+1]
 
-  (,/jitLE each asm; vecSlots)}
+  // (code; the classified slots; which of them are written; which one is returned, as an index
+  // into that list, or -1; the global slots inlined as bit instructions). src/jit.rs reads the
+  // five-element form as "this backend inlines vector access"; a two-element one still means the
+  // old `*mut Value`-through-the-trampolines layout.
+  (,/jitLE each asm; vecSlots; vecWrites; $[isnull st[`retvec]; -1; vecSlots?(st[`retvec])]; `int$st[`primslots])}
 
 
 // ==== tracing JIT (src/trace.rs): compile one recorded loop iteration ====
