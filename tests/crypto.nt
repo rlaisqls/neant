@@ -44,7 +44,7 @@ teq["one reduces to one"; scMod bitsBE (31#0x00),0x01; 1,11#0]
 
 // ---- the compiled kernels in src/neant/crypto/crypto.nt against the vector forms they replaced.
 // shaBlocksL, chachaXorL, polyBlocksL, fcarryL and fmulL are scalar loops the whole-function JIT
-// tier compiles; shaBlockV, chachaBlockV, p5mul, fcarryV and fmulV are the column forms that were
+// tier compiles; shaBlockV, chachaBlockV, poly1305V, fcarryV and fmulV are the column forms that were
 // there before, kept for exactly this. Every case below is the same arithmetic written twice, so a
 // disagreement is a bug in the rewrite and not a missing test vector — the published vectors are
 // in tests/lang.nt, and this is what stands behind them.
@@ -74,7 +74,7 @@ teq["chacha20 of nothing is nothing"; chacha20[cckey;1;ccnon;0x]; 0x]
 // is every length either side of a multiple of 16
 cpkey: cbytes 32
 cpLens: (til 50), 100 255 256 257 1000
-teq["poly1305 agrees with the block form on 54 lengths"; (distinct {[n] m: cbytes n
+teq["poly1305 agrees with the block form on 55 lengths"; (distinct {[n] m: cbytes n
   (poly1305[cpkey;m]) ~ poly1305V[cpkey;m]} each cpLens); ,1b]
 teq["poly1305 of the empty message is just s"; (poly1305[cpkey;0x]) ~ cpkey[16+til 16]; 1b]
 
