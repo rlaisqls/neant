@@ -21,8 +21,10 @@
 // untouched and is still what x509.nt and verify.nt call.
 //
 // ---- what a batch buys, measured on this machine, and what it does not
-// (Cortex-X925, 20 cores; ./target/release/neant; the 512 signatures in tests/data/p256-batch.txt,
-// made by openssl; the machine had other work on it, so the thread rows are a floor, not a ceiling)
+// (Cortex-X925, 20 cores; ./target/release/neant; the 512 real signatures in
+// tests/data/p256-batch.txt, made by openssl, with the corpus repeated to fill the 1024- and
+// 2048-lane rows. tests/bench.nt re-runs exactly this. Other agents were building on this machine
+// while it ran, and a re-run lands within about 15% either way, so read these as a floor.)
 //
 //               one thread                          twenty threads, twenty independent batches
 //   N      ms/signature   verify/s              ms/signature   verify/s   thread scaling
@@ -367,34 +369,44 @@ bpShamir: {[C;b1;b2;T1;T2;T3;t3inf]
 // bit i of every lane at once, least significant first, off lane-major limbs
 bfBit: {[U;i] 1 band U[i div BNB] shr i mod BNB}
 
-// the per-signature checks that are decisions, not arithmetic: r and s in [1,n-1], the digest the
-// right length, the public key a point on the curve. A lane that fails any of them is answered 0b
-// without the batch ever seeing it, and is filled with a well-formed stand-in so that the lanes
-// around it still step together.
+// The per-signature checks that are decisions rather than arithmetic: r and s in [1,n-1], the
+// digest the right length, the public key an on-curve uncompressed point with both coordinates
+// below p -- ec.nt's own ecPoint, so there is one copy of that check in the tree. () is no, for
+// every reason, exactly as ec.nt's ecVerify answers 0b for every reason. One list argument because
+// `@` below applies it to one, and `@` is here for the same belt-and-braces ec.nt wraps its own
+// exports in: bignum.nt signals on an operand wider than it can multiply exactly, and a signature
+// does not get to turn that into an exception the caller has to catch.
+bqLane: {[a]
+  C: a[0]; k: a[1]; dg: a[2]; sg: a[3]
+  if[not (C`dgst) = count dg; :()]
+  rv: bnFromBytes sg[0]
+  sd: bnFromBytes sg[1]
+  if[bnIsZero rv; :()]
+  if[bnIsZero sd; :()]
+  if[not 0 > bnCmp[rv; C`n]; :()]
+  if[not 0 > bnCmp[sd; C`n]; :()]
+  Q: ecPoint[C; k]
+  if[0 = count Q; :()]
+  (rv; sd; bnMod[bnFromBytes dg; C`n]; Q[0]; Q[1])}
+
+// A lane that bqLane refused is answered 0b without the batch ever seeing it, and is filled with a
+// well-formed stand-in -- r = s = e = 1 and Q = G -- so that the lanes around it still step
+// together. The stand-in cannot change any other lane's answer: no lane's arithmetic reads another
+// lane, and its own answer was already decided here.
 bqPrep: {[C;keys;digests;sigs]
   nn: count sigs
   ok: nn#0; rl: (); sl: (); el: (); qx: (); qy: ()
   i: 0
   while[i<nn
-    rv: bnFromBytes sigs[i][0]
-    sd: bnFromBytes sigs[i][1]
-    dg: digests[i]
-    Q: $[(C`dgst) = count dg; @[{[a] ecPoint[a[0];a[1]]}; (C; keys[i]); {()}]; ()]
-    good: 0 < count Q
-    if[good; good: not bnIsZero rv]
-    if[good; good: not bnIsZero sd]
-    if[good; good: 0 > bnCmp[rv; C`n]]
-    if[good; good: 0 > bnCmp[sd; C`n]]
+    v: @[bqLane; (C; keys[i]; digests[i]; sigs[i]); {()}]
+    good: 0 < count v
     ok[i]: `int$ good
-    if[not good
-      rv: ,1
-      sd: ,1
-      Q: (C`gx; C`gy)]
-    rl,: ,rv
-    sl,: ,sd
-    el,: ,$[good; bnMod[bnFromBytes dg; C`n]; ,1]
-    qx,: ,(Q[0])
-    qy,: ,(Q[1])
+    if[not good; v: (,1; ,1; ,1; C`gx; C`gy)]
+    rl,: ,(v[0])
+    sl,: ,(v[1])
+    el,: ,(v[2])
+    qx,: ,(v[3])
+    qy,: ,(v[4])
     i+:1]
   `ok`r`s`e`qx`qy!(ok;rl;sl;el;qx;qy)}
 
@@ -496,9 +508,11 @@ batchVerifyP256DerWho: {[keys;digests;sigs] batchVerifyP256Who[keys;digests; bqD
 BATCHNT: "src/neant/crypto/batch.nt"
 
 // Threads cost lanes, too: a batch split k ways has k times fewer lanes per vector operation, and
-// the per-operation overhead is amortised over those lanes, so splitting ONE batch k ways is worth
-// much less than k. Twenty independent full-size batches is what scales; the header's table
-// measures both shapes.
+// the dispatch is amortised over those lanes, so splitting ONE batch k ways is worth far less than
+// k. Measured on the 512-signature corpus: 2512 ms in one thread, 1818 ms split four ways (1.38x),
+// 1967 ms split twenty (1.29x) -- four threads beat twenty. This entry point is for a caller who has
+// one batch and wants it sooner; twenty INDEPENDENT batches is the shape that scales, and that is
+// the twenty-thread column in the header's table.
 batchVerifyP256Par: {[keys;digests;sigs;nthr]
   nn: count sigs
   if[nn=0; :0#1b]

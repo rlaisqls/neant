@@ -444,7 +444,9 @@ whole batch (Montgomery's trick as a binary product tree, replacing a Fermat `s^
 signature), and a projective final comparison `X = r·Z²` — or `(r+n)·Z²`, the case `ec.nt`'s header
 warns about — which removes the inversion mod p entirely.
 
-Measured on this machine, against the 512 real openssl signatures in `tests/data/p256-batch.txt`:
+Measured on this machine by `tests/bench.nt`, against the 512 real openssl signatures in
+`tests/data/p256-batch.txt` (repeated to fill the 2048-lane row), with other work running on the
+machine at the time — a re-run lands within about 15% either way:
 
 | N | 1 thread, ms/sig | 1 thread, verify/s | 20 threads, ms/sig | 20 threads, verify/s |
 |---:|---:|---:|---:|---:|
@@ -469,8 +471,11 @@ jump**. Twenty threads in the same hot loop queue on one lock: a batch of 64 acr
 at 224 verify/s that way and at **611** when each thread re-`load`s the module first and gets its own
 `FnCode`, which is what `batchVerifyP256Par` does. The fix that would make that unnecessary is in the
 VM: `Compiled` and `Rejected` are write-once, so the hot path need not take the mutex at all.
-Splitting *one* batch across threads is a different and worse idea — k threads means k times fewer
-lanes to amortise over — and 512 split twenty ways measured slower than 512 in one thread.
+Splitting *one* batch across threads is a different and much weaker idea: k threads means k times
+fewer lanes to amortise the dispatch over, and it measures that way — 512 signatures take 2512ms in
+one thread, 1818ms split four ways (1.38x) and 1967ms split twenty (1.29x), so four threads beat
+twenty. `batchVerifyP256Par` is for a caller who has one batch and wants it sooner; the throughput
+column above is twenty *independent* batches, which is the shape that scales.
 
 `src/neant/crypto/der.nt` and `src/neant/crypto/x509.nt` (loadable, not in the boot image) read
 **ASN.1 DER and X.509 certificates** — parsing only, no signature check and no chain building:
