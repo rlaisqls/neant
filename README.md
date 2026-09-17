@@ -446,6 +446,12 @@ produces every message. `tests/x509.nt` is what says the speed was not bought by
 compares the two element for element and octet for octet over every certificate in the repository,
 field for field over the same, and asserts that everything either must refuse, both still refuse.
 
+It is a *batch* reader, and says so in its numbers: one
+certificate costs 540 us through `x509ParseMany` against 485 through `x509Parse`, because derScan's
+whole-vector steps have a fixed cost that one certificate does not amortise; three certificates — a
+TLS chain — already come out ahead, 1295 us against 1520; 146 come out 2.6x ahead. `x509Parse` is
+still the entry point for one, and still what `tls.nt` calls.
+
 **What that cost, measured** (`tests/x509bench.nt`, `/etc/ssl/certs/ca-certificates.crt`, 146 roots,
 155,984 octets of DER, 9387 elements, 64 to a certificate):
 
