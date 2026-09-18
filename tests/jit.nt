@@ -421,3 +421,27 @@ jbSame["three arguments";        {[x;y] $[x>3; x; 99]};    9; 0]
 jbSame["the if form still agrees"; {[x;y] r: y; if[x>y; r: x]; r}; 5; 3]
 jbSame["a while still agrees";   {[x;y] s: 0; while[x>y; s: s+1; x: x-1]; s}; 5; 3]
 jbSame["nested conditionals";    {[x;y] $[x>y; $[x>9; 1; 2]; 3]}; 5; 3]
+
+// ---- a conditional as the LEFT operand of what consumes it.
+//
+// Found by tests/jitdiff.nt, which generates bodies rather than listing them. A fused comparison
+// leaves its flags for the branch to read, so the branch cannot materialise anything itself, and
+// only the comparison's own two operands were being put in their canonical registers first.
+// Everything UNDER them stayed wherever it was — and the path that takes the branch arrives at a
+// target whose state has been reset to "every slot is canonical". `($[c; a; b]) + 1` is that shape:
+// operands are pushed right first, so the `1` sits under the comparison the whole way across it.
+// `1 + $[c; a; b]` has nothing underneath and was always right, which is how this survived.
+tsection "jit: a conditional under a pending operand"
+jcSame: {[nm;f;a;b] c: f[a;b]; i: 0; while[i<300; f[i-100; 100-i]; i+:1]; teq["compiled = interpreted: ",nm; f[a;b]; c]}
+jcSame["($[x>y; 8; 16]) + 1, else";      {[x;y] (($[x>y; 8; 16]) + 1)};   0; 0]
+jcSame["($[x>y; 8; 16]) + 1, then";      {[x;y] (($[x>y; 8; 16]) + 1)};   5; 3]
+jcSame["1 + ($[x>y; 8; 16])";            {[x;y] (1 + ($[x>y; 8; 16]))};   0; 0]
+jcSame["($[x>y; 8; 16]) + y";            {[x;y] (($[x>y; 8; 16]) + y)};   0; 0]
+jcSame["($[x>y; x; y]) + 1";             {[x;y] (($[x>y; x; y]) + 1)};    1; 2]
+jcSame["($[x>y; 8; 16]) shr 1";          {[x;y] (($[x>y; 8; 16]) shr 1)}; 0; 0]
+jcSame["($[x>y; 8; 16]) badd 1";         {[x;y] (($[x>y; 8; 16]) badd 1)}; 0; 0]
+jcSame["a constant condition";           {[x;y] (($[x>3; 8; 16]) + 1)};   0; 0]
+jcSame["two of them in a row";           {[x;y] ((($[x>y; 8; 16]) + 1) + y)}; 1; 2]
+jcSame["a nested conditional consumed";  {[x;y] (($[x>x; y; 11]) shr 7)}; 0; 0]
+jcSame["both, nested";  {[x;y] ($[x>y; (($[x>x; y; 11]) shr 7); (($[x>x; y; 11]) shr 7)])}; 0; 0]
+jcSame["two conditionals joined";        {[x;y] (($[x>y; 1; 2]) + ($[x<y; 4; 8]))}; 0; 0]

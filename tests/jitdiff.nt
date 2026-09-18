@@ -1,0 +1,101 @@
+// A GENERATOR for the JIT, not a list of cases.
+//
+// Both of the wrong answers this tree's JIT has produced were found by accident, while measuring
+// something else: `{x>3}` changed its result type once it got hot, and every `$[c; a; b]` whose arms
+// ended the function returned the wrong arm. A wrong register is a wrong ANSWER and not a bail, so
+// the fail-closed design that makes everything else here safe does nothing for this one class — and
+// a hand-written list only ever covers the shapes somebody thought of. tests/jit.nt keeps those
+// cases as regressions; this covers the class they came from.
+//
+// THE BASELINE. Each body is built twice: once as written, and once with a single integer literal
+// wrapped in `(- - n)`. The pair has the same value for every input and differs only in that the
+// second can never be compiled, because a monadic minus pair is outside the subset either tier will
+// take. That is the only honest interpreter baseline available — since the tracing tier landed, a
+// function's own first call is not one, because a loop inside it can be taken over partway through
+// (tests/jit.nt's header says the same thing about its hand-written cases).
+//
+// The seed is fixed, so a failure is reproducible and prints the body that caused it.
+tsection "jit: generated differential"
+rseed 20260918
+
+jdVar:  {$[0=rand[2]; "x"; "y"]}
+jdLit:  {string rand[20]}                       // non-negative only: a bare `-3` after a verb lexes
+jdAtom: {$[0=rand[2]; jdVar[]; jdLit[]]}        // as a monadic minus, which is not compilable at all
+jdOp:   {,("+-*&|")[rand[5]]}
+jdCmp:  {,("<>=")[rand[3]]}
+
+// a fully parenthesised expression: this language has no precedence, so anything less is ambiguous
+jdExpr: {[d]
+  if[d<1; :jdAtom[]]
+  r: rand[6]
+  if[r=0; :"(",(jdExpr[d-1]),(jdOp[]),(jdExpr[d-1]),")"]
+  if[r=1; :"($[",(jdExpr[d-1]),(jdCmp[]),(jdExpr[d-1]),"; ",(jdExpr[d-1]),"; ",(jdExpr[d-1]),"])"]
+  if[r=2; :"(",(jdExpr[d-1])," band ",(jdExpr[d-1]),")"]
+  if[r=3; :"(",(jdExpr[d-1])," bxor ",(jdExpr[d-1]),")"]
+  if[r=4; :"(",(jdExpr[d-1])," shr ",(string rand[8]),")"]
+  "(",(jdExpr[d-1])," badd ",(jdExpr[d-1]),")"}
+
+// the same source with its first integer literal wrapped, which is what makes the twin uncompilable
+jdSlow: {[s]
+  d: & s in "0123456789"
+  if[0=count d; :s]
+  a: first d
+  b: a
+  while[$[b<count s; (s[b]) in "0123456789"; 0b]; b+:1]
+  (a#s),"(- - ",(s[a+til b-a]),")",b _ s}
+
+// x and y at both ends of the range, around zero, and where a multiply overflows
+jdArgs: ((0;0);(1;2);(5;3);(3;5);(0-7;4);(4;0-7);(1;0);(0;1);(1000000;7);(123456789;987654321))
+// `@[h; v; handler]` hands h the whole of v as ONE argument, so h takes the pair and splits it
+jdCall:  {[f;a] @[{[p] (p 0)[(p 1) 0; (p 1) 1]}; (f;a); {"'",x}]}
+jdApply: {[f] jdCall[f] each jdArgs}
+
+// drive the method tier past its 64-call threshold with arguments that take both sides of a branch
+jdWarm: {[f] i: 0; while[i<200; f[i-100; 100-i]; i+:1]}
+
+// built together so the twin is the SAME body, not another draw from the generator
+jdPair: {[mk;depth] body: jdExpr depth; (mk body; mk jdSlow body)}
+
+jdRun: {[nm;mk;depth;n]
+  bad: ()
+  i: 0
+  while[i<n
+    p: jdPair[mk;depth]
+    f: @[nrun; p 0; {`err}]
+    g: @[nrun; p 1; {`err}]
+    // `@` gives a symbol, never a numeric type code
+    if[not (`sym=@f) | `sym=@g
+      jdWarm f
+      if[not (jdApply f)~jdApply g; bad,: enlist p 0]]
+    i+:1]
+  // a failure prints the body that caused it, which with the fixed seed above reproduces exactly
+  teq[nm," (",(string n)," bodies)"; $[0=count bad; "none"; first bad]; "none"]}
+
+// the method tier: a whole function, compiled after 64 calls
+jdMethod: {[b] "{[x;y] ",b,"}"}
+jdRun["the method tier agrees with the interpreter"; jdMethod; 3; 400]
+jdRun["the method tier, deeper bodies"; jdMethod; 4; 200]
+
+// a body that ENDS in a conditional is the shape that was broken: the arm that falls through meets
+// the other at a position the compiler's linear walk never visited
+jdTail: {[b] "{[x;y] ($[x>y; ",b,"; ",b,"])}"}
+jdRun["a conditional that ends the function"; jdTail; 2; 300]
+
+// the tracing tier: a loop hot enough to be taken over inside a single call
+jdLoop: {[b] "{[x;y] s: 0; i: 0; while[i<120; s: (s badd ",b,"); x: (x+1); i: i+1]; s}"}
+jdRun["the tracing tier agrees with the interpreter"; jdLoop; 3; 200]
+jdDo: {[b] "{[x;y] s: 0; do[120; s: (s badd ",b,"); x: (x+1)]; s}"}
+jdRun["a do loop agrees with the interpreter"; jdDo; 3; 200]
+
+// an explicit `:` return, which is the one thing that puts a Ret in the middle of a body — both the
+// merge handling and jitRetKind (src/neant/jit/arm64.nt) key off where those are
+jdRet: {[b] "{[x;y] if[x>y; :",b,"]; ",b,"}"}
+jdRun["an early return agrees with the interpreter"; jdRet; 3; 300]
+// several statements, so a value travels through a local rather than staying on the stack
+jdStmts: {[b] "{[x;y] a2: ",b,"; b2: (a2 badd ",b,"); ($[a2>b2; a2; b2])}"}
+jdRun["a value carried through locals"; jdStmts; 3; 300]
+// a conditional UNDER a pending operand, which is the shape that was broken
+// LEFT operand: the other side is pushed first and waits under the branch. `(b) + ($[..])` has
+// nothing underneath and was never broken.
+jdUnder: {[b] "{[x;y] (($[x>y; ",b,"; ",b,"]) + (",b,"))}"}
+jdRun["a conditional as a dyad's left operand"; jdUnder; 2; 300]
