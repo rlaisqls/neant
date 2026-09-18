@@ -18,6 +18,17 @@
 // tlsConnectOpts[host;port;(enlist `verify)!enlist 0b] is the opt-out, it has to be written at the
 // call site, and what it gives you is an encrypted channel to whoever answered the socket.
 //
+// Revocation is separate and OPT-IN, because it means fetching over the network mid-handshake:
+//   load "src/neant/crypto/crl.nt"; load "src/neant/net/http.nt"
+//   h: tlsConnectOpts["example.com"; 443; (enlist `crl)!enlist {[u] (httpGet u)`body}]
+// The option is the fetcher rather than a flag, so the caller owns the timeout, the caching and
+// what an unreachable distribution point means. Nothing soft-fails: a fetch that does not come back
+// takes the connection down, since "could not check" is not "checked and it is fine".
+//
+// `crl` checks the intermediates only (crl.nt's crlChainCa), which costs milliseconds; `crlFull`
+// adds the leaf's own list, which on a public CA means tens of megabytes and tens of seconds — the
+// measurement and the reasoning are in crl.nt's header. Both take the same fetcher.
+//
 // The ClientHello offers six signature schemes and src/neant/crypto/verify.nt can check all six:
 // ecdsa_secp256r1_sha256, ecdsa_secp384r1_sha384, rsa_pss_rsae_sha256, rsa_pss_rsae_sha384, and —
 // for certificates only, which is all RFC 8446 4.4.3 allows them for — rsa_pkcs1_sha256 and
@@ -217,9 +228,18 @@ certVerify: {[a]
 
 // chain + hostname, packaged as one argument so tlsConnect can trap it. Returns the leaf's key,
 // which is what CertificateVerify is checked against — binding the handshake to the chain.
+//
+// a[4] is the revocation fetcher, or () for none. Revocation is OPT-IN and it is a function rather
+// than a flag on purpose: checking a CRL means going to the network in the middle of a handshake,
+// which is the caller's decision to make and not this file's. Nothing here soft-fails — a fetch
+// that does not come back takes the connection down — because "could not check" and "checked and it
+// is fine" are different answers and only the caller knows which one this connection can live with.
 checkChain: {[a]
   chain: x509Parse each a[0]
   x509VerifyChain[chain; a[2]; a[1]; a[3]]
+  if[0<count a[4]
+    w: $[a[5]; crlChain[chain; a[4]; a[3]]; crlChainCa[chain; a[4]; a[3]]]
+    if[0<count w; signal w]]
   (chain[0])`spki}
 
 // a check whose failure has to take the socket down with it: a connection left open after the peer
@@ -247,11 +267,13 @@ tlsRoots: {[]
 //            because a test wants to reach the record layer without a trust store.
 tlsConnect: {[host;port] tlsConnectOpts[host;port;()!()]}
 tlsConnectOpts: {[host;port;opts]
-  vfy: 1b; roots: ()!(); nw: (now`date; now`time)
+  vfy: 1b; roots: ()!(); nw: (now`date; now`time); crlf: (); crlAll: 0b
   if[0<count opts
     if[`verify in key opts; vfy: opts`verify]
     if[`roots in key opts; roots: opts`roots]
-    if[`now in key opts; nw: opts`now]]
+    if[`now in key opts; nw: opts`now]
+    if[`crl in key opts; crlf: opts`crl]                   // a url -> bytes function; see checkChain
+    if[`crlFull in key opts; crlf: opts`crlFull; crlAll: 1b]]
   if[vfy; if[0=count roots; roots: tlsRoots[]]]
   priv: urand 32                                           // `rand` is a reproducible PRNG, never a key
   pub: x25519[priv; X25519BASE]
@@ -293,7 +315,7 @@ tlsConnectOpts: {[host;port;opts]
           certs: tlsGuard[h; parseCerts; wdrop[4;raw]]
           TLSCERT[h]: certs
           sawCert: 1
-          if[vfy; spki: tlsGuard[h; checkChain; (certs;host;roots;nw)]]]
+          if[vfy; spki: tlsGuard[h; checkChain; (certs;host;roots;nw;crlf;crlAll)]]]
         // CertificateVerify: `tr` holds the transcript through the Certificate message, because
         // every message is appended only after it has been handled — which is exactly the hash
         // RFC 8446 4.4.3 signs over.

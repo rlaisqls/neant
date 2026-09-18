@@ -59,3 +59,16 @@ teq["urls: a certificate with no distribution point has none"; crlUrls (pemLoad 
 
 // PEM handling, which is crl.nt's own because x509.nt's is hardwired to CERTIFICATE markers
 terrLike["pem: a file with no CRL in it is refused by name"; {[] crlPem read0 "tests/data/pki-leaf.pem"}; "crl: no -----BEGIN X509 CRL-----"]
+
+// ---- over a chain. The fetcher is a function, so a test supplies one that reads a fixture off
+// disk and the whole path is exercised without a socket.
+crlFetch: {[u] $[u~"fixture:revoked"; crlLoad "tests/data/pki-crl-revoked.pem"; u~"fixture:empty"; crlLoad "tests/data/pki-crl-empty.pem"; signal "no such fixture: ",u]}
+crlCalls: shared 0
+crlCounting: {[u] supd[crlCalls; {x+1}]; crlFetch u}
+
+// a certificate with no distribution point is not an error: 5280 does not require one, and
+// treating "nothing to check" as "failed to check" would refuse most private PKIs outright
+teq["chain: a chain with no distribution points passes"; crlChain[(crlLeaf; crlRoot); crlFetch; crlNow]; ""]
+teq["chain: and it fetched nothing"; (sset[crlCalls;0]; crlChain[(crlLeaf; crlRoot); crlCounting; crlNow]; sget crlCalls)[2]; 0]
+// the leaf's own list is what crlChainCa skips and crlChain does not
+teq["chain: crlChainCa skips the leaf's list"; crlChainCa[(crlLeaf; crlRoot); crlFetch; crlNow]; ""]

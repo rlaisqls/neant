@@ -719,11 +719,23 @@ lives, `src/neant/net/http.nt` fetches it, and the program composes the two and 
 timeouts, caching and what to do when the fetch fails.
 
 ```
-load "src/neant/crypto/crl.nt"
-u: first crlUrls der                      // the cRLDistributionPoints extension
-crl: crlParse (httpGet u)`body
-crlCheck[crl; leaf; issuer; (now`date; now`time)]   // "" or why it cannot answer, or that it is revoked
+load "src/neant/crypto/crl.nt"; load "src/neant/net/http.nt"
+h: tlsConnectOpts["example.com"; 443; (enlist `crl)!enlist {[u] (httpGet u)`body}]
 ```
+
+`crl` is opt-in and is the *fetcher* rather than a flag, so the caller owns the timeout, the caching
+and what an unreachable distribution point means. Nothing soft-fails: a fetch that does not come back
+takes the connection down, because "could not check" is not "checked and it is fine".
+
+**It checks the intermediates, not the leaf**, and the reason is a measurement. A public CA's leaf
+CRL is enormous — example.com's is **43,495,327 bytes and 887,654 serials**, 3.0s to fetch and 12.8s
+to parse (`derScan` is 8.1s on the same buffer, so it is the size and not the parser). Its two
+intermediates' lists are **301 and 299 bytes and 1ms**. Checking the intermediates costs **36ms** on a
+313ms handshake and catches the case revocation is really for, a sub-CA that has to be withdrawn;
+checking the leaf as well turns a 313ms handshake into 18.5s. That asymmetry is the whole story of
+why the web left CRLs for OCSP and then for pushed lists, and no parser fixes it. `crlFull` is the
+complete check for when you want it — a private PKI, a list you fetched once and cached, or a leaf
+whose CA publishes something reasonable.
 
 Against the real web (`tests/data/live-crl.nt`): Google's leaf names
 `http://c.pki.goog/we2/Gt0Gl6QoGAU.crl`, which is 53,504 bytes fetched in ~400ms, parses in 17ms to

@@ -149,16 +149,60 @@ crlCheck: {[crl;c;issuer;now]
   if[crlHas[crl; c`serial]; :"crl: ",(c`subject)," is revoked (serial ",(hex c`serial),") by the list from ",crl`issuer]
   ""}
 
+// ---- the whole thing, over a chain. `fetch` is the caller's: a function from a URL to the bytes
+// at it (src/neant/net/http.nt's httpGet wrapped is the obvious one), and it stays the caller's for
+// the reason in this file's header. What this adds is the loop and the policy that goes with it:
+//
+//   * every certificate BELOW the trust anchor is checked, not only the leaf. A revoked
+//     intermediate is the case revocation exists for.
+//   * a certificate with no distribution point is not an error. RFC 5280 does not require one, and
+//     treating "nothing to check" as "failed to check" would refuse most private PKIs outright.
+//   * a fetch that fails IS an error here, and the caller decides what that means. Soft-fail — the
+//     browser behaviour of ignoring an unreachable responder — is a policy that belongs to whoever
+//     knows whether this connection is worth blocking, not to this function. Trap it to get it.
+//
+//   why: crlChain[(leaf; intermediate); {[u] (httpGet u)`body}; (now`date; now`time)]
+//
+// WHAT THIS COSTS, measured rather than guessed, because it decides which of the two to call.
+// A public CA's leaf CRL is enormous: example.com's is **43,495,327 bytes and 887,654 serials**,
+// 3.0s to fetch and 12.8s to parse (derScan is 8.1s on the same buffer, so it is the size and not
+// the parser). Its two intermediates' lists are **301 and 299 bytes, 1ms**. That asymmetry is the
+// whole story of why the web left CRLs for OCSP and then for pushed lists, and it is not something
+// a faster parser fixes.
+//
+// So `crlChainCa` checks every link EXCEPT the leaf's own list. It costs milliseconds, and it
+// catches the case revocation is really for — a sub-CA that has to be withdrawn — while leaving the
+// unbounded download out of the handshake. `crlChain` is the complete check, for a private PKI, for
+// a pinned list you fetched once, or when you have decided the leaf's list is worth the wait.
+crlChain: {[chain;fetch;now] crlFrom[chain;fetch;now;0]}
+crlChainCa: {[chain;fetch;now] crlFrom[chain;fetch;now;1]}
+crlFrom: {[chain;fetch;now;from]
+  n: count chain
+  i: from
+  while[i<(n-1)
+    w: crlOne[chain[i]; chain[i+1]; fetch; now]
+    if[0<count w; :w]
+    i+:1]
+  ""}
+// one link. The DER is needed as well as the parsed form, since the distribution point is an
+// extension x509Parse does not keep — it models four, and this is a fifth.
+crlOne: {[c;issuer;fetch;now]
+  us: crlUrlsTbs c`tbs
+  if[0=count us; :""]
+  crl: crlParse fetch first us
+  crlCheck[crl; c; issuer; now]}
+
 // ---- where to fetch one. cRLDistributionPoints (2.5.29.31) holds DistributionPoint entries, each
 // of which may carry a distributionPoint [0] whose fullName [0] is a GeneralNames; a uniformResourceIdentifier
 // is [6]. Everything else in the structure — relative names, reasons, cRLIssuer — is skipped rather
 // than modelled, so this answers "which URLs, if any" and nothing else.
 CRLEXTDP: "2.5.29.31"
-crlUrls: {[der]
-  top: derParse der
-  derWant[top;DERSEQ;1b]
-  ks: derKids top
-  tbs: ks[0]
+// over a whole certificate's DER, or over the tbsCertificate bytes x509Parse already kept as `tbs`
+// — the extensions live in the tbs, so a parsed certificate needs no second copy of the whole thing
+crlUrls: {[der] crlUrlsTbs (derKids derParse der)[0][`raw]}
+crlUrlsTbs: {[tbsRaw]
+  tbs: derParse tbsRaw
+  derWant[tbs;DERSEQ;1b]
   t: derKids tbs
   out: ()
   i: 0
