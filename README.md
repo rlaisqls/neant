@@ -699,6 +699,16 @@ worse until the bignum arithmetic became compiled scalar loops (["the bignum ari
 compiled scalar loops"](#the-bignum-arithmetic-runs-as-compiled-scalar-loops)); `p256.nt`'s header
 counts out where what is left goes and which two optimisations were measured and rejected.
 
+**extendedKeyUsage is enforced**, for `serverAuth`, and it nests: an intermediate restricted to
+`emailProtection` cannot issue a server certificate under it, so a certificate a CA correctly limited
+to S/MIME or code signing cannot serve a web request just because its SAN carries a hostname. RFC 5280
+defines the extension per certificate and says nothing about chaining; the nesting is what CA/Browser
+Forum requires and what browsers do, and it costs a real chain nothing — Google's leaf carries
+`serverAuth` and both certificates above it carry `serverAuth` and `clientAuth`. An **absent**
+extension is unconstrained, per 5280, and a trust anchor is exempt: it is trusted by being in the
+store, not by what it says about itself. The refusal names the OIDs the certificate does carry and
+the one it does not.
+
 RSA over SHA-512 (PKCS#1 and PSS) and Ed25519 in a chain are checked as of `tests/data/pki-ed-gen.sh`'s
 fixtures. Ed25519 is the one algorithm here that names no digest: RFC 8032 signs the message and
 hashes it internally, so `verify.nt` hands `ed25519Verify` the tbs span rather than a digest of it.
@@ -710,8 +720,7 @@ What is still **not** checked, plainly: **P-521**, refused with the curve named,
 `p521.nt`; **ecdsaSha512**, refused for the curve-pairing reason below rather than for want of the
 hash; **SHA-1**, refused because it is broken; **revocation**, no CRL and no
 OCSP, so a certificate revoked this morning still verifies; **name constraints** and certificate
-policies; and **extendedKeyUsage**, which is parsed and ignored, so a certificate issued for e-mail
-will serve a web request. There are **no client certificates and no TLS server side**. A mismatched
+policies. There are **no client certificates and no TLS server side**. A mismatched
 ECDSA algorithm and curve — `ecdsaSha384` under a P-256 key, or the reverse — is also refused, with
 both named. Every one of those refusals names the algorithm or the curve rather than skipping the
 check. This is a verifier written from scratch to be read, not a substitute for a reviewed TLS

@@ -371,3 +371,21 @@ teq["ed25519: an RSA key cannot carry an Ed25519 signature"; x509KeyWhy[vfyP "pk
 // and the hash naming this depends on: x509.nt's OID table had the SHA-512 entry spliced in as
 // characters rather than as one string, so every SHA-512 hash read back `unknown
 teq["sha512: x509.nt can name the hash at all"; count X509HASHOIDS; 4]
+
+// ---- extendedKeyUsage. The three leaves differ ONLY in their EKU, so a refusal can be attributed
+// to it and to nothing else, and each refusal is asserted by its REASON rather than merely by
+// failing: a negative test that checks only "it was refused" passes over a verifier that refuses
+// for the wrong reason, which is how the SHA-512 OID bug survived a green suite.
+vfyEkuR: x509LoadRoots "tests/data/pki-sha512-root.pem"
+vfyEkuV: {[c;h] x509VerifyChain[c; vfyEkuR; h; vfyNow]}
+teq["eku: absent is unconstrained, so it verifies"; vfyEkuV[enlist vfyP "pki-eku-none-leaf"; "leaf.neant.test"]; 1b]
+teq["eku: serverAuth verifies"; vfyEkuV[enlist vfyP "pki-sha512-leaf"; "leaf.neant.test"]; 1b]
+teq["eku: the email leaf's own EKU is emailProtection"; (vfyP "pki-eku-email-leaf")`eku; enlist "1.3.6.1.5.5.7.3.4"]
+vfyEkuM1: "x509: ",vfyL," may not be used for TLS server authentication: its extendedKeyUsage is 1.3.6.1.5.5.7.3.4, which does not include serverAuth"
+terrLike["eku: a leaf issued for S/MIME is refused for TLS"; {[] vfyEkuV[enlist vfyP "pki-eku-email-leaf"; "leaf.neant.test"]}; vfyEkuM1]
+// and it nests: the leaf below is a perfectly good serverAuth certificate, refused for its issuer
+teq["eku: the nested leaf itself asks for serverAuth"; (vfyP "pki-eku-int-leaf")`eku; enlist "1.3.6.1.5.5.7.3.1"]
+vfyEkuM2: "x509: CN=neant fixture s-mime only ca,O=neant fixtures,C=US may not be used for TLS server authentication"
+terrLike["eku: an S/MIME-only intermediate cannot issue a server certificate"; {[] vfyEkuV[(vfyP "pki-eku-int-leaf"; vfyP "pki-eku-int"); "leaf.neant.test"]}; vfyEkuM2]
+// a trust anchor is exempt — it is trusted by being in the store, not by what it says about itself
+teq["eku: the real Google chain still verifies"; x509SigOk vfyG[1]; 1b]

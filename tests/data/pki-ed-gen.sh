@@ -63,7 +63,42 @@ openssl x509 -req -in pki-sha512-leaf.csr -CA pki-sha512-root.pem -CAkey pki-sha
   -sigopt rsa_padding_mode:pss -sigopt rsa_pss_saltlen:64 -sigopt rsa_mgf1_md:sha512 \
   -extfile pki-ed-ext.cnf -extensions leaf -out pki-pss512-leaf.pem 2>/dev/null
 
-rm -f pki-ed-leaf.csr pki-sha512-leaf.csr pki-ed-ext.cnf
+# ---- extendedKeyUsage, which verify.nt enforces for serverAuth and nests through intermediates.
+# Three certificates that differ ONLY in their EKU, so a refusal can be attributed to it and to
+# nothing else: one issued for S/MIME, one with no EKU at all (absent is unconstrained, RFC 5280
+# 4.2.1.12), and an intermediate restricted to S/MIME issuing a perfectly good server leaf.
+cat > pki-eku-ext.cnf <<'EOF'
+[email]
+basicConstraints = critical,CA:FALSE
+keyUsage         = critical,digitalSignature
+extendedKeyUsage = emailProtection
+subjectAltName   = DNS:leaf.neant.test,IP:127.0.0.1
+[noeku]
+basicConstraints = critical,CA:FALSE
+keyUsage         = critical,digitalSignature
+subjectAltName   = DNS:leaf.neant.test,IP:127.0.0.1
+[emailca]
+basicConstraints = critical,CA:TRUE,pathlen:0
+keyUsage         = critical,keyCertSign,cRLSign
+extendedKeyUsage = emailProtection
+[server]
+basicConstraints = critical,CA:FALSE
+keyUsage         = critical,digitalSignature
+extendedKeyUsage = serverAuth
+subjectAltName   = DNS:leaf.neant.test,IP:127.0.0.1
+EOF
+
+openssl req -new -key pki-sha512-leaf.key -subj "$LS" -out pki-eku.csr 2>/dev/null
+openssl x509 -req -in pki-eku.csr -CA pki-sha512-root.pem -CAkey pki-sha512-root.key -set_serial 56   -not_before $L -not_after $LE -sha256 -extfile pki-eku-ext.cnf -extensions email   -out pki-eku-email-leaf.pem 2>/dev/null
+openssl x509 -req -in pki-eku.csr -CA pki-sha512-root.pem -CAkey pki-sha512-root.key -set_serial 57   -not_before $L -not_after $LE -sha256 -extfile pki-eku-ext.cnf -extensions noeku   -out pki-eku-none-leaf.pem 2>/dev/null
+
+# an intermediate that may only do S/MIME, and a leaf under it that asks for serverAuth
+openssl genrsa -out pki-eku-int.key 2048 2>/dev/null
+openssl req -new -key pki-eku-int.key -subj "/C=US/O=neant fixtures/CN=neant fixture s-mime only ca" -out pki-eku-int.csr 2>/dev/null
+openssl x509 -req -in pki-eku-int.csr -CA pki-sha512-root.pem -CAkey pki-sha512-root.key -set_serial 58   -not_before $R -not_after $RE -sha256 -extfile pki-eku-ext.cnf -extensions emailca   -out pki-eku-int.pem 2>/dev/null
+openssl x509 -req -in pki-eku.csr -CA pki-eku-int.pem -CAkey pki-eku-int.key -set_serial 59   -not_before $L -not_after $LE -sha256 -extfile pki-eku-ext.cnf -extensions server   -out pki-eku-int-leaf.pem 2>/dev/null
+
+rm -f pki-ed-leaf.csr pki-sha512-leaf.csr pki-ed-ext.cnf pki-eku.csr pki-eku-int.csr pki-eku-ext.cnf
 
 hdr() {
   f=$1; shift
@@ -77,10 +112,14 @@ hdr pki-ed-leaf.pem "an Ed25519 leaf issued by pki-ed-root; SAN DNS:leaf.neant.t
 hdr pki-sha512-root.pem "an RSA-2048 root self-signed with sha512WithRSAEncryption"
 hdr pki-sha512-leaf.pem "an RSA leaf issued by it with sha512WithRSAEncryption"
 hdr pki-pss512-leaf.pem "the same leaf signed RSASSA-PSS with SHA-512 and a 64-byte salt"
-for k in pki-ed-root.key pki-ed-leaf.key pki-sha512-root.key pki-sha512-leaf.key; do
+hdr pki-eku-email-leaf.pem "a leaf issued for emailProtection: refused for TLS by extendedKeyUsage, and by nothing else"
+hdr pki-eku-none-leaf.pem "the same leaf with NO extendedKeyUsage: unconstrained, so it must be accepted"
+hdr pki-eku-int.pem "an intermediate restricted to emailProtection: nothing under it may serve TLS"
+hdr pki-eku-int-leaf.pem "a serverAuth leaf under that intermediate: refused because the constraint nests"
+for k in pki-ed-root.key pki-ed-leaf.key pki-sha512-root.key pki-sha512-leaf.key pki-eku-int.key; do
   { echo "# A THROWAWAY fixture key, committed on purpose, as pki-gen.sh's are: a key that only ever"
     echo "# signs certificates for names under .neant.test buys hermetic tests for nothing."
     echo "# Regenerate with:  sh tests/data/pki-ed-gen.sh"
     cat "$k"; } > "$k.h" && mv "$k.h" "$k"
 done
-chmod 644 pki-ed*.pem pki-ed*.key pki-sha512*.pem pki-sha512*.key pki-pss512*.pem
+chmod 644 pki-ed*.pem pki-ed*.key pki-sha512*.pem pki-sha512*.key pki-pss512*.pem pki-eku*.pem pki-eku*.key

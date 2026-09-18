@@ -275,6 +275,32 @@ x509IsAnchor: {[roots;c]
   ok}
 
 // ---- the checks every certificate faces on its own
+// ---- extendedKeyUsage (RFC 5280 4.2.1.12). The extension says what the key was ISSUED for, so a
+// verifier that ignores it hands back the constraint the CA applied: a certificate issued for
+// S/MIME or code signing, whose SAN happens to carry a hostname, would serve a web request.
+//
+// Two decisions, neither of which RFC 5280 settles, both taken the way browsers take them:
+//   * this function is TLS server verification — it takes a hostname — so the purpose is
+//     serverAuth, not a parameter.
+//   * the constraint NESTS: an intermediate restricted to emailProtection cannot issue a server
+//     certificate under it. 5280 defines EKU per certificate and says nothing about chaining;
+//     CA/Browser Forum requires serverAuth on intermediates and browsers enforce the nesting.
+//     Checked against a real chain: Google's leaf carries serverAuth and both certificates above
+//     it carry serverAuth and clientAuth, so the strict reading costs a real chain nothing.
+//   * a trust anchor is exempt: it is trusted by being in the store, not by what it says about
+//     itself, which is also what implementations do.
+// An ABSENT extension is unconstrained, per 5280. Getting that wrong would refuse ordinary CAs.
+X509EKUSERVER: "1.3.6.1.5.5.7.3.1"
+X509EKUANY: "2.5.29.37.0"
+// -> "" when the certificate may be used for TLS server authentication, otherwise why not
+x509EkuWhy: {[c]
+  e: c`eku
+  if[0=count e; :""]
+  if[X509EKUSERVER in e; :""]
+  if[X509EKUANY in e; :""]
+  m: "x509: ",(c`subject)," may not be used for TLS server authentication: its extendedKeyUsage is "
+  m,("," sv e),", which does not include serverAuth (",X509EKUSERVER,")"}
+
 x509CheckOne: {[c;now]
   if[0<count c`critUnknown
     m: "x509: ",(c`subject)," has a critical extension this verifier does not model: "
@@ -339,6 +365,9 @@ x509VerifyChain: {[chain;roots;host;now]
   while[i<n
     x509CheckOne[chain[i];now]
     if[0<i; x509CheckCa[chain[i];i-1]]                 // i-1 intermediates hang below chain[i]
+    if[not x509IsAnchor[roots;chain[i]]                // an anchor is exempt; see x509EkuWhy
+      ew: x509EkuWhy chain[i]
+      if[0<count ew; signal ew]]
     i+:1]
 
   if[not x509CheckHost[chain[0];host]                  // 3. the leaf is for this host
