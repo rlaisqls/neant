@@ -12,11 +12,12 @@ tok["while is refused"; jctHas[{[a;b] i:0; while[i<b; a: a bxor i; i: i+1]; a}; 
 tok["a do loop with a computed trip count is refused"; jctHas[{[a;b] n:0; do[b; n: n bxor a]; n}; "whose trip count is not a literal"]]
 tok["a function that does not compile at all is refused"; jctHas[{[a] 1.5*a}; "does not compile at all"]]
 
-// and the machine-code rule. Nothing passes yet, for the reason the file's header sets out: the
-// null-collision check after every arithmetic and bit operation is itself a branch on a value.
-// These pin the current answer so that the compile mode which removes it has to change them.
-jctBx: jctW {[a;b] a bxor b}
-tok["a bare bxor is not constant-time today"; 0<count jctBx]
-tok["nor is badd"; 0<count jctW {[a;b] a badd b}]
-print "    (bxor today: ",jctBx,")"
+// and the machine-code rule. A function built out of the bit primitives has no null-sentinel check
+// to branch on (jitHasArith, src/neant/jit/arm64.nt), so it comes out clean; one that mixes in an
+// ordinary `+` does not, and the check has to be there.
+teq["a bare bxor is constant-time"; jctW {[a;b] a bxor b}; ""]
+teq["so is badd"; jctW {[a;b] a badd b}; ""]
+teq["and a literal shift, whose range is known"; jctW {[x] x shl 3}; ""]
+tok["a + alongside a bit op brings the check back"; jctHas[{[a;b] (a bxor b) + 1}; "conditional branches"]]
+tok["and the reason is reported with the offsets"; jctHas[{[a;b] (a bxor b) + 1}; "at words"]]
 teq["a do loop with a literal count gets past the bytecode rules"; 0=count (jctW {[a] n:0; do[8; n: n bxor a]; n}) ss "trip count"; 1b]

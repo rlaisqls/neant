@@ -1,0 +1,45 @@
+// src/neant/stdlib/ct.nt. Two things are asserted about every function here: that it computes the
+// right answer, and that `jitct` says its emitted machine code has no data-dependent branch. The
+// second is the one that would otherwise rot silently — a helper rewritten with an `if`, or a `+`
+// slipped in where `badd` belongs, still returns the right answer.
+tsection "ct"
+load "src/neant/stdlib/ct.nt"
+ctT: {[f] jitct f}
+ctIs: {[name;f] teq[name; ctT f; ""]}
+
+ctIs["ctNeg is constant-time"; ctNeg]
+ctIs["ctMask is constant-time"; ctMask]
+ctIs["ctNot is constant-time"; ctNot]
+ctIs["ctSel is constant-time"; ctSel]
+ctIs["ctZeroBit is constant-time"; ctZeroBit]
+ctIs["ctEqBit is constant-time"; ctEqBit]
+ctIs["ctEqMask is constant-time"; ctEqMask]
+ctIs["ctLtBit is constant-time"; ctLtBit]
+ctIs["ctAcc is constant-time"; ctAcc]
+
+teq["ctNeg"; (ctNeg 0; ctNeg 1; ctNeg 5); 0 -1 -5]
+teq["ctMask: a bit becomes all ones or none"; (ctMask 0; ctMask 1); 0 -1]
+teq["ctNot"; (ctNot 0; ctNot (-1)); -1 0]
+teq["ctSel takes the first arm on a true mask"; ctSel[ctMask 1; 111; 222]; 111]
+teq["and the second on a false one"; ctSel[ctMask 0; 111; 222]; 222]
+teq["ctZeroBit"; (ctZeroBit 0; ctZeroBit 9; ctZeroBit (-1)); 1 0 0]
+teq["ctEqBit"; (ctEqBit[7;7]; ctEqBit[7;8]; ctEqBit[0;0]); 1 0 1]
+teq["ctEqMask"; (ctEqMask[7;7]; ctEqMask[7;8]); -1 0]
+// the comparison is UNSIGNED, which is what a limb is: -1 is the largest word, not the smallest
+teq["ctLtBit over small numbers"; (ctLtBit[1;2]; ctLtBit[2;1]; ctLtBit[2;2]); 1 0 0]
+teq["ctLtBit reads the words as unsigned"; (ctLtBit[0;-1]; ctLtBit[-1;0]); 1 0]
+teq["ctLtBit across the sign boundary"; (ctLtBit[9223372036854775807; -9223372036854775808]; ctLtBit[-9223372036854775808; 9223372036854775807]); 1 0]
+
+// the fold a tag comparison is made of: every word is touched, and the answer is read at the end
+ctA1: ctAcc[ctAcc[0;1;1];2;2]
+ctA2: ctAcc[ctAcc[0;1;1];2;3]
+teq["ctAcc: all equal"; ctZeroBit ctA1; 1]
+teq["ctAcc: one word differs"; ctZeroBit ctA2; 0]
+teq["ctAcc: and a difference in the first word is not lost by a later match"; ctZeroBit ctAcc[ctAcc[0;1;9];2;2]; 0]
+
+// the discipline itself, which is what keeps the property: these are the shapes that cost it
+teq["a + in the body costs the guarantee"; 0<count ctT {[a;b] (a bxor b) + 1}; 1b]
+teq["so does an if"; 0<count ctT {[a;b] $[a>b; a; b]}; 1b]
+teq["so does a call to another function"; 0<count ctT {[x] ctNeg x}; 1b]
+teq["a literal shift keeps it"; ctT {[x] x shr 63}; ""]
+teq["a variable shift does not, since the range has to be tested"; 0<count ctT {[x;y] x shr y}; 1b]

@@ -364,6 +364,22 @@ jitMatAlias: {[st;r]
 // these branches are free, being never taken and perfectly predicted — and removing them outright,
 // which is unsound and was measured only as a ceiling, is worth 17% of a multiply-accumulate loop
 // and 8% of an RSA-2048 verification. So this stays the obvious thing.
+// Does this function contain `+`, `-` or `*` at all? The null check after a BIT operation exists
+// only because a result that lands on the sentinel would be read as a null by one of those three —
+// the interpreter propagates it there and compiled code does not, so the two would disagree. A
+// function that never uses them cannot reach that disagreement, and the check is then pure cost and
+// a branch on a value. That is the whole of what makes a function compilable constant-time: no
+// marking, no mode flag a caller has to remember, just the property itself.
+jitHasArith: {[opcodes;opargs;consts]
+  n: count opcodes
+  i: 0
+  while[i<n
+    if[(opcodes[i])=6
+      k: jitDyadKind string consts[opargs[i]]
+      if[not isnull k; if[k<3; :1b]]]
+    i+:1]
+  0b}
+
 jitNullCheck: {[st;dst]
   st: jitApp[st;jitCmpR[dst;jitNI]]
   st[`deoptFixups]: (st[`deoptFixups]),enlist ((count st[`asm]);null)
@@ -638,7 +654,10 @@ jitOpVecRet: {[st;slot;atEnd]
 // primitive each slot held so entry can re-check it: these are globals and can be reassigned.
 // Kind: 0=badd 1=band 2=bor 3=bxor 4=shl 5=shr, matching `BIT_PRIMS` there.
 //
-// The two shifts deopt unless the count is in [0;64) — AArch64 reads it mod 64 and `ib_shl`/
+// The two shifts deopt unless the count is in [0;64), and only when the count is not already known
+// to this walk: a literal shift — which is what a rotation or a limb mask is built out of — needs
+// no guard, and a literal outside the range is simply not compiled.
+// The rest of the original note: — AArch64 reads it mod 64 and `ib_shl`/
 // `ib_shr` (src/prims.rs) truncate to u32 and answer 0, so outside that range the machine and the
 // interpreter genuinely differ and the honest thing is to let the interpreter have it. All six
 // work on the raw 64-bit pattern and so may *produce* the int-null sentinel where `+ - *` may not;
@@ -646,6 +665,11 @@ jitOpVecRet: {[st;slot;atEnd]
 // int and the interpreter as a null, so the result is checked exactly as an arithmetic one is.
 jitOpBit: {[st;kind;slot]
   if[(st[`depth])<2; :null]
+  // the shift count before anything is materialised: a negative vreg means the walk is still
+  // carrying it as a constant, and then the range the guard below tests is already known
+  d0: st[`depth]
+  kc: $[((st[`vregs])[d0-2])<0; (st[`vconst])[d0-2]; null]
+  if[kind>3; if[not isnull kc; if[not (kc<64) & -1<kc; :null]]]   // a constant shift out of range: the interpreter's
   st: jitMat1[st; (st[`depth])-1]
   st: jitMat1[st; (st[`depth])-2]
   x: jitSTACK+((st[`depth])-1)
@@ -654,10 +678,13 @@ jitOpBit: {[st;kind;slot]
   asm: st[`asm]
   st[`asm]: 0#0                        // sole owner: see jitApp
   df: st[`deoptFixups]
-  if[kind>3
+  // ... and when it is known to be in range, the guard is not emitted at all. That is worth a
+  // branch and two words on every shift in a limb kernel, and it is what lets a function built out
+  // of constant shifts and masks come out with no data-dependent branch in it (see jitCtWhy).
+  if[kind>3; if[isnull kc
     ; asm: asm,jitCmpImm[y;64]
       df: df,enlist ((count asm);`hs)
-      asm: asm,0]
+      asm: asm,0]]
   $[kind=0
     ; asm: asm,jitAddR[dst;x;y]
     ; kind=1
@@ -673,7 +700,7 @@ jitOpBit: {[st;kind;slot]
   st[`deoptFixups]: df
   st: jitVDrop[st;2]
   st: jitVPush[st;dst;0]
-  st: jitNullCheck[st;dst]
+  if[st`arith; st: jitNullCheck[st;dst]]     // see jitHasArith
   st[`primslots]: distinct (st[`primslots]),slot
   st[`pending]: null
   st}
@@ -712,6 +739,7 @@ jitCompile: {[input;trampolines]
   while[p<count lregs; asm: asm,jitLdrImm[lregs[p]; jitLOC; 8*lslots[p]]; p: p+1]
 
   st: jitNewState[asm;lslots;lregs]
+  st[`arith]: jitHasArith[opcodes;opargs;consts]
   // every bytecode position something jumps to: the walk is linear, so this is where the path
   // falling into a target has to be brought back to the canonical layout (see jitMatAll) before
   // the target's own first instruction, which is what makes both paths agree

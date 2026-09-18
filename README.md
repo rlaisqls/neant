@@ -853,20 +853,37 @@ source, so it cannot be talked around. Two rules:
   bounds check, or anything a later change to `arm64.nt` starts emitting is caught without being
   anticipated.
 
-**What it says today is "no", for everything, and the reason is specific.** Even `a bxor b` compiles
-to the `eor` and then a comparison of its *result* against the int-null sentinel, with a branch to a
-deopt. That check is not superfluous — a value equal to the sentinel would be read as a null by a
-later `+`, `-` or `*`, which the interpreter propagates and compiled code does not — but it is a
-branch on a value. The way out is a pair rather than a single change: a function restricted to
-`badd` and the bit primitives, which is how constant-time code is written anyway, can never hand a
-sentinel to an operation that would misread it, and then those checks can go. That has to be a real
-compile *mode*, because the point of the checker is to inspect the code that will actually run.
+**What makes a function pass** is a discipline the compiler can see, not a mode a caller has to
+remember. `a bxor b` used to compile to the `eor` and then a comparison of its *result* against the
+int-null sentinel, branching to a deopt — necessary, because a value equal to the sentinel would be
+read as a null by a later `+`, `-` or `*`, which the interpreter propagates and compiled code does
+not. But a function that never uses those three cannot reach that disagreement, so `jitHasArith`
+(src/neant/jit/arm64.nt) looks for them once and the checks after the bit operations are simply not
+emitted. Nothing is marked; the property is the code's own. A shift by a literal drops its range
+guard the same way, which is what a rotation in a hash is made of.
 
-Even with that, this would prove one property and not constant-time in general: `MUL` is
-constant-time on the cores this targets but not architecturally required to be, and nothing here
-says anything about what a caller does before or after. Branch-free selection needs no new codegen —
-a mask out of `neg`, `band` and `bxor` is already in the compilable subset — so what was missing was
-never the ability to write such code, only any way to know that you had.
+So the answer is now "yes" for the shapes constant-time code is actually written in:
+
+```
+jitct {[a;b] (a band b) bor a bxor b}    // ""
+jitct {[x] x shr 63}                     // ""
+jitct {[a] n: 0; do[8; n: n bxor a]; n}  // ""
+jitct {[a;b] (a bxor b) + 1}             // the check is back, and named
+```
+
+`src/neant/stdlib/ct.nt` is the set of primitives built on it — `ctMask`, `ctSel`, `ctEqBit`,
+`ctLtBit` (unsigned, which is what a limb is), and the `ctAcc` fold a tag comparison needs, since
+`~` stops at the first difference. Each is asserted constant-time in `tests/ct.nt` alongside its
+answer, so a helper rewritten with an `if`, or a `+` slipped in where `badd` belongs, fails the
+suite rather than quietly costing the property. They are written out rather than composed: a
+compiled function calling another goes through a trampoline that checks whether the callee bailed
+out, and that check is a branch — one that could never be taken between two functions that cannot
+deopt, which is a refinement the checker does not make yet.
+
+This proves one property and not constant-time in general: `MUL` is constant-time on the cores this
+targets but not architecturally required to be, and nothing here says anything about what a caller
+does before or after. What it does mean is that the crypto can now be *moved* onto ground where the
+claim is checked rather than argued — none of it has been yet.
 
 ## Errors
 
