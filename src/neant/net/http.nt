@@ -249,6 +249,19 @@ httpKeep: {[req]
   if[not (httpFind[`byte$v; `byte$"close"])<0; :0b]
   $[(req`version)~"HTTP/1.0"; not (httpFind[`byte$v; `byte$"keep-alive"])<0; 1b]}
 
+/// `httpsServe[l;handler;certs;pk]`: the same, behind TLS. `certs` is the chain leaf-first as DER
+// (`pemLoad` gives that) and `pk` an `rsaKeyLoad` key for the leaf; both come from
+// src/neant/crypto/tlsserver.nt and src/neant/crypto/sign.nt, which the caller loads — this file
+// does not, so a plaintext server pays nothing for the existence of this one.
+// A handshake that fails takes only its own connection down, never the accept loop.
+httpsServe: {[l;handler;certs;pk]
+  while[1
+    c: accept l
+    spawn {h: @[{[a] tlsAccept[a 0; a 1; a 2]}; (c;certs;pk); {`httpsbad}]
+      if[`httpsbad~h; :hclose c]
+      httpServeConn[httpTls h; handler]
+      tlsClose h}]}
+
 /// `httpServe[l;handler]`: accepts forever, one spawned worker per connection, and serves requests
 // on that connection until either side is done with it. `handler` is `req -> (status;reason;headers;body)`,
 // called with `httpRecv`'s dict.  A handler that answers `Connection: close` gets the connection

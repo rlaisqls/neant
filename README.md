@@ -366,13 +366,46 @@ the real web needs it, and `example.com` is already one of the sites that answer
 response with neither a `Content-Length` nor chunking is read to the close, and `204`/`304`/`1xx`
 and a `HEAD` reply never take a body whatever their headers claim.
 
+`httpsServe[l; handler; certs; pk]` is the same server behind TLS — the transport triple swapped for
+`tlsAccept`'s and nothing else changed:
+
+```
+load "src/neant/crypto/tlsserver.nt"; load "src/neant/crypto/sign.nt"
+l: hlisten "0.0.0.0:8443"
+httpsServe[l; handler; pemLoad "cert.pem"; rsaKeyLoad "key.pem"]
+```
+
+`curl --tlsv1.3 --cacert root.pem https://leaf.neant.test:8443/from-curl` fetches from it with the
+certificate verified (`ssl_verify_result 0`).
+
 What is missing: pipelining (a request is answered before the next is read), multipart, cookies,
-proxies, compression — nothing sends `Accept-Encoding`, and a server that gzips anyway hands back
-bytes this does not decode — and a TLS server side for `httpServe` to sit behind, which is
-`src/neant/crypto/tls.nt`'s missing half.
+proxies, and compression — nothing sends `Accept-Encoding`, and a server that gzips anyway hands
+back bytes this does not decode.
 
 `tests/http.nt` is the suite, all of it against sockets this process opens; `tests/data/live-http.nt`
 is the one that goes out to the network, run by hand.
+
+## Serving TLS
+
+`src/neant/crypto/tlsserver.nt` is the handshake from the other side: `tlsAccept[conn; certs; pk]`
+returns an ordinary `tls.nt` handle, so `tlsSend`, `tlsRecv` and `tlsClose` work on it unchanged —
+the only thing that differs between the two ends is which traffic secret writes and which reads.
+Everything else is `tls.nt`'s functions called in mirror: the record layer, the key schedule, the
+transcript discipline. What is new is the ClientHello parser, the ServerHello builder, and a
+CertificateVerify **signed** rather than checked, which is what `src/neant/crypto/sign.nt` exists for.
+
+The scope is narrow and deliberate: one cipher suite (`TLS_CHACHA20_POLY1305_SHA256`, because
+`crypto.nt` has ChaCha20 and Poly1305 and no AES), one group (x25519), one signature scheme
+(`rsa_pss_rsae_sha256`, so the server's key must be RSA). No client certificates — it never sends a
+CertificateRequest, so whoever connects is anonymous. No resumption, no early data, no
+HelloRetryRequest: a client whose key_share is not x25519 is refused rather than asked to try again.
+Each of those refusals names what was missing.
+
+The test that matters is not this process talking to itself: `openssl s_client` handshakes against
+it, verifies the fixture chain and echoes a line back (`openssl_client_completes_our_handshake`,
+src/main.rs), so a ServerHello, a signature or a Finished got subtly wrong fails there rather than
+only in a conversation with ourselves. **`sign.nt` is not constant-time and a server is where that
+matters most** — read its header before putting this anywhere real.
 
 ## Bytes and crypto
 

@@ -391,6 +391,45 @@ mod http {
 
     /// httpServe run against real client sockets (not neant's own hopen), the most direct way to
     /// check request parsing and response formatting against literal bytes on the wire.
+    /// The check tests/tlsserver.nt cannot make: that a real TLS implementation accepts what this
+    /// server sends. `openssl s_client` handshakes against it, verifies the fixture chain to the
+    /// fixture root, and echoes a line back — so a ServerHello, a Certificate, a CertificateVerify
+    /// signature or a Finished this build got subtly wrong fails here rather than only when talking
+    /// to itself. Needs a subprocess, which is why it is Rust.
+    #[test]
+    fn openssl_client_completes_our_handshake() {
+        let probe = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = probe.local_addr().unwrap().port();
+        drop(probe);
+        let mut v = boot_vm();
+        for f in ["src/neant/crypto/tlsclient.nt", "src/neant/crypto/sign.nt", "src/neant/crypto/tlsserver.nt"] {
+            v.eval(&std::fs::read_to_string(f).unwrap()).unwrap_or_else(|e| panic!("{f}: '{}", e.0));
+        }
+        v.eval("certs: pemLoad \"tests/data/pki-sha512-leaf.pem\"; pk: rsaKeyLoad \"tests/data/pki-sha512-leaf.key\"").unwrap();
+        v.eval(&format!("l: hlisten \"127.0.0.1:{port}\"")).unwrap();
+        let t = std::thread::spawn(move || {
+            v.eval("c: accept l; h: tlsAccept[c; certs; pk]; m: tlsRecv h; tlsSend[h; (`byte$\"echo:\"),m]; tlsClose h; `char$m")
+                .map(|r| r.fmt()).unwrap_or_else(|e| format!("'{}", e.0))
+        });
+        std::thread::sleep(std::time::Duration::from_millis(200));
+
+        let out = std::process::Command::new("openssl")
+            .args(["s_client", "-connect", &format!("127.0.0.1:{port}"), "-tls1_3",
+                   "-CAfile", "tests/data/pki-sha512-root.pem", "-servername", "leaf.neant.test",
+                   "-verify_return_error", "-quiet"])
+            .stdin(std::process::Stdio::piped()).stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn().expect("openssl s_client");
+        use std::io::Write as _;
+        out.stdin.as_ref().unwrap().write_all(b"hello from openssl\n").unwrap();
+        let done = out.wait_with_output().unwrap();
+        let said = String::from_utf8_lossy(&done.stdout).to_string();
+        let err = String::from_utf8_lossy(&done.stderr).to_string();
+        assert!(said.contains("echo:hello from openssl"), "s_client stdout {said:?} stderr {err:?}");
+        let saw = t.join().unwrap();
+        assert!(saw.contains("hello from openssl"), "the server read {saw:?}");
+    }
+
     #[test]
     fn serves_get_and_post_over_real_sockets() {
         let mut v = boot_vm();
