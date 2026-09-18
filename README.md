@@ -1278,8 +1278,9 @@ what the interpreter would. That last one matters most: a wrong register here is
 not a crash, and the fail-closed design of both tiers does not help with it — it only guarantees
 that what fails to compile falls back. So the first thing to run on an x86-64 box is
 `cargo test --release`, whose JIT tests compare every compiled path against the interpreter
-(["What the tests check"](#what-the-tests-check)); expect to debug. Every performance number in this
-section and the next is AArch64's.
+(["What the tests check"](#what-the-tests-check)); expect to debug — and note that the generated
+differential suite below would run there too, which is a better first hour than reading the
+disassembly. Every performance number in this section and the next is AArch64's.
 
 ### `f each x`, in compiled code
 
@@ -1349,6 +1350,43 @@ in anything but a bare constant was fine, which is how it survived — `{$[x>5; 
 right. The fix brings that position to the canonical layout like every other target.
 `tests/jit.nt` now takes the interpreted answer, warms the function past the threshold, and demands
 the same answer back, for nineteen shapes; eleven of them fail on the code before the fix.
+
+### Generated differential testing
+
+Both of the wrong answers above were found by accident, while measuring something else. That is the
+problem, not the bugs: a wrong register is a wrong *answer* and not a bail, so the fail-closed design
+that makes everything else here safe does nothing for this one class, and a hand-written list only
+ever covers the shapes somebody thought of.
+
+`tests/jitdiff.nt` generates them instead — about 2200 function bodies a run, from the compilable
+subset: arithmetic, comparisons, `$[..]`, the bit builtins, loops, an early `:` return, values
+carried through locals. Each body is built twice, once as written and once with a single integer
+literal wrapped in `(- - n)`. The pair has the same value for every input and differs only in that
+the second can never be compiled, because a monadic minus pair is outside the subset either tier
+takes. That twin is the only honest interpreter baseline available: since the tracing tier landed, a
+function's own first call is not one, because a loop inside it can be taken over partway through.
+The seed is fixed, so a failure prints the body that caused it and reproduces exactly. It costs 7
+seconds.
+
+It found a third wrong answer within minutes of working, in a shape nobody had written down:
+
+```
+f: {[x;y] (($[x>y; 8; 16]) + 1)}
+f[0;0]                    17
+do[300; f[0;0]]; f[0;0]   18                <- same function, now hot
+```
+
+A fused comparison leaves its flags for the branch to read, so that branch cannot materialise
+anything itself — and only the comparison's own two operands were being put in their canonical
+registers first. Everything *under* them stayed wherever it happened to be, and the path that takes
+the branch arrives at a target whose state has been reset to "every slot is canonical". Operands are
+pushed right first, so in `($[c; a; b]) + 1` the `1` sits under the comparison the whole way across
+it as a pending constant that was never stored. `1 + $[c; a; b]` has nothing underneath and was
+always right, which is how it survived. The fix materialises below the operands before the `cmp`,
+where there are no flags to clobber yet.
+
+Three wrong answers in the method tier, all in branch handling, all found in one sitting once
+something was looking. The generator is the part worth keeping.
 
 ### Stage 2b (started): a tracing JIT for hot loops
 
@@ -1494,7 +1532,13 @@ There is no external oracle left, so the front end is pinned by fixpoints and by
   non-int counter, a closure or primitive or projection callee, an arity mismatch, a global read,
   deep recursion, too many locals — since what matters there is that it be rejected rather than
   miscompiled. These are `tests/jit.nt`, in neant: a case is a source string and the text the REPL
-  prints for it, which needs no Rust. What stays in Rust is only what has to look at the host — the
+  prints for it, which needs no Rust.
+- **The JIT against the interpreter, on bodies nobody wrote.** The list above covers the shapes
+  someone thought of, and the three wrong answers the method tier has produced were all found by
+  accident. `tests/jitdiff.nt` generates about 2200 bodies a run from the compilable subset and
+  requires each to agree with a twin that has `(- - n)` spliced in and therefore can never compile.
+  Fixed seed, so a failure prints the body and reproduces. See
+  ["Generated differential testing"](#generated-differential-testing). What stays in Rust is only what has to look at the host — the
   two wall-clock bounds that catch the JIT silently compiling nothing at all, the `FnCode` flag that
   says a function really was compiled, and the deopt cases that need two separate VMs so one provably
   never tiers up. `tests/bench.nt` is the ratio measurement, run by hand.
