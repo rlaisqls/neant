@@ -1279,6 +1279,48 @@ that what fails to compile falls back. So the first thing to run on an x86-64 bo
 (["What the tests check"](#what-the-tests-check)); expect to debug. Every performance number in this
 section and the next is AArch64's.
 
+### `f each x`, in compiled code
+
+`each` applied a lambda by calling it, once per element, through `Vm::call_code` — which redid for
+every element work that cannot change between them: the arity and projection checks, the JIT cache
+lookup and its atomic, and a round trip through the locals pool. Measured on a 100k int vector, that
+machinery was about 40ns an element against roughly 8 for the adverb itself and 18 for the body of
+`{x+1}`. The call, not the work. `(neg) each x`, a primitive that enters none of it, was 8.7ns where
+`{x} each x` — an empty body — was 49.
+
+There are now two steps below that. `each_lambda` (src/vm.rs) resolves the callee once for the whole
+vector and keeps one locals buffer. `each_ints_jit` goes further when the input is an int vector and
+the method JIT has compiled the body: `try_run_each_int` (src/jit.rs) checks once what `try_run`
+checks per call, then runs the compiled body straight over the raw elements — no `seq` boxing on the
+way in, no `pack` type scan on the way out.
+
+```
+{x+1} each x        67.7 ns/elem  ->  2.3      {x} each x     49.0  ->  2.3
+```
+
+Which shapes reach it, measured one per process because a benchmark harness's own hot loop perturbs
+this: `{x}`, `{x+1}`, `{x bxor 3}`, `{x shr 2}`, `{[x] y: x+1; y*2}`, `{[x] y: x+1; y}`,
+`{$[x>5; x; 0-x]}`, `{x>3}`, `{x&3}` all run fused. A body containing a call (163ns) or a loop
+(35-39ns) does not, and falls back to the path above, which stays the definition of what the fused
+one has to agree with — `tests/jit.nt` asserts that agreement element by element over a vector that
+includes the int null and both ends of the range.
+
+**A bug this turned up.** Compiled code hands back a bare `i64` and the caller has to put a type
+back on it; it always said `Int`. For a function whose answer is a comparison that is wrong:
+
+```
+f: {x>3}
+f 5                       1b
+do[200; f 5]; f 5         1                 <- same function, now hot
+```
+
+`jitRetKind` (src/neant/jit/arm64.nt) is what tells it which, from the bytecode: a returned value
+produced by an unfused comparison is a boolean; a body in which no comparison escapes a branch, no
+boolean constant appears and nothing unmodelled happens can only produce an integer. Anything else
+is "cannot say", which keeps the older behaviour — so `try_run` is strictly better than it was, and
+the fused `each` declines the fast path entirely rather than guess. x86.nt still returns the
+five-element shape without this field, and is no worse off than before.
+
 ### Stage 2b (started): a tracing JIT for hot loops
 
 The tier above tiers up whole *functions*, after 64 calls. That misses the shape this language is
