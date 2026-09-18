@@ -220,6 +220,24 @@ fn find_atom(x: &Value, i: &Value) -> Option<i64> {
 }
 fn find(x: Value, i: Value) -> R<Value> {
     if let Some(n) = find_atom(&x, &i) { return Ok(Int(n)); }
+    // both sides the same kind of typed vector: look the raw elements up directly. The `small`
+    // heuristic below is kept — for a handful of lookups a scan beats building a table at all.
+    macro_rules! fnd { ($xv:expr, $iv:expr) => {{
+        let n = $xv.len() as i64;
+        if $iv.len() * $xv.len() < 1 << 14 {
+            return Ok(ints($iv.iter().map(|e| $xv.iter().position(|q| q == e).map_or(n, |p| p as i64)).collect()));
+        }
+        let mut m: HashMap<_, i64> = HashMap::with_capacity($xv.len());
+        for (p, e) in $xv.iter().enumerate() { m.entry(e.clone()).or_insert(p as i64); }
+        return Ok(ints($iv.iter().map(|e| m.get(e).copied().unwrap_or(n)).collect()));
+    }}}
+    match (&x, &i) {
+        (Ints(a), Ints(b)) => fnd!(a, b),     (Bools(a), Bools(b)) => fnd!(a, b),
+        (Chars(a), Chars(b)) => fnd!(a, b),   (Syms(a), Syms(b)) => fnd!(a, b),
+        (Dates(a), Dates(b)) => fnd!(a, b),   (Times(a), Times(b)) => fnd!(a, b),
+        (Bytes(a), Bytes(b)) => fnd!(a, b),
+        _ => {}
+    }
     let xs = x.seq();
     let n = xs.len() as i64;
     let small = i.is_atom() || i.count() * xs.len() < 1 << 14;   // few lookups: a scan beats building the table
@@ -298,7 +316,25 @@ fn empty_like(x: &Value) -> Value {
     }
 }
 /// `=x` group: distinct items -> indices where they occur, in first-seen order.
+/// `group x` -> the distinct values against the indices where each occurs, the same way.
 fn group(x: Value) -> R<Value> {
+    macro_rules! grp { ($v:expr, $ctor:ident) => {{
+        let mut at: HashMap<_, usize> = HashMap::with_capacity($v.len());
+        let (mut keys, mut idx): (Vec<_>, Vec<Vec<i64>>) = (Vec::new(), Vec::new());
+        for (i, e) in $v.iter().enumerate() {
+            match at.get(e) {
+                Some(&p) => idx[p].push(i as i64),
+                None => { at.insert(e.clone(), keys.len()); keys.push(e.clone()); idx.push(vec![i as i64]); }
+            }
+        }
+        return dict($ctor(keys), list(idx.into_iter().map(ints).collect()));
+    }}}
+    match &x {
+        Ints(v) => grp!(v, ints), Bools(v) => grp!(v, bools), Chars(v) => grp!(v, chars),
+        Syms(v) => grp!(v, syms), Dates(v) => grp!(v, dates), Times(v) => grp!(v, times),
+        Bytes(v) => grp!(v, bytes),
+        _ => {}
+    }
     let xs = x.seq();
     let (mut keys, mut idx): (Vec<Value>, Vec<Vec<i64>>) = (Vec::new(), Vec::new());
     match keys_of(&xs) {
@@ -351,7 +387,39 @@ fn reverse(x: Value) -> R<Value> {
     }
     let mut s = x.seq(); s.reverse(); Ok(pack(s))
 }
+/// `<x` and `>x`, which `sort`, `asc` and `desc` are all written in terms of.
+///
+/// Going through Value boxes every element and compares with cmp_val, which promotes both sides to
+/// f64 for anything numeric — an indirection and two conversions for each of the roughly seventeen
+/// comparisons an element takes at 100k. The typed paths sort (value, index) pairs directly, which
+/// also keeps the comparison in one cache-friendly array instead of chasing indices into another.
+///
+/// THE ORDER IS UNCHANGED in two respects that matter. The sort is still stable — an index
+/// permutation whose ties do not keep their input order is a different function — which is why the
+/// descending arm compares the value backwards and the index forwards rather than reversing. And a
+/// null still sorts first: the int null is i64::MIN, which is least under Ord exactly as it was
+/// least as an f64, and the float null is a NaN, handled by hand below as cmp_val handled it.
+///
+/// One thing does change, and it is a fix: two ints above 2^53 that differ used to compare EQUAL,
+/// because the f64 they were promoted to was the same. They now sort apart.
 fn grade(x: Value, desc: bool) -> R<Value> {
+    macro_rules! gr { ($v:expr) => {{
+        let mut p: Vec<(_, i64)> = $v.iter().enumerate().map(|(i, e)| (e.clone(), i as i64)).collect();
+        if desc { p.sort_unstable_by(|a, b| b.0.cmp(&a.0).then(a.1.cmp(&b.1))); } else { p.sort_unstable(); }
+        return Ok(ints(p.into_iter().map(|(_, i)| i).collect()));
+    }}}
+    match &x {
+        Ints(v) => gr!(v), Bools(v) => gr!(v), Chars(v) => gr!(v),
+        Syms(v) => gr!(v), Dates(v) => gr!(v), Times(v) => gr!(v), Bytes(v) => gr!(v),
+        Floats(v) => {
+            let mut idx: Vec<i64> = (0..v.len() as i64).collect();
+            let c = |a: f64, b: f64| a.partial_cmp(&b).unwrap_or_else(|| b.is_nan().cmp(&a.is_nan()));
+            if desc { idx.sort_by(|&a, &b| c(v[b as usize], v[a as usize])); }
+            else { idx.sort_by(|&a, &b| c(v[a as usize], v[b as usize])); }
+            return Ok(ints(idx));
+        }
+        _ => {}
+    }
     let s = x.seq(); let mut idx: Vec<usize> = (0..s.len()).collect();
     idx.sort_by(|&a, &b| if desc { cmp_val(&s[b], &s[a]) } else { cmp_val(&s[a], &s[b]) });
     Ok(ints(idx.into_iter().map(|i| i as i64).collect()))
@@ -382,7 +450,23 @@ fn floor(x: Value) -> R<Value> {
     }
 }
 fn til(x: Value) -> R<Value> { Ok(ints((0..int_of(&x)?).collect())) }
+/// `distinct x`. The typed paths hash the raw elements; the general one boxes each into a Value and
+/// then builds a Key from it, which is two allocations' worth of work per element to answer a
+/// question about an i64. `in`, `except`, `inter` and `union` in prelude.nt are all written in terms
+/// of this and `?`, so they follow.
 fn distinct(x: Value) -> R<Value> {
+    macro_rules! dis { ($v:expr, $ctor:ident) => {{
+        let mut seen = std::collections::HashSet::with_capacity($v.len());
+        let mut out = Vec::new();
+        for e in $v.iter() { if seen.insert(e.clone()) { out.push(e.clone()); } }
+        return Ok($ctor(out));
+    }}}
+    match &x {
+        Ints(v) => dis!(v, ints), Bools(v) => dis!(v, bools), Chars(v) => dis!(v, chars),
+        Syms(v) => dis!(v, syms), Dates(v) => dis!(v, dates), Times(v) => dis!(v, times),
+        Bytes(v) => dis!(v, bytes),
+        _ => {}
+    }
     let xs = x.seq();
     let mut out: Vec<Value> = Vec::new();
     match keys_of(&xs) {
