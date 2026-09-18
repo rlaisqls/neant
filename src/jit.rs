@@ -255,6 +255,28 @@ mod native {
             })
         }
 
+        /// `x f' y` over two whole int vectors, for the same reason and in the same shape as
+        /// `try_run_each_int` above. `prior` in prelude.nt is `f'[1_x; -1_x]`, so this is what it
+        /// rides on.
+        pub fn try_run_each2_int(&self, xs: &[i64], ys: &[i64], vm: &mut Vm) -> Option<Value> {
+            if self.arity != 2 || !self.vec_slots.is_empty() || self.ret_vec.is_some() { return None; }
+            let ret_bool = self.ret_bool?;
+            if self.nlocals > MAX_SLOTS || self.nlocals < 2 || xs.len() != ys.len() { return None; }
+            if !self.prims_intact(vm) { return None; }
+            let mut buf = [0i64; BUFLEN];
+            let mut out: Vec<i64> = Vec::with_capacity(xs.len());
+            for (&p, &q) in xs.iter().zip(ys) {
+                if p == crate::value::NI || q == crate::value::NI { return None; }
+                buf[..self.nlocals].fill(0);
+                buf[0] = p; buf[1] = q;
+                out.push(self.run(buf.as_mut_ptr(), vm)?);
+            }
+            Some(match ret_bool {
+                true => crate::value::bools(out.into_iter().map(|n| n != 0).collect()),
+                false => crate::value::ints(out),
+            })
+        }
+
         /// What a vector slot's word in `buf` holds, and the descriptor word beside it. Under the
         /// inlined layout that is the element data pointer and the element count: for a slot the
         /// body writes, `Arc::make_mut` first — our clone shares with the caller's value, so this

@@ -464,6 +464,27 @@ impl Vm {
             }
         }
     }
+    /// `x f' y` over two int vectors, the two-argument twin of `each_ints_jit` below. An atom on
+    /// either side is the broadcast the general path does, materialised here so the compiled loop
+    /// sees two equal-length slices.
+    fn each2_ints_jit(&mut self, g: &Value, x: &Value, y: &Value) -> Option<R<Value>> {
+        let (code, caps): (Arc<crate::value::FnCode>, &[Value]) = match g {
+            Lambda(c) => (c.clone(), &[]),
+            Closure(c, caps) => (c.clone(), caps.as_slice()),
+            _ => return None,
+        };
+        if code.params.len() != 2 || !caps.is_empty() || self.recorder.is_some() { return None; }
+        let (xs, ys): (Vec<i64>, Vec<i64>) = match (x, y) {
+            (Ints(a), Ints(b)) if a.len() == b.len() => (a.as_ref().clone(), b.as_ref().clone()),
+            (Int(a), Ints(b)) => (vec![*a; b.len()], b.as_ref().clone()),
+            (Ints(a), Int(b)) => (a.as_ref().clone(), vec![*b; a.len()]),
+            _ => return None,
+        };
+        if xs.is_empty() { return None; }
+        let compiled = code.jitted_n(self, xs.len())?;
+        compiled.try_run_each2_int(&xs, &ys, self).map(Ok)
+    }
+
     /// `f each x` where x is an int vector and the method JIT has compiled f to scalar code.
     ///
     /// `each_lambda` below took the per-element cost of entering the interpreter out of the adverb;
@@ -543,6 +564,8 @@ impl Vm {
             'L' => Ok(pack(x.seq().into_iter().map(|a| self.dyad(g, a, y.clone())).collect::<R<Vec<_>>>()?)),   // x f\: y — each x_i with all of y
             'R' => Ok(pack(y.seq().into_iter().map(|b| self.dyad(g, x.clone(), b)).collect::<R<Vec<_>>>()?)),   // x f/: y — all of x with each y_j
             _ => {
+                // the whole loop in compiled code, when the shapes allow it
+                if let Some(r) = self.each2_ints_jit(g, &x, &y) { return r; }
                 let (mut xs, mut ys) = (x.seq(), y.seq());
                 if xs.len() == 1 && ys.len() > 1 { xs = vec![xs[0].clone(); ys.len()]; }
                 if ys.len() == 1 && xs.len() > 1 { ys = vec![ys[0].clone(); xs.len()]; }

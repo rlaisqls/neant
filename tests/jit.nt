@@ -365,3 +365,59 @@ teq["each over a list";  {count x} each ("ab";"cde"); 2 3]
 teq["each over a dict keeps the keys"; {x+1} each `a`b!1 2; `a`b!2 3]
 JEG: 5
 teq["each with a captured global"; {x+JEG} each 1 2 3; 6 7 8]
+
+// and the two-argument twin, `x f' y` (src/vm.rs each2_ints_jit, src/jit.rs try_run_each2_int),
+// which is what `prior` rides on
+je2Ref: {[f;xs;ys] n: count xs; r: n#0; i: 0; while[i<n; r[i]: f[xs[i]; ys[i]]; i+:1]; r}
+je2Same: {[nm;f;xs;ys] teq["x f' y = one at a time: ",nm; xs f' ys; je2Ref[f;xs;ys]]}
+je2A: 100#til 50
+je2B: 100#til 37
+je2Same["x+y";        {x+y};      je2A; je2B]
+je2Same["x-y";        {x-y};      je2A; je2B]
+je2Same["x*y";        {x*y};      je2A; je2B]
+je2Same["x bxor y";   {x bxor y}; je2A; je2B]
+je2Same["a branch";   {$[x>y; x; y]}; je2A; je2B]
+je2Same["a scratch local"; {[x;y] t: x+y; t*2}; je2A; je2B]
+je2Same["at the ends"; {x+y}; jeEdge; reverse jeEdge]
+teq["broadcast on the left";  1 {x+y}' 10 20 30; 11 21 31]
+teq["broadcast on the right"; 1 2 3 {x+y}' 10; 11 12 13]
+teq["a comparison stays boolean"; 1 2 3 {x>y}' 3 2 1; 001b]
+teq["mismatched lengths still signal"; @[{1 2 {x+y}' 10 20 30}; 0; {x}]; "length: each"]
+teq["an empty pair"; () {x+y}' (); ()]
+teq["floats are not the fused path"; 1.5 2.5 {x+y}' 1 2; 2.5 4.5]
+teq["a null falls back to the general path"; 1 2 3 {x+y}' 10 20 0N; 11 22 0N]
+
+// ---- `$[c; a; b]` whose arms end the function.
+//
+// The method JIT used to answer 99 for every x on `{[x] $[x>3; x; 99]}`. The position after the
+// last op is a jump target — the then-arm jumps there — and the linear walk that stops at the last
+// op never visited it, so the arm that falls through was still holding its constant lazily when the
+// epilogue materialised it. That store is emitted AFTER the two paths join, so it ran on both and
+// overwrote what the other arm had put there. An arm ending in anything but a bare constant was
+// right, which is why this survived: `{$[x>5; x; 0-x]}` always worked.
+//
+// Each case takes the interpreted answer first, warms the function past the 64-call threshold, and
+// asks for the same answer again. A compiled function that disagrees with the interpreter is a
+// WRONG ANSWER rather than a crash, which is the one failure the fail-closed design cannot catch.
+tsection "jit: a branch that ends the function"
+jbSame: {[nm;f;a;b] c: f[a;b]; i: 0; while[i<300; f[a;b]; i+:1]; teq["compiled = interpreted: ",nm; f[a;b]; c]}
+jbSame1: {[nm;f;a] c: f a; i: 0; while[i<300; f a; i+:1]; teq["compiled = interpreted: ",nm; f a; c]}
+jbSame1["$[x>3; x; 99], true";   {[x] $[x>3; x; 99]};      9]
+jbSame1["$[x>3; x; 99], false";  {[x] $[x>3; x; 99]};      1]
+jbSame1["$[x>3; 11; 22], true";  {[x] $[x>3; 11; 22]};     9]
+jbSame1["$[x>3; 11; 22], false"; {[x] $[x>3; 11; 22]};     1]
+jbSame1["both arms an expression"; {$[x>5; x; 0-x]};       9]
+jbSame1["a constant then-arm";   {[x] $[x>3; 77; x]};      9]
+jbSame1["a local in both arms";  {[x] y: 3; $[x>y; x; y]}; 9]
+jbSame["$[x>y; x; y], x wins";   {[x;y] $[x>y; x; y]};     5; 3]
+jbSame["$[x>y; x; y], y wins";   {[x;y] $[x>y; x; y]};     3; 5]
+jbSame["$[x>y; x; y], equal";    {[x;y] $[x>y; x; y]};     4; 4]
+jbSame["$[x<y; x; y]";           {[x;y] $[x<y; x; y]};     5; 3]
+jbSame["$[x=y; x; y]";           {[x;y] $[x=y; x; y]};     5; 3]
+jbSame["$[x>y; 1; 2]";           {[x;y] $[x>y; 1; 2]};     5; 3]
+jbSame["a condition through a local"; {[x;y] c: x>y; $[c; x; y]}; 5; 3]
+jbSame["a constant condition";   {[x;y] $[x>3; x; y]};     9; 0]
+jbSame["three arguments";        {[x;y] $[x>3; x; 99]};    9; 0]
+jbSame["the if form still agrees"; {[x;y] r: y; if[x>y; r: x]; r}; 5; 3]
+jbSame["a while still agrees";   {[x;y] s: 0; while[x>y; s: s+1; x: x-1]; s}; 5; 3]
+jbSame["nested conditionals";    {[x;y] $[x>y; $[x>9; 1; 2]; 3]}; 5; 3]
