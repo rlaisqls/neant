@@ -450,7 +450,11 @@ impl Vm {
             }
             'L' | 'R' => err("rank: each-left/each-right take two arguments"),
             _ => {
-                let out = pack(x.seq().into_iter().map(|v| self.monad(g, v)).collect::<R<Vec<_>>>()?);
+                let xs = x.seq();
+                let out = pack(match self.each_lambda(g, &xs) {
+                    Some(r) => r?,
+                    None => xs.into_iter().map(|v| self.monad(g, v)).collect::<R<Vec<_>>>()?,
+                });
                 match x {   // each over a dict maps the values and keeps the keys
                     Dict(d) => Ok(Dict(Arc::new(crate::value::Dict { keys: d.keys.clone(), vals: out }))),
                     _ => Ok(out),
@@ -458,6 +462,53 @@ impl Vm {
             }
         }
     }
+    /// `f each x` where f is a one-parameter lambda, which is most of them.
+    ///
+    /// The general path calls `monad` per element and so reaches `call_code`, which redoes for
+    /// every single element work that cannot change between them: the arity and projection checks,
+    /// the JIT cache lookup with its atomic increment, and a round trip through the locals pool.
+    /// Measured on a 100k vector, that machinery was about 40ns an element, against roughly 8 for
+    /// the adverb itself and 18 for the body of `{x+1}` — the call, not the work. `(neg) each x`,
+    /// which is a primitive and never enters any of it, was 8.7 where `{x} each x` was 49.
+    ///
+    /// So: resolve the callee once, keep one locals buffer, and loop. Returns None for anything not
+    /// of this shape and the caller falls back to the general path, which stays the definition of
+    /// what this has to agree with.
+    fn each_lambda(&mut self, g: &Value, xs: &[Value]) -> Option<R<Vec<Value>>> {
+        let (code, caps): (Arc<crate::value::FnCode>, &[Value]) = match g {
+            Lambda(c) => (c.clone(), &[]),
+            Closure(c, caps) => (c.clone(), caps.as_slice()),
+            _ => return None,
+        };
+        if code.params.len() != 1 { return None; }
+        // while a trace is being recorded the recorder has to see each frame, which is exactly what
+        // this skips (see call_code), and a Null element means call_code would build a projection
+        if self.recorder.is_some() || xs.iter().any(|v| matches!(v, Null)) { return None; }
+        if self.depth > MAX_DEPTH { return Some(err("stack: recursion too deep")); }
+        let compiled = code.jitted_n(self, xs.len());
+        let nloc = code.nlocals.max(1);
+        let mut out: Vec<Value> = Vec::with_capacity(xs.len());
+        let mut loc: Vec<Value> = self.pool.pop().unwrap_or_default();
+        self.depth += 1;
+        let mut fail = None;
+        for v in xs {
+            loc.clear();
+            loc.push(v.clone());
+            loc.resize(nloc, Null);
+            loc.extend_from_slice(caps);
+            // a compiled version that bails out means "run it on the interpreter instead", the same
+            // as it does in call_code
+            let r = match compiled.as_ref().and_then(|c| c.try_run(&loc, self)) {
+                Some(v) => Ok(v),
+                None => self.execute(Some(&code), &code.ops, &code.consts, &code.lines, &mut loc),
+            };
+            match r { Ok(v) => out.push(v), Err(e) => { fail = Some(e); break; } }
+        }
+        self.depth -= 1;
+        loc.clear(); self.pool.push(loc);
+        Some(match fail { Some(e) => Err(e), None => Ok(out) })
+    }
+
     fn adv2(&mut self, c: char, g: &Value, x: Value, y: Value) -> R<Value> {
         match c {
             '/' => { let mut acc = x; for v in y.seq() { acc = self.dyad(g, acc, v)?; } Ok(acc) }

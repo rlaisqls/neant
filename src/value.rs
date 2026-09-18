@@ -160,7 +160,14 @@ impl FnCode {
     /// it doesn't qualify (see src/neant/jit/arm64.nt's compilability check), or because this arch
     /// has no backend.
     pub fn jitted(self: &Arc<FnCode>, vm: &mut crate::vm::Vm) -> Option<Arc<crate::jit::Compiled>> {
-        if self.calls.fetch_add(1, AtomicOrdering::Relaxed) + 1 < JIT_THRESHOLD { return None; }
+        self.jitted_n(vm, 1)
+    }
+    /// The same gate, advanced by a whole batch. `f each x` resolves the callee once for the whole
+    /// vector rather than once per element (src/vm.rs `each_lambda`), so the count has to move by
+    /// the number of elements or a function that goes hot inside one `each` would never tier up.
+    pub fn jitted_n(self: &Arc<FnCode>, vm: &mut crate::vm::Vm, n: usize) -> Option<Arc<crate::jit::Compiled>> {
+        let n = n.min(u32::MAX as usize) as u32;
+        if self.calls.fetch_add(n, AtomicOrdering::Relaxed).saturating_add(n) < JIT_THRESHOLD { return None; }
         self.jit_now(vm)
     }
     /// Same cache as `jitted`, but without the call-count gate: a compiled function calling this
