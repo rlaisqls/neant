@@ -176,3 +176,210 @@ terrLike["pemDecode: a character base64 does not have"
   {[] pemDecode "-----BEGIN CERTIFICATE-----\nB!A=\n-----END CERTIFICATE-----"}; "b64: bad char"]
 terrLike["pemDecode: an '=' before the end of a block"
   {[] pemDecode "-----BEGIN CERTIFICATE-----\nB=AA\n-----END CERTIFICATE-----"}; "b64: bad char"]
+
+// ---- and what a certificate SAYS, field by field. This was der_decodes_every_type_a_certificate_uses,
+// der_refuses_every_encoding_der_forbids, self_signed_rsa_matches_openssl,
+// ec_and_pss_certificates_match_openssl, real_chain_parses_and_links,
+// a_critical_extension_nobody_models_is_reported and malformed_certificates_signal in mod x509 in
+// src/main.rs. None of them needed Rust: each is a neant expression and the value it must have, so
+// `teq` compares the values here rather than the text the REPL would print for them. Every expected
+// value was read off `openssl x509 -text -noout` (OpenSSL 3.6.2) for the same fixture, and each
+// fixture under tests/data/ carries the command that generated it in its own header. The
+// hand-written DER vectors are X.690's own encodings, small enough to read by eye. The keys are
+// throwaway and a private half only ever existed to forge the blocks that must NOT verify.
+// The globals here take an x5f prefix so that nothing clashes with the columnar suite above.
+// `x5fd "hex"` parses one complete element; anything left over is already an error.
+x5fd: {[s] derParse unhex s}
+
+// ---- every universal type a certificate uses, decoded from its own encoding
+// INTEGER is two's complement, so the sign is in the top bit of the first octet
+teq["der: INTEGER 0"; derIntVal x5fd "020100"; 0]
+teq["der: INTEGER 127"; derIntVal x5fd "02017f"; 127]
+teq["der: INTEGER 128"; derIntVal x5fd "02020080"; 128]
+teq["der: INTEGER -1"; derIntVal x5fd "0201ff"; -1]
+teq["der: INTEGER -128"; derIntVal x5fd "020180"; -128]
+teq["der: INTEGER -256 needs two octets: minimal"; hex derInt x5fd "0202ff00"; "ff00"]
+teq["der: BOOLEAN true"; derBool x5fd "0101ff"; 1b]
+teq["der: BOOLEAN false"; derBool x5fd "010100"; 0b]
+teq["der: NULL"; derNull x5fd "0500"; 0x]
+teq["der: OCTET STRING"; hex derOct x5fd "0403010203"; "010203"]
+// the first octet packs two arcs as 40*a+b; { 2 999 3 } is X.690 8.19's own example
+teq["der: OBJECT IDENTIFIER"; derOid x5fd "06092a864886f70d01010b"; "1.2.840.113549.1.1.11"]
+teq["der: OBJECT IDENTIFIER 2.999.3"; derOid x5fd "0603883703"; "2.999.3"]
+teq["der: a named OID"; derOidSym derOid x5fd "06092a864886f70d01010b"; `sha256WithRsa]
+teq["der: an OID nobody names"; derOidSym derOid x5fd "0603883703"; `unknown]
+teq["der: BIT STRING, 4 unused bits, all of them zero"; derBitStr x5fd "030304f0f0"; (4;0xf0f0)]
+teq["der: BIT STRING as whole octets"; hex derBits x5fd "0303001234"; "1234"]
+teq["der: PrintableString"; derStr x5fd "130461626364"; "abcd"]
+teq["der: UTF8String, decoded as UTF-8"; derStr x5fd "0c04c3a9c3a8"; "éè"]
+teq["der: T61String, decoded as latin-1"; derStr x5fd "140241e9"; "Aé"]
+teq["der: UTCTime"; derTime x5fd "170d3236303130313032303330345a"; (2026.01.01;02:03:04.000)]
+teq["der: GeneralizedTime"; derTime x5fd "180f32303236303130313030303030305a"; (2026.01.01;00:00:00.000)]
+// RFC 5280 4.1.2.5.1: a two-digit year is 1950..2049, so 49 and 50 land a century apart
+teq["der: UTCTime year 49 is 2049"; (derTime x5fd "170d3439303130313030303030305a")[0]; 2049.01.01]
+teq["der: UTCTime year 50 is 1950"; (derTime x5fd "170d3530303130313030303030305a")[0]; 1950.01.01]
+// structure: long-form length, the high-tag-number form, and a constructed element's kids
+x5fLong: x5fd "3081c8",raze 200#enlist "00"
+teq["der: long-form length"; (x5fLong[`tag];x5fLong[`hlen];x5fLong[`len]); 16 3 200]
+x5fHigh: x5fd "5f1f0100"
+teq["der: the high-tag-number form"; (x5fHigh[`cls];x5fHigh[`tag];x5fHigh[`cons]); (`app;31;0b)]
+teq["der: a constructed element's kids"; count derKids x5fd "3006020101020102"; 2]
+teq["der: an empty SET has none"; count derKids x5fd "3100"; 0]
+// the span a node carries is the bytes it came from, not a re-encoding
+teq["der: a kid's span is the bytes it came from"; hex (derKids x5fd "3006020101020102")[1][`raw]; "020102"]
+
+// ---- everything that must not parse. A DER reader that shrugs at any of these hands a verifier an
+// encoding whose meaning two implementations can disagree about, which is the whole attack.
+x5fBad: (("indefinite length"; {[] x5fd "308005000000"}; "der: indefinite length is not DER")
+  ;("trailing bytes"; {[] x5fd "050000"}; "der: trailing bytes after the top-level element")
+  ;("non-minimal length"; {[] x5fd "3081050500"}; "der: non-minimal length")
+  ;("length past the end"; {[] x5fd "30050500"}; "der: length runs past the end of the input")
+  ;("truncated header"; {[] x5fd "05"}; "der: input ends inside an element")
+  ;("length wider than an int"; {[] x5fd "3085010000000500"}; "der: length does not fit an int")
+  ;("non-minimal tag"; {[] x5fd "5f800100"}; "der: non-minimal tag")
+  ;("padded positive INTEGER"; {[] derInt x5fd "0202007f"}; "der: non-minimal INTEGER")
+  ;("padded negative INTEGER"; {[] derInt x5fd "0202ffff"}; "der: non-minimal INTEGER")
+  ;("empty INTEGER"; {[] derInt x5fd "0200"}; "der: empty INTEGER")
+  ;("INTEGER wider than an i64"; {[] derIntVal x5fd "0209010000000000000000"}
+    ;"der: INTEGER too large for an int")
+  ;("BOOLEAN that is not 0x00/0xff"; {[] derBool x5fd "010101"}
+    ;"der: BOOLEAN must be 0x00 or 0xff in DER")
+  ;("two-octet BOOLEAN"; {[] derBool x5fd "0102ffff"}; "der: BOOLEAN must be one octet")
+  ;("NULL with content"; {[] derNull x5fd "050100"}; "der: NULL with content")
+  ;("padded OID subidentifier"; {[] derOid x5fd "06032a8001"}
+    ;"der: non-minimal OBJECT IDENTIFIER subidentifier")
+  ;("OID cut mid-subidentifier"; {[] derOid x5fd "06022a86"}
+    ;"der: OBJECT IDENTIFIER ends inside a subidentifier")
+  ;("empty OID"; {[] derOid x5fd "0600"}; "der: empty OBJECT IDENTIFIER")
+  ;("BIT STRING with set unused bits"; {[] derBitStr x5fd "030304f0f1"}
+    ;"der: BIT STRING trailing bits are not zero")
+  ;("BIT STRING claiming 8 unused"; {[] derBitStr x5fd "03020800"}
+    ;"der: BIT STRING unused-bit count out of range")
+  ;("empty BIT STRING with unused bits"; {[] derBitStr x5fd "030101"}
+    ;"der: BIT STRING has no octets but claims unused bits")
+  ;("partial-octet key"; {[] derBits x5fd "030304f0f0"}
+    ;"der: BIT STRING is not a whole number of octets")
+  ;("PrintableString with @"; {[] derStr x5fd "130140"}
+    ;"der: PrintableString has a character outside its set")
+  ;("IA5String above ASCII"; {[] derStr x5fd "160180"}; "der: IA5String is not ASCII")
+  ;("constructed string"; {[] derStr x5fd "3300"}; "der: a DER string must be primitive")
+  ;("UTCTime without seconds"; {[] derTime x5fd "170b3236303130313030303030"}
+    ;"der: UTCTime must be 13 characters")
+  ;("UTCTime without Z"; {[] derTime x5fd "170d323630313031303030303030ff"}
+    ;"der: UTCTime must end in Z")
+  ;("month 13"; {[] derTime x5fd "170d3236313330313030303030305a"}
+    ;"der: month out of range in UTCTime")
+  ;("30 February"; {[] derTime x5fd "170d3236303233303030303030305a"}
+    ;"der: day out of range in UTCTime")
+  ;("second 60"; {[] derTime x5fd "170d3236303130313030303036305a"}
+    ;"der: second out of range in UTCTime")
+  ;("primitive SEQUENCE"; {[] derWant[x5fd "1000";16;1b]}; "der: SEQUENCE must be constructed")
+  ;("kids of a primitive"; {[] derKids x5fd "0500"}
+    ;"der: expected a constructed element, got a primitive one"))
+{[t] terrLike["der refuses: ",t[0]; t[1]; t[2]]} each x5fBad
+
+// ---- the self-signed RSA fixture, field by field. Its key is regenerated by the command in its
+// header, so nothing here depends on the modulus' value — only on its size and on the fields the
+// command itself fixes.
+x5fC: x509Parse (pemLoad "tests/data/selfsigned-rsa.pem")[0]
+teq["rsa cert: version"; x5fC`ver; 3]
+teq["rsa cert: serial"; hex x5fC`serial; "0102030405060708"]        // openssl: serial=0102030405060708
+teq["rsa cert: sigAlg"; x5fC`sigAlg; `rsaPkcs1Sha256]               // Signature Algorithm: sha256WithRSA
+teq["rsa cert: sigAlgOid"; x5fC`sigAlgOid; "1.2.840.113549.1.1.11"]
+teq["rsa cert: PKCS#1 v1.5 has no parameters"; x5fC`sigParams; ()!()]
+// openssl x509 -noout -subject -issuer -nameopt RFC2253, verbatim
+teq["rsa cert: subject"; x5fC`subject; "CN=selfsigned.neant.test,OU=crypto,O=neant,L=San Francisco,ST=California,C=US"]
+teq["rsa cert: self-signed, so it is its own issuer"; (x5fC`issuer) ~ x5fC`subject; 1b]
+teq["rsa cert: and canonically too"; (x5fC`issuerCanon) ~ x5fC`subjectCanon; 1b]
+teq["rsa cert: subjectCanon"; x5fC`subjectCanon; "2.5.4.6=us,2.5.4.8=california,2.5.4.7=san francisco,2.5.4.10=neant,2.5.4.11=crypto,2.5.4.3=selfsigned.neant.test"]
+teq["rsa cert: notBefore"; x5fC`notBefore; (2026.01.01;00:00:00.000)]   // Not Before: Jan  1 00:00:00 2026
+teq["rsa cert: notAfter"; x5fC`notAfter; (2036.01.01;00:00:00.000)]     // Not After : Jan  1 00:00:00 2036
+teq["rsa cert: spki alg"; (x5fC`spki)`alg; `rsa]
+teq["rsa cert: Public-Key: (2048 bit)"; count (x5fC`spki)`n; 256]
+teq["rsa cert: Exponent: 65537 (0x10001)"; hex (x5fC`spki)`e; "010001"]
+teq["rsa cert: the sign octet is stripped"; 0=`int$((x5fC`spki)`n)[0]; 0b]
+teq["rsa cert: san, with the IP: entry skipped"; x5fC`san; ("selfsigned.neant.test";"alt.neant.test")]
+teq["rsa cert: eku is serverAuth, clientAuth"; x5fC`eku; ("1.3.6.1.5.5.7.3.1";"1.3.6.1.5.5.7.3.2")]
+teq["rsa cert: CA:TRUE, pathlen:2"; (x5fC`isCa; x5fC`pathLen); (1b;2)]
+teq["rsa cert: keyUsage"; x5fC`keyUsage; `digitalSignature`keyCertSign`cRLSign]
+teq["rsa cert: both critical extensions are modelled"; x5fC`critUnknown; ()]
+teq["rsa cert: signature length"; count x5fC`sig; 256]
+// `tbs is the span, not a re-encoding: it is exactly the bytes at offset 4 of the file
+x5fDer: (pemLoad "tests/data/selfsigned-rsa.pem")[0]
+teq["rsa cert: tbs is the span the file holds"; (x5fC`tbs) ~ x5fDer[4+til count x5fC`tbs]; 1b]
+
+// ---- the EC and RSASSA-PSS fixtures: the two spki shapes and the two signature-algorithm shapes
+// the RSA fixture cannot reach. PSS names its hash in the parameters, not in the OID.
+x5fE: x509Parse (pemLoad "tests/data/selfsigned-ec.pem")[0]
+x5fP: x509Parse (pemLoad "tests/data/selfsigned-pss.pem")[0]
+teq["ec cert: serial"; `int$(x5fE`serial)[0]; 42]                   // openssl: serial=2A
+teq["ec cert: sigAlg"; x5fE`sigAlg; `ecdsaSha256]                   // ecdsa-with-SHA256
+teq["ec cert: sigAlgOid"; x5fE`sigAlgOid; "1.2.840.10045.4.3.2"]
+teq["ec cert: subject"; x5fE`subject; "CN=ec.neant.test,O=neant,C=US"]
+teq["ec cert: spki alg"; (x5fE`spki)`alg; `ec]
+teq["ec cert: NIST CURVE: P-256"; (x5fE`spki)`curve; `p256]
+teq["ec cert: ASN1 OID: prime256v1"; (x5fE`spki)`oid; "1.2.840.10045.3.1.7"]
+teq["ec cert: 0x04 and two 32-octet coordinates"; count (x5fE`spki)`point; 65]
+teq["ec cert: san"; x5fE`san; enlist "ec.neant.test"]
+// CA:FALSE is the DEFAULT, so DER encodes BasicConstraints as an empty SEQUENCE
+teq["ec cert: CA:FALSE is the default"; (x5fE`isCa; x5fE`pathLen); (0b;0N)]
+teq["ec cert: keyUsage"; x5fE`keyUsage; enlist `digitalSignature]
+teq["pss cert: serial"; `int$(x5fP`serial)[0]; 123]                 // openssl: serial=7B
+teq["pss cert: sigAlg"; x5fP`sigAlg; `rsaPssSha256]                 // Signature Algorithm: rsassaPss
+teq["pss cert: sigAlgOid"; x5fP`sigAlgOid; "1.2.840.113549.1.1.10"]
+// Hash Algorithm: sha256 / Mask Algorithm: mgf1 with sha256 / Salt Length: 0x20
+teq["pss cert: sigParams"; x5fP`sigParams; `hash`mgfHash`saltLen!(`sha256;`sha256;32)]
+teq["pss cert: spki alg"; (x5fP`spki)`alg; `rsa]
+teq["pss cert: no keyUsage extension at all"; x5fP`keyUsage; ()]
+
+// ---- a chain exactly as a server sends one. The point of `issuerCanon`/`subjectCanon` is here:
+// chain building matches one certificate's issuer against another's subject, and it must be a
+// comparison on a canonical form, not on the printable text.
+x5fCs: x509Parse each pemLoad "tests/data/chain-google.pem"
+teq["chain: leaf, intermediate, root"; count x5fCs; 3]
+teq["chain: the leaf's subject"; (x5fCs[0])`subject; "CN=www.google.com"]
+teq["chain: the leaf's issuer"; (x5fCs[0])`issuer; "CN=WE2,O=Google Trust Services,C=US"]
+teq["chain: the leaf's serial"; hex (x5fCs[0])`serial; "465ba8f43add48190abbcabc0878c127"]
+teq["chain: Not Before: Sep 4 08:06:59 2026"; (x5fCs[0])`notBefore; (2026.09.04;08:06:59.000)]
+teq["chain: the leaf's notAfter"; (x5fCs[0])`notAfter; (2026.11.27;08:06:58.000)]
+teq["chain: the leaf's sigAlg"; (x5fCs[0])`sigAlg; `ecdsaSha256]
+teq["chain: the leaf's curve"; ((x5fCs[0])`spki)`curve; `p256]
+teq["chain: the leaf's san"; (x5fCs[0])`san; enlist "www.google.com"]
+teq["chain: the leaf is not a CA"; ((x5fCs[0])`isCa; (x5fCs[0])`pathLen); (0b;0N)]
+teq["chain: the intermediate's subject"; (x5fCs[1])`subject; "CN=WE2,O=Google Trust Services,C=US"]
+teq["chain: the intermediate's sigAlg"; (x5fCs[1])`sigAlg; `ecdsaSha384]
+teq["chain: CA:TRUE, pathlen:0"; ((x5fCs[1])`isCa; (x5fCs[1])`pathLen); (1b;0)]
+teq["chain: the root's subject"; (x5fCs[2])`subject; "CN=GTS Root R4,O=Google Trust Services LLC,C=US"]
+teq["chain: the root's issuer"; (x5fCs[2])`issuer; "CN=GlobalSign Root CA,OU=Root CA,O=GlobalSign nv-sa,C=BE"]
+teq["chain: an EC key cross-signed by RSA"; (x5fCs[2])`sigAlg; `rsaPkcs1Sha256]
+teq["chain: the root's curve"; ((x5fCs[2])`spki)`curve; `p384]
+teq["chain: CA:TRUE with no pathlen"; ((x5fCs[2])`isCa; (x5fCs[2])`pathLen); (1b;0N)]
+teq["chain: nothing critical is unmodelled"; {x`critUnknown} each x5fCs; (();();())]
+teq["chain: the leaf links to the intermediate"; (x5fCs[0])[`issuerCanon] ~ (x5fCs[1])`subjectCanon; 1b]
+teq["chain: the intermediate links to the root"; (x5fCs[1])[`issuerCanon] ~ (x5fCs[2])`subjectCanon; 1b]
+teq["chain: and the leaf does not link to the root"; (x5fCs[0])[`issuerCanon] ~ (x5fCs[2])`subjectCanon; 0b]
+// the hashes a verifier will actually sign-check, over the spans the parser kept:
+//   python3 -c 'import base64,hashlib,re,sys; ...' -- or equivalently
+//   openssl asn1parse -in <one cert> -strparse 4 -noout -out - | sha256sum
+teq["chain: sha256 of the leaf's tbs"; hex sha256 (x5fCs[0])`tbs; "68d4a9fb5c3da2814f42d61dd2558273479b5f75fd8ae13d7f9e715c3eae7306"]
+teq["chain: sha256 of the intermediate's tbs"; hex sha256 (x5fCs[1])`tbs; "c3210337a3f77559f6371588cdc4894e3d084bb79f4c283f9320b7bd8cf16474"]
+teq["chain: sha256 of the root's tbs"; hex sha256 (x5fCs[2])`tbs; "6e62a0efd60a04d93f2f864b54442717a666c038c8c70546af6319e4f46a2f73"]
+
+// ---- RFC 5280 4.2: a critical extension a verifier does not understand means the certificate must
+// be rejected. Dropping it silently is a way a verifier gets fooled, so it is reported instead.
+x5fCrit: x509Parse (pemLoad "tests/data/critical-unknown-ext.pem")[0]
+teq["critical: the unmodelled extension is named"; x5fCrit`critUnknown; enlist "1.3.6.1.4.1.99999.1"]
+teq["critical: subject"; x5fCrit`subject; "CN=critical.neant.test"]
+teq["critical: serial"; hex x5fCrit`serial; "1234"]
+
+// ---- tests/data/malformed.pem, block by block, in the order tests/data/malformed.py writes them.
+// The last one is the interesting one: two AlgorithmIdentifiers of the same length that say
+// different things, which only RFC 5280 4.1.1.2's equality check catches.
+x5fDs: pemLoad "tests/data/malformed.pem"
+teq["malformed: five blocks"; count x5fDs; 5]
+x5fMal: ((0; "der: length runs past the end of the input")
+  ;(1; "der: non-minimal length")
+  ;(2; "der: indefinite length is not DER")
+  ;(3; "der: trailing bytes after the top-level element")
+  ;(4; "x509: signatureAlgorithm does not match the one inside tbsCertificate"))
+{[t] terrLike["malformed: block ",string t[0]; {[] x509Parse x5fDs[t[0]]}; t[1]]} each x5fMal
