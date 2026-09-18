@@ -865,6 +865,23 @@ jitCompile: {[input;trampolines]
     ip: ip+1]
 
   if[not isnull st[`pending]; :null]
+  // The position after the last op is a jump target like any other — `$[c; a; b]` whose then-arm
+  // ends the function jumps here — and the linear walk, which stops at n-1, never visits it. So the
+  // path that falls through is brought to the canonical layout HERE, the way every other target
+  // does it above.
+  //
+  // Without this the epilogue's own jitMat1 does the materialising instead, and that is emitted
+  // AFTER the two paths have joined: a constant the falling-through arm was still holding lazily
+  // became a store that runs on both paths and overwrote what the other arm had put there. That is
+  // why `{[x] $[x>3; x; 99]}` compiled to something that answered 99 for every x, while
+  // `{$[x>5; x; 0-x]}` — whose else arm ends in a dyad, so its top of stack is a register and not a
+  // pending constant — was right all along.
+  if[n in targets
+    ; st: jitMatAll[st; st[`depth]]
+      if[not isnull (st[`depthAt])[n]
+        ; st[`depth]: (st[`depthAt])[n]
+          st[`vregs]: jitSTACK+til st[`depth]
+          st[`vconst]: (st[`depth])#0]]
   ipWord[n]: count st[`asm]
 
   lastOp: $[n>0; opcodes[n-1]; -1]
