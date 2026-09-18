@@ -101,3 +101,22 @@ teq["the two scalars really do differ in weight"; (sum ctLo; sum ctHi); 1 255]
 ctTLo: ctMs[{ecCtMul[P256C; ctLo; (P256C`gx; P256C`gy)]}; 6]
 ctTHi: ctMs[{ecCtMul[P256C; ctHi; (P256C`gx; P256C`gy)]}; 6]
 teq["ecCtMul does not care how many bits are set"; ctTHi < 1.3 * 5 | ctTLo; 1b]
+
+// x25519's ladder always did the same field operations in the same order; what it branched on was
+// the SWAP, i.e. whether two consecutive bits of the private key differ — which is the key up to
+// one bit. fcswap replaced the `if`.
+teq["fcswap swaps under an all-ones mask"; fcswap[(-1); 1 2 3; 7 8 9]; (7 8 9; 1 2 3)]
+teq["fcswap leaves the pair alone under a zero mask"; fcswap[0; 1 2 3; 7 8 9]; (1 2 3; 7 8 9)]
+// fcswap itself returns a pair, which is outside the compilable subset, so jitct cannot speak for
+// it — but each half of it is exactly ctSel's expression, and that shape is checkable.
+teq["and the shape each half is built from is constant-time"
+  jitct {[m;a;b] (b band m) bor a band m bxor (-1)}; ""]
+teq["jitct says so about fcswap rather than pretending"
+  0<count jitct fcswap; 1b]
+
+// THERE IS NO TIMING ASSERTION FOR x25519 HERE, deliberately. Measured at 200 multiplies a side,
+// a scalar that made the old code swap at every step ran 630 ms against 604 ms for one that almost
+// never did — 4%, which this clock cannot separate from noise, so a test built on it would pass
+// whether or not the branch was there and would be worth nothing. The branch was removed because a
+// branch on key bits is a branch on key bits and a branch predictor is a finer instrument than
+// `now`time`, not because the wall clock objected. ecCtMul above is the case where it did.

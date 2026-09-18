@@ -917,6 +917,16 @@ ecCtMul          592 ms         589 ms
 
 Signing costs about 1.8x what it did. That is the price, and it is paid once per signature.
 
+**The x25519 swap.** A Montgomery ladder does the same field operations in the same order for every
+scalar, and this one always did — but it swapped its two accumulators with an `if`, so the one thing
+left to see was whether two consecutive bits of the private key differ, which is the key up to one
+bit. `fcswap` computes both arms and selects with a mask. Being exact about what this is worth:
+measured the same way, a scalar that made the old code swap at every step ran 630 ms against 604 ms
+for one that almost never did. Four percent is not something that clock can separate from noise,
+which is why `tests/ct.nt` asserts nothing about it. The branch was removed because a branch on key
+bits is a branch on key bits and a branch predictor is a much finer instrument than a millisecond
+counter — not because the wall clock objected. It costs about 15%.
+
 **What is still not constant-time**, because the claim is worth less than the exactness: the field
 layer below. `bnMontMul` trims its own result, so a value with a zero top limb makes the next
 multiply cheaper, and `bnAddModL`'s conditional subtract is a branch. The `efCt*` wrappers pad every

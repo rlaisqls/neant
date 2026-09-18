@@ -376,20 +376,37 @@ freduce: {[v] v: fcarry v
 fdecode: {[b] bits: raze {(x shr til 8) band 1} each `int$b; bits[255]: 0; bits,: 8#0; {+/x*2^til 22} each 22 cut bits}
 fencode: {[v] bits: raze {(x shr til 22) band 1} each freduce v; `byte$ {+/x*2^til 8} each 8 cut 256#bits}
 finv: {[a] r: F1; i: 254; while[not i<0; r: fsq r; if[(i>4) | i in 0 1 3; r: fmul[r;a]]; i: i-1]; r}   // a^(p-2), p-2 = 2^255-21
-// x25519[scalar 32 bytes; u 32 bytes] -> 32 bytes. Montgomery ladder; ponytail: not constant-time (branches on key bits)
+// A swap that is not a branch. `m` is 0 or all ones; both arms are computed whatever it holds, and
+// which one lands is arithmetic rather than control flow. Limbs are ordinary 22-bit integers, so
+// `band` and `bor` reach them directly. src/neant/stdlib/ct.nt is where this shape is written out
+// and checked against the emitted machine code; it is restated here because crypto.nt is in the
+// boot image and ct.nt is not, and a boot file may not depend on one that is loaded later.
+fcswap: {[m;a;b] ((b band m) bor a band m bxor (-1); (a band m) bor b band m bxor (-1))}
+
+// x25519[scalar 32 bytes; u 32 bytes] -> 32 bytes.
+//
+// A Montgomery ladder does the same field operations in the same order for every scalar — that is
+// the point of it — and this one always did. What it used to do was SWAP with an `if`, so the one
+// thing left that timing could see was whether consecutive bits of the private key differed. That
+// is enough: an attacker who learns which bits differ learns the key up to one bit. The swap is
+// fcswap now, so nothing in the loop depends on `k`.
 x25519: {[k;u]
   if[not fieldWarmed; fieldWarm[]]
   k: `int$k; k[0]: k[0] band 248; k[31]: (k[31] band 127) bor 64
   x1: fdecode u; x2: F1; z2: F0; x3: x1; z3: F1; swap: 0; t: 254
   while[not t<0
     kt: (k[t div 8] shr t mod 8) band 1; swap: swap bxor kt
-    if[swap; tmp: x2; x2: x3; x3: tmp; tmp: z2; z2: z3; z3: tmp]
+    sm: (swap bxor (-1)) badd 1
+    px: fcswap[sm; x2; x3]; x2: px 0; x3: px 1
+    pz: fcswap[sm; z2; z3]; z2: pz 0; z3: pz 1
     swap: kt
     A: fadd[x2;z2]; AA: fsq A; B: fsub[x2;z2]; BB: fsq B; E: fsub[AA;BB]
     C: fadd[x3;z3]; D: fsub[x3;z3]; DA: fmul[D;A]; CB: fmul[C;B]
     x3: fsq fadd[DA;CB]; z3: fmul[x1; fsq fsub[DA;CB]]
     x2: fmul[AA;BB]; z2: fmul[E; fadd[AA; fmuls[E;121665]]]
     t: t-1]
-  if[swap; tmp: x2; x2: x3; x3: tmp; tmp: z2; z2: z3; z3: tmp]
+  sm: (swap bxor (-1)) badd 1
+  px: fcswap[sm; x2; x3]; x2: px 0
+  pz: fcswap[sm; z2; z3]; z2: pz 0
   fencode fmul[x2; finv z2]}
 X25519BASE: 0x09, 31#0x00
