@@ -1351,6 +1351,36 @@ right. The fix brings that position to the canonical layout like every other tar
 `tests/jit.nt` now takes the interpreted answer, warms the function past the threshold, and demands
 the same answer back, for nineteen shapes; eleven of them fail on the code before the fix.
 
+### A buffer the function makes for itself
+
+A compiled body cannot construct a vector: nothing in the op subset builds one. So a vector slot
+could only ever be a parameter or a capture, which the runtime fills at entry — and a loop that
+starts `r: n#0` fell out of the compiled path entirely, which is how anyone writes a loop that fills
+a buffer.
+
+It needs no new opcode. `n#0` is the five ops `Push(0) LoadL(n) Dyad(#) StoreL(r) Pop`, and the
+runtime can do exactly that at entry from the length already sitting in the parameter slot, the same
+way it binds a caller's vector. So `jitVecAllocs` (src/neant/jit/arm64.nt) finds those runs, the
+codegen emits nothing for them, and `try_run` makes the buffer.
+
+```
+{[n] r: n#0; i: 0; while[i<n; r[i]: (i*2); i: i+1]; r}     1.2x  ->  3.9x
+```
+
+That is the same 3.9x a parameter buffer already got, which is the point: it is now the same path.
+A literal length (`r: 64#0`) works too.
+
+Every condition on it is about the buffer being there before anything looks at it — the fill is the
+integer `0`, the length is a parameter that is never reassigned or a literal, the slot is a scratch
+local, and this is the slot's first appearance. The last one is a correctness trap rather than a
+convenience: **the runtime allocates unconditionally**, so an allocation the interpreter might skip
+would be a divergence, not an optimisation. `$[c; r: n#0; 0]` followed by a read of `r` answers 0
+compiled and signals interpreted, so an allocation with a branch before it is not one.
+
+**Ints only.** A vector slot holds an `Ints` and nothing else, so `64#0x00` is still not a buffer
+this can make, and the byte-building loops named above are still interpreted for that reason rather
+than the one the previous paragraph used to give.
+
 ### Generated differential testing
 
 Both of the wrong answers above were found by accident, while measuring something else. That is the
@@ -1555,7 +1585,7 @@ There is no external oracle left, so the front end is pinned by fixpoints and by
   someone thought of, and the three wrong answers the method tier has produced were all found by
   accident. `tests/jitdiff.nt` generates about 2200 bodies a run from the compilable subset and
   requires each to agree with a twin that has `(- - n)` spliced in and therefore can never compile.
-  Eighteen templates: whole functions for the method tier, and for the tracing tier loops with
+  Nineteen templates: whole functions for the method tier, and for the tracing tier loops with
   guards that flip, loop-carried locals, nesting, `break`, an early return, vector slots, an index
   off the end and arithmetic that reaches the int null. Fixed seed, so a failure prints the body and
   reproduces. See
@@ -1787,12 +1817,13 @@ caller, so it would mean writing the nine multiplications out by hand.
 For the JIT: int/float promotion inside a trace, so `1.0*i` compiles; side traces for a branch that
 flips for good, which currently bails on every iteration and runs the rest of it interpreted (no
 cliff, but no gain either); a rewind-free exit for a branch inside an inlined callee, which needs
-the interpreter to be able to resume inside a frame it never entered; and **a vector return**. A
-function whose result is a vector is compiled by neither tier, and since parameters are by value a
-filled buffer has no other way out — `::` to a global and `sset` are refused too. That is what keeps
-every byte-building loop in the language interpreted: certificate parsing, base64, the formatter.
-The same loop returning an int compiles and runs 20 to 100 times faster ("Bytes and crypto" has the
-measurement); `not` and `break` in a loop body also hand it back, and so does a tenth parameter.
+the interpreter to be able to resume inside a frame it never entered; . A vector return works — that entry used to say
+it did not, and measuring said otherwise: a function handed a buffer as a parameter, filling it and
+returning it, runs 3.7x its uncompilable twin. What was missing was a buffer the function makes for
+itself, and that is now in too (below). What is still out is a BYTE or CHAR buffer: a vector slot is
+`Ints` and nothing else, so `64#0x00` does not qualify, and that is what certificate parsing, base64
+and the formatter all start by making. `not` and `break` in a loop body also hand a loop back, and
+so does a tenth parameter.
 
 A register-style calling convention was tried and reverted — it measured slower, and the profile
 said frame setup is ~5% while `Value` clone/drop and small-list allocation are ~35%. The allocation
