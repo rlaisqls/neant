@@ -27,7 +27,37 @@ fn report(r: value::R<value::Value>) -> bool {
     }
 }
 
+/// Keep large vectors out of mmap.
+///
+/// glibc's malloc starts sending any block over 128 KB to mmap, and free() gives those straight back
+/// to the kernel — so an array language, whose every operation allocates a fresh result, faults in
+/// the whole result vector from scratch on every single operation once the vectors get past 16k
+/// int64s. Measured on `abs` over 100k ints: 1,256,235 minor page faults and 3.79 ns per element,
+/// against 2,506 and 1.10 with the threshold raised. That is 3.4x, for arithmetic that never
+/// touched the disk or the network.
+///
+/// The threshold is normally raised by glibc itself, but only once it has seen an mmap'd block
+/// freed, so whether a program pays this depends on whether something earlier happened to allocate
+/// and release a big enough temporary. That is not a thing to leave to chance.
+///
+/// Declared here rather than pulled in with the libc crate because this tree has no dependencies and
+/// that is worth more than the five lines. glibc only: mallopt is not in POSIX, and musl does not
+/// have it, so the symbol has to be absent from the link on anything else.
+#[cfg(all(target_os = "linux", target_env = "gnu"))]
+fn tune_allocator() {
+    unsafe extern "C" { fn mallopt(param: i32, value: i32) -> i32; }
+    const M_TRIM_THRESHOLD: i32 = -1;
+    const M_MMAP_THRESHOLD: i32 = -3;
+    unsafe {
+        mallopt(M_MMAP_THRESHOLD, 512 * 1024 * 1024);
+        mallopt(M_TRIM_THRESHOLD, 512 * 1024 * 1024);
+    }
+}
+#[cfg(not(all(target_os = "linux", target_env = "gnu")))]
+fn tune_allocator() {}
+
 fn main() {
+    tune_allocator();
     let argv: Vec<String> = std::env::args().collect();
     let read = |path: &str| std::fs::read_to_string(path).unwrap_or_else(|e| { eprintln!("{path}: {e}"); std::process::exit(2) });
     let mut vm = boot_vm();
