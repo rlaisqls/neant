@@ -810,8 +810,10 @@ checks RFC 6979 A.2.5's **k, r and s**, not just that a signature verifies.
 
 The oracle is OpenSSL: every pinned signature in `tests/sign.nt`, RSA and ECDSA alike, was produced
 by this code and then checked with `openssl dgst -verify`, so the test freezes that agreement without
-needing openssl to run. **It is not constant-time** — `bnModExp` branches on the exponent's bits — so
-this signs where the timing is not observable, and blinding is not written.
+needing openssl to run. **Neither signing path branches on a secret any more** — the ECDSA scalar
+multiply is `ecCtMul` and the RSA exponentiation is `bnModExpCtL` over a blinded exponent — but
+neither blinds the base, which is the setting where an attacker picks the messages. ["What has been
+moved onto it"](#what-has-been-moved-onto-it) is exact about where that line falls.
 
 RSA over SHA-512 (PKCS#1 and PSS) and Ed25519 in a chain are checked as of `tests/data/pki-ed-gen.sh`'s
 fixtures. Ed25519 is the one algorithm here that names no digest: RFC 8032 signs the message and
