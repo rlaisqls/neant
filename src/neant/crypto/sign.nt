@@ -1,0 +1,125 @@
+// RSA signing (RFC 8017 §8), in neant — the other half of rsa.nt, which only ever verified.
+//   load "src/neant/crypto/sign.nt"     // after bignum.nt, sha512.nt, rsa.nt, der.nt
+//
+//   k: rsaKeyLoad "tests/data/pki-sha512-leaf.key"
+//   sig: rsaSignPss[k; `sha256; sha256 msg]              // salt from urand, hLen bytes, as RFC 8017 §9.1 wants
+//   sig: rsaSignPkcs1[k; `sha256; sha256 msg]            // the deterministic v1.5 form
+//
+// WHY THIS IS SEPARATE FROM rsa.nt. Verifying uses the public exponent and nothing secret; signing
+// uses `d`, and every mistake here leaks a key rather than accepting a bad signature. Keeping the
+// two files apart means a program that only verifies — which is every TLS client — never loads the
+// code that touches a private key, and the header of the file it does load can go on saying it
+// holds no secrets.
+//
+// NOT CONSTANT-TIME, and this matters more here than anywhere else in this tree. bnModExp is
+// square-and-multiply over the exponent's bits with data-dependent branching, so a local attacker
+// who can time these operations can recover `d`. That is a real limit, not a caveat: sign with this
+// where the timing is not observable — a test, a fixture, an offline signature — and not on a
+// public-facing server sharing a machine with an attacker. Blinding would be the fix and is not
+// written.
+
+// ---- private keys. PKCS#8 (BEGIN PRIVATE KEY) wraps an RSAPrivateKey in an OCTET STRING; PKCS#1
+// (BEGIN RSA PRIVATE KEY) is that structure on its own.
+//   RSAPrivateKey ::= SEQUENCE { version, n, e, d, p, q, dP, dQ, qInv }
+// -> `n`e`d`p`q`dp`dq`qinv, every field a byte vector, and `bits
+SIGNPEM8: "-----BEGIN PRIVATE KEY-----"
+SIGNPEM8E: "-----END PRIVATE KEY-----"
+SIGNPEM1: "-----BEGIN RSA PRIVATE KEY-----"
+SIGNPEM1E: "-----END RSA PRIVATE KEY-----"
+SIGNRSAOID: "1.2.840.113549.1.1.1"
+
+signPem: {[ls;b;e]
+  t: {trim x except "\r"} each ls
+  i: &{[b;x] x~b}[b] each t
+  j: &{[e;x] x~e}[e] each t
+  if[0=count i; :0x]
+  if[0=count j; signal "sign: a PEM block with no ",e]
+  if[(first j)<first i; signal "sign: the PEM markers are in the wrong order"]
+  unb64 raze t[(1+first i)+til (first j)-1+first i]}
+
+rsaKeyLoad: {[path] rsaKeyPem read0 path}
+rsaKeyPem: {[ls]
+  d8: signPem[ls; SIGNPEM8; SIGNPEM8E]
+  if[count d8; :rsaKeyPkcs8 d8]
+  d1: signPem[ls; SIGNPEM1; SIGNPEM1E]
+  if[count d1; :rsaKeyDer d1]
+  signal "sign: no ",SIGNPEM8," or ",SIGNPEM1," in the input"}
+
+// PrivateKeyInfo ::= SEQUENCE { version, privateKeyAlgorithm, privateKey OCTET STRING }
+rsaKeyPkcs8: {[der]
+  top: derParse der
+  derWant[top;DERSEQ;1b]
+  k: derKids top
+  if[3>count k; signal "sign: a PrivateKeyInfo is a version, an algorithm and a key"]
+  a: x509Alg k[1]
+  if[not (a[0]) ~ SIGNRSAOID; signal "sign: this build signs with RSA only, not ",a[0]]
+  rsaKeyDer derOct k[2]}
+
+rsaKeyDer: {[der]
+  top: derParse der
+  derWant[top;DERSEQ;1b]
+  k: derKids top
+  if[9>count k; signal "sign: an RSAPrivateKey has nine fields; this one has ",string count k]
+  if[not 0=derIntVal k[0]; signal "sign: only a two-prime RSAPrivateKey (version 0) is read here"]
+  v: x509Mag each k[1+til 8]
+  ky: `n`e`d`p`q`dp`dq`qinv
+  r: ky!v
+  r[`bits]: bnBits bnFromBytes r`n
+  // the key has to be the one it claims to be, because a wrong modulus signs garbage silently
+  if[not (bnCmp[bnMul[bnFromBytes r`p; bnFromBytes r`q]; bnFromBytes r`n]) = 0; signal "sign: p*q is not n"]
+  r}
+
+// ---- the private operation. m^d mod n, by CRT when the key carries the primes: two exponentiations
+// over half-width moduli is about four times the work of one over the full width, and every RSA key
+// in a PEM file carries them.
+rsaPriv: {[key;m]
+  n: bnFromBytes key`n
+  x: bnFromBytes m
+  if[not (bnCmp[x;n])<0; signal "sign: the encoded message is not less than the modulus"]
+  p: bnFromBytes key`p; q: bnFromBytes key`q
+  m1: bnModExp[m; key`dp; key`p]
+  m2: bnModExp[m; key`dq; key`q]
+  // h = qInv * (m1 - m2) mod p, then m = m2 + q*h
+  d: bnSubMod[bnMod[bnPad[bnFromBytes m1; count p]; p]; bnMod[bnPad[bnFromBytes m2; count p]; p]; p]
+  h: bnMod[bnMul[bnFromBytes key`qinv; d]; p]
+  r: bnAdd[bnFromBytes m2; bnMul[q; h]]
+  bnBytesN[bnMod[r; n]; ceiling (key`bits) % 8]}
+
+// ---- EMSA-PKCS1-v1_5 (RFC 8017 §9.2): 00 01 FF..FF 00 DigestInfo, to exactly k octets.
+// The inverse of what rsaVerifyPkcs1 takes apart, and it uses rsa.nt's own DigestInfo table so the
+// two can never disagree about what a hash's prefix is.
+rsaSignPkcs1: {[key;hash;digest]
+  di: rsaDigestInfo hash
+  if[0=count di; signal "sign: no DigestInfo for ",string hash]
+  if[not (count digest) = rsaHashLen hash; signal "sign: the digest is the wrong length for ",string hash]
+  k: ceiling (key`bits) % 8
+  t: di,digest
+  if[k < 11 + count t; signal "sign: the key is too small for a ",(string hash)," signature"]
+  em: (0x0001), ((k-3)-count t)#0xff
+  em,: (0x00),t
+  rsaPriv[key; em]}
+
+// ---- EMSA-PSS-ENCODE (RFC 8017 §9.1.1), the exact inverse of rsaVerifyPss's decode.
+// The salt is hLen bytes from urand — `rand` is a reproducible PRNG and a predictable salt is a
+// weakness the standard's own security proof depends on not having. rsaSignPssSalt takes one
+// explicitly, for a test that wants a fixed vector.
+rsaSignPss: {[key;hash;digest] rsaSignPssSalt[key;hash;digest; urand rsaHashLen hash]}
+rsaSignPssSalt: {[key;hash;digest;salt]
+  hLen: rsaHashLen hash
+  if[0=hLen; signal "sign: no such hash: ",string hash]
+  if[not (count digest) = hLen; signal "sign: the digest is the wrong length for ",string hash]
+  sLen: count salt
+  emBits: (key`bits) - 1
+  emLen: ceiling emBits % 8
+  if[emLen < 2+hLen+sLen; signal "sign: the key is too small for a ",(string hash)," PSS signature with a ",(string sLen),"-byte salt"]
+  H: rsaHash[hash; ((8#0x00), digest), salt]             // M' = eight zero bytes | mHash | salt
+  dbLen: (emLen - hLen) - 1
+  db: (((dbLen-sLen)-1)#0x00), (0x01), salt
+  masked: db bxor rsaMgf1[hash;H;dbLen]
+  nbits: (8*emLen) - emBits                              // the leading bits emBits forces to zero
+  masked[0]: `byte$ (`int$ masked[0]) band (2 xexp 8-nbits)-1
+  rsaPriv[key; (masked,H),0xbc]}
+
+// ---- and the round trip, which is the only test that means anything: sign, then verify with the
+// public half through rsa.nt's own verifier.
+rsaSignCheck: {[key;hash;digest;sig] rsaVerifyPss[key`n; key`e; hash; digest; sig]}

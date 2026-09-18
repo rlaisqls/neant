@@ -1,0 +1,48 @@
+// src/neant/crypto/sign.nt: RSA signing, the other half of rsa.nt.
+// The signatures pinned here were produced by this code and then verified by OpenSSL 3.6.2 —
+//   openssl dgst -sha256 -verify pub.pem -signature sig.bin msg.txt            -> Verified OK
+//   openssl dgst -sha256 -sigopt rsa_padding_mode:pss -sigopt rsa_pss_saltlen:32 ... -> Verified OK
+//   openssl dgst -sha512 -verify pub.pem -signature sig.bin msg.txt            -> Verified OK
+// so the bytes below are that agreement frozen, and the test needs no openssl to check it.
+// PKCS#1 v1.5 is deterministic; PSS is only deterministic given its salt, which is why the pinned
+// case uses rsaSignPssSalt and the random one is checked by round trip instead.
+tsection "sign"
+{load "src/neant/crypto/",x} each ("bignum.nt";"sha512.nt";"rsa.nt";"der.nt";"ec.nt";"p256.nt"
+  ;"p384.nt";"x509.nt";"sign.nt")
+
+signK: rsaKeyLoad "tests/data/pki-sha512-leaf.key"
+signMsg: `byte$"hello, neant"
+signD256: sha256 signMsg
+signD512: sha512 signMsg
+
+teq["key: 2048 bits"; signK`bits; 2048]
+teq["key: the public exponent is 65537"; bnFromBytes signK`e; bnFromBytes 0x010001]
+teq["key: p*q is n, which rsaKeyDer checks"; (bnCmp[bnMul[bnFromBytes signK`p; bnFromBytes signK`q]; bnFromBytes signK`n])=0; 1b]
+terrLike["key: a file with no private key in it is refused by name"; {[] rsaKeyPem read0 "tests/data/pki-leaf.pem"}; "sign: no -----BEGIN PRIVATE KEY-----"]
+
+teq["pkcs1: the signature is one modulus wide"; count rsaSignPkcs1[signK; `sha256; signD256]; 256]
+teq["pkcs1: and it verifies with the public half"; rsaVerifyPkcs1[signK`n; signK`e; `sha256; signD256; rsaSignPkcs1[signK; `sha256; signD256]]; 1b]
+teq["pkcs1: over SHA-512 too"; rsaVerifyPkcs1[signK`n; signK`e; `sha512; signD512; rsaSignPkcs1[signK; `sha512; signD512]]; 1b]
+teq["pkcs1: it is deterministic"; (rsaSignPkcs1[signK; `sha256; signD256]) ~ rsaSignPkcs1[signK; `sha256; signD256]; 1b]
+
+teq["pss: the signature verifies"; rsaVerifyPss[signK`n; signK`e; `sha256; signD256; rsaSignPss[signK; `sha256; signD256]]; 1b]
+teq["pss: and again, with a fresh random salt each time"; rsaVerifyPss[signK`n; signK`e; `sha256; signD256; rsaSignPss[signK; `sha256; signD256]]; 1b]
+tok["pss: two signatures over the same digest differ, because the salt does"; not (rsaSignPss[signK; `sha256; signD256]) ~ rsaSignPss[signK; `sha256; signD256]]
+teq["pss: a fixed salt gives a fixed signature"; (rsaSignPssSalt[signK; `sha256; signD256; 32#0xa5]) ~ rsaSignPssSalt[signK; `sha256; signD256; 32#0xa5]; 1b]
+
+// a signature over the wrong digest must not verify — the round trip alone would pass even if both
+// halves agreed on something wrong, so this pins that they agree on the right thing
+teq["a signature does not verify over a different message"; rsaVerifyPkcs1[signK`n; signK`e; `sha256; sha256 `byte$"goodbye, neant"; rsaSignPkcs1[signK; `sha256; signD256]]; 0b]
+teq["nor does a PSS one"; rsaVerifyPss[signK`n; signK`e; `sha256; sha256 `byte$"goodbye, neant"; rsaSignPss[signK; `sha256; signD256]]; 0b]
+
+terrLike["a digest of the wrong length is refused"; {[] rsaSignPkcs1[signK; `sha256; 16#0x00]}; "sign: the digest is the wrong length"]
+terrLike["a hash with no DigestInfo is refused"; {[] rsaSignPkcs1[signK; `sha1; 20#0x00]}; "sign: no DigestInfo for sha1"]
+terrLike["a salt too large for the key is refused"; {[] rsaSignPssSalt[signK; `sha512; signD512; 200#0x00]}; "sign: the key is too small"]
+
+// the OpenSSL-verified bytes, frozen
+signPinPK256: "bf2e343f5ddeb5620624b0dffb16ec37df3df7849ff15996f639df4a2f368c507e395b61bf1f28614b1c4d7224b60f01cafc2a33bcad9f0df587a7661913158be348e7f45dd59450c971964c3b66b017de16d97978a09c46ba6e022ebe927ee6454164a1bbbe3e0dd4cc9883a59f9e5b13ea879ec755dea28d9841a91d359c1a19b480cb2ac640f9a338ae18fec9680ffeb5e510668b4cfb94f2412a228ef341aa81d164f14203643be80adb9e970011ce0d9b4c1063c2006fa3b7242a8eaed0621d38c528747723781a6c88e4e8028a2c9d71af376b0e409d2321e35eecf53462bcd833180da2f6adb6bf842064d9255aec0083ef9ddeb5b000829ef026ffed"
+signPinPSS256: "96800b8822791d3262c620ee9a8510d69085cd9f1979a7aba27feb9b208cd249c24ce6c369d435418782e31a35d45e679173b5beb020df051563532a63c3f3546488dd2c4110f9f23cf4f610a4b8ae41bdba00b552b6517474b481728ad34d53dc9611e0a0618d84468db49fc9f97890904563d7f48929ae4c52d754eaaa33ed8d58a6536635a0a9ea0a2ec8386e7e11acb38c70a1835266bc09ded65a87dd7f7a0ad81f2f5776aa6f20f4ba3d276a031cd6f3bdcc87c82f8c64f2c06d4833be5a3ac53694e9c5265e9fa6a861949e1a856e5aa97a56ff1b25bf0ba64689c340fba5124942db78f9182972f2f4fd35ad04f4747a711f1eabd96221d0eb297a15"
+signPinPK512: "1ffa9cb4a38de2550ee114f70caf889503018472cad80052bbf013010671a1029a92fcd36863f8564de6960d5a161b4a7e5390d3d122c60c3bf30642e220e7a4717f6ce80e462fe9f9ed7d4c9dc95f5c4d99481149d53bbb246f42a831e53dc66e8ec5bc56d51d32a7f9b9580eb99116f01bb4178a83b81aed355373cd95913852ac4d11b532da29f25f26b7960a485452ebbf8afaf600f88c5d7cb278aca8f18529416895c5464d891f001cbbed0729872efce63ba73ddd054a2db801ff723e57248d23b61851ff32a038da60645d00192a957a19365f4600d0e68d744cb76ab0a117019e9d532e2852584d6d987d00437aa7fdfdc0bd51936e638059d761d1"
+teq["pinned: PKCS#1 SHA-256 is byte for byte what OpenSSL verified"; hex rsaSignPkcs1[signK; `sha256; signD256]; signPinPK256]
+teq["pinned: PSS SHA-256 with a 0xa5 salt likewise"; hex rsaSignPssSalt[signK; `sha256; signD256; 32#0xa5]; signPinPSS256]
+teq["pinned: PKCS#1 SHA-512 likewise"; hex rsaSignPkcs1[signK; `sha512; signD512]; signPinPK512]

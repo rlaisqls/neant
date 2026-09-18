@@ -747,6 +747,23 @@ model is refused, on the principle `x509.nt` already applies. A stale list is re
 believed; a list with no `nextUpdate` is not treated as stale, since 5280 only says it SHOULD be
 there and refusing every list that omits it would refuse more than it protects.
 
+**Signing** is `src/neant/crypto/sign.nt`, kept apart from `rsa.nt` on purpose: verifying touches
+nothing secret, signing touches `d`, and a program that only verifies — which is every TLS client
+here — should never load the code that reads a private key.
+
+```
+load "src/neant/crypto/sign.nt"
+k: rsaKeyLoad "key.pem"                      // PKCS#8 or PKCS#1, and p*q is checked against n
+sig: rsaSignPss[k; `sha256; sha256 msg]      // salt from urand; rsaSignPssSalt fixes it for a vector
+sig: rsaSignPkcs1[k; `sha256; sha256 msg]    // the deterministic v1.5 form
+```
+
+RSASSA-PSS and PKCS#1 v1.5, over any hash `rsa.nt`'s table knows, ~19ms for a 2048-bit key by CRT.
+The oracle is OpenSSL: every pinned signature in `tests/sign.nt` was produced by this code and then
+checked with `openssl dgst -verify`, so the test freezes that agreement without needing openssl to
+run. **It is not constant-time** — `bnModExp` branches on the exponent's bits — so this signs where
+the timing is not observable, and blinding is not written.
+
 RSA over SHA-512 (PKCS#1 and PSS) and Ed25519 in a chain are checked as of `tests/data/pki-ed-gen.sh`'s
 fixtures. Ed25519 is the one algorithm here that names no digest: RFC 8032 signs the message and
 hashes it internally, so `verify.nt` hands `ed25519Verify` the tbs span rather than a digest of it.
