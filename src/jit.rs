@@ -96,6 +96,13 @@ mod native {
         /// descriptor area at `buf[MAX_SLOTS + k]`. False for a backend that still calls the
         /// `jit_vec_get`/`jit_vec_set` trampolines, which want the `*mut Value` there instead.
         inline_vec: bool,
+        /// What kind of value this returns, from `jitRetKind` in src/neant/jit/arm64.nt:
+        /// `Some(true)` a boolean, `Some(false)` an integer, `None` neither provably. Compiled code
+        /// hands back a bare i64 and something has to put a type back on it; this used to be `Int`
+        /// unconditionally, which made `{x>3}` answer 1b until it got hot and 1 afterwards. `None`
+        /// keeps that older behaviour, so a codegen that does not report this (x86.nt, which still
+        /// returns the five-element shape) is no worse off than before.
+        ret_bool: Option<bool>,
         entry: unsafe extern "C" fn(*mut i64, *mut i64, *mut Vm) -> i64,
     }
     unsafe impl Send for Compiled {}
@@ -208,7 +215,43 @@ mod native {
             // `Value` the slot was bound to, taken out of `vecbuf` before it is dropped.
             Some(match self.ret_vec {
                 Some(k) => std::mem::replace(&mut vecbuf[k], Value::Null),
+                None if self.ret_bool == Some(true) => Value::Bool(out != 0),
                 None => Value::Int(out),
+            })
+        }
+
+        /// `f each x` over a whole int vector at once.
+        ///
+        /// `try_run` above is written for one call and checks, every time, things that cannot
+        /// change between the elements of one `each`: that the bit builtins it inlined are still
+        /// the prims it compiled against, that no slot is a vector slot, and the shape of the
+        /// argument. Hoisting those out leaves a store and a native call per element.
+        ///
+        /// Deliberately narrow — arity one, no vector slots, no captures, an int result — because
+        /// anything else falls back to the general path, which stays the definition of what this
+        /// has to agree with. A `None` at any point means exactly what it means in `try_run`: run
+        /// it on the interpreter instead. Re-running the elements already done is free of
+        /// consequence for the same reason a deopt in the middle of a single call is, since a
+        /// compiled body has no effect a caller can see beyond the value it returns.
+        pub fn try_run_each_int(&self, xs: &[i64], vm: &mut Vm) -> Option<Value> {
+            if self.arity != 1 || !self.vec_slots.is_empty() || self.ret_vec.is_some() { return None; }
+            // unlike try_run, this declines rather than guessing: it is new code and can afford to
+            let ret_bool = self.ret_bool?;
+            if self.nlocals > MAX_SLOTS || self.nlocals == 0 { return None; }
+            if !self.prims_intact(vm) { return None; }
+            let mut buf = [0i64; BUFLEN];
+            let mut out: Vec<i64> = Vec::with_capacity(xs.len());
+            for &n in xs {
+                if n == crate::value::NI { return None; }   // try_run refuses a null argument, so this does
+                // the scratch locals between the argument and the captures are Null-until-written
+                // for the interpreter; zeroing them keeps one element from seeing the last one's
+                buf[..self.nlocals].fill(0);
+                buf[0] = n;
+                out.push(self.run(buf.as_mut_ptr(), vm)?);
+            }
+            Some(match ret_bool {
+                true => crate::value::bools(out.into_iter().map(|n| n != 0).collect()),
+                false => crate::value::ints(out),
             })
         }
 
@@ -405,16 +448,21 @@ mod native {
         let ints_of = |v: &Value| -> Option<Vec<usize>> {
             match v { Value::Ints(v) => Some(v.iter().map(|&n| n as usize).collect()), _ => None }
         };
-        let (bytes, vec_slots, vec_writes, ret_vec, prim_slots, inline_vec) = match result {
-            Ok(Value::List(items)) if items.len() == 2 || items.len() == 5 => {
+        let (bytes, vec_slots, vec_writes, ret_vec, prim_slots, inline_vec, ret_bool) = match result {
+            Ok(Value::List(items)) if matches!(items.len(), 2 | 5 | 6) => {
                 let bytes = match &items[0] { Value::Bytes(b) => b.clone(), _ => return None };
                 let vec_slots = ints_of(&items[1])?;
-                if items.len() == 2 { (bytes, vec_slots, Vec::new(), None, Vec::new(), false) } else {
+                if items.len() == 2 { (bytes, vec_slots, Vec::new(), None, Vec::new(), false, None) } else {
                     let vec_writes = ints_of(&items[2])?;
                     let ret_vec = match &items[3] { Value::Int(n) if *n >= 0 => Some(*n as usize), Value::Int(_) => None, _ => return None };
                     if ret_vec.is_some_and(|k| k >= vec_slots.len()) { return None; }
                     let prim_slots = ints_of(&items[4])?;
-                    (bytes, vec_slots, vec_writes, ret_vec, prim_slots, true)
+                    // the sixth element is jitRetKind's answer; a codegen that does not send one
+                    // leaves it None, which is exactly the behaviour there was before it existed
+                    let ret_bool = match items.get(5) {
+                        Some(Value::Int(1)) => Some(true), Some(Value::Int(0)) => Some(false), _ => None,
+                    };
+                    (bytes, vec_slots, vec_writes, ret_vec, prim_slots, true, ret_bool)
                 }
             }
             _ => return None, // Null (not compilable) or a runtime error in the codegen itself
@@ -426,12 +474,12 @@ mod native {
             let want = bit_now.iter().find(|&&(s, _)| s == slot as i64)?.1;
             prim_guards.push((slot, want));
         }
-        emit(&bytes, code.params.len(), code.nlocals, vec_slots, vec_writes, ret_vec, prim_guards, inline_vec)
+        emit(&bytes, code.params.len(), code.nlocals, vec_slots, vec_writes, ret_vec, prim_guards, inline_vec, ret_bool)
     }
 
     #[allow(clippy::too_many_arguments)]
     fn emit(bytes: &[u8], arity: usize, nlocals: usize, vec_slots: Vec<usize>, vec_writes: Vec<usize>,
-            ret_vec: Option<usize>, prim_guards: Vec<(usize, i64)>, inline_vec: bool) -> Option<super::Compiled> {
+            ret_vec: Option<usize>, prim_guards: Vec<(usize, i64)>, inline_vec: bool, ret_bool: Option<bool>) -> Option<super::Compiled> {
         if vec_slots.len() > MAX_VEC_SLOTS { return None; }
         let page = 4096usize;
         let len = bytes.len().div_ceil(page) * page;
@@ -449,7 +497,7 @@ mod native {
             #[cfg(target_arch = "aarch64")]
             __clear_cache(mem as *mut std::ffi::c_char, (mem as *mut u8).add(len) as *mut std::ffi::c_char);
             let entry: unsafe extern "C" fn(*mut i64, *mut i64, *mut Vm) -> i64 = std::mem::transmute(mem);
-            Some(super::Compiled { mem: mem as *mut u8, len, arity, nlocals, vec_slots, vec_writes, ret_vec, prim_guards, inline_vec, entry })
+            Some(super::Compiled { mem: mem as *mut u8, len, arity, nlocals, vec_slots, vec_writes, ret_vec, prim_guards, inline_vec, ret_bool, entry })
         }
     }
 

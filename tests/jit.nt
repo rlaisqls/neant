@@ -322,3 +322,46 @@ teq["a local reassigned while an older copy of it is still on the stack"; jtev "
 teq["a do counter taken from a local does not consume the local"; jtev "jt_dc: {[k] m: 4; s: 0; do[m; s: s+1]; s+m+k}; jt_dcS: {[k] m: 4; s: 0; do[m; s: s+(- - 1)]; s+m+k}; r: (); i: 0; while[i<80; r,: jt_dc 0; i+:1]; ((jt_dc 0)=jt_dcS 0; distinct r)"; "(1b;,8)"]
 teq["constants too wide for an immediate, and negative ones"; jtev "jt_ci: {[k] s: 0; i: 0; while[i<k; s: s + 100000; s: s + -5; s: s - 4095; s: s - 4096; i: i+1]; s}; jt_ciS: {[k] s: 0; i: 0; while[i<k; s: s + 100000; s: s + (- - -5); s: s - 4095; s: s - 4096; i: i+1]; s}; r: (); i: 0; while[i<80; r,: jt_ci 10; i+:1]; ((jt_ci 10)=jt_ciS 10; distinct r)"; "(1b;,918040)"]
 teq["every comparison fused with the branch that reads it"; jtev "jt_fc: {[k] s: 0; i: 0; while[i<k; if[i<3; s: s+1]; if[i>7; s: s+10]; if[i=5; s: s+100]; i: i+1]; s}; jt_fcS: {[k] s: 0; i: 0; while[i<k; if[i<3; s: s+(- - 1)]; if[i>7; s: s+10]; if[i=5; s: s+100]; i: i+1]; s}; r: (); i: 0; while[i<80; r,: jt_fc 10; i+:1]; ((jt_fc 10)=jt_fcS 10; distinct r)"; "(1b;,123)"]
+
+// ---- `f each x` run entirely in compiled code (src/vm.rs each_ints_jit, src/jit.rs
+// try_run_each_int). That path never enters the interpreter, so what it has to be held to is that
+// it agrees with the path that does — element by element through call_code, which is what `each`
+// did before it existed. The edge vector is where a disagreement would show: the int null, both
+// ends of the range, and the overflow off each of them.
+tsection "jit: each over compiled code"
+jeRef: {[f;xs] n: count xs; r: n#0; i: 0; while[i<n; r[i]: f[xs[i]]; i+:1]; r}
+jeSame: {[nm;f;xs] teq["each = one at a time: ",nm; f each xs; jeRef[f;xs]]}
+jeBig: 100#til 50
+jeEdge: 0 1 2147483647 9223372036854775807 0N
+jeEdge: jeEdge, (0-1), 0-9223372036854775807
+jeSame["x+1";            {x+1};                                  jeBig]
+jeSame["x+1 at the ends"; {x+1};                                 jeEdge]
+jeSame["x*x at the ends"; {x*x};                                 jeEdge]
+jeSame["x-1 at the ends"; {x-1};                                 jeEdge]
+jeSame["x div 3";        {x div 3};                              jeEdge]
+jeSame["x mod 7";        {x mod 7};                              jeEdge]
+jeSame["a branch";       {$[x>5; x; 0-x]};                       jeBig]
+jeSame["a branch at the ends"; {$[x>5; x; 0-x]};                 jeEdge]
+jeSame["bxor";           {x bxor 3};                             jeEdge]
+jeSame["shr";            {x shr 3};                              jeEdge]
+jeSame["a scratch local"; {[x] y: x+1; y*2};                     jeBig]
+jeSame["two scratch locals"; {[x] y: x+1; z2: y*2; z2-x};        jeBig]
+jeSame["a while loop";   {[x] s: 0; i: 0; while[i<3; s: s+x; i+:1]; s}; jeBig]
+jeSame["a do loop";      {[x] s: 0; do[4; s: s+x]; s};           jeBig]
+jeSame["a nested call";  {[x] {y+1}[x]};                         jeBig]
+jeSame["division by zero"; {x div 0};                            1 2 3]
+jeSame["one element";    {x+1};                                  ,5]
+// A comparison's answer is a boolean, and stayed one only until the function got hot: compiled code
+// hands back a bare i64 and the caller used to put `Int` on all of them. jitRetKind in arm64.nt is
+// what tells it which. Asserted on the value AND the type, since the values would match either way.
+jeCmp: {x>3}
+teq["a comparison stays boolean, cold"; jeCmp each 1 2 3 4 5; 00011b]
+teq["and hot"; {[f;n] i: 0; while[i<n; f 5; i+:1]; f each 1 2 3 4 5}[jeCmp; 200]; 00011b]
+teq["a comparison's type, hot"; @{x>3}[5]; `bool]
+teq["each of an empty vector"; {x+1} each 0#0; 0#0]
+// the fused path is for int vectors only; everything else has to come out the same anyway
+teq["each over floats";  {x+1} each 1.5 2.5; 2.5 3.5]
+teq["each over a list";  {count x} each ("ab";"cde"); 2 3]
+teq["each over a dict keeps the keys"; {x+1} each `a`b!1 2; `a`b!2 3]
+JEG: 5
+teq["each with a captured global"; {x+JEG} each 1 2 3; 6 7 8]

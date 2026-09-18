@@ -705,6 +705,59 @@ jitOpBit: {[st;kind;slot]
   st[`pending]: null
   st}
 
+// What KIND of value this function returns: 1 a boolean, 0 an integer, -1 neither provably.
+//
+// Compiled code hands back a bare i64 and the caller has to put a type back on it. It always said
+// `Int`, and for a function whose answer is a comparison that is WRONG — `{x>3}` returned 1b until
+// it got hot and 1 afterwards, which surfaces a long way from here as a display that changed or a
+// `~` that stopped matching. Two rules, both sound, neither complete:
+//
+//   A. every value handed back is a comparison that no branch consumed -> a boolean.
+//   B. nothing anywhere in the body can produce a boolean at all -> an integer. Arguments arrive as
+//      ints, since try_run refuses anything else, so the only sources are a comparison whose result
+//      escapes, a boolean constant, and any op this does not model. A comparison IMMEDIATELY
+//      FOLLOWED BY Jmpf is a condition and not an answer — the same fact jitOpDyad's `fuse`
+//      argument uses to skip materialising it — which is why an ordinary `while` does not
+//      disqualify a function, and that matters: most real bodies end by loading a local, so rule A
+//      alone would have covered almost nothing.
+//
+// Anything else is -1, meaning "carry on as before": try_run keeps saying Int and the fused
+// `f each x` in src/vm.rs declines the whole fast path rather than guess.
+jitRetKind: {[opcodes;opargs;consts;bitSlots]
+  n: count opcodes
+  if[0=n; :(-1)]
+  // rule B's disqualifiers
+  loose: 0
+  i: 0
+  while[i<n
+    op: opcodes[i]
+    if[op=6
+      k: jitDyadKind string consts[opargs[i]]
+      if[isnull k; loose: 1]
+      if[not isnull k; if[k>4; if[$[(i+1)<n; not (opcodes[i+1])=10; 1b]; loose: 1]]]]
+    if[op=0; if[not `int=@consts[opargs[i]]; loose: 1]]
+    // a global is only ever read here to reach one of the inlined bit builtins, whose answer is an
+    // int; the Call that consumes it is that same op pair and nothing else
+    if[op=1; if[not (consts[opargs[i]]) in bitSlots; loose: 1]]
+    if[op=7; if[$[i>0; not (opcodes[i-1])=1; 1b]; loose: 1]]
+    if[op in 5 2 8 12 13 14 15 17; loose: 1]
+    i+:1]
+  // rule A: a value is handed back by the op before each Ret, and by the last op of all
+  allcmp: 1
+  i: 0
+  while[i<n
+    if[$[(opcodes[i])=16; 1b; i=n-1]
+      j: $[(opcodes[i])=16; i-1; i]
+      ok: 0
+      if[not j<0
+        if[(opcodes[j])=6
+          k2: jitDyadKind string consts[opargs[j]]
+          if[$[isnull k2; 0b; k2>4]; ok: 1]]]
+      if[ok=0; allcmp: 0]]
+    i+:1]
+  if[allcmp=1; :1]
+  $[loose=0; 0; (-1)]}
+
 jitCompile: {[input;trampolines]
   opcodes: input[0]; opargs: input[1]; consts: input[2]; arity: input[3]; nlocals: input[4]
   n: count opcodes
@@ -853,7 +906,7 @@ jitCompile: {[input;trampolines]
   // into that list, or -1; the global slots inlined as bit instructions). src/jit.rs reads the
   // five-element form as "this backend inlines vector access"; a two-element one still means the
   // old `*mut Value`-through-the-trampolines layout.
-  (,/jitLE each asm; vecSlots; vecWrites; $[isnull st[`retvec]; -1; vecSlots?(st[`retvec])]; `int$st[`primslots])}
+  (,/jitLE each asm; vecSlots; vecWrites; $[isnull st[`retvec]; -1; vecSlots?(st[`retvec])]; `int$st[`primslots]; jitRetKind[opcodes;opargs;consts;bitSlots])}
 
 
 // ==== tracing JIT (src/trace.rs): compile one recorded loop iteration ====

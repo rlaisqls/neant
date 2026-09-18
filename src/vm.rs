@@ -450,6 +450,8 @@ impl Vm {
             }
             'L' | 'R' => err("rank: each-left/each-right take two arguments"),
             _ => {
+                // the whole loop in compiled code, when the shapes allow it
+                if let Some(r) = self.each_ints_jit(g, &x) { return r; }
                 let xs = x.seq();
                 let out = pack(match self.each_lambda(g, &xs) {
                     Some(r) => r?,
@@ -462,6 +464,27 @@ impl Vm {
             }
         }
     }
+    /// `f each x` where x is an int vector and the method JIT has compiled f to scalar code.
+    ///
+    /// `each_lambda` below took the per-element cost of entering the interpreter out of the adverb;
+    /// this takes the interpreter out of it altogether, running the compiled body over the raw
+    /// elements with none of the boxing `seq` does on the way in or the type scan `pack` does on
+    /// the way out. It answers None for every shape it does not handle — a capture, a vector slot,
+    /// a float, a null — and the paths below pick those up unchanged.
+    fn each_ints_jit(&mut self, g: &Value, x: &Value) -> Option<R<Value>> {
+        let Ints(xs) = x else { return None };
+        let (code, caps): (Arc<crate::value::FnCode>, &[Value]) = match g {
+            Lambda(c) => (c.clone(), &[]),
+            Closure(c, caps) => (c.clone(), caps.as_slice()),
+            _ => return None,
+        };
+        if code.params.len() != 1 || !caps.is_empty() || self.recorder.is_some() { return None; }
+        if xs.is_empty() { return None; }
+        let compiled = code.jitted_n(self, xs.len())?;
+        let xs = xs.clone();   // `self` is about to be borrowed mutably; the Arc bump is once, not per element
+        compiled.try_run_each_int(&xs, self).map(Ok)
+    }
+
     /// `f each x` where f is a one-parameter lambda, which is most of them.
     ///
     /// The general path calls `monad` per element and so reaches `call_code`, which redoes for
