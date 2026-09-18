@@ -406,8 +406,9 @@ Each of those refusals names what was missing.
 The test that matters is not this process talking to itself: `openssl s_client` handshakes against
 it, verifies the fixture chain and echoes a line back (`openssl_client_completes_our_handshake`,
 src/main.rs), so a ServerHello, a signature or a Finished got subtly wrong fails there rather than
-only in a conversation with ourselves. **`sign.nt` is not constant-time and a server is where that
-matters most** — read its header before putting this anywhere real.
+only in a conversation with ourselves. **`sign.nt` is only partly constant-time and a server is where
+that matters most**: the ECDSA scalar multiply is branch-free (`ecCtMul`, below), RSA signing is
+not — read its header before putting this anywhere real.
 
 ## Bytes and crypto
 
@@ -827,7 +828,7 @@ CertificateRequest, so whoever connects to it is anonymous. A mismatched
 ECDSA algorithm and curve — `ecdsaSha384` under a P-256 key, or the reverse — is also refused, with
 both named. Every one of those refusals names the algorithm or the curve rather than skipping the
 check. This is a verifier written from scratch to be read, not a substitute for a reviewed TLS
-stack, and nothing in it is constant-time.
+stack. Verification has no secrets to leak; what the signing side does and does not hide is below.
 
 ### Constant time, and a checker for it
 
@@ -882,8 +883,47 @@ deopt, which is a refinement the checker does not make yet.
 
 This proves one property and not constant-time in general: `MUL` is constant-time on the cores this
 targets but not architecturally required to be, and nothing here says anything about what a caller
-does before or after. What it does mean is that the crypto can now be *moved* onto ground where the
-claim is checked rather than argued — none of it has been yet.
+does before or after. What it does mean is that the crypto can be *moved* onto ground where the
+claim is checked rather than argued.
+
+### What has been moved onto it
+
+Two places branched on a secret, and both are now written without the branch.
+
+**Authenticator comparison.** `aeadDecrypt` checked its Poly1305 tag with `~`, which is Rust's
+`Vec<u8>` equality: it memcmps and returns the moment it finds a difference, so the time it takes
+counts how many leading bytes of a forged tag were right. That turns forging a 16-byte tag from one
+guess in 2^128 into sixteen searches of 256. `macEq` (src/neant/crypto/crypto.nt) xors the two
+vectors and sums the result — whole-vector primitives with no early exit — and the two TLS
+`Finished` checks, client and server, go through it too.
+
+**The ECDSA nonce.** `ecShamir` does an addition per *set* bit of the scalar. For verification that
+is free speed and every input is public. For signing the scalar is the nonce `k`, and a handful of
+`k`'s bits recovers the private key, because the lattice attacks on biased ECDSA nonces need far
+less than a handful. `ecCtMul` (src/neant/crypto/ec.nt) is double-and-add-always instead: every bit
+costs one doubling and one addition, the addition happens whatever the bit is, and `ctSel` decides
+with a mask which result survives. The addition formula's early returns are gone — `ecCtDbl` needs
+none, since `(X:Y:0)` doubles to `z3 = 0` on its own — and the one reachable degenerate case, the
+accumulator still being the point at infinity, is put back as a mask.
+
+The difference, measured on P-256 with two 256-bit scalars of the same width, one with a single set
+bit and one with 255 (`tests/ct.nt`):
+
+```
+              1 bit set    255 bits set
+ecShamir         218 ms         455 ms     <- the side channel, in one number
+ecCtMul          592 ms         589 ms
+```
+
+Signing costs about 1.8x what it did. That is the price, and it is paid once per signature.
+
+**What is still not constant-time**, because the claim is worth less than the exactness: the field
+layer below. `bnMontMul` trims its own result, so a value with a zero top limb makes the next
+multiply cheaper, and `bnAddModL`'s conditional subtract is a branch. The `efCt*` wrappers pad every
+operand back to the curve's full limb width, which closes the first of those inside the loop; the
+second remains, as a second-order channel on intermediate coordinates rather than a first-order one
+on the scalar's own bits. RSA is untouched: `bnModExp` still branches on its exponent, and for
+`rsaSignPss` that exponent is the private key. `sign.nt`'s header says so.
 
 ## Errors
 

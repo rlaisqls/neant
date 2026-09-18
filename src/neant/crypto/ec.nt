@@ -3,6 +3,8 @@
 // der.nt for the signature's encoding. Not part of the boot image — load all three:
 //   load "src/neant/crypto/bignum.nt"   load "src/neant/crypto/der.nt"
 //   load "src/neant/crypto/ec.nt"
+// ct.nt it loads itself, because ecCtMul at the bottom is built out of that file's masks and a
+// caller should not be able to get the signing path without them.
 // and then one curve: src/neant/crypto/p256.nt or src/neant/crypto/p384.nt, which is what a caller
 // actually names. Nothing here knows which curve it is on.
 //
@@ -80,6 +82,8 @@
 // so `f[a\n  ; b]` would hand f an empty argument per newline, while a `( ... )` list spanning
 // lines is exactly the list it looks like. Five hex strings do not fit on one line.
 //   (p; n; b; Gx; Gy; digest octets)
+load "src/neant/stdlib/ct.nt"
+
 ecCurve: {[a]
   ph: a[0]; nh: a[1]; bh: a[2]; gxh: a[3]; gyh: a[4]; dgst: a[5]
   P: bnFromBytes unhex ph
@@ -194,6 +198,107 @@ ecShamir: {[C;b1;A1;b2;A2]
     if[j>0
       e: T[j-1]
       if[0 < count e; R: ecMAdd[C;R;e]]]
+    i+:1]
+  R}
+
+// ---- k*A for a SECRET k. Everything above this line is for verification, where every input is
+// public; this is the one path a signer takes, and it is a different problem.
+//
+// ecShamir branches on the scalar: `if[j>0; R: ecMAdd[...]]` does an addition for a one bit and
+// nothing for a zero, so how long a multiply runs counts the ones in the scalar. For verification
+// that is free speed. For signing it is the whole key — the scalar there is the nonce k, and a
+// handful of k's bits recovers d outright, because the lattice attacks on biased ECDSA nonces need
+// far less than a handful. ecdsaSign originally called ecShamir, which is to say the side channel
+// arrived with the signing code and not with the curve arithmetic it borrowed.
+//
+// This is double-and-add-always: every bit costs one doubling and one addition, the addition is
+// performed whatever the bit is, and a mask rather than a branch decides which of the two results
+// survives. src/neant/stdlib/ct.nt holds the mask primitives and says why each is written the way
+// it is; they are used here rather than restated so that `jitct`'s check of them covers this too.
+// The cost is one addition per bit instead of one per set bit, so signing does about a third more
+// work than it did.
+//
+// TWO CASES ARE ARGUED AWAY RATHER THAN COMPUTED, and the argument is the usual one. The addition
+// formula is undefined when the two points share an x coordinate, which here means 2m*A = +-A for
+// the prefix m of the scalar, i.e. 2m = +-1 mod n. For a nonce drawn as RFC 6979 draws it that is
+// one chance in 2^255 at each step. Note what the failure would be: a wrong signature, which
+// verification catches, and NOT a timing difference — there is no branch either way, so the
+// negligible-probability argument is only buying correctness, never secrecy.
+//
+// WHAT IS STILL NOT CONSTANT-TIME, and it is worth being exact about. The field layer below is not.
+// bnMontMul trims its own result, so an intermediate with a zero top limb makes the next multiply
+// cheaper, and bnAddModL's conditional subtract is a branch on a value. The efCt* wrappers below
+// pad every operand back to the curve's full limb width, which closes the first of those inside
+// this loop; the conditional subtract remains, and it is a second-order channel on intermediate
+// coordinates rather than a first-order one on the scalar's own bits. The first-order one is what
+// this closes.
+
+// the field operations at a fixed width. The padding is not tidiness: bnMontMul costs
+// `count a` times `count b` and trims what it returns, so without this the cost of each step
+// would depend on how many leading limbs the last step's value happened to leave zero.
+efCtMul: {[C;a;b] bnPad[bnMontMul[a;b;C`p;C`np]; C`limbs]}
+efCtSqr: {[C;a] bnPad[bnMontMul[a;a;C`p;C`np]; C`limbs]}
+efCtAdd: {[C;a;b] bnPad[bnAddMod[a;b;C`p]; C`limbs]}
+efCtSub: {[C;a;b] bnPad[bnSubMod[a;b;C`p]; C`limbs]}
+
+// all-ones when every limb is zero, zero otherwise. bnIsZero answers the same question through
+// bnTrim, which scans down from the top limb and so takes longer the more leading zeros it finds;
+// asking it about a Z coordinate would be a clock on the scalar's leading zero bits, which is
+// precisely what is being hidden. Limbs are non-negative, so their bitwise or is zero exactly when
+// all of them are.
+ecCtZeroMask: {[v] ctMask ctZeroBit (bor/)v}
+// mask all ones picks P, zero picks Q
+ecCtSelPt: {[m;P;Q] (ctSel[m;P[0];Q[0]]; ctSel[m;P[1];Q[1]]; ctSel[m;P[2];Q[2]])}
+
+// dbl-2001-b again with the `if[bnIsZero P[2]; :P]` taken out. The formula does not need it: for a
+// point at infinity (X:Y:0) it computes z3 = (Y+0)^2 - Y^2 - 0 = 0, so infinity doubles to infinity
+// on its own and the early return was only ever saving the work.
+ecCtDbl: {[C;P]
+  d: efCtSqr[C;P[2]]
+  g: efCtSqr[C;P[1]]
+  bt: efCtMul[C;P[0];g]
+  al: efCtMul[C; efCtSub[C;P[0];d]; efCtAdd[C;P[0];d]]
+  al: efCtAdd[C; al; efCtAdd[C;al;al]]
+  b4: efCtAdd[C;bt;bt]; b4: efCtAdd[C;b4;b4]
+  x3: efCtSub[C; efCtSqr[C;al]; efCtAdd[C;b4;b4]]
+  z3: efCtSub[C; efCtSub[C; efCtSqr[C; efCtAdd[C;P[1];P[2]]]; g]; d]
+  g8: efCtSqr[C;g]; g8: efCtAdd[C;g8;g8]; g8: efCtAdd[C;g8;g8]; g8: efCtAdd[C;g8;g8]
+  y3: efCtSub[C; efCtMul[C; al; efCtSub[C;b4;x3]]; g8]
+  (x3;y3;z3)}
+
+// madd-2007-bl with all three early returns taken out, because a formula with a branch in it cannot
+// be part of a constant-time multiply. The one case that is actually reachable — P at infinity,
+// which is every leading zero bit of the scalar — is put back with a mask in ecCtMul below.
+ecCtMAdd: {[C;P;A]
+  zz: efCtSqr[C;P[2]]
+  u2: efCtMul[C; A[0]; zz]
+  s2: efCtMul[C; A[1]; efCtMul[C;P[2];zz]]
+  h: efCtSub[C; u2; P[0]]
+  rr: efCtSub[C; s2; P[1]]
+  rr: efCtAdd[C;rr;rr]
+  hh: efCtSqr[C;h]
+  ii: efCtAdd[C;hh;hh]; ii: efCtAdd[C;ii;ii]
+  jj: efCtMul[C;h;ii]
+  v: efCtMul[C; P[0]; ii]
+  x3: efCtSub[C; efCtSub[C; efCtSqr[C;rr]; jj]; efCtAdd[C;v;v]]
+  t: efCtMul[C; P[1]; jj]
+  y3: efCtSub[C; efCtMul[C; rr; efCtSub[C;v;x3]]; efCtAdd[C;t;t]]
+  z3: efCtSub[C; efCtSub[C; efCtSqr[C; efCtAdd[C;P[2];h]]; zz]; hh]
+  (x3;y3;z3)}
+
+// sb is the scalar as bits, most significant first, exactly as ecBits gives them; A is affine in
+// Montgomery form, as C`gx`gy and ecPoint both are.
+ecCtMul: {[C;sb;A]
+  one: bnPad[C`one; C`limbs]
+  Aa: (bnPad[A[0]; C`limbs]; bnPad[A[1]; C`limbs])
+  R: (one; one; bnPad[BNZERO; C`limbs])
+  i: 0; n: count sb
+  while[i<n
+    R: ecCtDbl[C;R]
+    zm: ecCtZeroMask R[2]
+    S: ecCtMAdd[C;R;Aa]
+    S: ecCtSelPt[zm; (Aa[0]; Aa[1]; one); S]     // R was infinity, so the sum is just A
+    R: ecCtSelPt[ctMask sb[i]; S; R]             // and the bit says whether to keep the sum at all
     i+:1]
   R}
 

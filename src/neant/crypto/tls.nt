@@ -332,7 +332,7 @@ tlsConnectOpts: {[host;port;opts]
           if[vfy
             if[not sawCert; tlsGuard[h; {signal "tls: the server sent no Certificate"}; 0]]
             if[not sawCv; tlsGuard[h; {signal "tls: the server sent no CertificateVerify"}; 0]]]
-          if[not (wdrop[4;raw]) ~ hmac[expandLabel[sHS;"finished";0x;32]; sha256 tr]
+          if[not macEq[wdrop[4;raw]; hmac[expandLabel[sHS;"finished";0x;32]; sha256 tr]]
             hclose h
             signal "tls: the server's Finished did not verify"]
           fin: 1]

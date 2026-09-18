@@ -43,3 +43,61 @@ teq["so does an if"; 0<count ctT {[a;b] $[a>b; a; b]}; 1b]
 teq["so does a call to another function"; 0<count ctT {[x] ctNeg x}; 1b]
 teq["a literal shift keeps it"; ctT {[x] x shr 63}; ""]
 teq["a variable shift does not, since the range has to be tested"; 0<count ctT {[x;y] x shr y}; 1b]
+
+// ---- the crypto that was moved onto all of this.
+//
+// Two places used to branch on a secret. ecShamir does an addition per SET bit of the scalar, which
+// is right for verification and wrong for signing, where the scalar is the nonce; and `~` on an
+// authentication tag is Rust's Vec<u8> equality, which stops at the first byte that differs.
+tsection "ct: the crypto"
+load "src/neant/crypto/bignum.nt"
+load "src/neant/crypto/der.nt"
+load "src/neant/crypto/ec.nt"
+load "src/neant/crypto/p256.nt"
+load "src/neant/crypto/p384.nt"
+
+// macEq is in the boot image, so it is here without a load.
+teq["macEq: equal"; macEq[0x0102030405; 0x0102030405]; 1b]
+teq["macEq: differs in the last byte"; macEq[0x0102030406; 0x0102030405]; 0b]
+teq["macEq: differs in the first byte"; macEq[0x9902030405; 0x0102030405]; 0b]
+teq["macEq: a length mismatch is not equal"; macEq[0x010203; 0x0102030405]; 0b]
+teq["macEq: two empties are equal"; macEq[0x; 0x]; 1b]
+teq["macEq: every byte differing"; macEq[16#0xff; 16#0x00]; 0b]
+// and that the AEAD it guards still both accepts and refuses
+ctK: 32#0x2a
+ctN: 12#0x07
+ctE: aeadEncrypt[ctK; ctN; `byte$"aad"; `byte$"secret"]
+teq["aeadDecrypt round trip"; `char$aeadDecrypt[ctK; ctN; `byte$"aad"; ctE 0; ctE 1]; "secret"]
+teq["aeadDecrypt refuses a tag off by one bit"
+  @[{[a] aeadDecrypt[ctK; ctN; `byte$"aad"; ctE 0; a]}; (ctE 1) bxor 0x01,15#0x00; {x}]
+  "aead: bad tag"]
+
+// ecCtMul has to agree with ecShamir everywhere, or the property is bought with wrong signatures
+ctMulSame: {[C;k]
+  kv: bnFromBytes k
+  a: ecToAffine[C; ecShamir[C; ecBits[C;kv]; (C`gx; C`gy); ecBits[C;bnFromBytes 0x00]; (C`gx; C`gy)]]
+  b: ecToAffine[C; ecCtMul[C; ecBits[C;kv]; (C`gx; C`gy)]]
+  a~b}
+teq["ecCtMul = ecShamir, k=1"; ctMulSame[P256C; 0x01]; 1b]
+teq["ecCtMul = ecShamir, k=2"; ctMulSame[P256C; 0x02]; 1b]
+teq["ecCtMul = ecShamir, k=3"; ctMulSame[P256C; 0x03]; 1b]
+teq["ecCtMul = ecShamir, k=256"; ctMulSame[P256C; 0x0100]; 1b]
+teq["ecCtMul = ecShamir, a full-width k"; ctMulSame[P256C; 32#0x5b]; 1b]
+teq["ecCtMul = ecShamir, every bit set"; ctMulSame[P256C; 0x7f,31#0xff]; 1b]
+teq["ecCtMul = ecShamir on P-384"; ctMulSame[P384C; 48#0x5b]; 1b]
+teq["ecCtMul = ecShamir on P-384, k=1"; ctMulSame[P384C; 0x01]; 1b]
+
+// The point of all of it, measured rather than asserted about the source. Two scalars of the same
+// width, one with a single set bit and one with 255 of them: ecShamir takes about twice as long for
+// the second, which is the side channel in one number, and ecCtMul must not. The bound is loose
+// because this is a wall clock on a shared machine — it is there to catch the property being lost
+// outright (a `+` or an `if` creeping back into ecCtDbl or ecCtMAdd would put the two apart by
+// nothing, but a rewrite that reintroduced the skipped addition would show up at once), not to
+// measure anything finer.
+ctMs: {[f;n] t0: now`time; do[n; f[]]; `int$now[`time]-t0}
+ctLo: ecBits[P256C; bnFromBytes 0x01,31#0x00]
+ctHi: ecBits[P256C; bnFromBytes 0x7f,31#0xff]
+teq["the two scalars really do differ in weight"; (sum ctLo; sum ctHi); 1 255]
+ctTLo: ctMs[{ecCtMul[P256C; ctLo; (P256C`gx; P256C`gy)]}; 6]
+ctTHi: ctMs[{ecCtMul[P256C; ctHi; (P256C`gx; P256C`gy)]}; 6]
+teq["ecCtMul does not care how many bits are set"; ctTHi < 1.3 * 5 | ctTLo; 1b]

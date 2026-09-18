@@ -11,12 +11,19 @@
 // code that touches a private key, and the header of the file it does load can go on saying it
 // holds no secrets.
 //
-// NOT CONSTANT-TIME, and this matters more here than anywhere else in this tree. bnModExp is
-// square-and-multiply over the exponent's bits with data-dependent branching, so a local attacker
-// who can time these operations can recover `d`. That is a real limit, not a caveat: sign with this
-// where the timing is not observable — a test, a fixture, an offline signature — and not on a
-// public-facing server sharing a machine with an attacker. Blinding would be the fix and is not
-// written.
+// RSA SIGNING IS NOT CONSTANT-TIME, and this matters more here than anywhere else in this tree.
+// bnModExp is square-and-multiply over the exponent's bits with data-dependent branching, and for
+// rsaSignPss that exponent is `d` itself, so a local attacker who can time these operations can
+// recover the key. That is a real limit, not a caveat: sign RSA with this where the timing is not
+// observable — a test, a fixture, an offline signature — and not on a public-facing server sharing
+// a machine with an attacker. Blinding would be the fix and is not written.
+//
+// ECDSA SIGNING IS DIFFERENT, since ecdsaSign was changed to go through ec.nt's ecCtMul: the scalar
+// multiply by the nonce is double-and-add-always with masked selection, so no branch depends on k.
+// That is the first-order channel and it is closed; the field arithmetic underneath still is not
+// constant-time, and ecCtMul's header says exactly which part. `ki: bnModExpL[kv; C`nm2; C`n]`
+// below is square-and-multiply over a PUBLIC exponent (n-2) with a secret base, which is the
+// ordinary shape and not the one that leaks the exponent.
 
 // ---- private keys. PKCS#8 (BEGIN PRIVATE KEY) wraps an RSAPrivateKey in an OCTET STRING; PKCS#1
 // (BEGIN RSA PRIVATE KEY) is that structure on its own.
@@ -139,7 +146,8 @@ rsaSignCheck: {[key;hash;digest;sig] rsaVerifyPss[key`n; key`e; hash; digest; si
 // after a fork, and the same message signs to the same bytes — which also means the standard's own
 // test vectors pin this implementation exactly, and tests/sign.nt uses them.
 //
-// Not constant-time, for the same reason the RSA half is not: see this file's header.
+// The scalar multiply is constant-time (ecCtMul); the rest of the field arithmetic is not. See
+// this file's header, and ec.nt's above ecCtMul, for exactly where the line falls.
 
 // RFC 6979 2.3.2 bits2int, for the case this build is in — the digest and the subgroup order are
 // the same width (P-256 with SHA-256, P-384 with SHA-384), so it is the octets as an integer.
@@ -180,7 +188,9 @@ ecdsaSign: {[C;d;digest]
   G: (C`gx; C`gy)
   kb: ecNonce[C;d;digest]
   kv: bnFromBytes kb
-  R: ecShamir[C; ecBits[C;kv]; G; ecBits[C;bnFromBytes 0x00]; G]
+  // ecCtMul and NOT ecShamir: k is the secret here, and ecShamir branches on its bits. See the
+  // header above ecCtMul in ec.nt for what that costs and what it does and does not fix.
+  R: ecCtMul[C; ecBits[C;kv]; G]
   if[bnIsZero R[2]; signal "sign: k*G is the point at infinity"]
   xy: ecToAffine[C;R]
   r: bnMod[efFrom[C;xy[0]]; C`n]
