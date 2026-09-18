@@ -142,6 +142,36 @@ mod native {
     /// one carries an entry guard that the slot still holds that exact primitive.
     const BIT_PRIMS: [&str; 6] = ["badd", "band", "bor", "bxor", "shl", "shr"];
 
+    fn trampolines_for(bit_now: &[(i64, i64)]) -> Value {
+        Value::List(Arc::new(vec![
+            Value::Int(jit_call as *const () as i64),
+            Value::Int(jit_vec_get as *const () as i64),
+            Value::Int(jit_vec_set as *const () as i64),
+            crate::value::ints(bit_now.iter().map(|&(s, _)| s).collect()),
+        ]))
+    }
+    fn bit_slots(vm: &Vm) -> Vec<(i64, i64)> {
+        BIT_PRIMS.iter().map(|n| match (vm.slot_of(n), vm.get(n)) {
+            (Some(s), Some(Value::Prim(p))) if p.name == *n => (s as i64, p as *const crate::value::PrimDef as i64),
+            _ => (-1, 0),
+        }).collect()
+    }
+
+    /// `jitct f` — src/neant/jit/arm64.nt's constant-time check, run in exactly the environment the
+    /// compiler runs in: the same trampoline addresses and the same inlinable-primitive slots, so
+    /// what it inspects is the code that would actually execute. "" means the emitted machine code
+    /// has no data-dependent control flow; anything else is the reason it might.
+    pub fn ct_why(vm: &mut Vm, f: &Value) -> crate::value::R<Value> {
+        let code = match f {
+            Value::Lambda(c) => c.clone(),
+            Value::Closure(c, _) => c.clone(),
+            _ => return crate::value::err("jitct: not a lambda"),
+        };
+        let why = match vm.get("jitCtWhy") { Some(w) => w, None => return crate::value::err("jitct: src/neant/jit/arm64.nt is not loaded") };
+        let tr = trampolines_for(&bit_slots(vm));
+        vm.call(&why, vec![code.jit_input(), tr])
+    }
+
     impl Compiled {
         /// `None` means the entry guard failed (some arg/capture isn't the type its slot was
         /// classified as — plain non-null int, or `Ints` for a `vec_slots` entry), the compiled
@@ -353,12 +383,7 @@ mod native {
             (Some(s), Some(Value::Prim(p))) if p.name == *n => (s as i64, p as *const crate::value::PrimDef as i64),
             _ => (-1, 0),
         }).collect();
-        let trampolines = Value::List(Arc::new(vec![
-            Value::Int(jit_call as *const () as i64),
-            Value::Int(jit_vec_get as *const () as i64),
-            Value::Int(jit_vec_set as *const () as i64),
-            crate::value::ints(bit_now.iter().map(|&(s, _)| s).collect()),
-        ]));
+        let trampolines = trampolines_for(&bit_now);
         // `jitCompile` and its own helpers (jitOpDyad, ...) are neant functions too, and their own
         // bytecode contains the very op kinds they exist to handle — a Dyad inside `jitOpDyad`'s own
         // body, for instance. So compiling *any* of them, once its own call count crosses the
@@ -634,7 +659,7 @@ mod native {
 #[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
 pub(crate) use native::already_compiling;
 #[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
-pub use native::{compile, compile_trace, Compiled, CompiledTrace};
+pub use native::{compile, compile_trace, ct_why, Compiled, CompiledTrace};
 
 /// What `CompiledTrace::run` came back with — see its doc comment.
 pub enum TraceRun { Bailed(usize), TypeMismatch, StaleCallee }
@@ -651,6 +676,12 @@ impl Compiled {
 }
 #[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
 pub fn compile(_code: &Arc<FnCode>, _vm: &mut Vm) -> Option<Compiled> { None }
+/// No backend, so nothing here is compiled at all: say so rather than answering "" and implying a
+/// guarantee that is not being made.
+#[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
+pub fn ct_why(_vm: &mut Vm, _f: &Value) -> crate::value::R<Value> {
+    Ok(crate::value::chars("jitct: this build has no JIT backend, so nothing is compiled at all".chars().collect()))
+}
 #[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
 pub struct CompiledTrace(std::convert::Infallible);
 #[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]

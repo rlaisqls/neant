@@ -632,6 +632,14 @@ fn show(x: Value) -> R<Value> { out(&x.fmt()); Ok(Null) }
 /// ("," sv string 1 2 3), this is the whole value the way the REPL renders it — so tests/lang.nt
 /// can pin display forms (2f, ,`a, 101b) from neant instead of from Rust.
 fn repr(x: Value) -> R<Value> { Ok(chars(x.fmt().chars().collect())) }
+/// The bytecode-as-data the JIT's neant codegen is handed for this lambda — `FnCode::jit_input`,
+/// which until now only src/jit.rs could reach. It exists so that the constant-time checker in
+/// src/neant/jit/arm64.nt can be pointed at a function from neant, in a test or at a REPL, rather
+/// than only from inside the compile path; nothing else about it is new.
+fn jitinput(x: Value) -> R<Value> {
+    match &x { Lambda(c) => Ok(c.jit_input()), Closure(c, _) => Ok(c.jit_input()),
+               _ => err("jitinput: not a lambda") }
+}
 fn key(x: Value) -> R<Value> { match x { Dict(d) => Ok(d.keys.clone()), _ => til(x) } }
 fn value(x: Value) -> R<Value> { match x { Dict(d) => Ok(d.vals.clone()), _ => Ok(x) } }
 fn sqrt(x: Value) -> R<Value> { map_f(&x, f64::sqrt) }
@@ -766,13 +774,14 @@ pub static BUILTINS: &[PrimDef] = &[
     p!("shl", None, Some(shl), ib_shl), p!("shr", None, Some(shr), ib_shr), p!("bnot", Some(bnot), None),
     p!("key", Some(key), None), p!("value", Some(value), None), p!("group", Some(group), None),
     p!("isnull", Some(isnull), None), p!("now", Some(now), None), p!("fbits", Some(fbits), None),
-    p!("show", Some(show), None), p!("repr", Some(repr), None), p!("print", Some(print), None), p!("signal", Some(signal), None), p!("exit", Some(exit), None),
+    p!("show", Some(show), None), p!("repr", Some(repr), None), p!("jitinput", Some(jitinput), None), p!("print", Some(print), None), p!("signal", Some(signal), None), p!("exit", Some(exit), None),
     p!("read0", Some(read0), None), p!("read1", Some(read1), None), p!("write0", None, Some(write0)), p!("write1", Some(write1), None),
     p!("hopen", Some(hopen), None), p!("hclose", Some(hclose), None), p!("hsend", None, Some(hsend)), p!("hrecv", None, Some(hrecv)),
     p!("hlisten", Some(hlisten), None), p!("accept", Some(accept), None),
     p!("shared", Some(shared), None), p!("sget", Some(sget), None), p!("sset", None, Some(sset)),
     p!("each", None, None), p!("over", None, None), p!("scan", None, None),   // adverb keywords, dispatched in the VM
     p!("exec", None, None),   // runs bytecode data; dispatched in the VM
+    p!("jitct", None, None),  // the constant-time check; dispatched in the VM, which owns the trampolines
     p!("elast", None, None),  // elast `line / `trace: where the last caught error came from; dispatched in the VM
     p!("spawn", None, None), p!("join", None, None), p!("supd", None, None),  // concurrency: dispatched in the VM (call back into user code)
 ];

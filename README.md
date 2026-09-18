@@ -829,6 +829,45 @@ both named. Every one of those refusals names the algorithm or the curve rather 
 check. This is a verifier written from scratch to be read, not a substitute for a reviewed TLS
 stack, and nothing in it is constant-time.
 
+### Constant time, and a checker for it
+
+Nothing in this tree is constant-time. That sentence appears beside the crypto because it is true,
+and `jitct` is what turns it from a disclaimer into a measurement:
+
+```
+jitct {[a;b] a bxor b}
+"jitct: the code has 1 conditional branches for 0 counted loops (at words 15) — a deopt, a bounds
+ check, or a vector index whose bound has to be tested"
+```
+
+`jitct f` compiles `f` in exactly the environment the JIT compiles it in — the same trampoline
+addresses, the same inlinable-primitive slots — and answers `""` only when the *emitted machine
+code* has no data-dependent control flow. It is a check on the bytes, not an argument about the
+source, so it cannot be talked around. Two rules:
+
+- the bytecode may hold no `Jmpf`. Every `if`, `$[..]` and `while` compiles to one and each is a
+  branch on a value the function was handed. `do[n;..]` is allowed when `n` is a literal: then the
+  branch is on a counter that runs the same way for every input.
+- the emitted code may hold no conditional branch beyond one back-edge per such loop — no `B.cond`,
+  `CBZ`/`CBNZ`, `TBZ`/`TBNZ`. Decoding the words rather than enumerating the cases means a deopt, a
+  bounds check, or anything a later change to `arm64.nt` starts emitting is caught without being
+  anticipated.
+
+**What it says today is "no", for everything, and the reason is specific.** Even `a bxor b` compiles
+to the `eor` and then a comparison of its *result* against the int-null sentinel, with a branch to a
+deopt. That check is not superfluous — a value equal to the sentinel would be read as a null by a
+later `+`, `-` or `*`, which the interpreter propagates and compiled code does not — but it is a
+branch on a value. The way out is a pair rather than a single change: a function restricted to
+`badd` and the bit primitives, which is how constant-time code is written anyway, can never hand a
+sentinel to an operation that would misread it, and then those checks can go. That has to be a real
+compile *mode*, because the point of the checker is to inspect the code that will actually run.
+
+Even with that, this would prove one property and not constant-time in general: `MUL` is
+constant-time on the cores this targets but not architecturally required to be, and nothing here
+says anything about what a caller does before or after. Branch-free selection needs no new codegen —
+a mask out of `neg`, `band` and `bxor` is already in the compilable subset — so what was missing was
+never the ability to write such code, only any way to know that you had.
+
 ## Errors
 
 Lexer and parser errors carry the line. A runtime error points at the line that actually failed and

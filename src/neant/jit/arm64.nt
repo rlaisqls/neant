@@ -1423,3 +1423,103 @@ jitCompileTrace: {[input]
     fi: fi+1]
 
   (,/jitLE each asm; `int$slots; `int$stys; stackBase; {(x[0]; jitTrTagCodes x[1])} each exits)}
+
+// ============================================================================================
+// Constant-time checking. `jitCtWhy[input;trampolines]` answers "" when this function compiles to
+// machine code whose timing and memory accesses cannot depend on its arguments, and otherwise the
+// reason it does not. It is a CHECK, not a second code generator: the guarantee is read off the
+// bytes that were actually emitted, so it cannot be argued around.
+//
+// WHY A CHECK RATHER THAN A `csel` PASS. Branch-free *selection* needs no new codegen at all — a
+// mask built out of `neg`, `band` and `bxor` is already in the compilable subset, and is how
+// constant-time C is written anyway. What was missing was not the ability to emit such code but any
+// way to know that you had. So this proves it instead:
+//
+//   1. the bytecode may not contain `Jmpf` (opcode 10). Every `if`, `$[..]` and `while` compiles to
+//      one, and each is a branch on a value this function was handed. `do[n;..]` is `Loop`
+//      (opcode 18) and is allowed only when `n` is a literal — then the branch is on a counter that
+//      runs 0..n-1 for every input alike, which is what makes it timing-invariant.
+//   2. the emitted machine code may contain no conditional branch beyond the one back-edge each
+//      such `Loop` needs: no B.cond, CBZ/CBNZ or TBZ/TBNZ. This is decoded from the words, so a
+//      deopt (they are all conditional branches), a bounds check that can fail, and anything a
+//      future change to this file starts emitting are all caught without being enumerated.
+//   3. it must compile at all. A function that falls back to the interpreter has no guarantee of
+//      any kind, and silently getting the slow path is exactly how this sort of thing goes wrong.
+//
+// WHAT IT SAYS TODAY. Nothing in this build is constant-time yet, and the checker is what makes
+// that precise rather than a suspicion: even `{[a;b] a bxor b}` compiles to
+//
+//     eor x9, x10, x9
+//     cmp x9, x20            // x20 holds the int-null sentinel
+//     b.eq <deopt>
+//
+// The `bxor` itself is one instruction, and then its RESULT is compared against the sentinel. That
+// check is not superfluous: a value that happens to equal the sentinel would be read as a null by
+// a later `+`, `-` or `*`, which the interpreter propagates and compiled code does not, so the two
+// would disagree. It is also a branch on a value, which is exactly what must not be there.
+//
+// The way out is a pair, not a single change: a function that uses only `badd` and the bit
+// primitives — wrapping arithmetic, which is how constant-time code is written anyway — can never
+// hand a sentinel to an operation that would misread it, and then the checks after the bit ops can
+// go. That has to be a real COMPILE MODE rather than something this checker assumes, because the
+// whole point is to inspect the code that will actually execute. Until that mode exists this
+// answers "no" for everything, correctly.
+//
+// WHAT IS STILL NOT GUARANTEED, and this is the honest part. Within the compiled code there are no
+// `Value` operations, no allocation and no refcounting, so those cannot leak; the entry guard's
+// copy of a vector argument is a fixed size. But AArch64's `MUL` is constant-time on the cores this
+// targets and not architecturally required to be; a secret-dependent *index* into a vector is
+// rejected only because such an index would need arithmetic this walk refuses, not because the
+// check looks for it; and nothing here says anything about what the caller does before or after.
+// This proves one specific and useful property — no data-dependent control flow in the emitted
+// code — and claims nothing beyond it.
+
+// The whole function is scanned, prologue included, and that is not an oversight: the prologue
+// saves registers, loads locals and materialises the null sentinel, and emits no conditional branch
+// at all — the entry guards (every argument a plain non-null int, every inlined primitive still
+// bound to the global it was compiled against) are checked in Rust before the code is entered, not
+// by branches inside it. An earlier version of this skipped the prologue by remembering its length
+// in a global, which was WRONG in a way worth recording: `jitCompile` is reentrant — compiling one
+// function can cross another's tier-up threshold and compile that one too — so the global could be
+// overwritten between being set and being read, and the check would then skip into the middle of
+// the body and report code as constant-time that was not.
+
+// the top byte of every AArch64 conditional branch: B.cond, CBZ/CBNZ, TBZ/TBNZ, both widths
+JITCTBR: 84 52 180 53 181 54 182 55 183
+// the word offsets of every conditional branch in `bytes`
+jitCtCondAt: {[bytes]
+  n: (count bytes) div 4
+  w: `int$bytes[3+4*til n]                 // little-endian: byte 3 of each word is bits 31..24
+  &w in JITCTBR}
+jitCtCondBranches: {[bytes] count jitCtCondAt bytes}
+
+// -> "" when the bytecode may be compiled constant-time, else why not
+jitCtBytecodeWhy: {[opcodes;opargs;consts]
+  n: count opcodes
+  i: 0; loops: 0
+  while[i<n
+    op: opcodes[i]
+    if[op=10; :"jitct: a conditional branch on a value — if, $[..] or while at op ",string i]
+    if[op=18
+      // the trip count is whatever was pushed just before the loop head; a literal is a Push of a
+      // constant, and anything else (a local, a computed value) is a count this cannot see
+      if[i<1; :"jitct: a do loop with no trip count at op ",string i]
+      if[not (opcodes[i-1])=0; :"jitct: a do loop whose trip count is not a literal, at op ",string i]
+      loops+:1]
+    i+:1]
+  ""}
+
+jitCtWhy: {[input;trampolines]
+  w: jitCtBytecodeWhy[input[0]; input[1]; input[2]]
+  if[0<count w; :w]
+  r: jitCompile[input;trampolines]
+  if[isnull r; :"jitct: this function does not compile at all, so it has no guarantee"]
+  nl: jitCtLoops input[0]
+  at: jitCtCondAt r[0]
+  nb: count at
+  if[nb>nl
+    m: "jitct: the code has ",(string nb)," conditional branches for ",(string nl)," counted loops"
+    m,: " (at words ",(", " sv string each at),")"
+    :m," — a deopt, a bounds check, or a vector index whose bound has to be tested"]
+  ""}
+jitCtLoops: {[opcodes] sum opcodes=18}

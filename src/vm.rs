@@ -393,6 +393,7 @@ impl Vm {
             Prim(p) => match (p.m, p.name) {
                 (Some(m), _) => m(x),
                 (None, "exec") => self.exec(&x),
+                (None, "jitct") => crate::jit::ct_why(self, &x),
                 (None, "elast") => match &x {
                     Symbol(s) if &**s == "line" => Ok(Int(self.last_trace.first().map_or(0, |f| f.1) as i64)),
                     Symbol(s) if &**s == "trace" => Ok(pack(self.last_trace.iter()

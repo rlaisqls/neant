@@ -1,0 +1,22 @@
+// The constant-time checker in src/neant/jit/arm64.nt, reached through the `jitct` builtin so that
+// it inspects the code the compiler would actually emit — the same trampoline addresses and the
+// same inlinable-primitive slots. "" means no data-dependent control flow in the emitted machine
+// code; anything else is the reason there might be.
+tsection "jitct"
+jctW: {[f] jitct f}
+jctHas: {[f;frag] 0 < count ((jctW f) ss frag)}
+
+// the bytecode rules, which are refused before anything is emitted
+tok["if / $[..] is refused, and named"; jctHas[{[a;b] $[a>b; a; b]}; "a conditional branch on a value"]]
+tok["while is refused"; jctHas[{[a;b] i:0; while[i<b; a: a bxor i; i: i+1]; a}; "a conditional branch on a value"]]
+tok["a do loop with a computed trip count is refused"; jctHas[{[a;b] n:0; do[b; n: n bxor a]; n}; "whose trip count is not a literal"]]
+tok["a function that does not compile at all is refused"; jctHas[{[a] 1.5*a}; "does not compile at all"]]
+
+// and the machine-code rule. Nothing passes yet, for the reason the file's header sets out: the
+// null-collision check after every arithmetic and bit operation is itself a branch on a value.
+// These pin the current answer so that the compile mode which removes it has to change them.
+jctBx: jctW {[a;b] a bxor b}
+tok["a bare bxor is not constant-time today"; 0<count jctBx]
+tok["nor is badd"; 0<count jctW {[a;b] a badd b}]
+print "    (bxor today: ",jctBx,")"
+teq["a do loop with a literal count gets past the bytecode rules"; 0=count (jctW {[a] n:0; do[8; n: n bxor a]; n}) ss "trip count"; 1b]
