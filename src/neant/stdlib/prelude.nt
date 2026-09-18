@@ -98,7 +98,19 @@ svnum: {[b;d] if[(@d) in `bytes`bools; d: `int$d]; n: #d; bs: $[`int=@b; n#b; b]
 // nulls
 nullof: {t: @x; $[t in `int`ints; 0N; t in `float`floats; 0n; t in `sym`syms; `; t in `char`chars; " "; t in `date`dates; `date$-2147483648; t in `time`times; `time$0N; null]}
 fill: {[a;x] i: &isnull x; if[count i; x[i]: a]; x}
-fills: {{$[isnull y; x; y]}\x}
+// Forward-fill, without a scan that calls an interpreted lambda per element. `sums` of the
+// non-null flags gives, at each position, how many non-nulls have been seen; one less than that
+// indexes the list of their positions, so the whole answer is two gathers. A position before the
+// first non-null has nothing to take and keeps its null, which is the `j<0` fix-up.
+fills: {[x]
+  b: not isnull x
+  i: &b
+  if[0=#i; :x]
+  j: (sums `int$b)-1
+  r: x[i[0|j]]
+  k: &j<0
+  if[count k; r[k]: nullof x]
+  r}
 
 // vector utilities
 enlist: ,

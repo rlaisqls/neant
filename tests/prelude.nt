@@ -226,3 +226,18 @@ teq["within high edge"; 10 within 1 10; 1b]
 teq["within outside"; 0 within 1 10; 0b]
 teq["within vector"; 1 2 3 within 2 3; 011b]
 teq["within dates"; 2026.01.05 within 2026.01.01 2026.01.10; 1b]
+
+// fills, which is two gathers over the running count of non-nulls rather than a scan that calls a
+// lambda per element. The cases that pay for that shape: nothing to carry forward at the front, a
+// vector with no nulls at all, and one with nothing else.
+teq["fills: a gap in the middle"; fills 1 0N 3 0N 0N 6; 1 1 3 3 3 6]
+teq["fills: leading nulls stay null"; fills 0N 0N 3 0N 5; 0N 0N 3 3 5]
+teq["fills: nothing to fill"; fills 1 2 3; 1 2 3]
+teq["fills: nothing but nulls"; fills 0N 0N 0N; 0N 0N 0N]
+teq["fills: empty"; fills (); ()]
+teq["fills: one null"; fills (,0N); ,0N]
+teq["fills: one value"; fills (,5); ,5]
+teq["fills: floats"; fills 1.5 0n 3.5; 1.5 1.5 3.5]
+teq["fills: a leading float null"; fills 0n 1.5; 0n 1.5]
+teq["fills: symbols"; fills `a``b; `a`a`b]
+teq["fills: chars"; fills "a c"; "aac"]
