@@ -56,7 +56,8 @@ jdApply: {[f] jdCall[f] each jdArgs}
 // drive the method tier past its 64-call threshold with arguments that take both sides of a branch.
 // A LOOP template needs far fewer: the tracing tier takes a hot loop over partway through a single
 // call, so four is already past it, and the difference is the whole runtime of this file.
-jdWarm: {[f;k] i: 0; while[i<k; f[i-100; 100-i]; i+:1]}
+// the warm-up has to survive a body that signals — an index off the end does, on purpose
+jdWarm: {[f;k] i: 0; while[i<k; jdCall[f; (i-100; 100-i)]; i+:1]}
 
 // built together so the twin is the SAME body, not another draw from the generator
 jdPair: {[mk;depth] body: jdExpr depth; (mk body; mk jdSlow body)}

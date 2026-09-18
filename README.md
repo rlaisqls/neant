@@ -1388,6 +1388,24 @@ where there are no flags to clobber yet.
 Three wrong answers in the method tier, all in branch handling, all found in one sitting once
 something was looking. The generator is the part worth keeping.
 
+**The tracing tier, aimed at properly.** A trace is one recorded path kept behind guards, so what
+has to hold is that a guard which stops agreeing hands control back at exactly the right bytecode
+position, with every local and the whole operand stack as the interpreter would have had them. Two
+loop templates only stressed that incidentally. There are now ten more: trip counts that straddle
+the threshold, a branch that flips at a chosen iteration, three loop-carried locals, a stack that is
+not empty under the branch, a loop inside a loop, an early `:` return out of a loop, a `break`, a
+vector slot written and one read, an index that walks off the end, and `+` from `0W-7` so the result
+reaches the int null mid-loop. About 4200 bodies a run, 17 seconds.
+
+That the templates have teeth is checked rather than assumed: at 200 iterations a generated loop
+runs 9x faster than its twin after four calls, and 6x at 64, so it is being taken over. At 8 it is
+not, which is the point of straddling.
+
+**They found nothing.** Ten shapes, some 2800 generated loop bodies, no disagreement. That is
+evidence and not proof — `break` and the vector templates only run about 1.2x faster than their
+twins, so they are mostly exercising the refusal path rather than a compiled one — but after three
+wrong answers in the other tier it is worth saying plainly that this one was looked at.
+
 ### Stage 2b (started): a tracing JIT for hot loops
 
 The tier above tiers up whole *functions*, after 64 calls. That misses the shape this language is
@@ -1537,7 +1555,10 @@ There is no external oracle left, so the front end is pinned by fixpoints and by
   someone thought of, and the three wrong answers the method tier has produced were all found by
   accident. `tests/jitdiff.nt` generates about 2200 bodies a run from the compilable subset and
   requires each to agree with a twin that has `(- - n)` spliced in and therefore can never compile.
-  Fixed seed, so a failure prints the body and reproduces. See
+  Eighteen templates: whole functions for the method tier, and for the tracing tier loops with
+  guards that flip, loop-carried locals, nesting, `break`, an early return, vector slots, an index
+  off the end and arithmetic that reaches the int null. Fixed seed, so a failure prints the body and
+  reproduces. See
   ["Generated differential testing"](#generated-differential-testing). What stays in Rust is only what has to look at the host — the
   two wall-clock bounds that catch the JIT silently compiling nothing at all, the `FnCode` flag that
   says a function really was compiled, and the deopt cases that need two separate VMs so one provably
