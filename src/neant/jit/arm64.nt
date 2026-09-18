@@ -448,6 +448,16 @@ jitOpDyad: {[st;consts;a;fuse]
   kind: jitDyadKind string p
   if[isnull kind; :null]
   d: st[`depth]
+  // A FUSED comparison leaves its flags for jitOpJmpf's branch to read, so that branch cannot
+  // materialise anything itself — it would clobber them. Only the two operands are materialised
+  // below, which leaves everything UNDER them wherever it happened to be, and the path that takes
+  // the branch arrives at a target whose state has been reset to "every slot is in its canonical
+  // stack register". A slot that was still a pending constant was never stored there.
+  //
+  // That is `($[c; a; b]) + 1`: operands are pushed right first, so the `1` goes on the stack
+  // before the conditional and sits under the comparison the whole way across it. `1 + $[c; a; b]`
+  // has nothing underneath and was always right, which is how this survived.
+  if[fuse; st: jitMatAll[st; d-2]]
   xr: jitVR[st;d-1]; yr: jitVR[st;d-2]
   xc: (st[`vconst])[d-1]; yc: (st[`vconst])[d-2]
   // an immediate is available on the right of an add, a subtract or a compare, and on either
