@@ -101,6 +101,10 @@ fn join(mut x: Value, y: Value) -> R<Value> {
     }}}
     match (&x, &y) {
         (Bool(a), Bools(b)) => cat0!(*a, b, bools),   (Int(a), Ints(b)) => cat0!(*a, b, ints),
+        // a numeric atom against the other numeric vector: pack would promote these, so without
+        // them `ratios` — (first x), (1_x) % -1_x, an Int in front of a Floats — took the slow road
+        (Int(a), Floats(b)) => cat0!(*a as f64, b, floats),
+        (Float(a), Ints(b)) => { let mut v = Vec::with_capacity(b.len() + 1); v.push(*a); v.extend(b.iter().map(|&e| e as f64)); return Ok(floats(v)); }
         (Float(a), Floats(b)) => cat0!(*a, b, floats), (Char(a), Chars(b)) => cat0!(*a, b, chars),
         (Symbol(a), Syms(b)) => cat0!(a.clone(), b, syms), (Date(a), Dates(b)) => cat0!(*a, b, dates),
         (Time(a), Times(b)) => cat0!(*a, b, times),   (Byte(a), Bytes(b)) => cat0!(*a, b, bytes),
@@ -110,6 +114,10 @@ fn join(mut x: Value, y: Value) -> R<Value> {
         (Bools(a), Bools(b)) => cat2!(a, b, bools),   (Bools(a), Bool(b)) => cat1!(a, *b, bools),
         (Ints(a), Ints(b)) => cat2!(a, b, ints),      (Ints(a), Int(b)) => cat1!(a, *b, ints),
         (Floats(a), Floats(b)) => cat2!(a, b, floats), (Floats(a), Float(b)) => cat1!(a, *b, floats),
+        (Floats(a), Int(b)) => cat1!(a, *b as f64, floats),
+        (Ints(a), Float(b)) => { let mut v: Vec<f64> = a.iter().map(|&e| e as f64).collect(); v.push(*b); return Ok(floats(v)); }
+        (Ints(a), Floats(b)) => { let mut v: Vec<f64> = a.iter().map(|&e| e as f64).collect(); v.extend_from_slice(b); return Ok(floats(v)); }
+        (Floats(a), Ints(b)) => { let mut v = a.as_ref().clone(); v.extend(b.iter().map(|&e| e as f64)); return Ok(floats(v)); }
         (Chars(a), Chars(b)) => cat2!(a, b, chars),   (Chars(a), Char(b)) => cat1!(a, *b, chars),
         (Syms(a), Syms(b)) => cat2!(a, b, syms),      (Syms(a), Symbol(b)) => cat1!(a, b.clone(), syms),
         (Dates(a), Dates(b)) => cat2!(a, b, dates),   (Dates(a), Date(b)) => cat1!(a, *b, dates),

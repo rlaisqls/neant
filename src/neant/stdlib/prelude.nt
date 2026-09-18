@@ -35,7 +35,14 @@ upperc: "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
 // character, which is 26 passes over the input pretending to be one
 upper: {c: `code$x; `char$c-32*(c>96)&c<123}
 lower: {c: `code$x; `char$c+32*(c>64)&c<91}
-trim: {i: &not x in " \t\r\n"; $[#i; x[(first i)+til 1+(last i)-first i]; ""]}
+// walk in from the two ends rather than testing every character: the old form asked `in " \t\r\n"`
+// of all of them, which is four passes over the whole string to find out about its first and last
+// few, and then gathered the middle one index at a time
+trim: {[x] n: count x; i: 0
+  while[$[i<n; (x[i]) in " \t\r\n"; 0b]; i+:1]
+  j: n
+  while[$[j>i; (x[j-1]) in " \t\r\n"; 0b]; j-:1]
+  $[j>i; (j-i)#i _ x; ""]}
 // positions where p occurs in s
 // positions where p occurs in s, non-overlapping.  A one-character pattern is the common case and
 // is a single vector compare — "\n" ss on a 215KB buffer is 4ms that way against 95ms for a slice
@@ -169,7 +176,9 @@ ema: {[a;x] {[a;p;c] (a*c)+p*1-a}[a] scan x}
 
 // lists
 rotate: {[n;x] c: count x; x[(n+til c) mod c]}
-cut: {[i;x] if[`int=@i; i: i*til ceiling (count x)%i]; en: (1_i),count x; {[x;a;b] x[a+til b-a]}[x]'[i;en]}
+// a chunk is a drop then a take, both of which are slice copies; `x[a+til b-a]` built an index
+// vector per chunk and gathered through it
+cut: {[i;x] if[`int=@i; i: i*til ceiling (count x)%i]; en: (1_i),count x; {[x;a;b] (b-a)#a _ x}[x]'[i;en]}
 sublist: {[r;x] $[`int=@r; (r&count x)#x; x[r[0]+til r[1]&(count x)-r[0]]]}
 differ: {(,1b), not {x~y}'[1_x;-1_x]}
 
