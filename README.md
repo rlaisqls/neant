@@ -943,9 +943,19 @@ bnModExpL           171 ms         306 ms
 bnModExpCtL         406 ms         405 ms
 ```
 
-RSA-2048 signing goes from 18.3 ms to 28.7 ms a signature, about 1.6x.
+RSA-2048 signing goes from 18.3 ms to 31.2 ms a signature, about 1.7x.
 
-**What is still open**, and it is the same shape for all three: the base is not blinded. `bnMontMul`'s
+**The conditional subtract.** `bnMontFinL` — the last step of every Montgomery multiply, so the
+innermost thing in every exponentiation and every point addition — used to compare its result
+against the modulus limb by limb, stopping at the first pair that differed, and subtract only if it
+had to. That is Kocher's channel and Brumley and Boneh's: the one a chosen message steers. It now
+always subtracts, into scratch, and the borrow selects which result is kept. About 9%, and it lifts
+RSA-2048 signing to 31.2 ms. It is not `jitct`-checkable and cannot be — limb arithmetic is `+` and
+`-`, so the compiled code carries the int-null checks those bring, branching on a sentinel that a
+limb value never takes. Perfectly predicted is an argument, not a proof, and the checker deals only
+in emitted bytes.
+
+**What is still open**: the base is not blinded. `bnMontMul`'s
 reduction ends in a conditional subtract whose frequency depends on its operands, which is what an
 attacker choosing messages and timing the answers exploits. The fix is to sign `m * r^e` and divide
 the result by `r`, and that needs `r^-1 mod n`: a binary extended GCD wants a signed representation

@@ -17,7 +17,7 @@
 // bit count fixed by the modulus half's public width. It also blinds the exponent — dP + r(p-1),
 // which is congruent mod p-1 and so leaves the answer alone — so the pattern being walked differs
 // at every call and nothing the field arithmetic leaks can be accumulated across signatures onto
-// one fixed exponent. RSA-2048 signing goes from 18.3 ms to 28.7 ms, about 1.6x.
+// one fixed exponent. RSA-2048 signing goes from 18.3 ms to 31.2 ms, about 1.7x.
 //
 // WHAT IS STILL OPEN, and it is the reason to keep reading rather than to stop here: THE BASE IS
 // NOT BLINDED. bnMontMul's reduction ends in a conditional subtract, whose frequency depends on the

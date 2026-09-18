@@ -373,6 +373,23 @@ bnMontMulV: {[a;b;N;np]
 // the result is under 2N, so comparing and taking N off at most once settles it. All three passes
 // are in one kernel because each is n steps and a separate call, slice and allocation for each is
 // what a ten-limb field spends most of a multiply on.
+// The final "subtract N if the result is at least N", WITHOUT the branch that phrase describes.
+//
+// This used to compare out against N limb by limb and stop at the first pair that differed, then
+// subtract only if it had to. Both of those are the data deciding what the code does, and this is
+// the innermost thing in every modular exponentiation and every point addition — it is Kocher's
+// channel and Brumley and Boneh's, the one a chosen message steers.
+//
+// Now the subtraction always happens, into the scratch half of `out`, and its borrow decides which
+// of the two results is kept. `out` must therefore be (2n+2) limbs, not (n+1): the low n are the
+// answer, out[n] is the carry limb the loop above leaves, and out[n+1 ..] is the scratch.
+//
+// This does not make the function checkable with `jitct` and cannot: limb arithmetic is built out
+// of `+` and `-`, so the compiled code carries the int-null checks that come with them. Those
+// branch on a sentinel that limb values never take, so they are perfectly predicted rather than
+// data-dependent in any useful sense — but perfectly predicted is an argument, and `jitct` only
+// deals in the emitted bytes. What is removed here is the branching that genuinely did vary with
+// the data. Roughly 5%: two more passes of n limbs against the reduction's n-squared.
 bnMontFinL: {[out;t;N;n;msk;sh]
   hi: (2*n)+1
   c: 0
@@ -382,21 +399,25 @@ bnMontFinL: {[out;t;N;n;msk;sh]
     out[i-n]: x band msk
     c: x shr sh
     i: i+1]
-  r: $[0<out[n]; 1; 0]
-  j: n
-  while[(0<j) & r=0
-    j: j-1
-    x: out[j]
-    c: N[j]
-    r: $[x<c; -1; c<x; 1; 0]]
-  if[r>-1
-    c: 0
-    i: 0
-    while[i<n
-      x: ((msk+1) + c) + (out[i]) - N[i]
-      out[i]: x band msk
-      c: (x shr sh) - 1
-      i: i+1]]
+  // out - N into the scratch half, always. `c` lands at 0 when nothing was borrowed out, which is
+  // exactly when out >= N, and at -1 when it was.
+  c: 0
+  i: 0
+  while[i<n
+    x: ((msk+1) + c) + (out[i]) - N[i]
+    out[(n+1)+i]: x band msk
+    c: (x shr sh) - 1
+    i: i+1]
+  // subtract when nothing was borrowed, or when the carry limb out[n] is non-zero — out is then
+  // already 2^(n*sh) or more, which is past N whatever N is. Both without a comparison: for a limb
+  // v in [0, msk], (v + msk) shr sh is 1 exactly when v is non-zero.
+  g: (c + 1) bor ((out[n] + msk) shr sh)
+  m: 0 - g                                    // all ones when the subtraction is the one to keep
+  mn: g - 1                                   // and its complement, without writing a bare -1
+  i: 0
+  while[i<n
+    out[i]: ((out[i]) band mn) bor (out[(n+1)+i]) band m
+    i: i+1]
   out}
 bnMontMul: {[a;b;N;np]
   n: count N
@@ -404,7 +425,7 @@ bnMontMul: {[a;b;N;np]
   // so the product never needs carrying or trimming first. An uncarried limb is under 2^58.3 and
   // the reduction adds n more products to it, which still leaves it under 2^59.4.
   t: bnRedcL[bnMulL[((2*n)+1)#0; a; b; count a; count b]; N; np; n; BNM; BNB]
-  r: bnMontFinL[(n+1)#0; t; N; n; BNM; BNB]
+  r: bnMontFinL[((2*n)+2)#0; t; N; n; BNM; BNB]
   (bnTrimL[r;n])#r}
 // exponent bits most-significant-first with the leading zeros gone
 bnExpBits: {[e] k: bnBits e; $[k=0; (); reverse k # raze {(x shr til BNB) band 1} each e]}
@@ -500,7 +521,7 @@ bnWarm: {[]
     bnCmpL[1 1; 1 1; 2; 2; 2]
     bnAddL[3#0; 1 1; 1 1; 2; 2; 3; BNM; BNB]
     bnSubL[3#0; 1 1; 1 1; 2; 2; 2; BNM; BNB]
-    bnMontFinL[3#0; 5#0; 1 1; 2; BNM; BNB]
+    bnMontFinL[6#0; 5#0; 1 1; 2; BNM; BNB]
     bnTrimL[1 1; 2]
     bnAddModL[2#0; 1 1; 1 0; 1 1; 2; 2; 2; BNM; BNB]
     bnSubModL[2#0; 1 1; 1 0; 1 1; 2; 2; 2; BNM; BNB]]
