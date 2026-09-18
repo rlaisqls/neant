@@ -31,8 +31,10 @@ within: {(not x<y[0]) & not x>y[1]}
 // strings
 lowerc: "abcdefghijklmnopqrstuvwxyz"
 upperc: "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
-upper: {`char$(`code$x)-32*x in lowerc}
-lower: {`char$(`code$x)+32*x in upperc}
+// a range test on the code point, not `in lowerc`: membership scans the 26-element vector once per
+// character, which is 26 passes over the input pretending to be one
+upper: {c: `code$x; `char$c-32*(c>96)&c<123}
+lower: {c: `code$x; `char$c+32*(c>64)&c<91}
 trim: {i: &not x in " \t\r\n"; $[#i; x[(first i)+til 1+(last i)-first i]; ""]}
 // positions where p occurs in s
 // positions where p occurs in s, non-overlapping.  A one-character pattern is the common case and
