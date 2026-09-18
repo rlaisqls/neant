@@ -181,7 +181,10 @@ like: {[s;p] p: $[`char=@p; ,p; p]; s: $[`char=@s; ,s; s]
   $[0=#p; 0=#s; p[0]="*"; $[like[s;1_p]; 1b; 0=#s; 0b; like[1_s;p]]; 0=#s; 0b; (p[0]="?") | s[0]=p[0]; like[1_s;1_p]; 0b]}
 
 // bytes <-> hex text:  hex 0x0aff -> "0aff",  unhex "0aff" -> 0x0aff  (the lexer uses unhex for 0x literals)
-hex: {2_string x}
+// `string` of a ONE-element vector carries q's enlist comma (",0x36"), so dropping a fixed two
+// characters turned `hex enlist 0x36` into "x36" and `unhex hex` into 0x03 — a silent round-trip
+// corruption for any single byte.
+hex: {s: string x; $[","=s[0]; 3_s; 2_s]}
 unhex: {d: "0123456789abcdef"?lower x; n: (count x) div 2; `byte$(16*d[2*til n])+d[1+2*til n]}
 
 // ---- dates.  today[] is now`date.  `int$d is days since 2000.01.01 (a Saturday); dow is Monday=0 .. Sunday=6

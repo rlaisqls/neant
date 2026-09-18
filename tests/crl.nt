@@ -1,0 +1,61 @@
+// src/neant/crypto/crl.nt: parsing a CRL, verifying its signature, and answering whether a serial
+// is on it. The fixtures are tests/data/pki-crl-gen.sh's, which revokes a certificate that
+// pki-ed-gen.sh issued from the same CA — so "revoked" and "signed by the right key" are both real
+// rather than constructed. tests/data/live-crl.nt is the one that fetches Google's, by hand.
+tsection "crl"
+{load "src/neant/crypto/",x} each ("bignum.nt";"sha512.nt";"rsa.nt";"der.nt";"ec.nt";"p256.nt"
+  ;"p384.nt";"x509.nt";"verify.nt";"crl.nt")
+
+crlP: {[f] x509Parse (pemLoad "tests/data/",f,".pem")[0]}
+crlC: {[f] crlParse crlLoad "tests/data/",f,".pem"}
+crlNow: (2026.09.16; 12:00:00.000)
+crlRoot: crlP "pki-sha512-root"
+crlLeaf: crlP "pki-sha512-leaf"
+crlR: crlC "pki-crl-revoked"
+crlE: crlC "pki-crl-empty"
+crlS: crlC "pki-crl-stale"
+
+teq["parse: the issuer is the CA that signed it"; crlR`issuer; "CN=neant fixture sha512 root,O=neant fixtures,C=US"]
+teq["parse: the signature algorithm"; crlR`sigAlg; `rsaPkcs1Sha256]
+teq["parse: one revoked entry"; count crlR`serials; 1]
+teq["parse: and it is the leaf's serial"; crlTrim first crlR`serials; crlTrim crlLeaf`serial]
+teq["parse: an empty list has no revokedCertificates field at all"; count crlE`serials; 0]
+teq["parse: thisUpdate is a date"; type (crlR`thisUpdate)[0]; `date]
+teq["parse: nextUpdate is present"; 2=count crlR`nextUpdate; 1b]
+tok["parse: no critical extension this build cannot model"; 0=count crlR`critUnknown]
+
+teq["sig: the list verifies with the CA's key"; crlSigOk[crlR; crlRoot]; 1b]
+teq["sig: and not with somebody else's"; crlSigOk[crlR; crlP "pki-ed-root"]; 0b]
+
+teq["has: the revoked serial is on the list"; crlHas[crlR; crlLeaf`serial]; 1b]
+teq["has: a serial that is not"; crlHas[crlR; 0x0102030405]; 0b]
+teq["has: an empty list carries nothing"; crlHas[crlE; crlLeaf`serial]; 0b]
+// a serial is an arbitrary-length integer, so the comparison is on the bytes with leading zero
+// padding removed — DER may or may not carry a leading 00 to keep the value positive
+teq["has: leading zero padding does not change a serial"; crlHas[crlR; 0x00,crlLeaf`serial]; 1b]
+teq["trim: strips padding but never the whole value"; (crlTrim 0x000036; crlTrim 0x00; crlTrim 0x36); (,0x36; ,0x00; ,0x36)]
+
+crlWhyRev: crlCheck[crlR; crlLeaf; crlRoot; crlNow]
+tok["check: the revoked leaf is reported revoked"; 0<count crlWhyRev]
+teq["check: and the reason names the certificate, the serial and the list"; crlWhyRev; "crl: ",(crlLeaf`subject)," is revoked (serial ",(hex crlLeaf`serial),") by the list from ",crlR`issuer]
+teq["check: the same leaf against an empty list is not revoked"; crlCheck[crlE; crlLeaf; crlRoot; crlNow]; ""]
+
+// a stale list cannot answer: the CRL says nothing about what happened after its nextUpdate
+teq["stale: fresh at a time inside the window"; crlStale[crlR; crlNow]; 0b]
+teq["stale: expired once past nextUpdate"; crlStale[crlS; (2036.12.01; 12:00:00.000)]; 1b]
+crlWhyStale: crlCheck[crlS; crlLeaf; crlRoot; (2036.12.01; 12:00:00.000)]
+terrLike["stale: a list with no nextUpdate is never stale by this test"; {[] signal $[crlStale[`nextUpdate!enlist (); (2036.12.01; 12:00:00.000)]; "stale"; "not stale"]}; "not stale"]
+tok["stale: an expired list is refused rather than believed"; 0<count crlWhyStale]
+teq["stale: and the refusal says so"; 4#crlWhyStale; "crl:"]
+
+// an indirect CRL — one issued by anybody but the certificate's own CA — is refused, not guessed at
+crlWhyIndirect: crlCheck[crlR; crlP "pki-ed-leaf"; crlRoot; crlNow]
+tok["indirect: a list from another issuer is refused"; 0<count crlWhyIndirect]
+tok["indirect: and the refusal says which two names disagree"; 0<count crlWhyIndirect ss "an indirect CRL is not checked here"]
+
+// where to fetch one, read out of a real certificate rather than a fixture
+teq["urls: the distribution point in Google's leaf"; crlUrls (pemLoad "tests/data/chain-google.pem")[0]; enlist "http://c.pki.goog/we2/Gt0Gl6QoGAU.crl"]
+teq["urls: a certificate with no distribution point has none"; crlUrls (pemLoad "tests/data/pki-leaf.pem")[0]; ()]
+
+// PEM handling, which is crl.nt's own because x509.nt's is hardwired to CERTIFICATE markers
+terrLike["pem: a file with no CRL in it is refused by name"; {[] crlPem read0 "tests/data/pki-leaf.pem"}; "crl: no -----BEGIN X509 CRL-----"]

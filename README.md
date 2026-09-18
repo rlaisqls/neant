@@ -709,6 +709,32 @@ extension is unconstrained, per 5280, and a trust anchor is exempt: it is truste
 store, not by what it says about itself. The refusal names the OIDs the certificate does carry and
 the one it does not.
 
+**Revocation** is `src/neant/crypto/crl.nt`: parse a CRL, verify its signature with the issuing CA's
+key, and ask whether a serial is on it. OCSP is deliberately absent — Google's certificates no longer
+carry an OCSP responder at all, only a CRL distribution point, which is what settled it. Fetching is
+the *caller's*, also deliberately: `x509VerifyChain` is pure, and a verifier that reached for the
+network mid-chain would turn every verification into something that can hang and would leak which
+certificate is being checked to whoever runs the distribution point. So `crlUrls` says where the list
+lives, `src/neant/net/http.nt` fetches it, and the program composes the two and gets to decide about
+timeouts, caching and what to do when the fetch fails.
+
+```
+load "src/neant/crypto/crl.nt"
+u: first crlUrls der                      // the cRLDistributionPoints extension
+crl: crlParse (httpGet u)`body
+crlCheck[crl; leaf; issuer; (now`date; now`time)]   // "" or why it cannot answer, or that it is revoked
+```
+
+Against the real web (`tests/data/live-crl.nt`): Google's leaf names
+`http://c.pki.goog/we2/Gt0Gl6QoGAU.crl`, which is 53,504 bytes fetched in ~400ms, parses in 17ms to
+1499 revoked serials, and its ECDSA-SHA256 signature verifies against the intermediate in 34ms. A
+serial the list carries is found; the live leaf is not on it. Not implemented: delta CRLs, indirect
+CRLs (a list signed by anyone but the certificate's own CA is refused rather than guessed at),
+reason codes, and `issuingDistributionPoint` — a CRL carrying a critical extension this does not
+model is refused, on the principle `x509.nt` already applies. A stale list is refused rather than
+believed; a list with no `nextUpdate` is not treated as stale, since 5280 only says it SHOULD be
+there and refusing every list that omits it would refuse more than it protects.
+
 RSA over SHA-512 (PKCS#1 and PSS) and Ed25519 in a chain are checked as of `tests/data/pki-ed-gen.sh`'s
 fixtures. Ed25519 is the one algorithm here that names no digest: RFC 8032 signs the message and
 hashes it internally, so `verify.nt` hands `ed25519Verify` the tbs span rather than a digest of it.
@@ -718,8 +744,7 @@ on what else the program had loaded.
 
 What is still **not** checked, plainly: **P-521**, refused with the curve named, because there is no
 `p521.nt`; **ecdsaSha512**, refused for the curve-pairing reason below rather than for want of the
-hash; **SHA-1**, refused because it is broken; **revocation**, no CRL and no
-OCSP, so a certificate revoked this morning still verifies; **name constraints** and certificate
+hash; **SHA-1**, refused because it is broken; **name constraints** and certificate
 policies. There are **no client certificates and no TLS server side**. A mismatched
 ECDSA algorithm and curve — `ecdsaSha384` under a P-256 key, or the reverse — is also refused, with
 both named. Every one of those refusals names the algorithm or the curve rather than skipping the
@@ -1440,10 +1465,7 @@ the whole of the second curve. The decision that paid for that was made one chan
 measuring an optimisation and declining to write it.
 
 What is missing, then: **P-521**, another curve record and nothing else, wanted by nobody yet;
-**revocation**, which means OCSP or
-CRL fetching and so an HTTP client over TLS first — now possible, since the TLS client can reach a
-real responder; **name constraints** and **extendedKeyUsage** enforcement; client certificates; and a
-server side. Speed is a smaller open item than it was: one P-384 verification is ~38ms and one P-256
+**name constraints**; client certificates; and a server side. Speed is a smaller open item than it was: one P-384 verification is ~38ms and one P-256
 ~21.5ms against RSA-2048's ~0.50ms, an order of magnitude off each of the old numbers, and what is
 left is counted out in ["the bignum arithmetic runs as compiled scalar
 loops"](#the-bignum-arithmetic-runs-as-compiled-scalar-loops).
