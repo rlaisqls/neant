@@ -28,9 +28,10 @@
 //     x25519 is refused rather than asked to try again, which is a real interoperability limit and
 //     not a security one.
 //   * sign.nt is only PARTLY constant-time, and a server is exactly where that matters most: this
-//     signs on a machine an attacker may be able to time. The ECDSA path's scalar multiply is
-//     branch-free (ec.nt's ecCtMul), so an RSA key is the exposed case here — bnModExp branches on
-//     `d`. Read sign.nt's header before putting this anywhere real.
+//     signs on a machine an attacker may be able to time. Neither path branches on a secret now —
+//     ec.nt's ecCtMul for P-256, bignum.nt's bnModExpCtL with a blinded exponent for RSA — but
+//     neither blinds the base, which is the setting where the attacker picks the messages. Read
+//     sign.nt's header before putting this anywhere real.
 
 TLSSCHACHA: 4867                                  // TLS_CHACHA20_POLY1305_SHA256
 TLSSX25519: 29

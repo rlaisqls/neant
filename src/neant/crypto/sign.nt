@@ -11,12 +11,22 @@
 // code that touches a private key, and the header of the file it does load can go on saying it
 // holds no secrets.
 //
-// RSA SIGNING IS NOT CONSTANT-TIME, and this matters more here than anywhere else in this tree.
-// bnModExp is square-and-multiply over the exponent's bits with data-dependent branching, and for
-// rsaSignPss that exponent is `d` itself, so a local attacker who can time these operations can
-// recover the key. That is a real limit, not a caveat: sign RSA with this where the timing is not
-// observable — a test, a fixture, an offline signature — and not on a public-facing server sharing
-// a machine with an attacker. Blinding would be the fix and is not written.
+// RSA SIGNING no longer branches on the private exponent. rsaPriv used to call bnModExp, which is
+// square-and-multiply over the exponent's bits, so the time it took counted the ones in dP and dQ;
+// it now calls bnModExpCtL, which multiplies at every bit and keeps the result with a mask, over a
+// bit count fixed by the modulus half's public width. It also blinds the exponent — dP + r(p-1),
+// which is congruent mod p-1 and so leaves the answer alone — so the pattern being walked differs
+// at every call and nothing the field arithmetic leaks can be accumulated across signatures onto
+// one fixed exponent. RSA-2048 signing goes from 18.3 ms to 28.7 ms, about 1.6x.
+//
+// WHAT IS STILL OPEN, and it is the reason to keep reading rather than to stop here: THE BASE IS
+// NOT BLINDED. bnMontMul's reduction ends in a conditional subtract, whose frequency depends on the
+// operands, and an attacker who can choose messages and time the answers is exactly the Brumley-
+// Boneh setting that exploits it. The standard fix is to sign (m * r^e) and divide the result by r,
+// which needs r^-1 mod n; a binary extended GCD needs a signed representation and bignum.nt has
+// none, and Fermat per prime would mean two more full exponentiations. Neither is written. So:
+// this is no longer a key read out by timing the exponent, and it is not yet a signer to put in
+// front of an attacker who picks the messages.
 //
 // ECDSA SIGNING IS DIFFERENT, since ecdsaSign was changed to go through ec.nt's ecCtMul: the scalar
 // multiply by the nonce is double-and-add-always with masked selection, so no branch depends on k.
@@ -79,17 +89,31 @@ rsaKeyDer: {[der]
 // ---- the private operation. m^d mod n, by CRT when the key carries the primes: two exponentiations
 // over half-width moduli is about four times the work of one over the full width, and every RSA key
 // in a PEM file carries them.
+// EXPONENT BLINDING. dP + r(p-1) is congruent to dP mod p-1, so m to that power is m^dP mod p for
+// every m — including the one case the congruence does not cover, p dividing m, where both sides
+// are zero. What changes is the bit pattern the exponentiation walks, which is different at every
+// call, so whatever the field arithmetic underneath still leaks about intermediate values cannot be
+// accumulated across signatures into the one fixed exponent that matters. It costs 64 bits out of
+// roughly a thousand. It is NOT a substitute for blinding the base, which is what defeats an
+// attacker choosing messages and timing the answers; that needs a modular inverse and bignum.nt has
+// no signed representation to run a binary extended GCD in, so it is not written. See this file's
+// header.
+RSABX: 65                                                 // the bits blinding can add: 64, and a carry
+rsaBlindExp: {[eb;P] bnAdd[bnFromBytes eb; bnMul[bnFromBytes urand 8; bnSub[P; ,1]]]}
+
 rsaPriv: {[key;m]
   n: bnFromBytes key`n
   x: bnFromBytes m
   if[not (bnCmp[x;n])<0; signal "sign: the encoded message is not less than the modulus"]
   p: bnFromBytes key`p; q: bnFromBytes key`q
-  m1: bnModExp[m; key`dp; key`p]
-  m2: bnModExp[m; key`dq; key`q]
+  // bnModExpCtL and NOT bnModExp: the exponent here is the private key, and bnModExp branches on
+  // its bits. The width walked is the modulus half's, which is public, plus what blinding adds.
+  m1: bnModExpCtL[x; rsaBlindExp[key`dp; p]; p; RSABX + bnBits p]
+  m2: bnModExpCtL[x; rsaBlindExp[key`dq; q]; q; RSABX + bnBits q]
   // h = qInv * (m1 - m2) mod p, then m = m2 + q*h
-  d: bnSubMod[bnMod[bnPad[bnFromBytes m1; count p]; p]; bnMod[bnPad[bnFromBytes m2; count p]; p]; p]
+  d: bnSubMod[bnMod[bnPad[m1; count p]; p]; bnMod[bnPad[m2; count p]; p]; p]
   h: bnMod[bnMul[bnFromBytes key`qinv; d]; p]
-  r: bnAdd[bnFromBytes m2; bnMul[q; h]]
+  r: bnAdd[m2; bnMul[q; h]]
   bnBytesN[bnMod[r; n]; ceiling (key`bits) % 8]}
 
 // ---- EMSA-PKCS1-v1_5 (RFC 8017 §9.2): 00 01 FF..FF 00 DigestInfo, to exactly k octets.

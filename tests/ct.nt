@@ -120,3 +120,35 @@ teq["jitct says so about fcswap rather than pretending"
 // whether or not the branch was there and would be worth nothing. The branch was removed because a
 // branch on key bits is a branch on key bits and a branch predictor is a finer instrument than
 // `now`time`, not because the wall clock objected. ecCtMul above is the case where it did.
+
+// ---- the RSA private exponent.
+//
+// bnModExpL multiplies for a set bit and not for a clear one, so its clock counts the ones in the
+// exponent. For a verification that exponent is 65537 and public; for rsaPriv it is dP and dQ.
+tsection "ct: the RSA exponent"
+ctN: bnFromBytes 0xf0000000000000000000000000000000000000000000000000000000000000c5
+// on one line on purpose: a newline inside a `{ }` body is a statement separator, so a `~` left at
+// the start of the second line becomes the monadic one and the test compares nothing
+ctSame: {[bb;eb] a: bnModExpL[bnFromBytes bb; bnFromBytes eb; ctN]; a ~ bnModExpCtL[bnFromBytes bb; bnFromBytes eb; ctN; bnBits ctN]}
+teq["bnModExpCtL = bnModExpL, 2^3"; ctSame[0x02; 0x03]; 1b]
+teq["bnModExpCtL = bnModExpL, a zero exponent"; ctSame[0x02; 0x00]; 1b]
+teq["bnModExpCtL = bnModExpL, exponent 1"; ctSame[0x02; 0x01]; 1b]
+teq["bnModExpCtL = bnModExpL, 65537"; ctSame[0x1234567890abcdef; 0x010001]; 1b]
+teq["bnModExpCtL = bnModExpL, a wide exponent"; ctSame[0xdeadbeef; 0x7fffffffffffffffffffffffffffffff]; 1b]
+teq["bnModExpCtL = bnModExpL, a base above the modulus"; ctSame[0xff,32#0xff; 0x010001]; 1b]
+// the leading zeros are what bnExpBits throws away and this must not: they are where the top set
+// bit is, which is the one thing a fixed iteration count is there to hide
+teq["bnExpBitsN keeps the leading zeros"; bnExpBitsN[bnFromBytes 0x05; 8]; 0 0 0 0 0 1 0 1]
+teq["bnExpBitsN pads an exponent shorter than the width"; bnExpBitsN[bnFromBytes 0x00; 4]; 0 0 0 0]
+
+// and the clock, the same way ecCtMul was measured: two exponents of the same width, one set bit
+// against 255.
+ctENb: bnBits ctN
+ctELo: bnFromBytes 0x80,31#0x00
+ctEHi: bnFromBytes 0x7f,31#0xff
+ctEB: bnFromBytes 0xdeadbeefcafe
+teq["the two exponents really do differ in weight"
+  (sum bnExpBitsN[ctELo;ctENb]; sum bnExpBitsN[ctEHi;ctENb]); 1 255]
+ctRLo: ctMs[{bnModExpCtL[ctEB; ctELo; ctN; ctENb]}; 150]
+ctRHi: ctMs[{bnModExpCtL[ctEB; ctEHi; ctN; ctENb]}; 150]
+teq["bnModExpCtL does not care how many exponent bits are set"; ctRHi < 1.3 * 5 | ctRLo; 1b]

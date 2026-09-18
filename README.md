@@ -407,8 +407,8 @@ The test that matters is not this process talking to itself: `openssl s_client` 
 it, verifies the fixture chain and echoes a line back (`openssl_client_completes_our_handshake`,
 src/main.rs), so a ServerHello, a signature or a Finished got subtly wrong fails there rather than
 only in a conversation with ourselves. **`sign.nt` is only partly constant-time and a server is where
-that matters most**: the ECDSA scalar multiply is branch-free (`ecCtMul`, below), RSA signing is
-not — read its header before putting this anywhere real.
+that matters most**: nothing in it branches on a secret any more (`ecCtMul` and `bnModExpCtL`,
+below), but the base is not blinded — read its header before putting this anywhere real.
 
 ## Bytes and crypto
 
@@ -927,13 +927,37 @@ which is why `tests/ct.nt` asserts nothing about it. The branch was removed beca
 bits is a branch on key bits and a branch predictor is a much finer instrument than a millisecond
 counter — not because the wall clock objected. It costs about 15%.
 
-**What is still not constant-time**, because the claim is worth less than the exactness: the field
-layer below. `bnMontMul` trims its own result, so a value with a zero top limb makes the next
-multiply cheaper, and `bnAddModL`'s conditional subtract is a branch. The `efCt*` wrappers pad every
-operand back to the curve's full limb width, which closes the first of those inside the loop; the
-second remains, as a second-order channel on intermediate coordinates rather than a first-order one
-on the scalar's own bits. RSA is untouched: `bnModExp` still branches on its exponent, and for
-`rsaSignPss` that exponent is the private key. `sign.nt`'s header says so.
+**The RSA private exponent.** `bnModExpL` multiplies for a set bit and does nothing for a clear one.
+Where the exponent is public that is the right trade — 65537 for a verification, n-2 for a modular
+inverse — and where it is `dP` or `dQ` it is the private key, read out by a clock.
+`bnModExpCtL` (src/neant/crypto/bignum.nt) multiplies at every bit and keeps the result with a mask,
+over a bit count the caller passes rather than `bnBits` of the exponent, because stripping the
+leading zeros would announce where the top set bit is. `rsaPriv` also blinds the exponent: `dP +
+r(p-1)` is congruent mod `p-1`, so the answer is unchanged — signatures stay byte-identical, which
+is how the pinned OpenSSL-verified vectors in `tests/sign.nt` still pass — while the bit pattern
+walked differs at every call.
+
+```
+                 1 bit set    255 bits set
+bnModExpL           171 ms         306 ms
+bnModExpCtL         406 ms         405 ms
+```
+
+RSA-2048 signing goes from 18.3 ms to 28.7 ms a signature, about 1.6x.
+
+**What is still open**, and it is the same shape for all three: the base is not blinded. `bnMontMul`'s
+reduction ends in a conditional subtract whose frequency depends on its operands, which is what an
+attacker choosing messages and timing the answers exploits. The fix is to sign `m * r^e` and divide
+the result by `r`, and that needs `r^-1 mod n`: a binary extended GCD wants a signed representation
+that `bignum.nt` does not have, and Fermat per prime would cost two more full exponentiations.
+Not written. So what is closed is the first-order channel — the secret steering control flow — in
+all four places it existed, and what is open is a second-order one on intermediate values.
+
+**What is still not constant-time** in the field layer: `bnMontMul` trims its own result, so a value
+with a zero top limb makes the next multiply cheaper, and `bnAddModL`'s conditional subtract is a
+branch. The `efCt*` wrappers pad every operand back to the curve's full limb width, which closes the
+first of those inside the loop; the second remains, as a second-order channel on intermediate
+coordinates rather than a first-order one on the scalar's own bits.
 
 ## Errors
 

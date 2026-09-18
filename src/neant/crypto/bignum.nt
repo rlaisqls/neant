@@ -33,6 +33,8 @@
 // exponentiation instead of eighteen times. REDC needs an odd modulus, so bnModExp signals on an
 // even one rather than returning a wrong answer.
 
+load "src/neant/stdlib/ct.nt"    // bnModExpCtL below is built out of its masks
+
 BNB:    26                          // limb width in bits
 BNM:    67108863                    // 2^26-1, the limb mask
 BNBASE: 67108864                    // 2^26
@@ -420,6 +422,53 @@ bnModExpL: {[b;e;N]
     if[bits[i]; acc: bnMontMul[acc;x;N;np]]
     i+:1]
   bnMontMul[acc; ,1; N; np]}                              // back out of Montgomery form
+// ---- the same thing with a SECRET exponent
+//
+// bnModExpL is square-and-multiply: `if[bits[i]; acc: bnMontMul[acc;x;N;np]]` multiplies for a one
+// bit and does nothing for a zero, so how long it runs counts the ones in the exponent. Where the
+// exponent is public that is the right trade and nothing is lost — n-2 for a modular inverse, the
+// certificate's `e` for a verification, p-2 in ec.nt's efInv. Where it is `d`, `dP` or `dQ` the
+// exponent IS the private key, and the time it takes is the key being read out.
+//
+// This is square-and-multiply-always instead: the multiply happens at every bit and ct.nt's mask
+// picks whether its result or the untouched accumulator survives. Three things the branchy version
+// got away with and this cannot:
+//
+//   * THE BIT COUNT IS AN ARGUMENT, not bnBits of the exponent. bnExpBits strips leading zeros, so
+//     the number of iterations would announce where the exponent's top set bit is. The caller
+//     passes a width that is public — the modulus's, for an RSA CRT half.
+//   * EVERY VALUE IS PADDED to the modulus's limb width. bnMontMul costs `count a` times `count b`
+//     and trims what it returns, so otherwise each step's cost would depend on how many leading
+//     limbs the step before it happened to leave zero.
+//   * THE EXPONENT IS NEVER INDEXED BY ITSELF. Its limbs are expanded once into a bit vector that
+//     is walked in order, which is the same memory in the same order for every key.
+//
+// WHAT IS STILL NOT CONSTANT-TIME: bnMontMul's own reduction. bnMontFinL ends in a conditional
+// subtract, and that is a branch on a value — one that depends on the operands rather than on the
+// exponent, which is the difference between a first-order channel on the key and a second-order one
+// on intermediates. Blinding the base is the standard answer to the second and it is not written;
+// sign.nt blinds the exponent, which is cheap and needs no modular inverse, and its header says
+// what that does and does not buy.
+
+// the low `nb` bits of e, most significant first, leading zeros KEPT — which is the whole point
+bnExpBitsN: {[e;nb] reverse nb # (raze {(x shr til BNB) band 1} each e), nb#0}
+
+// base^exp mod N on limbs, walking exactly `nb` bits of the exponent. N odd and > 1.
+bnModExpCtL: {[b;e;N;nb]
+  n: count N
+  np: bnMontInv N[0]
+  r2: bnMod[((2*n)#0), 1; N]
+  x: bnPad[bnMontMul[bnMod[b;N]; r2; N; np]; n]
+  acc: bnPad[bnMontMul[,1; r2; N; np]; n]
+  bits: bnExpBitsN[e; nb]
+  i: 0
+  while[i<nb
+    acc: bnPad[bnMontMul[acc;acc;N;np]; n]
+    t: bnPad[bnMontMul[acc;x;N;np]; n]
+    acc: ctSel[ctMask bits[i]; t; acc]
+    i+:1]
+  bnMontMul[acc; ,1; N; np]}
+
 // bnModExp[base;exp;mod] -> bytes. Everything big-endian; the result is minimal (no leading zeros),
 // so a caller wanting a fixed width pads it. An even or zero modulus signals: see the header.
 bnModExp: {[bb;eb;mb]
