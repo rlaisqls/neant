@@ -242,6 +242,65 @@ jitDyadKind: {[name]
   i: ks ss name
   $[0=count i; null; first i]}
 
+// ---- `r: n#0` inside the function.
+//
+// jitClassifySlots below restricts vector slots to parameters and captures, and its header says
+// why: nothing in the compilable op subset can construct a vector, so only a slot the runtime
+// populates at entry ever holds one. A local buffer is the case that kept every byte-building loop
+// in this language interpreted — certificate parsing, base64, the formatter all start by making a
+// buffer and filling it.
+//
+// It does not need a new opcode. `n#0` is the five ops `Push(0) LoadL(p) Dyad(#) StoreL(s) Pop`,
+// and src/jit.rs can do exactly that at entry, from the length already sitting in parameter slot
+// `p`, the same way it binds a caller's vector to a parameter slot. So the run emits nothing and
+// the slot joins the vector ones.
+//
+// Every condition is about being able to say the buffer is there before anything looks at it:
+//   * the fill is the INTEGER 0, so the runtime knows what to fill with;
+//   * the length is a PARAMETER that is never assigned to — at entry the runtime has those and
+//     nothing else, and one that is reassigned would not still hold what `#` saw — or a literal,
+//     which is `r: 64#0` and just as common;
+//   * the slot is a SCRATCH LOCAL — a parameter already arrives with a value;
+//   * this is the slot's FIRST appearance, so nothing read it before it existed;
+//   * and no branch has been passed yet. The runtime allocates unconditionally, so an allocation
+//     the interpreter might SKIP is a divergence, not an optimisation: `$[c; r: n#0; 0]` followed
+//     by a read of `r` answers 0 compiled and signals interpreted.
+// Anything else is simply not an allocation as far as this is concerned, and the function compiles
+// or fails to compile exactly as it did before.
+jitVecAllocs: {[opcodes;opargs;consts;n;arity;nlocals]
+  // a slot assigned anywhere: `StoreL` and the `TakeL` of an amend. A length parameter must not be.
+  stored: ()
+  i: 0
+  while[i<n; if[((opcodes[i])=4)|((opcodes[i])=13); stored: stored,opargs[i]]; i: i+1]
+  slots: (); lens: (); at: (); seen: ()
+  branched: 0b
+  i: 0
+  while[i<n
+    op: opcodes[i]
+    if[(op=9)|(op=10)|(op=18); branched: 1b]
+    isAlloc: 0b
+    if[branched; isAlloc: 0b]
+    if[(not branched) & (op=0) & ((i+4)<n)
+      ; isAlloc: (((opcodes[i+1])=3)|((opcodes[i+1])=0)) & ((opcodes[i+2])=6) & ((opcodes[i+3])=4) & ((opcodes[i+4])=11)]
+    if[isAlloc
+      ; s: opargs[i+3]; c: consts[opargs[i]]
+        // how long: a parameter slot (>= 0), or a literal, sent as -1-length so one list carries
+        // both and src/jit.rs can tell them apart by the sign
+        byParam: (opcodes[i+1])=3
+        ln: $[byParam; opargs[i+1]; (-1)-consts[opargs[i+1]]]
+        good: `int=@c
+        if[good; good: 0=c]
+        if[good; good: (,"#") ~ string consts[opargs[i+2]]]   // `string` of a verb is a 1-element vector, not a char
+        if[good; good: $[byParam; (ln<arity) & (not ln in stored) & (not ln in seen); `int=@consts[opargs[i+1]]]]
+        if[good; if[not byParam; good: ln<0]]                 // a negative literal length is not one
+        if[good; good: (not s<arity) & (s<nlocals) & (not s in seen)]
+        if[good; slots: slots,s; lens: lens,ln; at: at,i; seen: seen,s; i: i+5]
+        if[not good; isAlloc: 0b]]
+    if[not isAlloc
+      ; if[((opcodes[i])=3)|((opcodes[i])=4)|((opcodes[i])=13); seen: seen,opargs[i]]
+        i: i+1]]
+  (`int$slots; `int$lens; `int$at)}
+
 // A local slot is `intvec`-eligible only if *every* appearance of it is one of two exact shapes:
 // `x[i]` read — `LoadL(s)` immediately consumed by `Call(1)` (`app` in compile.nt: `gen index; gen
 // x; emit call 1` — a vector applied as its own indexing function, no dedicated opcode) — or
@@ -255,10 +314,13 @@ jitDyadKind: {[name]
 // construct a fresh vector value (no arbitrary `LoadG`, no `List`), so only a param/capture is ever
 // actually populated with one at entry (`Compiled::try_run`, src/jit.rs) — a scratch local has
 // nothing valid written into its slot for this scheme to read as a pointer.
-jitClassifySlots: {[opcodes;opargs;n;arity;nlocals]
+jitClassifySlots: {[opcodes;opargs;n;arity;nlocals;allocSlots;allocAt]
   readSlots: (); writeSlots: (); intUseSlots: ()
   i: 0
   while[i<n
+    // an `r: n#0` run (jitVecAllocs) is not an appearance of anything: the runtime performs it
+    if[i in allocAt; i: i+5]
+    if[not i<n; :`int$distinct (readSlots,writeSlots) except distinct intUseSlots]
     op: opcodes[i]; a: opargs[i]
     // `&` is eager (no short-circuit): `opcodes[i+1]` can't sit alongside `(i+1)<n` in one, or it
     // reads out of range whenever the bounds check is what makes it false — same trap as
@@ -282,17 +344,19 @@ jitClassifySlots: {[opcodes;opargs;n;arity;nlocals]
   i: 0
   while[i<count vecSlots
     s: vecSlots[i]
-    if[(not s in bad) & ((s<arity)|(not s<nlocals)); cand: cand,s]
+    if[(not s in bad) & ((s<arity)|(not s<nlocals)|(s in allocSlots)); cand: cand,s]
     i: i+1]
   `int$cand}
 
 // Which of the classified slots the body actually writes (`x[i]:v`), by the same triple
 // jitClassifySlots recognises. src/jit.rs makes exactly those uniquely owned at entry, so an
 // inlined store can write straight into the elements; a read-only slot is never copied.
-jitVecWrites: {[opcodes;opargs;n;vecSlots]
+jitVecWrites: {[opcodes;opargs;n;vecSlots;allocAt]
   w: ()
   i: 0
   while[i<n
+    if[i in allocAt; i: i+5]
+    if[not i<n; :`int$distinct w]
     a: opargs[i]
     isWriteHead: $[((opcodes[i])=13) & ((i+2)<n); ((opcodes[i+1])=15) & ((opargs[i+1])=1) & ((opcodes[i+2])=4) & ((opargs[i+2])=a); 0b]
     if[isWriteHead; if[a in vecSlots; w: w,a]]
@@ -776,8 +840,17 @@ jitCompile: {[input;trampolines]
   // its primitive right now. Absent entirely (a caller that predates them, e.g. tests/x86.nt's
   // stand-in addresses) means nothing is inlinable, which is only slower.
   bitSlots: $[3<count trampolines; `int$trampolines[3]; 6#-1]
-  vecSlots: jitClassifySlots[opcodes;opargs;n;arity;nlocals]
-  vecWrites: jitVecWrites[opcodes;opargs;n;vecSlots]
+  // `r: n#0` runs the runtime performs at entry instead (jitVecAllocs). Their ops emit nothing, so
+  // everything that walks the op stream has to step over them.
+  allocs: jitVecAllocs[opcodes;opargs;consts;n;arity;nlocals]
+  allocSlots: allocs[0]; allocLens: allocs[1]; allocAt: allocs[2]
+  vecSlots: jitClassifySlots[opcodes;opargs;n;arity;nlocals;allocSlots;allocAt]
+  // a buffer the runtime made and nothing then treats as a vector is not one: drop the allocation
+  // rather than leave a slot the codegen will read as an int and the runtime will fill as a vector
+  keep: & allocSlots in vecSlots
+  allocLens: allocLens[keep]; allocAt: allocAt[keep]; allocSlots: allocSlots[keep]
+  vecSlots: jitClassifySlots[opcodes;opargs;n;arity;nlocals;allocSlots;allocAt]
+  vecWrites: jitVecWrites[opcodes;opargs;n;vecSlots;allocAt]
   lslots: jitLocalSlots[opcodes;opargs;n]
   // Register-resident or not, every slot is reached in `buf` through jitLdrImm/jitStrImm's 12-bit
   // scaled offset at least once (the prologue load below, or every access for an overflow slot).
@@ -812,6 +885,7 @@ jitCompile: {[input;trampolines]
   targets: `int$distinct targets
   ipWord: (n+1)#0   // n+1: a jump target can be the position right after the last op (e.g. a `do` loop's exit)
   ip: 0
+  while[$[ip<n; ip in allocAt; 0b]; ip: ip+5]      // a run at the very top
   while[ip<n
     if[ip in targets; st: jitMatAll[st; st[`depth]]]
     if[not isnull (st[`depthAt])[ip]
@@ -872,7 +946,8 @@ jitCompile: {[input;trampolines]
     ; st: null]
 
     if[isnull st; :null]
-    ip: ip+1]
+    ip: ip+1
+    while[$[ip<n; ip in allocAt; 0b]; ip: ip+5]]
 
   if[not isnull st[`pending]; :null]
   // The position after the last op is a jump target like any other — `$[c; a; b]` whose then-arm
@@ -933,7 +1008,7 @@ jitCompile: {[input;trampolines]
   // into that list, or -1; the global slots inlined as bit instructions). src/jit.rs reads the
   // five-element form as "this backend inlines vector access"; a two-element one still means the
   // old `*mut Value`-through-the-trampolines layout.
-  (,/jitLE each asm; vecSlots; vecWrites; $[isnull st[`retvec]; -1; vecSlots?(st[`retvec])]; `int$st[`primslots]; jitRetKind[opcodes;opargs;consts;bitSlots])}
+  (,/jitLE each asm; vecSlots; vecWrites; $[isnull st[`retvec]; -1; vecSlots?(st[`retvec])]; `int$st[`primslots]; jitRetKind[opcodes;opargs;consts;bitSlots]; (allocSlots; allocLens))}
 
 
 // ==== tracing JIT (src/trace.rs): compile one recorded loop iteration ====

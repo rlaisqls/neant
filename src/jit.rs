@@ -103,6 +103,13 @@ mod native {
         /// keeps that older behaviour, so a codegen that does not report this (x86.nt, which still
         /// returns the five-element shape) is no worse off than before.
         ret_bool: Option<bool>,
+        /// `(local slot; the parameter slot holding its length)` for every `r: n#0` the body writes
+        /// (`jitVecAllocs`, src/neant/jit/arm64.nt). The codegen emits nothing for those ops; the
+        /// buffer is made here at entry instead, which is the only way a compiled body gets a
+        /// vector it did not receive — nothing in the op subset can construct one.
+        /// The length is a parameter slot when it is >= 0, and a literal `-1 - len` when it is
+        /// negative, which is `r: 64#0`.
+        vec_allocs: Vec<(usize, i64)>,
         entry: unsafe extern "C" fn(*mut i64, *mut i64, *mut Vm) -> i64,
     }
     unsafe impl Send for Compiled {}
@@ -134,6 +141,10 @@ mod native {
     /// a plain int (see `try_run`/`try_run_raw`) — capped separately from `MAX_SLOTS` since real
     /// functions have at most a couple of vector params/captures, never dozens.
     const MAX_VEC_SLOTS: usize = 8;
+    /// The largest `r: n#0` this will make at entry. Past it the call falls back and the
+    /// interpreter allocates, which is the same answer at interpreter speed — a cap here only
+    /// decides who does the allocating, never what the program means.
+    const MAX_ALLOC: i64 = 1 << 24;
     /// `buf` is `MAX_SLOTS` local words followed by one *descriptor* word per vector slot — its
     /// element count, at `buf[MAX_SLOTS + k]` for the k'th entry of `vec_slots`. That is the whole
     /// of what an inlined `x[i]` needs beyond the data pointer already in the slot's own word: a
@@ -209,6 +220,16 @@ mod native {
                         match v { Value::Int(n) if *n != crate::value::NI => buf[i] = *n, _ => return None }
                     }
                 }
+            }
+            // `r: n#0`: the codegen emitted nothing for it, so the buffer is made here, from the
+            // length the parameter slot is already holding. A length that is negative or absurd
+            // falls back rather than allocating — the interpreter will do whatever it does.
+            for &(slot, how) in &self.vec_allocs {
+                let len = if how >= 0 { buf[how as usize] } else { -1 - how };
+                if !(0..=MAX_ALLOC).contains(&len) { return None; }
+                let k = self.vec_slots.iter().position(|&s| s == slot)?;
+                vecbuf[k] = crate::value::ints(vec![0i64; len as usize]);
+                buf[slot] = self.bind_vec(&mut vecbuf[k], slot, &mut buf[MAX_SLOTS + k]);
             }
             let out = self.run(buf.as_mut_ptr(), vm)?;
             // A vector-returning body's x0 is a placeholder: the answer is the (now filled in)
@@ -318,6 +339,10 @@ mod native {
             // A vector-returning callee has nothing to hand back through this path, whose whole
             // point is that a result is a plain int in a register: that call deopts instead.
             if self.ret_vec.is_some() { return None; }
+            // a body that makes its own buffer deopts on this path rather than being given one: the
+            // compiled-to-compiled call exists to keep a result in a register, and a caller that
+            // wants this callee's buffer filled is not that
+            if !self.vec_allocs.is_empty() { return None; }
             if !self.prims_intact(vm) { return None; }
             let mut buf = [0i64; BUFLEN];
             let mut vecbuf: [Value; MAX_VEC_SLOTS] = std::array::from_fn(|_| Value::Null);
@@ -470,11 +495,11 @@ mod native {
         let ints_of = |v: &Value| -> Option<Vec<usize>> {
             match v { Value::Ints(v) => Some(v.iter().map(|&n| n as usize).collect()), _ => None }
         };
-        let (bytes, vec_slots, vec_writes, ret_vec, prim_slots, inline_vec, ret_bool) = match result {
-            Ok(Value::List(items)) if matches!(items.len(), 2 | 5 | 6) => {
+        let (bytes, vec_slots, vec_writes, ret_vec, prim_slots, inline_vec, ret_bool, vec_allocs) = match result {
+            Ok(Value::List(items)) if matches!(items.len(), 2 | 5 | 6 | 7) => {
                 let bytes = match &items[0] { Value::Bytes(b) => b.clone(), _ => return None };
                 let vec_slots = ints_of(&items[1])?;
-                if items.len() == 2 { (bytes, vec_slots, Vec::new(), None, Vec::new(), false, None) } else {
+                if items.len() == 2 { (bytes, vec_slots, Vec::new(), None, Vec::new(), false, None, Vec::new()) } else {
                     let vec_writes = ints_of(&items[2])?;
                     let ret_vec = match &items[3] { Value::Int(n) if *n >= 0 => Some(*n as usize), Value::Int(_) => None, _ => return None };
                     if ret_vec.is_some_and(|k| k >= vec_slots.len()) { return None; }
@@ -484,7 +509,22 @@ mod native {
                     let ret_bool = match items.get(5) {
                         Some(Value::Int(1)) => Some(true), Some(Value::Int(0)) => Some(false), _ => None,
                     };
-                    (bytes, vec_slots, vec_writes, ret_vec, prim_slots, true, ret_bool)
+                    // the seventh element is jitVecAllocs' two parallel lists; a codegen that does
+                    // not send one allocates nothing, which is what every one of them did before
+                    let mut vec_allocs: Vec<(usize, i64)> = Vec::new();
+                    if let Some(Value::List(two)) = items.get(6) {
+                        if two.len() != 2 { return None; }
+                        let sl = ints_of(&two[0])?;
+                        let Value::Ints(ln) = &two[1] else { return None };
+                        if sl.len() != ln.len() { return None; }
+                        for (&a, &b) in sl.iter().zip(ln.iter()) {
+                            // a length that is itself a vector slot would hand us a pointer
+                            if !vec_slots.contains(&a) { return None; }
+                            if b >= 0 && vec_slots.contains(&(b as usize)) { return None; }
+                            vec_allocs.push((a, b));
+                        }
+                    }
+                    (bytes, vec_slots, vec_writes, ret_vec, prim_slots, true, ret_bool, vec_allocs)
                 }
             }
             _ => return None, // Null (not compilable) or a runtime error in the codegen itself
@@ -496,12 +536,13 @@ mod native {
             let want = bit_now.iter().find(|&&(s, _)| s == slot as i64)?.1;
             prim_guards.push((slot, want));
         }
-        emit(&bytes, code.params.len(), code.nlocals, vec_slots, vec_writes, ret_vec, prim_guards, inline_vec, ret_bool)
+        emit(&bytes, code.params.len(), code.nlocals, vec_slots, vec_writes, ret_vec, prim_guards, inline_vec, ret_bool, vec_allocs)
     }
 
     #[allow(clippy::too_many_arguments)]
     fn emit(bytes: &[u8], arity: usize, nlocals: usize, vec_slots: Vec<usize>, vec_writes: Vec<usize>,
-            ret_vec: Option<usize>, prim_guards: Vec<(usize, i64)>, inline_vec: bool, ret_bool: Option<bool>) -> Option<super::Compiled> {
+            ret_vec: Option<usize>, prim_guards: Vec<(usize, i64)>, inline_vec: bool, ret_bool: Option<bool>,
+            vec_allocs: Vec<(usize, i64)>) -> Option<super::Compiled> {
         if vec_slots.len() > MAX_VEC_SLOTS { return None; }
         let page = 4096usize;
         let len = bytes.len().div_ceil(page) * page;
@@ -519,7 +560,7 @@ mod native {
             #[cfg(target_arch = "aarch64")]
             __clear_cache(mem as *mut std::ffi::c_char, (mem as *mut u8).add(len) as *mut std::ffi::c_char);
             let entry: unsafe extern "C" fn(*mut i64, *mut i64, *mut Vm) -> i64 = std::mem::transmute(mem);
-            Some(super::Compiled { mem: mem as *mut u8, len, arity, nlocals, vec_slots, vec_writes, ret_vec, prim_guards, inline_vec, ret_bool, entry })
+            Some(super::Compiled { mem: mem as *mut u8, len, arity, nlocals, vec_slots, vec_writes, ret_vec, prim_guards, inline_vec, ret_bool, vec_allocs, entry })
         }
     }
 

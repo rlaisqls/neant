@@ -445,3 +445,38 @@ jcSame["two of them in a row";           {[x;y] ((($[x>y; 8; 16]) + 1) + y)}; 1;
 jcSame["a nested conditional consumed";  {[x;y] (($[x>x; y; 11]) shr 7)}; 0; 0]
 jcSame["both, nested";  {[x;y] ($[x>y; (($[x>x; y; 11]) shr 7); (($[x>x; y; 11]) shr 7)])}; 0; 0]
 jcSame["two conditionals joined";        {[x;y] (($[x>y; 1; 2]) + ($[x<y; 4; 8]))}; 0; 0]
+
+// ---- a buffer the function makes for itself.
+//
+// A compiled body cannot construct a vector — nothing in the op subset builds one — so a vector
+// slot could only ever be a parameter or a capture, which the runtime fills at entry. `r: n#0` is
+// the case that left out, and it is how anyone writes a loop that fills a buffer. It does not need
+// a new opcode: the five ops `Push(0) LoadL(n) Dyad(#) StoreL(r) Pop` emit nothing and src/jit.rs
+// makes the buffer at entry from the length, exactly as it binds a caller's vector to a parameter.
+//
+// The conditions are all about the buffer being there before anything looks at it, and the one that
+// is a correctness trap rather than a convenience is the last: the runtime allocates
+// unconditionally, so an allocation the interpreter might SKIP would be a divergence.
+tsection "jit: a buffer the function makes"
+jlSame: {[nm;f;a] c: f a; i: 0; while[i<300; f a; i+:1]; teq["compiled = interpreted: ",nm; f a; c]}
+jlFill: {[n] r: n#0; i: 0; while[i<n; r[i]: (i*2); i: i+1]; r}
+jlSame["a parameter length";        jlFill; 6]
+jlSame["length zero";               jlFill; 0]
+jlSame["length one";                jlFill; 1]
+jlLit: {[n] r: 8#0; i: 0; while[i<8; r[i]: (i*2); i: i+1]; r}
+jlSame["a literal length";          jlLit; 0]
+jlInt: {[n] r: n#0; i: 0; while[i<n; r[i]: (i*2); i: i+1]; (r[0])}
+jlSame["returning an int instead";  jlInt; 6]
+jlTwo: {[n] a2: n#0; b2: n#0; i: 0; while[i<n; a2[i]: i; b2[i]: (i*3); i: i+1]; (a2[n-1] badd b2[n-1])}
+jlSame["two buffers";               jlTwo; 6]
+jlRead: {[n] r: n#0; i: 0; while[i<n; r[i]: ((r[i]) badd i); i: i+1]; r}
+jlSame["read back what was written"; jlRead; 6]
+// the length reassigned after the fact: the allocation used the value at entry, and so must the answer
+jlReassign: {[n] r: n#0; i: 0; while[i<n; r[i]: i; i: i+1]; n: 99; (r[0] badd n)}
+jlSame["the length reassigned later"; jlReassign; 6]
+// an allocation the interpreter might not reach at all
+jlCond: {[n] $[n>0; r: n#0; 0]; (r[0])}
+teq["an allocation inside a branch, taken"; jlCond 3; 0]
+teq["and the same once hot"; {[f;k] i: 0; while[i<k; f 3; i+:1]; f 3}[jlCond; 300]; 0]
+// big enough to be past anything a buffer is normally
+jlSame["a large buffer";            jlFill; 20000]

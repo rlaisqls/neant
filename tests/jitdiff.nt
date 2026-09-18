@@ -50,6 +50,7 @@ jdSlow: {[s]
 // x and y at both ends of the range, around zero, and where a multiply overflows
 jdArgs: ((0;0);(1;2);(5;3);(3;5);(0-7;4);(4;0-7);(1;0);(0;1);(1000000;7);(123456789;987654321))
 // `@[h; v; handler]` hands h the whole of v as ONE argument, so h takes the pair and splits it
+// `@[h; v; handler]` hands h the whole of v as ONE argument, so h takes the pair and splits it
 jdCall:  {[f;a] @[{[p] (p 0)[(p 1) 0; (p 1) 1]}; (f;a); {"'",x}]}
 jdApply: {[f] jdCall[f] each jdArgs}
 
@@ -132,6 +133,14 @@ jdRun["an early return out of a loop"; jdRetLoop; 2; 250; 4]
 jdBreakT: {[n;k;b] "{[x;y] s: 0; i: 0; while[i<",(string n),"; s: (s badd ",b,"); if[i>",(string k),"; break]; x: (x+1); i: i+1]; s}"}
 jdBreak: {n: jdN[]; jdBreakT[n; rand[1+n]]}
 jdRun["a break out of a loop"; jdBreak; 2; 250; 4]
+
+// a buffer the function makes for itself and returns, which is what jitVecAllocs added: the whole
+// loop compiles, so these bodies are checked against an interpreter that really is one. The length
+// is a literal and not a parameter on purpose — jdArgs reaches 123456789, and a generated body
+// asking for a vector that long would be the twin allocating a gigabyte, not a test.
+jdBufT: {[n;b] "{[x;y] r: ",(string n),"#0; i: 0; while[i<",(string n),"; r[i]: ",b,"; x: (x+1); i: i+1]; r}"}
+jdBuf: {jdBufT[jdN[]]}
+jdRun["a buffer the function makes"; jdBuf; 2; 250; 4]
 
 // a vector slot written and read in the loop, which is its own mechanism in the codegen
 jdVecT: {[n;b] "{[x;y] r: ",(string n),"#0; i: 0; while[i<",(string n),"; r[i]: ",b,"; x: (x+1); i: i+1]; (sum r)}"}

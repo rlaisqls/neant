@@ -483,7 +483,9 @@ jitCompileX86: {[input;trampolines]
   opcodes: input[0]; opargs: input[1]; consts: input[2]; arity: input[3]; nlocals: input[4]
   n: count opcodes
   callAddr: trampolines[0]; vecgetAddr: trampolines[1]; vecsetAddr: trampolines[2]
-  vecSlots: jitClassifySlots[opcodes;opargs;n;arity;nlocals]
+  // This backend has no `r: n#0` allocation support (see jitVecAllocs in arm64.nt), so it passes
+  // empty lists and classifies exactly what it always did.
+  vecSlots: jitClassifySlots[opcodes;opargs;n;arity;nlocals;`int$();`int$()]
   lslots: jitLocalSlots[opcodes;opargs;n]
   // Same bound arm64.nt checks: a slot is reached in `buf` at a fixed displacement at least once
   // (the prologue load, or every access for an overflow slot). disp32 could reach far further
