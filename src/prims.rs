@@ -77,17 +77,94 @@ fn join(mut x: Value, y: Value) -> R<Value> {
     // or index error. Nothing legitimate joins onto a function, so it is an error here instead.
     if x.is_fn() { return err("type: , has a function on its left — `f ,x` parses as `f , x`, so write `f (,x)`"); }
     if try_append(&mut x, &y) { return Ok(x); }
+    // try_append only works when the left side's Arc is uniquely owned. When it is not — `a,a`, or
+    // anything still held by a variable — the fallback used to box both sides into Vec<Value> and
+    // let pack work out the type again. Two slice copies instead.
+    macro_rules! cat2 { ($a:expr, $b:expr, $ctor:ident) => {{
+        let mut v = Vec::with_capacity($a.len() + $b.len());
+        v.extend_from_slice($a); v.extend_from_slice($b);
+        return Ok($ctor(v));
+    }}}
+    macro_rules! cat1 { ($a:expr, $b:expr, $ctor:ident) => {{
+        let mut v = Vec::with_capacity($a.len() + 1);
+        v.extend_from_slice($a); v.push($b);
+        return Ok($ctor(v));
+    }}}
+    match (&x, &y) {
+        (Bools(a), Bools(b)) => cat2!(a, b, bools),   (Bools(a), Bool(b)) => cat1!(a, *b, bools),
+        (Ints(a), Ints(b)) => cat2!(a, b, ints),      (Ints(a), Int(b)) => cat1!(a, *b, ints),
+        (Floats(a), Floats(b)) => cat2!(a, b, floats), (Floats(a), Float(b)) => cat1!(a, *b, floats),
+        (Chars(a), Chars(b)) => cat2!(a, b, chars),   (Chars(a), Char(b)) => cat1!(a, *b, chars),
+        (Syms(a), Syms(b)) => cat2!(a, b, syms),      (Syms(a), Symbol(b)) => cat1!(a, b.clone(), syms),
+        (Dates(a), Dates(b)) => cat2!(a, b, dates),   (Dates(a), Date(b)) => cat1!(a, *b, dates),
+        (Times(a), Times(b)) => cat2!(a, b, times),   (Times(a), Time(b)) => cat1!(a, *b, times),
+        (Bytes(a), Bytes(b)) => cat2!(a, b, bytes),   (Bytes(a), Byte(b)) => cat1!(a, *b, bytes),
+        _ => {}
+    }
     let mut a = x.seq(); a.extend(y.seq()); Ok(pack(a))
 }
-fn take(n: Value, x: Value) -> R<Value> {
-    let n = int_of(&n)?; let s = x.seq(); let len = s.len() as i64;
-    if n == 0 { return Ok(pack(vec![])); }   // 0 from anything, even empty, is just empty — no cycling needed
-    if len == 0 { return err("take from empty"); }
-    let idx: Vec<i64> = if n >= 0 { (0..n).map(|i| i % len).collect() } else { (n..0).map(|i| (len + i) % len).collect() };
-    Ok(pack(idx.into_iter().map(|i| s[i as usize].clone()).collect()))
+
+/// The element order `n # x` wants: the first n cycling round from the front, or — for a negative n
+/// — the last |n|, cycling round from the back. Whole-slice copies, never one index at a time.
+fn cyc<T: Clone>(s: &[T], n: i64) -> Vec<T> {
+    let ln = s.len();
+    let cnt = n.unsigned_abs() as usize;
+    let start = if n >= 0 { 0 } else { (ln - cnt % ln) % ln };   // where the window opens
+    let mut out = Vec::with_capacity(cnt);
+    if start != 0 { out.extend_from_slice(&s[start..start + (ln - start).min(cnt)]); }
+    while out.len() + ln <= cnt { out.extend_from_slice(s); }
+    let rest = cnt - out.len();
+    out.extend_from_slice(&s[..rest]);
+    out
 }
+
+/// `n # x`. A typed vector stays typed and the copy is a memcpy. This used to call `seq`, which
+/// boxes every element into a Value, then build an index vector with an integer division per
+/// element, then box again and let `pack` work out the type a third time — about 25x the cost, and
+/// for a negative n larger than the length it indexed with a wrapped-around usize and panicked.
+fn take(n: Value, x: Value) -> R<Value> {
+    let n = int_of(&n)?;
+    if n == 0 { return Ok(pack(vec![])); }   // 0 from anything, even empty, is just empty — no cycling needed
+    // `n # atom` is a fill, and it is how every buffer in this tree is made — bnPad, the limb
+    // kernels' scratch, every `k#0x00`. Cycling a one-element list through Value would box the atom,
+    // clone it n times and let pack re-derive the type; `vec![b; n]` is a memset.
+    macro_rules! rep { ($b:expr, $ctor:ident) => { return Ok($ctor(vec![$b; n.unsigned_abs() as usize])) } }
+    match &x {
+        Bool(b) => rep!(*b, bools),     Int(i) => rep!(*i, ints),   Float(f) => rep!(*f, floats),
+        Char(c) => rep!(*c, chars),     Symbol(y) => rep!(y.clone(), syms), Date(d) => rep!(*d, dates),
+        Time(t) => rep!(*t, times),     Byte(b) => rep!(*b, bytes),
+        _ => {}
+    }
+    macro_rules! tk { ($v:expr, $ctor:ident) => {{
+        if $v.is_empty() { return err("take from empty"); }
+        return Ok($ctor(cyc($v, n)));
+    }}}
+    match &x {
+        Bools(v) => tk!(v, bools), Ints(v) => tk!(v, ints),   Floats(v) => tk!(v, floats),
+        Chars(v) => tk!(v, chars), Syms(v) => tk!(v, syms),   Dates(v) => tk!(v, dates),
+        Times(v) => tk!(v, times), Bytes(v) => tk!(v, bytes), List(v) => tk!(v, list),
+        _ => {}
+    }
+    let s = x.seq();
+    if s.is_empty() { return err("take from empty"); }
+    Ok(pack(cyc(&s, n)))
+}
+
+/// `n _ x`, the same way: a slice of the typed vector rather than a round trip through Value.
 fn drop(n: Value, x: Value) -> R<Value> {
-    let n = int_of(&n)?; let s = x.seq(); let len = s.len() as i64;
+    let n = int_of(&n)?;
+    macro_rules! dr { ($v:expr, $ctor:ident) => {{
+        let len = $v.len() as i64;
+        let (a, b) = if n >= 0 { (n.min(len), len) } else { (0, (len + n).max(0)) };
+        return Ok($ctor($v[a as usize..b as usize].to_vec()));
+    }}}
+    match &x {
+        Bools(v) => dr!(v, bools), Ints(v) => dr!(v, ints),   Floats(v) => dr!(v, floats),
+        Chars(v) => dr!(v, chars), Syms(v) => dr!(v, syms),   Dates(v) => dr!(v, dates),
+        Times(v) => dr!(v, times), Bytes(v) => dr!(v, bytes), List(v) => dr!(v, list),
+        _ => {}
+    }
+    let s = x.seq(); let len = s.len() as i64;
     let (a, b) = if n >= 0 { (n.min(len), len) } else { (0, (len + n).max(0)) };
     Ok(pack(s[a as usize..b as usize].to_vec()))
 }
