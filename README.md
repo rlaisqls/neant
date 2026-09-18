@@ -396,7 +396,9 @@ CertificateVerify **signed** rather than checked, which is what `src/neant/crypt
 
 The scope is narrow and deliberate: one cipher suite (`TLS_CHACHA20_POLY1305_SHA256`, because
 `crypto.nt` has ChaCha20 and Poly1305 and no AES), one group (x25519), one signature scheme
-(`rsa_pss_rsae_sha256`, so the server's key must be RSA). No client certificates — it never sends a
+(`rsa_pss_rsae_sha256` for an RSA key, `ecdsa_secp256r1_sha256` for a P-256 one — the server signs
+with whichever kind of key it was handed, and a key on any other curve is refused with the curve
+named). No client certificates — it never sends a
 CertificateRequest, so whoever connects is anonymous. No resumption, no early data, no
 HelloRetryRequest: a client whose key_share is not x25519 is refused rather than asked to try again.
 Each of those refusals names what was missing.
@@ -792,10 +794,23 @@ sig: rsaSignPkcs1[k; `sha256; sha256 msg]    // the deterministic v1.5 form
 ```
 
 RSASSA-PSS and PKCS#1 v1.5, over any hash `rsa.nt`'s table knows, ~19ms for a 2048-bit key by CRT.
-The oracle is OpenSSL: every pinned signature in `tests/sign.nt` was produced by this code and then
-checked with `openssl dgst -verify`, so the test freezes that agreement without needing openssl to
-run. **It is not constant-time** — `bnModExp` branches on the exponent's bits — so this signs where
-the timing is not observable, and blinding is not written.
+**ECDSA** on P-256 is there too, with the nonce from **RFC 6979** rather than from a random source:
+
+```
+k: ecKeyLoad "ec-key.pem"
+sig: ecdsaSignDer[P256C; k`d; sha256 msg]     // the DER SEQUENCE { r, s } TLS and X.509 carry
+```
+
+ECDSA's nonce is not a salt. If it repeats across two signatures, or is biased, or leaks a few bits,
+the private key falls out by algebra — that has taken real keys, from the PS3 to Bitcoin wallets.
+Deriving it from the key and the message with HMAC-DRBG removes the random source as a failure mode
+entirely, and it makes the standard's own test vectors pin the implementation: `tests/sign.nt`
+checks RFC 6979 A.2.5's **k, r and s**, not just that a signature verifies.
+
+The oracle is OpenSSL: every pinned signature in `tests/sign.nt`, RSA and ECDSA alike, was produced
+by this code and then checked with `openssl dgst -verify`, so the test freezes that agreement without
+needing openssl to run. **It is not constant-time** — `bnModExp` branches on the exponent's bits — so
+this signs where the timing is not observable, and blinding is not written.
 
 RSA over SHA-512 (PKCS#1 and PSS) and Ed25519 in a chain are checked as of `tests/data/pki-ed-gen.sh`'s
 fixtures. Ed25519 is the one algorithm here that names no digest: RFC 8032 signs the message and
@@ -807,7 +822,8 @@ on what else the program had loaded.
 What is still **not** checked, plainly: **P-521**, refused with the curve named, because there is no
 `p521.nt`; **ecdsaSha512**, refused for the curve-pairing reason below rather than for want of the
 hash; **SHA-1**, refused because it is broken; **name constraints** and certificate
-policies. There are **no client certificates and no TLS server side**. A mismatched
+policies. There are **no client certificates**: the server side (below) never sends a
+CertificateRequest, so whoever connects to it is anonymous. A mismatched
 ECDSA algorithm and curve — `ecdsaSha384` under a P-256 key, or the reverse — is also refused, with
 both named. Every one of those refusals names the algorithm or the curve rather than skipping the
 check. This is a verifier written from scratch to be read, not a substitute for a reviewed TLS
@@ -1527,7 +1543,7 @@ the whole of the second curve. The decision that paid for that was made one chan
 measuring an optimisation and declining to write it.
 
 What is missing, then: **P-521**, another curve record and nothing else, wanted by nobody yet;
-**name constraints**; client certificates; and a server side. Speed is a smaller open item than it was: one P-384 verification is ~38ms and one P-256
+**name constraints**; and client certificates. Speed is a smaller open item than it was: one P-384 verification is ~38ms and one P-256
 ~21.5ms against RSA-2048's ~0.50ms, an order of magnitude off each of the old numbers, and what is
 left is counted out in ["the bignum arithmetic runs as compiled scalar
 loops"](#the-bignum-arithmetic-runs-as-compiled-scalar-loops).

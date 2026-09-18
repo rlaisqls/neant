@@ -71,3 +71,21 @@ teq["https: a request over TLS"; `char$(httpExchange[tssHC; tssU; "GET"; "/hello
 teq["https: and a second on the same connection"; `char$(httpExchange[tssHC; tssU; "GET"; "/again"; ()!(); ""])`body; "you asked for /again"]
 (tssHC 2)[]
 teq["https: the server loop ended with the connection"; join tssS; 1]
+
+// ---- the same server on an EC key: the scheme it signs with follows the key it was given
+tssEcCerts: pemLoad "tests/data/pki-ec-leaf.pem"
+tssEcKey: ecKeyLoad "tests/data/pki-ec-leaf.key"
+tssEcRoots: x509LoadRoots "tests/data/pki-ec-root.pem"
+tssEcOpts: `roots`now!(tssEcRoots; (2026.09.16; 12:00:00.000))
+teq["the scheme follows the key: RSA"; tlssScheme tssKey; 2052]
+teq["and EC"; tlssScheme tssEcKey; 1027]
+terrLike["a key on a curve this server cannot sign on is refused by name"; {[] tlssScheme `d`oid`pub!(32#0x01; "1.3.132.0.34"; 0x)}; "tls: this server signs on P-256 only, and the key names the curve 1.3.132.0.34"]
+
+tssEcA: tssNext[]
+tssEcL: hlisten tssEcA
+tssEcS: spawn {c: accept tssEcL; h: tlsAccept[c; tssEcCerts; tssEcKey]; m: tlsRecv h; tlsSend[h; (`byte$"ec:"),m]; tlsClose h; hclose tssEcL; `char$m}
+tssEcC: tlsConnectOpts["127.0.0.1"; `int$last ":" vs tssEcA; tssEcOpts]
+tlsSend[tssEcC; "hello"]
+teq["an EC certificate is served and the chain verifies"; `char$tlsRecv tssEcC; "ec:hello"]
+tlsClose tssEcC
+teq["and the server read what was sent"; join tssEcS; "hello"]

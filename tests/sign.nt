@@ -46,3 +46,29 @@ signPinPK512: "1ffa9cb4a38de2550ee114f70caf889503018472cad80052bbf013010671a1029
 teq["pinned: PKCS#1 SHA-256 is byte for byte what OpenSSL verified"; hex rsaSignPkcs1[signK; `sha256; signD256]; signPinPK256]
 teq["pinned: PSS SHA-256 with a 0xa5 salt likewise"; hex rsaSignPssSalt[signK; `sha256; signD256; 32#0xa5]; signPinPSS256]
 teq["pinned: PKCS#1 SHA-512 likewise"; hex rsaSignPkcs1[signK; `sha512; signD512]; signPinPK512]
+
+// ---- ECDSA with RFC 6979's deterministic nonce. The vectors are the RFC's own (A.2.5: P-256,
+// SHA-256, the message "sample"), which is the point of being deterministic: the standard pins
+// every intermediate, so k itself is checked and not only the signature it produces.
+{load "src/neant/crypto/",x} each ("ec.nt";"p256.nt")
+signEcX: unhex "C9AFA9D845BA75166B5C215767B1D6934E50C3DB36E89B127B8A622B120F6721"
+signEcDg: sha256 `byte$"sample"
+teq["rfc6979: k for P-256/SHA-256 over \"sample\""; upper hex ecNonce[P256C; signEcX; signEcDg]; "A6E3C57DD01ABE90086538398355DD4C3B17AA873382B0F24D6129493D8AAD60"]
+signEcRS: ecdsaSign[P256C; signEcX; signEcDg]
+teq["rfc6979: r"; upper hex signEcRS 0; "EFD48B2AACB6A8FD1140DD9CD45E81D69D2C877B56AAF991C34D0EA84EAF3716"]
+teq["rfc6979: s"; upper hex signEcRS 1; "F7CB1C942D657C41D436C7A1B6E29F65F3E900DBB9AFF4064DC4AB2F843ACDA8"]
+teq["rfc6979: signing the same message twice gives the same bytes"; (ecdsaSign[P256C; signEcX; signEcDg]) ~ signEcRS; 1b]
+
+// the fixture EC key, round-tripped through this build's own verifier. The DER signature below was
+// also checked with `openssl dgst -sha256 -verify` -> Verified OK.
+signEcK: ecKeyLoad "tests/data/pki-ec-leaf.key"
+signEcC: x509Parse (pemLoad "tests/data/pki-ec-leaf.pem")[0]
+teq["ec key: the curve is named"; signEcK`oid; "1.2.840.10045.3.1.7"]
+teq["ec key: the scalar is 32 bytes"; count signEcK`d; 32]
+signEcMsg: sha256 `byte$"hello, neant"
+signEcSig: ecdsaSignDer[P256C; signEcK`d; signEcMsg]
+teq["ecdsa: the signature verifies against the certificate's key"; ecdsaVerifyP256Der[(signEcC`spki)`point; signEcMsg; signEcSig]; 1b]
+teq["ecdsa: and not over another message"; ecdsaVerifyP256Der[(signEcC`spki)`point; sha256 `byte$"goodbye"; signEcSig]; 0b]
+teq["ecdsa: openssl verified exactly these bytes"; hex signEcSig; "304502200be5dbe9beeddb85114a43649509fee8354f0f14fab2c9002d5a29b0d209b798022100e8e987125fd2fd16d040e178acbdb42b16c9f165e7b4187bda0c803cf40e8d40"]
+terrLike["ecdsa: a digest of the wrong width is refused"; {[] ecdsaSign[P256C; signEcK`d; 48#0x00]}; "sign: the digest is not this curve's hash width"]
+terrLike["ecdsa: a scalar of zero is refused"; {[] ecdsaSign[P256C; 32#0x00; signEcMsg]}; "sign: the private scalar is zero"]

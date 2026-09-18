@@ -19,7 +19,9 @@
 // SCOPE, and it is narrow on purpose:
 //   * one cipher suite, TLS_CHACHA20_POLY1305_SHA256 (0x1303), because crypto.nt has ChaCha20 and
 //     Poly1305 and no AES. A ClientHello that does not offer it is refused by name.
-//   * one group, x25519. One signature scheme, rsa_pss_rsae_sha256 — the server's key must be RSA.
+//   * one group, x25519. Two signature schemes, chosen by what kind of key you hand it:
+//     rsa_pss_rsae_sha256 for an RSA key, ecdsa_secp256r1_sha256 for a P-256 one — which is what
+//     the public web actually serves. A key on any other curve is refused with the curve named.
 //   * NO client certificates: this never sends a CertificateRequest, so it never authenticates the
 //     peer. Whoever connects is anonymous, exactly as a public web server's clients are.
 //   * no session resumption, no early data, no HelloRetryRequest. A client whose key_share is not
@@ -32,6 +34,8 @@
 TLSSCHACHA: 4867                                  // TLS_CHACHA20_POLY1305_SHA256
 TLSSX25519: 29
 TLSSPSS256: 2052                                  // rsa_pss_rsae_sha256
+TLSSECP256: 1027                                  // ecdsa_secp256r1_sha256
+TLSSP256OID: "1.2.840.10045.3.1.7"
 TLSSCVCTX: (64#0x20), (`byte$"TLS 1.3, server CertificateVerify"), 0x00
 
 // ---- ClientHello, taken apart. The body is
@@ -68,7 +72,17 @@ tlssClientShare: {[ch]
     i: i+4+n]
   signal "tls: the client offered no x25519 key_share, and this server has no other group"}
 
-tlssCheck: {[ch]
+// which scheme this server's key signs with, refusing a key it cannot use BY NAME rather than
+// discovering it halfway through a handshake
+tlssScheme: {[pk]
+  if[`n in key pk; :TLSSPSS256]
+  if[not `d in key pk; signal "tls: the key is neither an RSA nor an EC private key"]
+  if[not (pk`oid) ~ TLSSP256OID
+    signal "tls: this server signs on P-256 only, and the key names the curve ",$[0=count pk`oid; "(none)"; pk`oid]]
+  TLSSECP256}
+tlssSchemeName: {[sc] $[sc=TLSSPSS256; "rsa_pss_rsae_sha256"; "ecdsa_secp256r1_sha256"]}
+
+tlssCheck: {[ch;sc]
   if[not TLSSCHACHA in tlssU16s ch`suites
     signal "tls: the client offered no TLS_CHACHA20_POLY1305_SHA256, and this server has no other suite"]
   spv: findExt[ch`exts; 43]
@@ -76,8 +90,8 @@ tlssCheck: {[ch]
   if[not 772 in tlssU16s spv[1+til `int$spv[0]]; signal "tls: the client did not offer TLS 1.3"]
   sa: findExt[ch`exts; 13]
   if[0=count sa; signal "tls: the client sent no signature_algorithms"]
-  if[not TLSSPSS256 in tlssU16s sa[2+til wbe sa[0 1]]
-    signal "tls: the client offered no rsa_pss_rsae_sha256, which is the only scheme this server signs with"]
+  if[not sc in tlssU16s sa[2+til wbe sa[0 1]]
+    signal "tls: the client offered no ",(tlssSchemeName sc),", which is what this server's key signs with"]
   1b}
 
 // ---- ServerHello. Its supported_versions carries the version alone, where the ClientHello's
@@ -98,9 +112,10 @@ tlssCertMsg: {[certs]
 // transcript hash — the same bytes tls.nt's certVerify checks on the other side, which is why that
 // constant is written out again here rather than shared: if the two ever disagree, the handshake
 // fails loudly instead of one side quietly signing something the other does not check.
-tlssCertVerify: {[pk;tr]
-  sig: rsaSignPss[pk; `sha256; sha256 TLSSCVCTX, sha256 tr]
-  0x0f, wlp24 ((wu16 TLSSPSS256), wlp16 sig)}
+tlssCertVerify: {[pk;sc;tr]
+  d: sha256 TLSSCVCTX, sha256 tr
+  sig: $[sc=TLSSPSS256; rsaSignPss[pk; `sha256; d]; ecdsaSignDer[P256C; pk`d; d]]
+  0x0f, wlp24 ((wu16 sc), wlp16 sig)}
 
 tlssFinished: {[secret;tr] 0x14, wlp24 hmac[expandLabel[secret;"finished";0x;32]; sha256 tr]}
 
@@ -112,8 +127,9 @@ tlsAccept: {[conn;certs;pk]
   if[0=count certs; signal "tls: a server needs at least one certificate"]
   r: readRec conn
   if[not r[0]=22; tlssBad[conn; "tls: expected a handshake record, got type ",string r[0]]]
+  sc: tlssScheme pk
   ch: tlssParseCh r[2]
-  tlssCheck ch
+  tlssCheck[ch;sc]
   tr: r[2]
 
   priv: urand 32                                  // `rand` is a reproducible PRNG, never a key
@@ -135,7 +151,7 @@ tlsAccept: {[conn;certs;pk]
   sealRec[conn; sk[0]; sk[1]; 0; 22; ee]; tr,: ee
   cm: tlssCertMsg certs
   sealRec[conn; sk[0]; sk[1]; 1; 22; cm]; tr,: cm
-  cv: tlssCertVerify[pk; tr]
+  cv: tlssCertVerify[pk; sc; tr]
   sealRec[conn; sk[0]; sk[1]; 2; 22; cv]; tr,: cv
   fin: tlssFinished[sHS; tr]
   sealRec[conn; sk[0]; sk[1]; 3; 22; fin]; tr,: fin

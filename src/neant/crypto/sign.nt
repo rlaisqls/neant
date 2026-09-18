@@ -123,3 +123,124 @@ rsaSignPssSalt: {[key;hash;digest;salt]
 // ---- and the round trip, which is the only test that means anything: sign, then verify with the
 // public half through rsa.nt's own verifier.
 rsaSignCheck: {[key;hash;digest;sig] rsaVerifyPss[key`n; key`e; hash; digest; sig]}
+
+// ============================================================================================
+// ECDSA (FIPS 186-4), with the nonce from RFC 6979 rather than from a random source.
+//   load "src/neant/crypto/ec.nt"; load "src/neant/crypto/p256.nt"   // before this file is used
+//   k: ecKeyLoad "ec-key.pem"
+//   sig: ecdsaSignDer[P256C; k`d; sha256 msg]        // DER SEQUENCE { r, s }, what TLS and X.509 carry
+//
+// WHY DETERMINISTIC, and this is the whole reason the extra machinery is here rather than a call to
+// `urand`. ECDSA's per-signature nonce k is not a salt: if it ever repeats across two signatures, or
+// is biased, or leaks a few bits, the private key falls out by algebra — two signatures with the
+// same k give d directly, and a few bits of bias over enough signatures give it to a lattice. That
+// has taken real keys, from the PS3 to Bitcoin wallets. RFC 6979 derives k from the key and the
+// message with HMAC-DRBG, so there is no random source to get wrong, no state to fail to reseed
+// after a fork, and the same message signs to the same bytes — which also means the standard's own
+// test vectors pin this implementation exactly, and tests/sign.nt uses them.
+//
+// Not constant-time, for the same reason the RSA half is not: see this file's header.
+
+// RFC 6979 2.3.2 bits2int, for the case this build is in — the digest and the subgroup order are
+// the same width (P-256 with SHA-256, P-384 with SHA-384), so it is the octets as an integer.
+// 2.3.4 bits2octets is that reduced mod n and written back out at the order's width.
+ecNonceOct: {[C;b;len] bnBytesN[bnMod[bnFromBytes b; C`n]; len]}
+
+// RFC 6979 3.2: HMAC-DRBG over SHA-256, seeded with the key and the digest, until it yields a
+// k in [1, n-1]. `hmac` is crypto.nt's, which is HMAC-SHA-256.
+ecNonce: {[C;d;digest]
+  ln: ceiling (bnBits C`n) % 8
+  x: bnBytesN[bnFromBytes d; ln]
+  h1: ecNonceOct[C; digest; ln]
+  v: 32#0x01
+  kk: 32#0x00
+  kk: hmac[kk; (v, 0x00, x), h1]
+  v: hmac[kk; v]
+  kk: hmac[kk; (v, 0x01, x), h1]
+  v: hmac[kk; v]
+  out: 0x
+  while[1
+    t: 0x
+    while[(count t)<ln; v: hmac[kk; v]; t,: v]
+    cand: bnFromBytes ln#t
+    if[not bnIsZero cand; if[0>bnCmp[cand; C`n]; :ln#t]]
+    kk: hmac[kk; v, 0x00]
+    v: hmac[kk; v]]
+  out}
+
+// (r; s) as big-endian magnitudes at the order's width. `d` is the private scalar, `digest` the
+// already-computed hash, which must be C`dgst octets for the same reason ecVerify insists on it.
+ecdsaSign: {[C;d;digest]
+  if[not (C`dgst) = count digest; signal "sign: the digest is not this curve's hash width"]
+  ln: ceiling (bnBits C`n) % 8
+  dv: bnFromBytes d
+  if[bnIsZero dv; signal "sign: the private scalar is zero"]
+  if[not 0>bnCmp[dv; C`n]; signal "sign: the private scalar is not less than the order"]
+  e: bnMod[bnFromBytes digest; C`n]
+  G: (C`gx; C`gy)
+  kb: ecNonce[C;d;digest]
+  kv: bnFromBytes kb
+  R: ecShamir[C; ecBits[C;kv]; G; ecBits[C;bnFromBytes 0x00]; G]
+  if[bnIsZero R[2]; signal "sign: k*G is the point at infinity"]
+  xy: ecToAffine[C;R]
+  r: bnMod[efFrom[C;xy[0]]; C`n]
+  if[bnIsZero r; signal "sign: r is zero, which RFC 6979's k cannot produce for a real curve"]
+  ki: bnModExpL[kv; C`nm2; C`n]                         // k^-1 mod n; n is prime, so Fermat
+  s: bnMod[bnMul[ki; bnMod[bnAdd[e; bnMod[bnMul[r;dv]; C`n]]; C`n]]; C`n]
+  if[bnIsZero s; signal "sign: s is zero"]
+  (bnBytesN[r;ln]; bnBytesN[s;ln])}
+
+// the DER a certificate's signatureValue and a TLS CertificateVerify carry: SEQUENCE { r, s }, each
+// a minimally-encoded INTEGER, which means a leading 00 when the top bit would read as a sign bit
+ecDerInt: {[b]
+  t: crlTrimZ b
+  $[127<`int$t[0]; (0x02, wu8b 1+count t), 0x00, t; (0x02, wu8b count t), t]}
+crlTrimZ: {[b] i: 0; n: count b; while[$[i<(n-1); 0=`int$b[i]; 0b]; i+:1]; i _ b}
+wu8b: {[n] `byte$ n band 255}
+ecdsaSignDer: {[C;d;digest]
+  rs: ecdsaSign[C;d;digest]
+  body: (ecDerInt rs[0]), ecDerInt rs[1]
+  (0x30, wu8b count body), body}
+
+// ---- EC private keys. SEC 1 (BEGIN EC PRIVATE KEY) is
+//   ECPrivateKey ::= SEQUENCE { version, privateKey OCTET STRING, [0] parameters, [1] publicKey }
+// and PKCS#8 wraps that in an OCTET STRING beside an id-ecPublicKey algorithm.
+// -> `d`curve`pub, with `d the private scalar as bytes and `pub the SEC 1 point
+SIGNECPEM: "-----BEGIN EC PRIVATE KEY-----"
+SIGNECPEME: "-----END EC PRIVATE KEY-----"
+SIGNECOID: "1.2.840.10045.2.1"
+
+ecKeyLoad: {[path] ecKeyPem read0 path}
+ecKeyPem: {[ls]
+  d1: signPem[ls; SIGNECPEM; SIGNECPEME]
+  if[count d1; :ecKeySec1 d1]
+  d8: signPem[ls; SIGNPEM8; SIGNPEM8E]
+  if[count d8; :ecKeyPkcs8 d8]
+  signal "sign: no ",SIGNECPEM," or ",SIGNPEM8," in the input"}
+ecKeyPkcs8: {[der]
+  top: derParse der
+  derWant[top;DERSEQ;1b]
+  k: derKids top
+  if[3>count k; signal "sign: a PrivateKeyInfo is a version, an algorithm and a key"]
+  a: x509Alg k[1]
+  if[not (a[0]) ~ SIGNECOID; signal "sign: not an EC private key, but ",a[0]]
+  crv: $[1=count a[1]; derOid (a[1])[0]; ""]
+  r: ecKeySec1 derOct k[2]
+  if[count crv; r[`oid]: crv]
+  r}
+ecKeySec1: {[der]
+  top: derParse der
+  derWant[top;DERSEQ;1b]
+  k: derKids top
+  if[2>count k; signal "sign: an ECPrivateKey is a version and a private key"]
+  if[not 1=derIntVal k[0]; signal "sign: only ECPrivateKey version 1 is read here"]
+  dv: derOct k[1]
+  oid: ""; pub: 0x
+  i: 2
+  while[i<count k
+    nd: k[i]
+    if[`ctx=nd`cls
+      if[0=nd`tag; if[1=count derKids nd; oid: derOid (derKids nd)[0]]]
+      if[1=nd`tag; if[1=count derKids nd; pub: derBits (derKids nd)[0]]]]
+    i+:1]
+  `d`oid`pub!(dv; oid; pub)}
