@@ -1321,6 +1321,33 @@ is "cannot say", which keeps the older behaviour — so `try_run` is strictly be
 the fused `each` declines the fast path entirely rather than guess. x86.nt still returns the
 five-element shape without this field, and is no worse off than before.
 
+`x f' y` has the same pair of paths (`each2_ints_jit`, `try_run_each2_int`), which is what `prior`
+is written in terms of:
+
+```
+a {x+y}' b          73.0 ns/elem  ->  3.5      prior[{x-y};a]   56.3  ->  4.0
+```
+
+**A second bug, and a worse one.** Writing the two-argument suite turned up a compiled function that
+answered differently from the interpreter — the one failure the fail-closed design cannot catch,
+since a wrong register is a wrong *answer* and not a bail:
+
+```
+f: {[x] $[x>3; x; 99]}
+f 9                       9
+do[300; f 9]; f 9         99                <- same function, now hot
+```
+
+Every `$[c; a; b]` whose arms end the function was affected, at any arity, for as long as the method
+tier has existed. The position after the last op is a jump target — the then-arm jumps there — and
+the linear walk stops at the last op, so it never visited it. The arm that fell through was still
+holding its value as a pending constant when the epilogue materialised it, and that store is emitted
+*after* the two paths join: it ran on both and overwrote what the other arm had left. An arm ending
+in anything but a bare constant was fine, which is how it survived — `{$[x>5; x; 0-x]}` was always
+right. The fix brings that position to the canonical layout like every other target.
+`tests/jit.nt` now takes the interpreted answer, warms the function past the threshold, and demands
+the same answer back, for nineteen shapes; eleven of them fail on the code before the fix.
+
 ### Stage 2b (started): a tracing JIT for hot loops
 
 The tier above tiers up whole *functions*, after 64 calls. That misses the shape this language is
