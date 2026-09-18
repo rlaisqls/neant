@@ -90,6 +90,22 @@ fn join(mut x: Value, y: Value) -> R<Value> {
         v.extend_from_slice($a); v.push($b);
         return Ok($ctor(v));
     }}}
+    // and the atom on the LEFT, which is not the mirror image of the one on the right: `v , atom`
+    // can append in place when the Arc is unshared, `atom , v` never can, so without this arm
+    // prelude's `prev` — (nullof x), -1_x — boxed the whole vector while `next` did not, and the
+    // two were 100x apart for no reason a reader of either could see.
+    macro_rules! cat0 { ($a:expr, $b:expr, $ctor:ident) => {{
+        let mut v = Vec::with_capacity($b.len() + 1);
+        v.push($a); v.extend_from_slice($b);
+        return Ok($ctor(v));
+    }}}
+    match (&x, &y) {
+        (Bool(a), Bools(b)) => cat0!(*a, b, bools),   (Int(a), Ints(b)) => cat0!(*a, b, ints),
+        (Float(a), Floats(b)) => cat0!(*a, b, floats), (Char(a), Chars(b)) => cat0!(*a, b, chars),
+        (Symbol(a), Syms(b)) => cat0!(a.clone(), b, syms), (Date(a), Dates(b)) => cat0!(*a, b, dates),
+        (Time(a), Times(b)) => cat0!(*a, b, times),   (Byte(a), Bytes(b)) => cat0!(*a, b, bytes),
+        _ => {}
+    }
     match (&x, &y) {
         (Bools(a), Bools(b)) => cat2!(a, b, bools),   (Bools(a), Bool(b)) => cat1!(a, *b, bools),
         (Ints(a), Ints(b)) => cat2!(a, b, ints),      (Ints(a), Int(b)) => cat1!(a, *b, ints),
@@ -342,7 +358,17 @@ fn grade(x: Value, desc: bool) -> R<Value> {
 }
 fn iasc(x: Value) -> R<Value> { grade(x, false) }
 fn idesc(x: Value) -> R<Value> { grade(x, true) }
+/// `not x`. The integer shapes answer directly: sh_f would promote every i64 to an f64 first, which
+/// is a whole extra pass and allocation to reach the same answer.
 fn not(x: Value) -> R<Value> {
+    match &x {
+        Bools(v) => return Ok(bools(v.iter().map(|&b| !b).collect())),
+        Ints(v) => return Ok(bools(v.iter().map(|&a| a == 0).collect())),
+        Floats(v) => return Ok(bools(v.iter().map(|&a| a == 0.0).collect())),
+        Bytes(v) => return Ok(bools(v.iter().map(|&b| b == 0).collect())),
+        Bool(b) => return Ok(Bool(!*b)), Int(a) => return Ok(Bool(*a == 0)), Byte(b) => return Ok(Bool(*b == 0)),
+        _ => {}
+    }
     match sh_f(&x) { Some(Sh::A(a)) => Ok(Bool(a == 0.0)), Some(Sh::V(v)) => Ok(bools(v.iter().map(|&a| a == 0.0).collect())), None => err("type: not") }
 }
 fn enlist(x: Value) -> R<Value> { Ok(pack(vec![x])) }
@@ -628,6 +654,19 @@ fn fbits(x: Value) -> R<Value> {
 fn isnull(x: Value) -> R<Value> {
     fn one(v: &Value) -> bool {
         match v { Null => true, Int(i) => *i == NI, Float(f) => f.is_nan(), Symbol(s) => s.is_empty(), Char(c) => *c == ' ', Date(d) => *d == i32::MIN, Time(t) => *t == NI, _ => false }
+    }
+    // typed vectors compare the raw element against their own null; going through `one` means
+    // boxing each one into a Value first, and `fill` and `fills` call this on every vector they see
+    match &x {
+        Ints(v) => return Ok(bools(v.iter().map(|&i| i == NI).collect())),
+        Floats(v) => return Ok(bools(v.iter().map(|f| f.is_nan()).collect())),
+        Syms(v) => return Ok(bools(v.iter().map(|s| s.is_empty()).collect())),
+        Chars(v) => return Ok(bools(v.iter().map(|&c| c == ' ').collect())),
+        Dates(v) => return Ok(bools(v.iter().map(|&d| d == i32::MIN).collect())),
+        Times(v) => return Ok(bools(v.iter().map(|&t| t == NI).collect())),
+        Bools(v) => return Ok(bools(vec![false; v.len()])),
+        Bytes(v) => return Ok(bools(vec![false; v.len()])),
+        _ => {}
     }
     if x.is_atom() { Ok(Bool(one(&x))) } else { Ok(bools(x.seq().iter().map(one).collect())) }
 }
