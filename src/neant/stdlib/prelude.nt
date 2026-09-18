@@ -56,8 +56,14 @@ ss: {[s;p] p: $[`char=@p; ,p; p]; n: #p
   if[0=#c; :c]
   c: c[&not c>(#s)-n]
   if[1=n; :c]
-  if[0=#c; :c]
-  c: c[&{[s;p;n;i] p~s[i+til n]}[s;p;n] each c]
+  // narrow one character at a time, with a vector compare over the surviving candidates rather than
+  // a lambda per candidate: `{p~s[i+til n]} each c` matched the whole pattern at each position
+  // through the interpreter, which for a two-character pattern on a 100k buffer was about 190ns a
+  // byte. Each pass here is a gather and a compare over a set that only shrinks.
+  k: 1
+  while[$[k<n; 0<#c; 0b]
+    c: c[&(s[c+k])=p[k]]
+    k+:1]
   $[1<#c; ssTrim[n;c]; c]}
 ssAll: {[s;p] & {[s;p;i] s[i+til count p]~p}[s;p] each til 1+(#s)-count p}
 ssTrim: {[n;c] {[n;a;i] $[i<n+last a; a; a,i]}[n]/[,first c; 1_c]}
@@ -176,9 +182,10 @@ ema: {[a;x] {[a;p;c] (a*c)+p*1-a}[a] scan x}
 
 // lists
 rotate: {[n;x] c: count x; x[(n+til c) mod c]}
-// a chunk is a drop then a take, both of which are slice copies; `x[a+til b-a]` built an index
-// vector per chunk and gathered through it
-cut: {[i;x] if[`int=@i; i: i*til ceiling (count x)%i]; en: (1_i),count x; {[x;a;b] (b-a)#a _ x}[x]'[i;en]}
+// `x[a+til b-a]` and NOT `(b-a)#a _ x`, which looks like two slice copies and is not: `_` copies
+// the whole tail, so a chunk near the front costs the length of the rest of the vector and cutting
+// into k chunks costs O(n*k). The gather costs the chunk.
+cut: {[i;x] if[`int=@i; i: i*til ceiling (count x)%i]; en: (1_i),count x; {[x;a;b] x[a+til b-a]}[x]'[i;en]}
 sublist: {[r;x] $[`int=@r; (r&count x)#x; x[r[0]+til r[1]&(count x)-r[0]]]}
 differ: {(,1b), not {x~y}'[1_x;-1_x]}
 
