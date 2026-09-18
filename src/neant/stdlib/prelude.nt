@@ -66,7 +66,19 @@ ss: {[s;p] p: $[`char=@p; ,p; p]; n: #p
     k+:1]
   $[1<#c; ssTrim[n;c]; c]}
 ssAll: {[s;p] & {[s;p;i] s[i+til count p]~p}[s;p] each til 1+(#s)-count p}
-ssTrim: {[n;c] {[n;a;i] $[i<n+last a; a; a,i]}[n]/[,first c; 1_c]}
+// Drop the matches that overlap an earlier one. The fold this used to be called an interpreted
+// lambda per candidate AND grew its accumulator with `a,i`, which copies it — so it was quadratic in
+// the number of matches, and for a two-character pattern with fourteen thousand of them that was the
+// whole cost of `ss`. Overlap is rare, so ask first: if every gap is already at least the pattern
+// width there is nothing to drop, and that question is one vector compare.
+ssTrim: {[n;c]
+  if[not n>min 1_deltas c; :c]              // there is no `<=`: `n<=m` lexes as n < (=m), and `=` alone is group
+  m: #c; r: m#0; k: 0; i: 0; e: (-1)
+  while[i<m
+    v: c[i]
+    if[v>e; r[k]: v; k+:1; e: (v+n)-1]
+    i+:1]
+  k#r}
 // split s on sep -> list of strings;  join strings with sep.  With an int left argument vs/sv are the
 // numeric base forms instead (vsnum/svnum below):  "," vs "a,b" -> ("a";"b")   2 vs 13 -> 1 1 0 1
 vss: {[sep;s] p: s ss sep; st: 0, p+#sep; en: p, #s; {[s;a;b] s[a+til b-a]}[s]'[st;en]}
