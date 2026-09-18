@@ -1222,7 +1222,7 @@ were built and measured against the same loop:
   The general path boxes every index and element into a `Value`, indexes one at a time, then re-detects
   the type in `pack` — the shape `acc[i+til 12] +: a[i]*b` that the field arithmetic is built out of.
 
-Together: the self-hosted rebuild of the sources takes ~185ms (was ~324ms), and a `while` iteration
+Together: a `while` iteration
 costs 26ns. On the crypto in `src/neant/crypto/crypto.nt`, per 64KB: SHA-256 284ms → 119ms, ChaCha20 115 → 68,
 Poly1305 61 → 34, the AEAD 198 → 103; X25519 76ms → 42, and a TLS 1.3 handshake against OpenSSL
 169ms → 97ms. Allocation went from ~34% of samples to under 1%; what is left is the dispatch loop
@@ -1240,6 +1240,25 @@ could exist; the interpreted figure was flat from there until the kernels replac
 
 Runtime errors carry a line table, which costs ~10% of compile throughput. A frame is named by its
 caller's `LoadG`, so the bytecode carries positions but no names.
+
+#### The parser really is one pass now
+
+"No backtracking" at the top of this file was not true. `expr` saw `name [` and parsed the bracket
+speculatively, to find out whether it was looking at `x[i]: v` or at `x[i]`, and threw the result
+away when it was not. `while` and `if` are *names*, so every bracketed block went through it — and a
+block inside a block inside a block was parsed eight times. Measured on 1.6KB of statements wrapped
+in `d` nested `while`s, where only the wrapper changes: 12ms at depth 0 and **228ms at depth 6**,
+doubling with every level.
+
+It is a token scan now (`pmatch`): find the `]` that closes the `[`, look at what follows, and only
+look inside the bracket when a `:` says it is an assignment. `resolve` was quadratic for a separate
+reason — it recursed once per term and copied the remaining items each time, so a long expression
+was O(n²) to parse and ran out of stack somewhere past a thousand terms — and now walks the items
+backwards, keeping the last two results, because the rules consume one item or two.
+
+What the two are worth, measured: the same depth-6 block is 9ms rather than 228ms; loading the ten
+TLS modules is **373ms rather than 539ms**, with `tls.nt` — the file with the deepest nesting — going
+106ms to 39ms; and the self-hosted rebuild of all the sources is **611ms rather than 767ms**.
 
 #### The bignum arithmetic runs as compiled scalar loops
 

@@ -34,6 +34,22 @@ stmts: {[close;isStmt]
       out,: ,$[isStmt; (`at; ln; e); e]]]}
 
 // the whole rest of the line, or () when empty
+// The token index just past the `]` closing the `[` at token index j, or -1 — a scan over punct
+// tokens and nothing else. It exists so that `x[i]: v` can be told from `x[i]`, and from
+// `while[...]`, WITHOUT parsing the bracket speculatively and throwing the result away. That
+// speculation parsed every bracketed block twice, so a block nested d deep was parsed 2^d times:
+// measured at 12ms flat and 228ms at depth six for the same 1.6KB of statements. README's "one
+// linear pass ... and no backtracking" is what this restores.
+pmatch: {[j]
+  d: 0; i: j; n: count pt
+  while[i<n
+    t: pt[i]
+    if[t[0]=`punct
+      if[t[1] in "[({"; d+:1]
+      if[t[1] in "])}"; d-:1; if[d<1; :i+1]]]
+    i+:1]
+  -1}
+
 expr: {[]
   if[isP[0;":"]; pi::pi+1; :(`return; rhs[])]
   t: peek 0
@@ -43,26 +59,52 @@ expr: {[]
     if[isP[1;":"]; pi::pi+2; :(`assign; nm; rhs[])]
     if[((peek 1)[0]=`verb) & isP[2;":"]; v: (peek 1)[1]; pi::pi+3; :(`assign; nm; (`dy; (`verb; v); (`name; nm); rhs[]))]
     if[isP[1;"["]
-      save: pi; pi::pi+2; idx: pargs[]
-      if[count idx
-        if[isP[0;":"]; pi::pi+1; :(`iassign; nm; idx; rhs[])]
-        if[((peek 0)[0]=`verb) & isP[1;":"]
-          v: (peek 0)[1]; pi::pi+2
-          :(`iassign; nm; idx; (`dy; (`verb; v); (`call; (`name; nm); idx); rhs[]))]]
-      pi::save]]
+      // only look inside the bracket when what FOLLOWS it makes this an indexed assignment
+      j: pmatch[pi+1]
+      asn: 0b
+      if[j>0
+        k: j-pi
+        if[isP[k;":"]; asn: 1b]
+        if[((peek k)[0]=`verb) & isP[k+1;":"]; asn: 1b]]
+      if[asn
+        save: pi; pi::pi+2; idx: pargs[]
+        if[count idx
+          if[isP[0;":"]; pi::pi+1; :(`iassign; nm; idx; rhs[])]
+          if[((peek 0)[0]=`verb) & isP[1;":"]
+            v: (peek 0)[1]; pi::pi+2
+            :(`iassign; nm; idx; (`dy; (`verb; v); (`call; (`name; nm); idx); rhs[]))]]
+        pi::save]]]
   items: ()
   while[not stop[]; items,: ,primary[]]
   resolve items}
 rhs: {[] e: expr[]; if[0=count e; signal "parse: empty assignment"]; e}
 stop: {[] t: peek 0; $[t[0]=`eof; 1; t[0]=`punct; t[1] in ";)]}"; 0]}
 
-// [noun verb rest] -> dy, [verb rest] -> mo, [noun rest] -> app; the right operand is the rest of the line
+// [noun verb rest] -> dy, [verb rest] -> mo, [noun rest] -> app; the right operand is the rest of the
+// line, which is what makes this right-associative and why it is built from the right end backwards
+// rather than recursively from the left. The recursive form cost one stack frame and one copy of the
+// remaining items PER TERM: quadratic in the length of an expression, and `'stack: recursion too
+// deep` somewhere past a thousand terms. Walking backwards needs only the last two results, since
+// the dy rule consumes two items and every other rule consumes one.
+//
+// Positions the recursive form would have skipped are computed here and thrown away. That is safe,
+// not merely cheap: the only one skipped is i+1 after a dy at i, which begins with a verb and so
+// takes the mo rule, whose `need` is over exactly the acc[i+2] the dy rule itself needs — so it
+// signals if and only if the dy would have.
 resolve: {[items]
-  if[2>count items; :$[count items; items[0]; ()]]
-  h: items[0]; rest: 1_items
-  if[fnlike h; :(`mo; h; need resolve rest)]
-  if[fnlike rest[0]; :(`dy; rest[0]; h; need resolve 1_rest)]
-  (`app; h; need resolve rest)}
+  n: count items
+  if[n<2; :$[n; items[0]; ()]]
+  acc2: ()                       // resolve over items[i+2..]
+  acc1: items[n-1]               // resolve over items[i+1..]
+  i: n-2
+  while[not i<0
+    h: items[i]
+    r: ()
+    if[fnlike h; r: (`mo; h; need acc1)]
+    if[$[fnlike h; 0b; fnlike items[i+1]]; r: (`dy; items[i+1]; h; need acc2)]
+    if[$[fnlike h; 0b; not fnlike items[i+1]]; r: (`app; h; need acc1)]
+    acc2: acc1; acc1: r; i-:1]
+  acc1}
 
 primary: {[]
   t: peek 0; pi::pi+1; k: t[0]; v: t[1]
