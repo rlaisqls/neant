@@ -448,8 +448,33 @@ of 253 doublings. Scalars reduce mod L one bit at a time. Verification only: no 
 is constant-time, which is what a verifier's all-public inputs allow.
 
 SHA-384 is not a second hash. FIPS 180-4 5.3.4 and 6.5 define it as SHA-512's compression function
-with a different initial hash value and the digest cut to 48 octets, so `sha512Block` is the only
-copy of those 80 rounds in the tree and both hashes go through it. It used to live inside
+with a different initial hash value and the digest cut to 48 octets, so both hashes go through one
+kernel.
+
+**That kernel contains no `+`, `-` or `*`, and that is why it runs at all.** SHA-512 used to take
+1800ns a byte against SHA-256's 20 — the same algorithm, ninety times slower, because it was written
+a block at a time and grew its message schedule with `w,: ...`, which is not one of the two shapes a
+vector slot may appear in and so refused the whole function. Rewriting it in `shaBlocksL`'s shape —
+every buffer a parameter, the schedule written at `w[i]`, the whole message in one call — was not
+enough on its own: it compiled and then **deopted on nearly every round**. A function that uses one
+of those three operators makes the codegen check every bit operation's result against the int-null
+sentinel, because a later `+` would read that pattern as a null; and the sentinel is
+`0x8000000000000000`, which is exactly what `x shl 63` is whenever `x` is odd. A rotation does that
+constantly. SHA-256 never met it because it masks every word to 32 bits, so none of its values can
+be the sentinel; a 64-bit word has no room to be anything but the raw pattern.
+
+So `badd` replaced every `+`, and the subtractions became indices that walk alongside `i` rather
+than `i-15`. The same discipline `src/neant/stdlib/ct.nt` follows for constant-time code, arrived at
+from the opposite direction.
+
+```
+sha512, 64KB     110.9 ms  ->  0.90 ms    123x
+sha512, 1KB        2.12 ms  ->  0.060 ms   35x
+```
+
+At 6.9ns a byte it is now faster than SHA-256, which is what a 128-byte block of 64-bit words
+should be. `sha512Block`, the block-at-a-time form, is kept and `tests/crypto.nt` checks the two
+agree on 134 lengths, the way `shaBlockV` is kept beside `shaBlocksL`. It used to live inside
 `ed25519.nt`, because nothing else needed it; certificates signed `ecdsa-with-SHA384` do, and
 `verify.nt` has no business loading a curve it cannot verify in order to get a hash.
 
@@ -1798,6 +1823,7 @@ Measured on this machine against `8f04ace`, each the minimum of five runs of twe
 | `aeadEncrypt`, 64KB | 138.2 ms | **2.45 ms** | 56x |
 | `aeadEncrypt`, 10KB | 21.6 ms | **0.38 ms** | 57x |
 | `x25519` | 47.5 ms | **3.05 ms** | 15.6x |
+| `sha512`, 64KB | 110.9 ms | **0.90 ms** | 123x |
 | verified TLS 1.3 handshake, www.google.com | 394–462 ms | **223–265 ms** | 1.8x |
 
 Against OpenSSL 3.6.2 on the same core (`openssl speed -elapsed`, 2.46 GB/s for both at 16KB and

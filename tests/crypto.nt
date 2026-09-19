@@ -57,6 +57,17 @@ cbytes: {[n] `byte$ n rand 256}
 cshaLens: (til 130), 200 1000 4096 5555
 teq["sha256 kernel agrees with the column form on 134 lengths"; (distinct {[n] m: cbytes n; (sha256 m) ~ sha256V m} each cshaLens); ,1b]
 teq["sha256 of the empty message still needs a whole padding block"; (sha256 0x) ~ sha256V 0x; 1b]
+// and the same for SHA-512, whose kernel is newer: sha512HashV is the block-at-a-time form that
+// grew its schedule by append, which is why it never compiled. The lengths straddle 112 mod 128,
+// where the padding needs a second block.
+teq["sha512 kernel agrees with the block form on 134 lengths"
+  (distinct {[n] m: cbytes n; (sha512Hash[sha512H0;m]) ~ sha512HashV[sha512H0;m]} each cshaLens); ,1b]
+teq["sha512 of the empty message"; (sha512Hash[sha512H0;0x]) ~ sha512HashV[sha512H0;0x]; 1b]
+teq["sha384 shares the kernel"; (sha512Hash[sha384H0;`byte$"abc"]) ~ sha512HashV[sha384H0;`byte$"abc"]; 1b]
+// the shape the kernel has to keep: one `+`, `-` or `*` anywhere in it puts an int-null check after
+// every bit operation, and `x shl 63` IS the int null whenever x is odd, so the body would deopt on
+// most rounds and the whole hash would run interpreted again
+teq["the sha512 kernel uses no + - *"; jitHasArith[(jitinput sha512BlocksL)[0]; (jitinput sha512BlocksL)[1]; (jitinput sha512BlocksL)[2]]; 0b]
 
 // chacha: the tail of the last block is guarded rather than trimmed, so every length mod 64 matters
 cckey: cbytes 32

@@ -47,8 +47,97 @@ sha512Block: {[h;blk]
     hh: g; g: f; f: e; e: d badd t1; d: c; c: b; b: a; a: t1 badd t2
     i+:1]
   h badd (a;b;c;d;e;f;g;hh)}
+// ---- the same compression function in the shape the whole-function JIT takes.
+//
+// sha512Block above is a block at a time, grows its schedule with `w,: ...` and keeps the eight
+// working words in eight locals. None of that compiles: an append is not one of the two shapes a
+// vector slot may appear in (see jitClassifySlots in src/neant/jit/arm64.nt), and one op outside
+// the subset refuses the whole function. So it ran interpreted, at 1800ns a byte against sha256's
+// 20 — the same algorithm, ninety times slower, for no reason but how it was written.
+//
+// This is crypto.nt's shaBlocksL with 64-bit words: every buffer is a PARAMETER, because a scratch
+// local cannot be indexed; the schedule is written at `w[i]` rather than appended; the rotations
+// are written out, since the shift counts are then constants and each is two shifts and an or; and
+// the whole message goes through in ONE call, which is also why the warm-up below exists. `msk` is
+// all ones and stands in for `bnot`, which is not one of the six builtins the codegen inlines and
+// would therefore be a call — crypto.nt's header says the same thing about sha256.
+//
+// sha512Block is kept, and tests/crypto.nt checks the two agree on random messages, exactly as
+// crypto.nt keeps shaBlockV beside shaBlocksL for the same reason.
+SHA512W: 80#0
+SHA512ONES: 0-1
+// NO `+`, `-` OR `*` ANYWHERE IN THIS FUNCTION, and that is not a style: it is why it runs
+// compiled at all.
+//
+// A function that uses one of those three makes the codegen emit, after every bit operation, a
+// check of the result against the int-null sentinel — necessary, because a later `+` would read
+// that bit pattern as a null and the interpreter and the compiled code would disagree (jitHasArith,
+// src/neant/jit/arm64.nt). The sentinel is 0x8000000000000000, and `x shl 63` is EXACTLY that
+// whenever x is odd. A rotation does it on most rounds, so the check fires, the body deopts, and
+// the whole hash runs interpreted — which is what it did: 1800ns a byte against sha256's 20.
+//
+// sha256 never met this because it masks every word to 32 bits, so no value it holds can be the
+// sentinel. A 64-bit word has no room to be anything but the raw pattern, so the arithmetic has to
+// go instead: `badd` is the wrapping add and carries no check, and the subtractions became rolling
+// indices (j15, j2, j16, j7 walk alongside i) rather than `i-15`.
+sha512BlocksL: {[h;w;k;p;nblk;msk]
+  blk: 0
+  o: 0
+  while[blk<nblk
+    i: 0
+    while[i<16
+      // in two halves, and not one eight-way `bor`: the codegen's operand stack is jitMAXDEPTH (6)
+      // words deep and an eight-way chain wants more than that, which refuses the function
+      hi: (((p[o] shl 56) bor (p[o badd 1] shl 48)) bor (p[o badd 2] shl 40)) bor (p[o badd 3] shl 32)
+      lo: (((p[o badd 4] shl 24) bor (p[o badd 5] shl 16)) bor (p[o badd 6] shl 8)) bor p[o badd 7]
+      w[i]: hi bor lo
+      o: o badd 8
+      i: i badd 1]
+    j15: 1; j2: 14; j16: 0; j7: 9
+    while[i<80
+      x: w[j15]
+      s0: (((x shr 1) bor x shl 63) bxor ((x shr 8) bor x shl 56)) bxor x shr 7
+      y: w[j2]
+      s1: (((y shr 19) bor y shl 45) bxor ((y shr 61) bor y shl 3)) bxor y shr 6
+      w[i]: (w[j16]) badd s0 badd (w[j7]) badd s1
+      i: i badd 1
+      j15: j15 badd 1
+      j2: j2 badd 1
+      j16: j16 badd 1
+      j7: j7 badd 1]
+    aa: h[0]; bb: h[1]; cc: h[2]; dd: h[3]; ee: h[4]; ff: h[5]; gg: h[6]; hh: h[7]
+    i: 0
+    while[i<80
+      S1: (((ee shr 14) bor ee shl 50) bxor ((ee shr 18) bor ee shl 46)) bxor (ee shr 41) bor ee shl 23
+      ch: (ee band ff) bxor (msk bxor ee) band gg
+      t1: hh badd S1 badd ch badd (k[i]) badd w[i]
+      S0: (((aa shr 28) bor aa shl 36) bxor ((aa shr 34) bor aa shl 30)) bxor (aa shr 39) bor aa shl 25
+      maj: ((aa band bb) bxor aa band cc) bxor bb band cc
+      t2: S0 badd maj
+      hh: gg; gg: ff; ff: ee; ee: dd badd t1; dd: cc; cc: bb; bb: aa; aa: t1 badd t2
+      i: i badd 1]
+    h[0]: (h[0]) badd aa
+    h[1]: (h[1]) badd bb
+    h[2]: (h[2]) badd cc
+    h[3]: (h[3]) badd dd
+    h[4]: (h[4]) badd ee
+    h[5]: (h[5]) badd ff
+    h[6]: (h[6]) badd gg
+    h[7]: (h[7]) badd hh
+    blk: blk badd 1]
+  h}
+// 64 empty calls take it over the tier's 64-CALL threshold before the first real hash, because one
+// hash of any size is one call. crypto.nt's shaWarm says the rest.
+sha512Warmed: 0b
+sha512Warm: {[] sha512Warmed:: 1b; do[64; sha512BlocksL[8#0; SHA512W; sha512K; 128#0; 0; SHA512ONES]]; 1b}
+
 // the whole message through the compression function from a given IV, as eight 64-bit words
-sha512Hash: {[h0;b] p: sha512Pad b; h: h0; i: 0
+sha512Hash: {[h0;b]
+  if[not sha512Warmed; sha512Warm[]]
+  p: `int$ sha512Pad b
+  sha512BlocksL[h0; SHA512W; sha512K; p; (count p) shr 7; SHA512ONES]}
+// the block-at-a-time form this replaced, kept so the two can be checked against each other
+sha512HashV: {[h0;b] p: sha512Pad b; h: h0; i: 0
   while[i<count p; h: sha512Block[h; p[i+til 128]]; i+:128]
   h}
 sha512: {[b] be64bytes sha512Hash[sha512H0; b]}
