@@ -1,4 +1,4 @@
-// AArch64 codegen for the baseline JIT (src/jit.rs owns memory/execution; see README "Stage 2").
+// AArch64 codegen for the baseline JIT (src/jit.rs owns memory/execution; see docs/compiler.md "Stage 2").
 // Always loaded (part of the boot image) so the JIT can call `jitCompile` on any hot function, but
 // nothing here is meant to be called directly from ordinary scripts.
 //
@@ -57,7 +57,7 @@ jitTrOUT: 1
 jitFSTACK: 16
 
 // ---- instruction encoders. Every formula here was cross-checked against `objdump -d` output on
-// a snippet assembled with this box's own `as`/`gcc` before being trusted (see README "Stage 2").
+// a snippet assembled with this box's own `as`/`gcc` before being trusted (see docs/compiler.md "Stage 2").
 jitMovz: {[rd;imm16;hw] (jitW 0xD2800000) bor (hw shl 21) bor (imm16 shl 5) bor rd}
 jitMovk: {[rd;imm16;hw] (jitW 0xF2800000) bor (hw shl 21) bor (imm16 shl 5) bor rd}
 jitAddR: {[rd;rn;rm] (jitW 0x8B000000) bor (rm shl 16) bor (rn shl 5) bor rd}
@@ -118,7 +118,7 @@ jitLoadConst: {[asm;rd;v]
     hw: hw+1]
   asm}
 
-// ---- locals in registers (README "Stage 2"). Every slot a compiled function touches as a local
+// ---- locals in registers (docs/compiler.md "Stage 2"). Every slot a compiled function touches as a local
 // (LoadL/StoreL/TakeL — params, scratch locals and captures alike, in first-seen bytecode order,
 // `jitLocalSlots`) gets one register for the whole function, and LoadL/StoreL become register
 // moves. The buffer x0 points at on entry (`buf`, src/jit.rs `try_run`/`try_run_raw`) is only how
@@ -390,7 +390,7 @@ jitNewState: {[asm;lslots;lregs]
 // Appending to `st[`asm]` directly copies the whole buffer every time — the dict holds one
 // reference and the local expression another, so the join cannot be in place and a compile is
 // quadratic in the code it emits. Clearing the slot first leaves exactly one owner, which is what
-// makes `x: x,y` an in-place extend (README "Performance"); every emitter here goes through this.
+// makes `x: x,y` an in-place extend (docs/performance.md "Performance"); every emitter here goes through this.
 jitApp: {[st;ws] asm: st[`asm]; st[`asm]: 0#0; asm: asm,ws; st[`asm]: asm; st}
 jitVR: {[st;d] (st[`vregs])[d]}
 jitMat1: {[st;d]
@@ -422,7 +422,7 @@ jitMatAlias: {[st;r]
 
 // `+ - *` on two ordinary ints can land on exactly the null sentinel, which the interpreter would
 // propagate as a null and compiled code would not, so every one of them is checked and deopts.
-// Both ways of making that branch cheaper were built and measured against this one; see README
+// Both ways of making that branch cheaper were built and measured against this one; see docs/compiler.md
 // "What the null-sentinel checks cost, measured". Folding a whole block's checks into one branch
 // through a `cinc` accumulator is *slower* — the accumulator is a loop-carried dependency where
 // these branches are free, being never taken and perfectly predicted — and removing them outright,
@@ -457,7 +457,7 @@ jitNullCheck: {[st;dst]
 jitOpPush: {[st;ip;opcodes;consts;a]
   c: consts[a]
   $[isnull c
-    ; $[not (opcodes[ip+1])=11; null   // Null is only ever immediately Pop'd (if/while/do's own statement value) — see README "Stage 2"
+    ; $[not (opcodes[ip+1])=11; null   // Null is only ever immediately Pop'd (if/while/do's own statement value) — see docs/compiler.md "Stage 2"
         ; jitVPush[st; jitSTACK+(st[`depth]); 0]]
     ; not (`int)=type c
     ; null

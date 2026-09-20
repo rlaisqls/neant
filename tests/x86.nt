@@ -1,5 +1,5 @@
 // src/neant/jit/x86.nt: the x86-64 backend for both JIT tiers. This machine is AArch64, so
-// **nothing here executes a single byte the backend emits** — see README "Stage 2"'s x86-64
+// **nothing here executes a single byte the backend emits** — see docs/compiler.md "Stage 2"'s x86-64
 // subsection for what that does and does not leave proven. What these tests can check, and do:
 //
 //   - every instruction encoder, byte for byte, against `nasm`'s own output for the same

@@ -4,7 +4,7 @@
 // operations and hands back columns. x509.nt parses a certificate out of either: x509Parse out of
 // the dicts, x509ParseMany out of the columns.
 //
-// The columnar reader exists for speed (tests/x509bench.nt has the numbers, and the README the
+// The columnar reader exists for speed (tests/x509bench.nt has the numbers, and docs/performance.md the
 // comparison with OpenSSL). This file is what says it did not buy that speed by checking less. It
 // asserts three things: that derScan finds exactly the elements derTLV and derKids find, element
 // for element and octet for octet, over every certificate in the repository; that x509ParseMany

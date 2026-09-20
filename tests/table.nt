@@ -1,4 +1,4 @@
-// src/neant/stdlib/table.nt: a table is a dict of columns.  The people table is the README's.
+// src/neant/stdlib/table.nt: a table is a dict of columns.  The people table is docs/library.md's.
 people: tbl[`name`dept`pay; (`ann`bob`cy; `eng`ops`eng; 120 80 100)]
 tsection "table: build, show"
 teq["tbl is a dict"; people; `name`dept`pay!(`ann`bob`cy;`eng`ops`eng;120 80 100)]

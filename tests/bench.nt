@@ -44,7 +44,7 @@ do[70; vf[1 2 3 4 5;1 2 3 4 5;5]]
 bratio["vector index"; cold; btms {vf[xs;xs;1000000]}]
 
 // ---- the batch ECDSA verifier in src/neant/crypto/batch.nt. This is the table in that file's
-// header and in README.md, and it is the reason tests/bench.nt takes minutes rather than seconds:
+// header and in docs/performance.md, and it is the reason tests/bench.nt takes minutes rather than seconds:
 // the N=1 row alone is 512 lanes' worth of fixed cost paid once. Compare it against
 //   openssl speed -seconds 3 ecdsap256
 // on the same machine, and remember what is being compared with what: one number is this language's

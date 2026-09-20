@@ -33,7 +33,7 @@
 // doublings and ~288 mixed additions rather than 256 and ~192, and two Fermat inversions to the
 // 383rd power rather than the 255th), and each one is on 15 limbs rather than 10 — bnMontMul is
 // quadratic in the limb count, so 2.25x the work per multiplication. The measured numbers are in
-// src/main.rs (mod p384) and in README.md; they are read off this machine, not predicted here.
+// src/main.rs (mod p384) and in docs/crypto.md; they are read off this machine, not predicted here.
 
 // ---- the domain parameters (FIPS 186-4 D.1.2.4; `openssl ecparam -name secp384r1
 // -param_enc explicit -text` prints exactly these). a = p-3, which is what ec.nt's doubling

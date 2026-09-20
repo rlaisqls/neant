@@ -12,7 +12,7 @@
 // bnMul refuses anything wider. 1023 limbs is 26598 bits, five times an RSA-4096 modulus. Carries
 // are not propagated per product: bnCarryL runs them in one pass afterwards.
 //
-// EVERY INNER LOOP HERE IS A SCALAR LOOP OVER LIMBS, and that is deliberate — see README "Stage 2"
+// EVERY INNER LOOP HERE IS A SCALAR LOOP OVER LIMBS, and that is deliberate — see docs/compiler.md "Stage 2"
 // and "the bignum arithmetic runs as compiled scalar loops". This file used to be written as vector
 // column operations (`acc[i+til nb] +: a[i]*b`, one per limb of a), which is the fastest shape an
 // interpreter has and the slowest thing to hand a JIT: each one allocates intermediates and makes
@@ -500,7 +500,7 @@ bnModExp: {[bb;eb;mb]
   bnBytes bnModExpL[bnFromBytes bb; bnFromBytes eb; N]}
 
 // ---- the limb kernels, and why they are called eighty times here for nothing.
-// bnMulL, bnRedcL and bnCarryL are the three loops the whole-function JIT compiles (README
+// bnMulL, bnRedcL and bnCarryL are the three loops the whole-function JIT compiles (docs/compiler.md
 // "Stage 2"): scalar loops over `Ints` parameters, where `x[i]` and `x[i]:v` are a bounds check
 // and one instruction instead of the interpreter's dispatch and boxing, and where `band`/`shr`
 // are `and`/`lsr` rather than calls. That tier compiles a function after 64 calls, and one

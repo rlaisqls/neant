@@ -1,6 +1,6 @@
-// src/neant/stdlib/prelude.nt: one case per function in the README "Standard library" table, more where the
+// src/neant/stdlib/prelude.nt: one case per function in the docs/language.md "Standard library" table, more where the
 // left argument's shape changes the meaning (cut, sublist, bin, xbar, mavg, fills).  Expected values come
-// from the README and from the binary: these pin current behaviour.
+// from docs/language.md and from the binary: these pin current behaviour.
 tsection "prelude: aggregates"
 teq["sum ints"; sum 1 2 3; 6]
 teq["sum floats"; sum 1.5 2.5; 4.0]

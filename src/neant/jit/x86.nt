@@ -1,5 +1,5 @@
 // x86-64 (System V) codegen for the baseline JIT, beside src/neant/jit/arm64.nt (src/jit.rs owns
-// memory/execution; see README "Stage 2" and its x86-64 subsection). Two entry points, named apart
+// memory/execution; see docs/compiler.md "Stage 2" and its x86-64 subsection). Two entry points, named apart
 // from the AArch64 ones so both backends can be in the boot image at once and src/jit.rs picks the
 // one its target arch needs:
 //
@@ -113,7 +113,7 @@ jitxCcLE: 14
 jitxCcG: 15
 
 // ---- instruction encoders. Every one was cross-checked byte for byte against `nasm -f bin` output
-// for the same mnemonic and operands (tests/x86.nt asserts those bytes, and README "Stage 2"'s
+// for the same mnemonic and operands (tests/x86.nt asserts those bytes, and docs/compiler.md "Stage 2"'s
 // x86-64 subsection says what that does and does not prove), and read back with
 // `llvm-objdump -D -b binary -m x86-64`.
 
@@ -219,7 +219,7 @@ jitxPatch32: {[asm;off;target]
 // resolved on the spot instead of through a fixup list.
 jitxJmpTo: {[asm;target] jitxPatch32[asm,jitxJmp[]; (count asm)+1; target]}
 
-// ---- locals in registers (README "Stage 2"). Identical scheme to arm64.nt's, with a narrower
+// ---- locals in registers (docs/compiler.md "Stage 2"). Identical scheme to arm64.nt's, with a narrower
 // register window: `jitLocalSlots` (arm64.nt) hands out one register per slot the bytecode touches
 // as a local, in first-seen order, and everything past jitxLREGS stays in `buf` and is reached
 // through rbx per access. The prologue loads the register-resident ones once and nothing ever

@@ -2,7 +2,7 @@
 // 32-bit words live in ints and are masked with M32 after every sum.   hex sha256 `byte$"abc"
 //
 // EVERY HOT KERNEL HERE IS A SCALAR LOOP OVER INDICES, for the same reason src/neant/crypto/
-// bignum.nt's limb kernels are — see that file's header and README "Stage 2". The whole-function
+// bignum.nt's limb kernels are — see that file's header and docs/compiler.md "Stage 2". The whole-function
 // JIT tier compiles a function whose every op is integer arithmetic over its own locals, where
 // `x[i]` and `x[i]:v` on an `Ints` PARAMETER (or capture) are an inlined bounds check and one
 // scaled load or store, where `band bor bxor badd shl shr` are instructions rather than calls,

@@ -38,7 +38,7 @@ stmts: {[close;isStmt]
 // tokens and nothing else. It exists so that `x[i]: v` can be told from `x[i]`, and from
 // `while[...]`, WITHOUT parsing the bracket speculatively and throwing the result away. That
 // speculation parsed every bracketed block twice, so a block nested d deep was parsed 2^d times:
-// measured at 12ms flat and 228ms at depth six for the same 1.6KB of statements. README's "one
+// measured at 12ms flat and 228ms at depth six for the same 1.6KB of statements. docs/performance.md's "one
 // linear pass ... and no backtracking" is what this restores.
 pmatch: {[j]
   d: 0; i: j; n: count pt

@@ -1,7 +1,7 @@
 // Constant-time building blocks, in neant.  load "src/neant/stdlib/ct.nt"
 //
 // Every function here compiles to machine code with no data-dependent branch, and that is not a
-// claim about the source — `jitct` checks the emitted bytes (README "Constant time, and a checker
+// claim about the source — `jitct` checks the emitted bytes (docs/constant-time.md "Constant time, and a checker
 // for it") and tests/ct.nt asserts it for each one, so a change that quietly costs the property
 // fails the suite rather than going unnoticed.
 //

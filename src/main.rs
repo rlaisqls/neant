@@ -290,7 +290,7 @@ mod conc {
 }
 
 /// src/neant/crypto/tls.nt is a loadable module, not part of the image: key schedule and record layer,
-/// checked offline against RFC 8448. The handshake itself needs a server — see the README.
+/// checked offline against RFC 8448. The handshake itself needs a server — see docs/library.md.
 #[cfg(test)]
 mod tls {
     use super::*;
@@ -355,7 +355,7 @@ mod tls {
     fn accept_hands_connections_to_independent_spawned_workers() {
         use std::io::{Read, Write};
         let mut v = boot_vm();
-        // src/prims.rs keeps no way to ask a listener its bound port (out of scope, see README) —
+        // src/prims.rs keeps no way to ask a listener its bound port (out of scope, see docs/library.md) —
         // the test bypasses that by binding its own listener on an OS-assigned port, dropping it
         // immediately, and pointing neant's `hlisten` at that same port. A small, accepted TOCTOU
         // race in exchange for not growing the primitive surface just for this test.

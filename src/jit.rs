@@ -1,7 +1,7 @@
 //! A conservative, hand-rolled baseline JIT for integer-only hot loops and calls, on AArch64 and
 //! x86-64.
 //!
-//! Scope (see README "Stage 2"): compiles a whole `FnCode` to native code only if every op in it
+//! Scope (see docs/compiler.md "Stage 2"): compiles a whole `FnCode` to native code only if every op in it
 //! is provably a pure integer computation over its own locals — arithmetic, comparison,
 //! `Jmp`/`Jmpf`/`Loop` control flow (`while`, `if`, `do`), and a call to another function that is
 //! *itself* provably pure the same way (see `jit_call` below). Anything else is rejected once,
@@ -27,7 +27,7 @@
 //! comes back into executable memory).
 //!
 //! **Only the AArch64 backend has ever executed.** Both are compiled and both are covered by tests
-//! that check what can be checked without running (README "Stage 2", x86-64 subsection): the
+//! that check what can be checked without running (docs/compiler.md "Stage 2", x86-64 subsection): the
 //! development machine is AArch64, so the x86-64 encoders are verified against `nasm`'s bytes and
 //! the glue here against `cargo check --target x86_64-unknown-linux-gnu`, not against a running
 //! program. Everything below is fail-closed either way — a backend that returns `None`, or a
@@ -432,7 +432,7 @@ mod native {
     /// `x[i]` from compiled code (`jitOpVecGet` / `jitxOpVecGet`): `vp` is a pointer into
     /// the `vecbuf` side table `try_run`/`try_run_raw` populated at entry, live for the whole
     /// compiled call. All `Arc`/COW handling stays here in Rust rather than being inlined as
-    /// hand-rolled pointer arithmetic — see README "Stage 2" for why. Bounds-checked; out
+    /// hand-rolled pointer arithmetic — see docs/compiler.md "Stage 2" for why. Bounds-checked; out
     /// of range, or (shouldn't happen given the entry guard, but checked anyway) not actually
     /// `Ints`, both deopt like any other guarded point in a compiled function.
     unsafe extern "C" fn jit_vec_get(vp: *mut Value, idx: i64, ok: *mut i64) -> i64 {

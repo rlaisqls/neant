@@ -172,7 +172,7 @@ impl FnCode {
     }
     /// Same cache as `jitted`, but without the call-count gate: a compiled function calling this
     /// one directly (src/jit.rs's `jit_call` trampoline) needs to know *immediately* whether the
-    /// callee is equally pure, since that's what makes it safe to call at all (see README "Stage
+    /// callee is equally pure, since that's what makes it safe to call at all (see docs/compiler.md "Stage
     /// 2" and the trampoline's doc comment) — it can't wait for this callee's own count to warm up.
     pub(crate) fn jit_for_call(self: &Arc<FnCode>, vm: &mut crate::vm::Vm) -> Option<Arc<crate::jit::Compiled>> { self.jit_now(vm) }
     /// Built once, read many times lock-free after that: `OnceLock` gives every call after the

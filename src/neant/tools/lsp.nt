@@ -49,7 +49,7 @@ lspSOURCES,: ("src/neant/core/compile.nt";"src/neant/crypto/crypto.nt";"src/nean
 lspStr: {$[`char=type x; ,x; x]}                       // a one-character string lexes as a char atom
 lspD1: {[k;v] (,k)!,v}                                 // a one-key dict whose value may be a dict
 // A missing key reads back as ::, and :: as a *function argument* builds a projection instead of
-// calling (README, json.nt's jnull) — so absence travels as `nil and only becomes a JSON null in
+// calling (docs/library.md, json.nt's jnull) — so absence travels as `nil and only becomes a JSON null in
 // lspRespond, where it sits inside a list literal rather than an argument.
 lspNil: `nil
 lspGet: {[d;k] $[`dict=type d; $[`null=type d[k]; lspNil; d[k]]; lspNil]}

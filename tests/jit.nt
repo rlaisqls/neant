@@ -2,7 +2,7 @@
 // used to be in src/main.rs. None of them needed Rust: each is a source string and the text the REPL
 // prints for it, which is what `nrun` and `repr` give from here.
 //
-// The method is the one README "Stage 2" describes: run the same loop twice, once so it tiers up and
+// The method is the one docs/compiler.md "Stage 2" describes: run the same loop twice, once so it tiers up and
 // once with `- -` spliced into the hot expression so it provably never can (the tier only takes
 // integer arithmetic it can prove pure, and a monadic minus pair is not in that subset), then require
 // the two to agree. Sizes straddle the 64-iteration/64-call tier-up threshold on purpose.
@@ -284,7 +284,7 @@ teq["vector write never corrupts a live second reference"; jtev "orig: 1 2 3; al
 
 teq["a bool local is still a bool after a traced loop"; jtev "{[k] i:0; b: 0b; while[i<k; b: i<100; i: i+1]; (type b; b)} 200"; "(`bool;0b)"]
 
-// ---- inlined vector access, the bit builtins and a vector return (README "Stage 2"). `x[i]` is
+// ---- inlined vector access, the bit builtins and a vector return (docs/compiler.md "Stage 2"). `x[i]` is
 // no longer a call: the slot's register is the element data pointer and the length sits beside it
 // in `buf`, so a read is a bounds check and an `ldr`. Everything below is the same differential
 // method as above — the compiled shape against the `- -` twin that provably never compiles.
