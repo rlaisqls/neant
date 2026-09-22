@@ -138,6 +138,11 @@ struct Ctx<'a> {
     /// indices into `reassigns` not yet decided in place or copy: not loop-forced, so resolved by
     /// the last-use scan once the body is built (docs/m5-design.md §2)
     reassign_pending: Vec<usize>,
+    /// the size atom already minted for an immutable local used as an array-repeat count
+    /// (`[e; n]`): reused so `[0; n]` and `[1; n]` name the same size, not two that happen to
+    /// agree at runtime. A mutable local gets a fresh atom at every use instead (it may have
+    /// changed between them), which is why this is keyed and not just "the local's own size".
+    size_of_local: HashMap<LocalId, SizeVar>,
 }
 
 fn check_func(f: &ast::Func, sigs: &HashMap<String, (FuncId, Vec<Ty>, Ty)>, structs: &[StructDef], struct_ids: &HashMap<String, StructId>) -> Result<Func> {
@@ -145,7 +150,7 @@ fn check_func(f: &ast::Func, sigs: &HashMap<String, (FuncId, Vec<Ty>, Ty)>, stru
     let mut cx = Ctx {
         sigs, structs, struct_ids, locals: vec![], scopes: vec![HashMap::new()], sizes: vec![], ret: ret.clone(),
         in_loop: 0, in_closure: 0, fresh: 0, pending_lets: vec![], root: HashMap::new(), moved: HashMap::new(),
-        loop_start: vec![], let_moves: vec![], reassigns: vec![], reassign_pending: vec![],
+        loop_start: vec![], let_moves: vec![], reassigns: vec![], reassign_pending: vec![], size_of_local: HashMap::new(),
     };
     let mut params = Vec::new();
     for (p, ty) in f.params.iter().zip(ptys) {
@@ -328,12 +333,31 @@ impl<'a> Ctx<'a> {
                         }
                         let size = match &cn.kind {
                             ExprKind::Int(k) => Size::Const(*k),
+                            // an array's own length does not change once it is born, mutable
+                            // elements or not, so this array's size is that one, not a new atom
+                            // that merely happens to agree with it at runtime
+                            ExprKind::Len(l) => match self.locals[*l].ty.size() {
+                                Some(sz) => sz.clone(),
+                                None => Size::Var(self.new_size(format!("{}.len()", self.locals[*l].name))),
+                            },
+                            // an immutable count is the same quantity at every use, so every
+                            // `[e; n]` sized by it gets the one atom already minted for it; a
+                            // mutable one may have changed between two uses, so it always gets
+                            // a fresh atom instead of assuming they still agree
+                            ExprKind::Local(l) if !self.locals[*l].mutable => {
+                                let sv = match self.size_of_local.get(l) {
+                                    Some(&sv) => sv,
+                                    None => {
+                                        let nm = self.locals[*l].name.clone();
+                                        let sv = self.new_size(nm);
+                                        self.size_of_local.insert(*l, sv);
+                                        sv
+                                    }
+                                };
+                                Size::Var(sv)
+                            }
                             ExprKind::Local(l) => {
                                 let nm = self.locals[*l].name.clone();
-                                Size::Var(self.new_size(nm))
-                            }
-                            ExprKind::Len(l) => {
-                                let nm = format!("{}.len()", self.locals[*l].name);
                                 Size::Var(self.new_size(nm))
                             }
                             _ => {

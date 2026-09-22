@@ -1,0 +1,12 @@
+// two arrays built from the same immutable local `n`, via `[e; n]`, get the same size atom now:
+// `ys = xs` sees them as the same type. A mutable `n` still gets a fresh atom at every use,
+// since it may have changed between them (checked by err_reassign_mutable_size).
+fn main() {
+    let n = 800000;
+    let mut ys = [0; n];
+    let xs = [1; n];
+    ys = xs;
+    ys[0] += 1;
+    println(ys[0]);
+    println(ys.len());
+}

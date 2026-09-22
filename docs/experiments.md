@@ -467,12 +467,14 @@ reassignment from the build-and-sum cost the two kernels share:
   build-and-sum cost or the page-fault effect and report a "clean" ratio nearer 1×; the number
   that matters is that the copy's *marginal* bytes, isolated by subtraction, scale exactly as
   predicted, at the same constant factor the rest of the traffic does.
-- **A rough edge the kernels had to route around, not a measurement finding.** `let n = @N@; let
-  xs = [1; n]; let mut ys = [0; n];` fails to typecheck — `[e; n]` allocates a fresh `Size::Var`
-  for `n` on every use, even the same local `n`, so `xs` and `ys` end up with two different size
-  atoms and `ys = xs` sees them as different types. Both kernels build `[0; @N@]` / `[1; @N@]`
-  directly from the substituted literal instead, which gives both arrays `Size::Const` and steps
-  around it. Real code naming its arrays' size once and building several arrays from it
-  would hit this immediately; it is a gap in size-variable reuse for `[e; n]`, not in `ys = xs`
-  itself, and is worth fixing before this feature is asked to carry ordinary code.
+- **A rough edge the kernels had to route around, found here and fixed the same day.** `let n =
+  @N@; let xs = [1; n]; let mut ys = [0; n];` failed to typecheck when this was written — `[e; n]`
+  allocated a fresh `Size::Var` for `n` on every use, even the same local `n`, so `xs` and `ys`
+  ended up with two different size atoms and `ys = xs` saw them as different types. The kernels
+  below use `let n = @N@;` and build `[0; n]` / `[1; n]` directly, which now typechecks: an
+  immutable local used as a count is given its size atom once and reused, a mutable one still gets
+  a fresh atom at every use (it may have changed between them), and `[e; xs.len()]` takes `xs`'s
+  own size rather than minting a new one that merely agrees with it. Fixed in `types.rs`
+  (`size_of_local`), goldens `reassign_named_size`, `reassign_len_size`,
+  `err_reassign_mutable_size`.
 

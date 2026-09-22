@@ -213,10 +213,15 @@ traffic beyond building and summing the pair; forced to copy, the machine pays f
 copy's own marginal cost — the copy kernel's bytes minus the in-place kernel's, isolating the
 reassignment from what both share — scales with `n` at slope 1.00 against `8·n`, at the model's
 usual ~3× counter gap (M1 §3's read-stream pairing, plus a fresh-`malloc`-every-repeat page-fault
-effect `sum`'s own sweep does not have). A rough edge found doing this, not part of the feature:
-`[e; n]` allocates a fresh size atom per use, so two arrays built from literally the same local `n`
-do not type-match for `ys = xs` — real code naming a size once and building several arrays from it
-would hit this; worth fixing before the feature is asked to carry ordinary code (not scheduled).
+effect `sum`'s own sweep does not have). A rough edge found doing this, not part of the feature and
+**fixed the same day**: `[e; n]` allocated a fresh size atom per use, so two arrays built from
+literally the same local `n` did not type-match for `ys = xs` — real code naming a size once and
+building several arrays from it would have hit this immediately. An immutable local used as a
+count is now given its size atom once and reused at every `[e; n]`; a mutable one still gets a
+fresh atom each time, since it may have changed between them; `[e; xs.len()]` takes `xs`'s own size
+rather than minting one that merely agrees with it. Goldens `reassign_named_size`,
+`reassign_len_size`, `err_reassign_mutable_size`; the measurement kernels rewritten to the natural
+`let n = @N@;` form, same predictions and outputs as before.
 Next: `span`.
 
 ## Self-hosting

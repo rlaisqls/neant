@@ -11,8 +11,9 @@ fn sum(xs: &[i64]) -> i64 {
 fn main() {
     let mut t = 0;
     for r in 0..@R@ {
-        let mut ys = [0; @N@];
-        let xs = [1; @N@];
+        let n = @N@;
+        let mut ys = [0; n];
+        let xs = [1; n];
         let v = &xs;
         ys = xs;
         ys[0] += 1;

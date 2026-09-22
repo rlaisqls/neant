@@ -1,0 +1,10 @@
+// a mutable count may have changed between the two uses, so it is never assumed to still agree:
+// each `[e; n]` gets its own fresh size atom, and ys = xs correctly sees two different types.
+fn main() {
+    let mut n = 5;
+    let xs = [1; n];
+    n = 3;
+    let mut ys = [0; n];
+    ys = xs;
+    println(ys[0]);
+}

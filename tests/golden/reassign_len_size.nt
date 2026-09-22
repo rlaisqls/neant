@@ -1,0 +1,11 @@
+// two arrays sized by `src.len()` get src's own size — a name already minted, not a fresh one
+// that merely agrees with it — so ys = xs sees them as the same type.
+fn main() {
+    let src = [1, 2, 3, 4, 5];
+    let mut ys = [0; src.len()];
+    let xs = [9; src.len()];
+    ys = xs;
+    ys[0] += 1;
+    println(ys[0]);
+    println(ys.len());
+}
