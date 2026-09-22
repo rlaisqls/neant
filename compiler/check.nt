@@ -784,31 +784,46 @@ fn check_chain(src: &[u8], toks: &[Token], nodes: &mut [Node], types: &mut [Ty],
         if cst[2] != 0 { return 0 - 1; }
         et = mt;
     };
+    // **values flow through the stages as a list**, not one at a time: `.enumerate()` puts the index
+    // in front of the element and the closure after it takes both. Two is all the corpus asks for.
+    let mut et1 = 0 - 1;
+    let mut nval = 1;
     let mut k = st0 - 1;
     while k >= 1 && cst[2] == 0 {
         let stg = cst[40 + k];
-        let lam = nodes[stg].c;
-        if lam < 0 || nodes[lam].kind != 79 || nodes[lam].a < 0
-            || nodes[nodes[lam].a].next >= 0 {
-            cst[2] = 1;
-            return 0 - 1;
-        }
-        if has_assign(nodes, nodes[lam].b) { cst[2] = 1; return 0 - 1; }
-        let saved = cst[1];
-        declare(syms, cst, nodes[nodes[lam].a].a, et, 0, 0 - 1);
-        let bt = check_expr(src, toks, nodes, types, syms, sigs, ptys, strs, flds, ntys, cst, nodes[lam].b);
-        cst[1] = saved;
-        if cst[2] != 0 { return 0 - 1; }
-        if name_is(src, toks, nodes[stg].b, b'm', b'a', b'p', 3) {
-            et = bt;
-        } else if name_is(src, toks, nodes[stg].b, b'f', b'i', b'l', 6) {
-            if bt != 2 { cst[2] = 1; return 0 - 1; }
+        if name_is(src, toks, nodes[stg].b, b'e', b'n', b'u', 9) {
+            if nodes[stg].c >= 0 || nval != 1 { cst[2] = 1; return 0 - 1; }
+            et1 = et;
+            et = 0;
+            nval = 2;
         } else {
-            cst[2] = 1;
-            return 0 - 1;
+            let lam = nodes[stg].c;
+            if lam < 0 || nodes[lam].kind != 79 || nodes[lam].a < 0 { cst[2] = 1; return 0 - 1; }
+            let p0 = nodes[lam].a;
+            let p1 = nodes[p0].next;
+            if nval == 1 && p1 >= 0 { cst[2] = 1; return 0 - 1; }
+            if nval == 2 && p1 < 0 { cst[2] = 1; return 0 - 1; }
+            if has_assign(nodes, nodes[lam].b) { cst[2] = 1; return 0 - 1; }
+            let saved = cst[1];
+            declare(syms, cst, nodes[p0].a, et, 0, 0 - 1);
+            if nval == 2 { declare(syms, cst, nodes[p1].a, et1, 0, 0 - 1); };
+            let bt = check_expr(src, toks, nodes, types, syms, sigs, ptys, strs, flds, ntys, cst, nodes[lam].b);
+            cst[1] = saved;
+            if cst[2] != 0 { return 0 - 1; }
+            if name_is(src, toks, nodes[stg].b, b'm', b'a', b'p', 3) {
+                et = bt;
+                et1 = 0 - 1;
+                nval = 1;
+            } else if name_is(src, toks, nodes[stg].b, b'f', b'i', b'l', 6) {
+                if bt != 2 { cst[2] = 1; return 0 - 1; }
+            } else {
+                cst[2] = 1;
+                return 0 - 1;
+            };
         };
         k -= 1;
     }
+    if nval != 1 { cst[2] = 1; return 0 - 1; }
     let term = cst[40];
     let is_sum = name_is(src, toks, nodes[term].b, b's', b'u', b'm', 3);
     let is_cnt = name_is(src, toks, nodes[term].b, b'c', b'o', b'u', 5);
@@ -816,22 +831,60 @@ fn check_chain(src: &[u8], toks: &[Token], nodes: &mut [Node], types: &mut [Ty],
     let is_min = name_is(src, toks, nodes[term].b, b'm', b'i', b'n', 3);
     let is_any = name_is(src, toks, nodes[term].b, b'a', b'n', b'y', 3);
     let is_all = name_is(src, toks, nodes[term].b, b'a', b'l', b'l', 3);
-    if !is_sum && !is_cnt && !is_max && !is_min && !is_any && !is_all { cst[2] = 1; return 0 - 1; }
-    if nodes[term].c >= 0 { cst[2] = 1; return 0 - 1; }
+    let is_fold = name_is(src, toks, nodes[term].b, b'f', b'o', b'l', 4);
+    if !is_sum && !is_cnt && !is_max && !is_min && !is_any && !is_all && !is_fold {
+        cst[2] = 1;
+        return 0 - 1;
+    }
+    // **`.fold(init, |acc, x| e)`** is the only terminal with arguments, and its accumulator starts
+    // at a value the program gives rather than at an identity the terminal knows
+    let mut fold_init = 0 - 1;
+    let mut fold_lam = 0 - 1;
+    if is_fold {
+        fold_init = nodes[term].c;
+        if fold_init < 0 { cst[2] = 1; return 0 - 1; }
+        fold_lam = nodes[fold_init].next;
+        if fold_lam < 0 || nodes[fold_lam].kind != 79 || nodes[fold_lam].next >= 0 {
+            cst[2] = 1;
+            return 0 - 1;
+        }
+        let fp0 = nodes[fold_lam].a;
+        if fp0 < 0 || nodes[fp0].next < 0 || nodes[nodes[fp0].next].next >= 0 {
+            cst[2] = 1;
+            return 0 - 1;
+        }
+        if has_assign(nodes, nodes[fold_lam].b) { cst[2] = 1; return 0 - 1; }
+    } else if nodes[term].c >= 0 {
+        cst[2] = 1;
+        return 0 - 1;
+    };
     // `any` and `all` want a `bool` an element at a time; `max` and `min` want a number
     if is_any || is_all {
         if et != 2 { cst[2] = 1; return 0 - 1; }
     } else if is_max || is_min {
         if et != 0 && et != 1 { cst[2] = 1; return 0 - 1; }
     };
-    let acc_ty = if is_cnt { 0 } else if is_any || is_all { 2 } else { et };
+    let mut acc_ty = if is_cnt { 0 } else if is_any || is_all { 2 } else { et };
+    if is_fold {
+        acc_ty = check_expr(src, toks, nodes, types, syms, sigs, ptys, strs, flds, ntys, cst, fold_init);
+        if cst[2] != 0 { return 0 - 1; }
+        // the closure returns what the accumulator holds, checked with both bound
+        let sv4 = cst[1];
+        declare(syms, cst, nodes[nodes[fold_lam].a].a, acc_ty, 0, 0 - 1);
+        declare(syms, cst, nodes[nodes[nodes[fold_lam].a].next].a, et, 0, 0 - 1);
+        let ft = check_expr(src, toks, nodes, types, syms, sigs, ptys, strs, flds, ntys, cst, nodes[fold_lam].b);
+        cst[1] = sv4;
+        if cst[2] != 0 { return 0 - 1; }
+        if ft != acc_ty { cst[2] = 1; return 0 - 1; }
+    };
     if acc_ty != 0 && acc_ty != 1 && acc_ty != 2 { cst[2] = 1; return 0 - 1; }
 
     // ---- build ----
     let iv = nfresh(cst);
     let av = nfresh(cst);
     let sn = nfresh(cst);
-    let zero = if acc_ty == 2 { mk_bool(nodes, cst, if is_all { 1 } else { 0 }) }
+    let zero = if is_fold { fold_init }
+               else if acc_ty == 2 { mk_bool(nodes, cst, if is_all { 1 } else { 0 }) }
                else { nlit(nodes, cst, if acc_ty == 1 { 61 } else { 60 }, 0) };
     let l0 = mk_let(nodes, cst, av, zero, 1);
     // `max` and `min` keep a `seen` flag beside the accumulator: the first element wins outright,
@@ -880,12 +933,27 @@ fn check_chain(src: &[u8], toks: &[Token], nodes: &mut [Node], types: &mut [Ty],
         };
         cure = nodes[comp].a;
     };
+    let mut cure1 = 0 - 1;
     let mut j = st0 - 1;
     while j >= 1 {
         let stg = cst[40 + j];
+        if name_is(src, toks, nodes[stg].b, b'e', b'n', b'u', 9) {
+            // the index goes in *front* of the element, so a closure after it reads `|i, x|`
+            let kv = nfresh(cst);
+            let iv2 = mk_var(nodes, cst, iv);
+            last = blk_add(nodes, blk, last, mk_let(nodes, cst, kv, iv2, 0));
+            cure1 = cure;
+            cure = mk_var(nodes, cst, kv);
+            j -= 1;
+        } else {
         let lam = nodes[stg].c;
         let pn = nodes[nodes[lam].a].a;
         last = blk_add(nodes, blk, last, mk_let(nodes, cst, pn, cure, 0));
+        if cure1 >= 0 {
+            let pn1 = nodes[nodes[nodes[lam].a].next].a;
+            last = blk_add(nodes, blk, last, mk_let(nodes, cst, pn1, cure1, 0));
+            cure1 = 0 - 1;
+        };
         if name_is(src, toks, nodes[stg].b, b'm', b'a', b'p', 3) {
             cure = nodes[lam].b;
         } else {
@@ -903,6 +971,7 @@ fn check_chain(src: &[u8], toks: &[Token], nodes: &mut [Node], types: &mut [Ty],
             cure = mk_var(nodes, cst, pn);
         };
         j -= 1;
+        };
     }
     // the terminal
     let tgt = mk_var(nodes, cst, av);
@@ -927,6 +996,14 @@ fn check_chain(src: &[u8], toks: &[Token], nodes: &mut [Node], types: &mut [Ty],
         let es2 = nnew(nodes, cst, 95);
         nodes[es2].a = iff;
         blk_add(nodes, blk, last, es2);
+    } else if is_fold {
+        // `acc = <closure body>`, with the accumulator and the element bound to its parameters
+        let fa = nodes[nodes[fold_lam].a].a;
+        let fx = nodes[nodes[nodes[fold_lam].a].next].a;
+        let accv = mk_var(nodes, cst, av);
+        last = blk_add(nodes, blk, last, mk_let(nodes, cst, fa, accv, 0));
+        last = blk_add(nodes, blk, last, mk_let(nodes, cst, fx, cure, 0));
+        blk_add(nodes, blk, last, mk_assign(nodes, cst, tgt, nodes[fold_lam].b, 0 - 1));
     } else if is_any || is_all {
         // `acc = acc || cur` / `acc = acc && cur`
         let t3 = mk_var(nodes, cst, av);

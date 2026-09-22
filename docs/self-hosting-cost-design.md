@@ -1709,3 +1709,28 @@ is built by the same code path as `xs.iter().filter(..).map(..).sum()` and comes
 Still outstanding, and still not guessed at: `zip`, `enumerate`, `fold` (all needing two-parameter
 closures) and the array-valued comprehension `owned.nt` wants, which allocates rather than reduces.
 `chains.nt` needs every one of them, so it stays out of the slice until they are all there.
+
+### `enumerate` and `fold`: values flow as a list
+
+Both match `neant cost` exactly — `enumerate` + `map` at 6 per element, `fold` at 4, a `fold` after
+a `map` at 5 — and the emitted code runs and prints what `neant run` prints.
+
+The change they forced is that **a chain carries a list of values, not one value**. `.enumerate()`
+puts the index in *front* of the element, which is why its closure reads `|i, x|` and not `|x, i|`,
+and a stage's closure then takes as many parameters as there are values. `types.rs` keeps exactly
+this (`vals`, with `vals.insert(0, k)` for enumerate); two is all the corpus asks for and two is
+what this carries.
+
+`fold` is the only terminal with arguments, and the only one whose accumulator starts at a value the
+program supplies rather than at an identity the terminal knows. Its closure's first parameter is the
+accumulator, so the loop body binds both before evaluating the body and assigns the result back.
+
+**`zip` is measured but not built, and the obstacle is worth naming.** It costs `6·a.len() + 2`
+against a hand-written `6·a.len()`, and the `+ 2` is the loop bound: `zip` runs to
+`min(a.len(), b.len())`, and a `min` costs 2. Building it needs the rewrite to synthesise a **call
+to `min`**, and a call is found by the *text* of its name token — `name_is_min` compares bytes — so
+there is no way to write one without source text saying `min`. That is a third convention on top of
+synthetic names and synthetic literals, and unlike those two it is about a *callee* rather than a
+value. It is small (a sentinel token value, and `name_is_min`/`name_is_max` learning it) but it
+should be taken deliberately: the number of "negative index means something special" rules in this
+tree is now three, and each one is a place where an integer field means two things.
