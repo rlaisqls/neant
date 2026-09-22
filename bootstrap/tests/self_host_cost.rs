@@ -4,9 +4,9 @@
 //! String equality is deliberately strict: it catches `n²/2 − n/2` written as `0.5·n² − 0.5·n`,
 //! and a term order that happens to agree on this corpus and not in general.
 //!
-//! Where the Rust compiler solves a recurrence the self-hosted pass cannot — self-recursion — it
-//! must say **unknown** rather than a number. A cost calculus that guesses is worse than one that
-//! declines, so that is asserted and not merely tolerated.
+//! Where the Rust compiler solves a recurrence the self-hosted pass cannot — two or more recursive
+//! calls per invocation — it must say **unknown** rather than a number. A cost calculus that
+//! guesses is worse than one that declines, so that is asserted and not merely tolerated.
 //!
 //! Two groups of functions differ **on purpose**, and are listed by name. `ys = xs` on whole arrays
 //! costs 1 when the compiler can prove the assignment is in place and the array's length when it
@@ -39,7 +39,7 @@ const COPIES_INSTEAD: &[(&str, &str)] = &[
 
 /// The number of functions whose `work` the self-hosted pass reproduces exactly. In the test so
 /// that widening the slice means changing a number someone has to look at.
-const EXACT: usize = 67;
+const EXACT: usize = 71;
 
 /// The same for `moves`, whose slice is narrower: a function that calls anything is unknown,
 /// because a callee's traffic depends on what is already resident (design §11).

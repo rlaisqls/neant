@@ -326,3 +326,40 @@ node and composes exactly as the work walk does.
 The lesson is about the method, not the rule: a difference that two readings of the source both
 fail to explain is a signal to *measure the source*, and a three-line `eprintln!` behind an
 environment variable answered in one run what an hour of reading had not.
+
+## 12. Self-recursion, one call per invocation
+
+`while` left five `work` unknowns, all of them self-recursive. Four are now solved and one is not,
+and the line between them is the number of recursive calls per invocation.
+
+`T(m) = f + T(m′)` needs a **measure** `m` the compiler finds rather than reads. The candidates are
+`analyze.rs`'s: each scalar parameter, then `xs.len() − i` for an array and a scalar, then a
+difference of two scalars — and the first that shrinks at the recursive call wins. Shrinkage is
+either `m − m′ = c` for a positive integer (unroll: the answer is `f·(m/c + 1)`) or `b·m′ ≤ m` for
+a small integer (halve: the answer is `f·(log m + 1)`, and the polynomial layer grows a `log`
+atom whose argument is itself a polynomial, kept in a side table so an atom stays an `i64`).
+
+**Out: two or more recursive calls.** That is `fib` — exponential when the measure falls by a
+constant — and the master theorem when it halves. `recur.nt`'s `msum` is the one golden that wants
+it, and it stays unknown.
+
+Also out: an `f` that is not a number. All four of the corpus's recurrences have a constant body
+cost; a body whose own cost varies with the measure needs the summation `analyze.rs` does, with
+each parameter advanced along its own shift.
+
+**71 work columns exact**, 4 differing by design, 1 declined.
+
+### What building it changed
+
+- **A recursive call inside an `if` counts along the heavier arm only.** `bsearch` calls itself on
+  each side of a branch and only one of them happens; counting both reads as two calls per level
+  and comes out linear instead of logarithmic. `analyze.rs` keeps the arm with more calls and, on a
+  tie, the else arm's arguments — which is what makes `bsearch`'s measure `hi − lo` and not
+  something that fails to shrink.
+- **A shared scratch buffer aliased between a print and its own nested call.** `pol_print` sorts a
+  polynomial's terms into an `order` array and then walks it — and printing `log(hi − lo)` calls
+  `pol_print` again, *in the middle of that walk*, on the same array. The argument's sort
+  overwrote the caller's, and its second term came out as the caller's own:
+  `15·log(hi − lo) − lo` where the answer is `15·log(hi − lo) + 15`. The fix is an offset, so a
+  nested print writes above the caller's region. The first genuinely re-entrant thing in the
+  self-hosted compiler, and it aliased on the first try.

@@ -18,8 +18,12 @@
 // the corpus's largest constant is seven digits, and the first slice's job is parity on it. Said
 // here rather than defended.
 //
+// One atom is not a plain number: `log(e)`, whose argument is itself a polynomial. It lives in a
+// side table — `logs[i]` is the argument's `Pol`, and the atom id is `2000 + i` — which keeps an
+// atom an `i64` everywhere else. Only a divide-and-conquer recurrence makes one.
+//
 // `pst` is this file's state, the one-element-array idiom again:
-//   pst[0] next free Fac   pst[1] next free Term   pst[2] next free Pol
+//   pst[0] next free Fac   pst[1] next free Term   pst[2] next free Pol   pst[5] next free Log
 
 struct Fac { atom: i64, exp: i64 }
 struct Term { fac: i64, n_fac: i64, cn: i64, cd: i64 }
@@ -468,4 +472,20 @@ fn pol_sum_over(facs: &mut [Fac], terms: &mut [Term], pols: &mut [Pol], pst: &mu
         i += 1;
     }
     out
+}
+
+// the atom `log(arg)`, reusing one already minted for the same argument so that two logs of the
+// same thing are the same atom and their terms merge
+fn log_atom(facs: &[Fac], terms: &[Term], pols: &[Pol], logs: &mut [i64], pst: &mut [i64], arg: i64) -> i64 {
+    let mut i = 0;
+    let mut found = -1;
+    while i < pst[5] {
+        if found < 0 && pol_eq(facs, terms, pols, logs[i], arg) { found = i; }
+        i += 1;
+    }
+    if found >= 0 { return 2000 + found; }
+    let k = pst[5];
+    logs[k] = arg;
+    pst[5] = k + 1;
+    2000 + k
 }
