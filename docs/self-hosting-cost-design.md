@@ -638,3 +638,68 @@ less the callee's own footprints, each credited only where it fits in `M`. The t
 
 **56 `moves` columns exact.** The seven declines are one thing — a site inside two loops — and
 `matmul`, `stencil` and `tri` are all of it.
+
+## 16. Nested loops: the per-level working set
+
+Seven declines remain and they are one mechanism. `settle_moves` computes, for each site and each
+loop it sits in, the lines that site touches over one full run of that loop — innermost outwards:
+
+```
+lines(inner of innermost) = 1
+lines(level) = inner × t          if the working set at this level does not fit M
+             = inner              if the access does not move with this loop
+             = inner × t          if it moves by a whole line or more
+             = inner + t·s/B      if contiguous and it moves by s < B per iteration
+```
+
+and a site's moves are `lines × B`. Worked by hand for `tri.nt`'s `tiles`, whose answer is
+`8·n + 2·B`:
+
+```
+for ii in 0..n/4 { for i in ii*4 .. ii*4+4 { s += a[i]; } }
+
+inner (i):   stride 1·8 = 8 < B;  slide = 4·8/B = 0.5, floored to one line
+             lines = 1 + 1 = 2
+outer (ii):  stride 4·8 = 32 < B; slide = (n/4)·32/B = n/8
+             lines = 2 + n/8
+moves = lines·B = 2·B + 8·n            ✓
+```
+
+The rule is not the hard part. The hard part is `stride` **with respect to each enclosing loop**,
+which for the outer level needs the inner loop variable's own bounds expressed in the outer atom —
+`i` runs `ii*4 .. ii*4+4`, so `a[i]` moves by `4` elements per lap of `ii`. This slice tracks a
+single loop variable and a single trip count; it needs an index as an **affine form in every open
+loop atom**, which is `analyze.rs`'s `Affine`.
+
+### `≈` is display, not analysis
+
+Worth recording because it looked like a third piece of machinery and is not. `lock.rs`:
+
+```rust
+if p.terms.len() <= 3 { p.display(names) } else { format!("≈ {}", p.leading().display(names)) }
+```
+
+A polynomial with more than three terms prints its **highest-degree terms** with `≈` in front; a
+condition prints `≈` when its working set has more than one term and only the leading one is shown.
+Nothing is approximated — the cost object is exact and the report is short. `stencil`'s two regimes
+print the same `≈ 40·n²` because they agree on the leading term and differ below it.
+
+### Multi-condition regimes
+
+`matmul` reports two pieces under two *different* conditions:
+
+```
+24·n² + 2·B·n            if ≈ 8·n² < M
+B·n³ + 8·n³ + 2·B·n²     if ≈ B·n + 8·n ≥ M
+```
+
+which the one-fork `Ck` of §13 cannot carry — it holds one condition and refuses a second. A
+general piecewise cost is `piece.rs`: a list of (conditions, polynomial), with feasibility, pruning
+by dominance, and a cross product on every `add`. That is the one place in this port where the
+Rust's full generality would have to be reproduced rather than narrowed.
+
+### The order to do it in
+
+Per-level lines first, and it alone finishes `tri.nt`'s `tiles` — the only one of the seven whose
+answer is a plain polynomial. Then `≈`, which is twenty lines of printing. Multi-condition regimes
+last, and only if the two before it do not already show the shape of what `matmul` needs.
