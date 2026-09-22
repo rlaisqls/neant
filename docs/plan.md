@@ -158,19 +158,24 @@ together — with the caveat the README carries: those nine were written after t
 them. The two holes are untouched: a worklist whose trip count is not a size expression, and
 mutual recursion with a measure that reads memory.
 
-## M4 — views, layout, regions (as planned)
+## M4, narrowed: no element/field views, arenas instead of region inference
 
-Stands on stage A. Structs and views (`&xs[i]`, `&p.field` as (collection, index[, field]),
-never an address; projections do not return addresses, which is the one mechanism argument for
-being a language). Compiler-owned representation per type, chosen by the footprint and moves of
-the loops that touch it, reported. Region inference (Tofte–Talpin) for pointer-linked structures,
-with the region's footprint and the residue rule giving the traversal bound. Arrays as values that
-move and return. Layout as a deterministic function of the type definition.
+docs/m4-design.md §1 and §6 cut this from the plan above and said why. A view of one element
+(`&ps[i]`, `&p.field`) would need a fat representation and nothing in the exit tests needs it; the
+projections that exist (`v.f`, `xs[i].f`) already return values, never addresses, which is the
+mechanism claim. And there is nothing to infer about where a pointer-linked structure lives: a
+list or a tree is a struct array — an **arena** — whose links are indices the programmer already
+wrote, so Tofte–Talpin has no unknown to find. What M4 built instead is the **region rule**: a
+non-affine site's root has a footprint, and once an arena that fits `M` has been fully touched
+nothing more is fetched, whatever the order — the same residue rule the rest of the calculus uses,
+applied inside one loop. Typed arena indices (`Idx<Node>`, an `i64` that can only index one arena)
+are a later convenience, not inference.
 
-**Exit.** A linked-list and a tree traversal get a bound from the residue rule; switching a struct
-from rows to columns on a benchmark changes measured refills in the direction and magnitude the
-model predicts. **This is the project's first real gate**: the point at which being a language,
-rather than an analyser, has bought something.
+**Exit, as delivered.** `sum_list` and a tree walk over an arena get the two-piece bound (the
+arena's footprint where it fits, `n` lines where it does not), measured within 1.2–1.4× on both
+sides of `M`; `sum_x` under AoS vs SoA measured 3.7–4.0× against a predicted 3×. **This was the
+project's first real gate** — the point at which being a language, rather than an analyser, bought
+something — and it held.
 
 ## M5 — span and in-place reuse
 
@@ -258,6 +263,6 @@ hold. `kernel.perf_event_paranoid` must be 2 or lower.
 | the boundary swallows the program (most lines rest on `extern` declarations) | Stage C measures it; if the exact share does not move, the positioning is reopened (§ Who switches) |
 | the moves model does not predict hardware | M1's experiment and kill criterion, passed; re-run at every rule change |
 | symbolic sizes or regimes explode | Exact by default, feasibility pruning, and an explosion is reported, not folded (decisions §3) |
-| region inference and cost-driven layout are research problems | M4 waits for stage A; the explicit `Arena` and an explicit layout attribute are the fallbacks that always work |
+| region inference and cost-driven layout are research problems | M4 built the arena region rule and the layout choice on stage A instead of inference; the explicit layout attribute is the fallback that always works |
 | self-hosting recreates the bootstrap trap | Two seeds, both in CI; the Rust compiler is frozen, not deleted; seed two is C, not an image |
 | the generated-C path cannot express a layout the model wants | Discovered in M4, where the backend decision is revisited with evidence |

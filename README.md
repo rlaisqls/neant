@@ -109,11 +109,13 @@ Each of these is what it is because a cost has to flow through it.
   AoS for another — and owning layout is what makes bytes moved a thing it can bound. It is also
   what makes every value position-independent, so writing a structure to disk or a socket and
   reading it back is a copy of bytes and not a serialization step.
-- **Regions are inferred.** Pointer structures — lists, trees, graphs — live inside a region the
-  compiler finds by escape analysis (Tofte–Talpin). Inside a region the pointers are free; the
-  region's size is known; and if it fits a cache level, a traversal costs one load of the region
-  regardless of access order. You write `Arena::with_capacity(..)` only when you want to pin that
-  size yourself.
+- **There are no pointers, so there is nothing to infer.** A linked structure — a list, a tree, a
+  graph — is a struct array whose links are indices into it: an arena, written by the programmer,
+  not a heap the compiler traces (Tofte–Talpin has no unknown to find when the allocation is
+  already named). What the compiler does is bound the traversal: a non-affine access into an
+  arena that fits a cache level costs one load of the arena regardless of access order; one that
+  does not costs a line per step. `Arena::with_capacity(..)` is not an opt-in pin, it is how a
+  linked structure is written.
 - **Mutation is written one way and the compiler says what it did.** `ys = xs; ys[3] = 9` is the
   same text whether it copies or updates in place. If `xs` is uniquely referenced it is in place and
   the cost says `1`; if it is not, the cost says `n` and names the line that keeps `xs` alive. This
