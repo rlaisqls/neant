@@ -60,7 +60,7 @@ fn main() {
         while f >= 0 {
             if nodes[f].kind == 110 {
                 fw[si] = w_func(&buf, &toks, &nodes, &types, &ntys, &sigs, &ptys, &fw, &mut facs, &mut terms, &mut pols, &mut pst, &mut env, &mut wst, &mut scratch, &mut cof, &mut rargs, &mut logs, &mut budget, f, si);
-                fm[si] = m_func(&buf, &toks, &nodes, &types, &strs, &flds, &ntys, &sigs, &ptys, &fm, &ffoot, &mut facs, &mut terms, &mut pols, &mut pst, &mut env, &mut cof, &mut sites, &mut cks, &mut budget, &mut resid, &mut wst, f, si);
+                fm[si] = m_func(&buf, &toks, &nodes, &types, &strs, &flds, &ntys, &sigs, &ptys, &fm, &ffoot, &mut facs, &mut terms, &mut pols, &mut pst, &mut env, &mut cof, &mut sites, &mut cks, &mut budget, &mut resid, &mut rargs, &mut logs, &mut scratch, &mut wst, f, si);
                 // after the walk, since it reads the sites the walk recorded; the second pass is
                 // what lets a call to a function declared later find them
                 foot_flags(&buf, &toks, &nodes, &sites, &mut ffoot, &wst, f, si);

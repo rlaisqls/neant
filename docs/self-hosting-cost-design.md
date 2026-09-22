@@ -544,3 +544,22 @@ The method is now twice-proven and worth stating plainly: when two readings of t
 contradict each other, stop reading and make the source say what it does. Both times a few lines of
 `eprintln!` behind an environment variable answered in one run what hours of reasoning had not, and
 both times the reasoning had produced something confident and wrong.
+
+### Self-recursion for `moves`, almost free
+
+The `work` column's recurrence solver turned out to apply to `moves` unchanged, once one assumption
+was dropped: **`f` need not be a number, only independent of the measure.** `B` is a perfectly good
+body cost for a recurrence over `xs.len() − i`, and it is exactly what a self-recursive walk's
+traffic looks like:
+
+```
+sum_from   moves B·xs.len() − B·i + B
+bsearch    moves 2·B·log(hi − lo) + 2·B
+```
+
+The only other thing needed was the rule the `work` walk already had and the `moves` walk did not:
+**recursive calls count along the heavier arm only**. `bsearch` calls itself on each side of an
+`if`, and counting both made it two calls per invocation and so out of slice.
+
+**47 `moves` columns exact**, up from 43. Every remaining difference is still AoS/SoA, and the 20
+declined are nested loops, calls inside loops, and whole-array reassignment.
