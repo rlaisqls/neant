@@ -222,7 +222,16 @@ fresh atom each time, since it may have changed between them; `[e; xs.len()]` ta
 rather than minting one that merely agrees with it. Goldens `reassign_named_size`,
 `reassign_len_size`, `err_reassign_mutable_size`; the measurement kernels rewritten to the natural
 `let n = @N@;` form, same predictions and outputs as before.
-Next: `span`.
+
+**Next: span**, designed in [m5-span-design.md](m5-span-design.md), not yet built. `.par()` on a
+chain whose terminal combines associatively (fusion's existing closure-purity check is the
+soundness argument parallel execution needs, for free); span as a third cost alongside work and
+moves, `O(log n)` for a parallel reduction against work's `O(n)`; `P` as a third machine parameter;
+OpenMP emission. The design names its own likely failure before measuring it: `T ≤ W/P + O(S)` has
+no memory-bandwidth term, and M1 already found `sum`/`dot` bandwidth-bound — the exit test compares
+a compute-bound and a memory-bound `.par()` kernel's wall-clock scaling across `P`, and if the
+memory-bound one flattens while `work/P` keeps predicting improvement, the honest fix is a second,
+`moves/BW` term and a roofline bound, decided by the machine rather than assumed here.
 
 ## Self-hosting
 
