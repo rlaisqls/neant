@@ -8,8 +8,7 @@
 //! must say **unknown** rather than a number. A cost calculus that guesses is worse than one that
 //! declines, so that is asserted and not merely tolerated.
 //!
-//! Two groups of functions differ **on purpose**, and are listed by name; a third differs for a
-//! reason nobody has worked out yet, and says so. `ys = xs` on whole arrays
+//! Two groups of functions differ **on purpose**, and are listed by name. `ys = xs` on whole arrays
 //! costs 1 when the compiler can prove the assignment is in place and the array's length when it
 //! cannot. The proof is M5's uniqueness analysis; the self-hosted compiler has none, so its
 //! emitter always copies (docs/self-hosting-arrays-design.md §7) and its cost says so. The two
@@ -44,7 +43,7 @@ const EXACT: usize = 67;
 
 /// The same for `moves`, whose slice is narrower: a function that calls anything is unknown,
 /// because a callee's traffic depends on what is already resident (design §11).
-const EXACT_MOVES: usize = 25;
+const EXACT_MOVES: usize = 26;
 
 /// `(file, function)` where the self-hosted `moves` differs because **the self-hosted emitter
 /// always lays an array of structs out as AoS** (docs/self-hosting-arrays-design.md §4) while the
@@ -60,14 +59,7 @@ const AOS_INSTEAD: &[(&str, &str)] = &[
     ("structs.nt", "shift"),
 ];
 
-/// **Not understood.** `vm.nt`'s `run` is a bytecode interpreter whose dispatch is an `if`/`else if`
-/// chain; `neant cost` reports `3·B·fuel + B` and the self-hosted pass `10·B·fuel + B`. Ten is
-/// what counting one site per (array, index, branch) gives, and three is exactly what ignoring the
-/// branch gives — but `parse.nt`'s `peek` needs the branch counted, or its two reads of `pos[0]`
-/// on either side of an `if` collapse into one and it reports `2·B` where `neant cost` says `3·B`.
-/// Both cannot be right, so one of the two readings of `analyze.rs`'s site identity is wrong and
-/// this is listed as a difference nobody has explained rather than as one somebody chose.
-const UNEXPLAINED_MOVES: &[(&str, &str)] = &[("vm.nt", "run")];
+
 
 /// The driver is a committed fragment, not a string in this file: a test that embeds the program
 /// it runs drifts from it silently, which this one did once.
@@ -155,13 +147,12 @@ fn self_hosted_work_agrees_with_bootstrap() {
         for (fname, mw) in &want_moves {
             let Some(g) = got_moves.get(fname.as_str()) else { continue };
             if *g == "unknown" { continue; }
-            let listed = AOS_INSTEAD.contains(&(name.as_str(), fname.as_str()))
-                || UNEXPLAINED_MOVES.contains(&(name.as_str(), fname.as_str()));
+            let listed = AOS_INSTEAD.contains(&(name.as_str(), fname.as_str()));
             if g == mw {
                 exact_moves += 1;
                 if listed {
                     failures.push(format!("{name} {fname} is listed as a moves difference, but the \
-                        two agree — delete it from AOS_INSTEAD or UNEXPLAINED_MOVES"));
+                        two agree — delete it from AOS_INSTEAD"));
                 }
             } else if !listed {
                 failures.push(format!("{name} {fname}: `neant cost` says moves [{mw}], the \

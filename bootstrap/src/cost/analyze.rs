@@ -1171,6 +1171,14 @@ impl<'a, 'b, 'c> Fa<'a, 'b, 'c> {
     fn settle_moves(&mut self) {
         let m = self.machine();
         let nsites = self.sites.len();
+        if std::env::var("NEANT_DEBUG_SITES").is_ok() {
+            eprintln!("=== {} : {} sites", self.f.name, nsites);
+            for (i, s) in self.sites.iter().enumerate() {
+                eprintln!("  [{i}] arr={} stride={} es={} field={:?} path={:?} branch={:?} aff={} key={:?}",
+                    self.f.locals[s.arr].name, s.stride, s.es, s.field, s.path, s.branch,
+                    s.aff.is_some(), s.key);
+            }
+        }
         // for every (site, loop): the alternatives for the lines the site touches over one full
         // run of that loop — each under the conditions that produced it, with whether they form
         // one contiguous region

@@ -1103,12 +1103,12 @@ fn scalar_bytes(types: &[Ty], strs: &[Str], flds: &[Fld], t: i64) -> i64 {
 // loop. wst[14] carries "the index is not affine" out of `idx_coef`.
 fn site_add(src: &[u8], toks: &[Token], nodes: &[Node], types: &[Ty], strs: &[Str], flds: &[Fld],
             ntys: &[i64], facs: &mut [Fac], terms: &mut [Term], pols: &mut [Pol],
-            pst: &mut [i64], env: &mut [Env], cof: &mut [Cof], sites: &mut [Site], wst: &mut [i64], arr: i64, idx: i64) {
+            pst: &mut [i64], env: &mut [Env], cof: &mut [Cof], sites: &mut [Site], wst: &mut [i64], arr: i64, idx: i64) -> i64 {
     let t = ntys[arr];
     let es = elem_bytes(types, strs, flds, t);
     if es < 0 || nodes[arr].kind != 65 {
         wst[1] = 1;
-        return;
+        return pol_zero(facs, terms, pols, pst);
     }
     let mut i = 0;
     while i < wst[10] {
@@ -1119,7 +1119,7 @@ fn site_add(src: &[u8], toks: &[Token], nodes: &[Node], types: &[Ty], strs: &[St
         if sites[i].inloop == wst[11] && sites[i].branch == wst[20]
             && name_eq(src, toks, sites[i].arr, nodes[arr].a)
             && expr_same(src, toks, nodes, sites[i].idx, idx) {
-            return;
+            return pol_zero(facs, terms, pols, pst);
         }
         i += 1;
     }
@@ -1136,27 +1136,40 @@ fn site_add(src: &[u8], toks: &[Token], nodes: &[Node], types: &[Ty], strs: &[St
     sites[s].branch = wst[20];
     sites[s].novar = if wst[12] < 0 { 1 } else { 0 };
     wst[10] = s + 1;
+
+    // settled here rather than in a pass at the end, so that the moves of an `if`'s two arms can
+    // be compared: sites in different arms are *alternatives*, and only one of them happens
+    let b = pol_atom(facs, terms, pols, pst, 0);
+    if wst[11] == 0 { return b; }
+    let trip = sites[s].trip;
+    let cm = if sites[s].coef < 0 { 0 - sites[s].coef } else { sites[s].coef };
+    let stride = cm * sites[s].stride;
+    if sites[s].bad != 0 || sites[s].coef == 0 && sites[s].novar != 0 || stride >= 64 {
+        return pol_mul(facs, terms, pols, pst, trip, b);
+    }
+    if stride == 0 { return b; }
+    let slide = pol_scale(facs, terms, pols, pst, trip, stride, 1);
+    pol_add(facs, terms, pols, pst, b, slide)
 }
 
 fn m_expr(src: &[u8], toks: &[Token], nodes: &[Node], types: &[Ty], strs: &[Str], flds: &[Fld],
           ntys: &[i64], facs: &mut [Fac], terms: &mut [Term], pols: &mut [Pol],
-            pst: &mut [i64], env: &mut [Env], cof: &mut [Cof], sites: &mut [Site], wst: &mut [i64], n: i64) {
-    if n < 0 || wst[1] != 0 { return; }
+            pst: &mut [i64], env: &mut [Env], cof: &mut [Cof], sites: &mut [Site], wst: &mut [i64], n: i64) -> i64 {
+    if n < 0 || wst[1] != 0 { return pol_zero(facs, terms, pols, pst); }
     let k = nodes[n].kind;
     if k == 68 {
-        m_expr(src, toks, nodes, types, strs, flds, ntys, facs, terms, pols, pst, env, cof, sites, wst, nodes[n].b);
-        site_add(src, toks, nodes, types, strs, flds, ntys, facs, terms, pols, pst, env, cof, sites, wst, nodes[n].a, nodes[n].b);
-        return;
+        let i = m_expr(src, toks, nodes, types, strs, flds, ntys, facs, terms, pols, pst, env, cof, sites, wst, nodes[n].b);
+        let s = site_add(src, toks, nodes, types, strs, flds, ntys, facs, terms, pols, pst, env, cof, sites, wst, nodes[n].a, nodes[n].b);
+        return pol_add(facs, terms, pols, pst, i, s);
     }
     if k == 69 {
         let base = nodes[n].a;
         if nodes[base].kind == 68 {
-            m_expr(src, toks, nodes, types, strs, flds, ntys, facs, terms, pols, pst, env, cof, sites, wst, nodes[base].b);
-            site_add(src, toks, nodes, types, strs, flds, ntys, facs, terms, pols, pst, env, cof, sites, wst, nodes[base].a, nodes[base].b);
-            return;
+            let i = m_expr(src, toks, nodes, types, strs, flds, ntys, facs, terms, pols, pst, env, cof, sites, wst, nodes[base].b);
+            let s = site_add(src, toks, nodes, types, strs, flds, ntys, facs, terms, pols, pst, env, cof, sites, wst, nodes[base].a, nodes[base].b);
+            return pol_add(facs, terms, pols, pst, i, s);
         }
-        m_expr(src, toks, nodes, types, strs, flds, ntys, facs, terms, pols, pst, env, cof, sites, wst, base);
-        return;
+        return m_expr(src, toks, nodes, types, strs, flds, ntys, facs, terms, pols, pst, env, cof, sites, wst, base);
     }
     if k == 71 {
         // a call's moves depend on what is already resident, which is the footprint machinery
@@ -1164,80 +1177,88 @@ fn m_expr(src: &[u8], toks: &[Token], nodes: &[Node], types: &[Ty], strs: &[Str]
         if !name_is_println(src, toks, nodes[n].a) && !name_is_min(src, toks, nodes[n].a)
             && !name_is_max(src, toks, nodes[n].a) {
             wst[1] = 1;
-            return;
+            return pol_zero(facs, terms, pols, pst);
         }
+        let mut acc = pol_zero(facs, terms, pols, pst);
         let mut a = nodes[n].b;
         while a >= 0 {
-            m_expr(src, toks, nodes, types, strs, flds, ntys, facs, terms, pols, pst, env, cof, sites, wst, a);
+            let w = m_expr(src, toks, nodes, types, strs, flds, ntys, facs, terms, pols, pst, env, cof, sites, wst, a);
+            acc = pol_add(facs, terms, pols, pst, acc, w);
             a = nodes[a].next;
         }
-        return;
+        return acc;
     }
     if k == 75 {
-        m_expr(src, toks, nodes, types, strs, flds, ntys, facs, terms, pols, pst, env, cof, sites, wst, nodes[n].a);
+        // **the two arms are alternatives, so the traffic is the larger and not the sum** — the
+        // same rule `work` follows, and the reason `vm.nt`'s dispatch chain costs three lines a
+        // lap and not ten. Sites still carry a branch tag, because two reads of one address on
+        // opposite sides of an `if` are two sites even though only one of them happens.
+        let c = m_expr(src, toks, nodes, types, strs, flds, ntys, facs, terms, pols, pst, env, cof, sites, wst, nodes[n].a);
         let saved = wst[20];
         wst[21] = wst[21] + 1;
         wst[20] = wst[21] * 2;
-        m_block(src, toks, nodes, types, strs, flds, ntys, facs, terms, pols, pst, env, cof, sites, wst, nodes[n].b);
+        let t = m_block(src, toks, nodes, types, strs, flds, ntys, facs, terms, pols, pst, env, cof, sites, wst, nodes[n].b);
         wst[20] = wst[21] * 2 + 1;
-        m_block(src, toks, nodes, types, strs, flds, ntys, facs, terms, pols, pst, env, cof, sites, wst, nodes[n].c);
+        let e = m_block(src, toks, nodes, types, strs, flds, ntys, facs, terms, pols, pst, env, cof, sites, wst, nodes[n].c);
         wst[20] = saved;
-        return;
+        let m = pol_max(facs, terms, pols, pst, wst, t, e);
+        return pol_add(facs, terms, pols, pst, c, m);
     }
     if k == 76 {
-        m_block(src, toks, nodes, types, strs, flds, ntys, facs, terms, pols, pst, env, cof, sites, wst, n);
-        return;
+        return m_block(src, toks, nodes, types, strs, flds, ntys, facs, terms, pols, pst, env, cof, sites, wst, n);
     }
     if k == 66 {
-        m_expr(src, toks, nodes, types, strs, flds, ntys, facs, terms, pols, pst, env, cof, sites, wst, nodes[n].a);
-        m_expr(src, toks, nodes, types, strs, flds, ntys, facs, terms, pols, pst, env, cof, sites, wst, nodes[n].b);
-        return;
+        let a = m_expr(src, toks, nodes, types, strs, flds, ntys, facs, terms, pols, pst, env, cof, sites, wst, nodes[n].a);
+        let b = m_expr(src, toks, nodes, types, strs, flds, ntys, facs, terms, pols, pst, env, cof, sites, wst, nodes[n].b);
+        return pol_add(facs, terms, pols, pst, a, b);
     }
     if k == 67 || k == 74 {
-        m_expr(src, toks, nodes, types, strs, flds, ntys, facs, terms, pols, pst, env, cof, sites, wst, nodes[n].a);
-        return;
+        return m_expr(src, toks, nodes, types, strs, flds, ntys, facs, terms, pols, pst, env, cof, sites, wst, nodes[n].a);
     }
     if k == 70 {
+        let mut acc = pol_zero(facs, terms, pols, pst);
         let mut fi = nodes[n].b;
         while fi >= 0 {
-            m_expr(src, toks, nodes, types, strs, flds, ntys, facs, terms, pols, pst, env, cof, sites, wst, nodes[fi].b);
+            let v = m_expr(src, toks, nodes, types, strs, flds, ntys, facs, terms, pols, pst, env, cof, sites, wst, nodes[fi].b);
+            acc = pol_add(facs, terms, pols, pst, acc, v);
             fi = nodes[fi].next;
         }
-        return;
+        return acc;
     }
-    if k == 77 || k == 78 {
-        wst[1] = 1;
-    }
+    if k == 77 || k == 78 { wst[1] = 1; };
+    pol_zero(facs, terms, pols, pst)
 }
 
 fn m_block(src: &[u8], toks: &[Token], nodes: &[Node], types: &[Ty], strs: &[Str], flds: &[Fld],
            ntys: &[i64], facs: &mut [Fac], terms: &mut [Term], pols: &mut [Pol],
-            pst: &mut [i64], env: &mut [Env], cof: &mut [Cof], sites: &mut [Site], wst: &mut [i64], n: i64) {
-    if n < 0 || wst[1] != 0 { return; }
+            pst: &mut [i64], env: &mut [Env], cof: &mut [Cof], sites: &mut [Site], wst: &mut [i64], n: i64) -> i64 {
+    if n < 0 || wst[1] != 0 { return pol_zero(facs, terms, pols, pst); }
     let saved = wst[0];
+    let mut acc = pol_zero(facs, terms, pols, pst);
     let mut s = nodes[n].a;
     while s >= 0 && wst[1] == 0 {
-        m_stmt(src, toks, nodes, types, strs, flds, ntys, facs, terms, pols, pst, env, cof, sites, wst, s);
+        let w = m_stmt(src, toks, nodes, types, strs, flds, ntys, facs, terms, pols, pst, env, cof, sites, wst, s);
+        acc = pol_add(facs, terms, pols, pst, acc, w);
         s = nodes[s].next;
     }
-    m_expr(src, toks, nodes, types, strs, flds, ntys, facs, terms, pols, pst, env, cof, sites, wst, nodes[n].b);
+    let t = m_expr(src, toks, nodes, types, strs, flds, ntys, facs, terms, pols, pst, env, cof, sites, wst, nodes[n].b);
     wst[0] = saved;
+    pol_add(facs, terms, pols, pst, acc, t)
 }
 
 fn m_stmt(src: &[u8], toks: &[Token], nodes: &[Node], types: &[Ty], strs: &[Str], flds: &[Fld],
           ntys: &[i64], facs: &mut [Fac], terms: &mut [Term], pols: &mut [Pol],
-            pst: &mut [i64], env: &mut [Env], cof: &mut [Cof], sites: &mut [Site], wst: &mut [i64], n: i64) {
+            pst: &mut [i64], env: &mut [Env], cof: &mut [Cof], sites: &mut [Site], wst: &mut [i64], n: i64) -> i64 {
     let k = nodes[n].kind;
     if k == 90 {
         let init = nodes[n].c;
         if nodes[init].kind == 77 || nodes[init].kind == 78 || nodes[init].kind == 64 {
-            // building an array streams every byte of it; the footprint that follows is the
-            // residency question this slice does not answer, so only a leaf that builds nothing
-            // stays in it
+            // building an array streams every byte of it, and the footprint that follows is the
+            // residency question this slice does not answer
             wst[1] = 1;
-            return;
+            return pol_zero(facs, terms, pols, pst);
         }
-        m_expr(src, toks, nodes, types, strs, flds, ntys, facs, terms, pols, pst, env, cof, sites, wst, init);
+        let w = m_expr(src, toks, nodes, types, strs, flds, ntys, facs, terms, pols, pst, env, cof, sites, wst, init);
         // the same environment the work walk keeps, and for the same reason: a `while`'s induction
         // variable needs its entry value, and an array's length is what a loop bound reads
         let t = ntys[init];
@@ -1247,18 +1268,22 @@ fn m_stmt(src: &[u8], toks: &[Token], nodes: &[Node], types: &[Ty], strs: &[Str]
         } else {
             env_add(env, wst, nodes[n].a, val_of(src, toks, nodes, facs, terms, pols, pst, env, wst, init), -1);
         }
-        return;
+        return w;
     }
     if k == 91 {
-        m_expr(src, toks, nodes, types, strs, flds, ntys, facs, terms, pols, pst, env, cof, sites, wst, nodes[n].b);
+        let mut acc = m_expr(src, toks, nodes, types, strs, flds, ntys, facs, terms, pols, pst, env, cof, sites, wst, nodes[n].b);
         let tgt = nodes[n].a;
         if nodes[tgt].kind == 68 {
-            m_expr(src, toks, nodes, types, strs, flds, ntys, facs, terms, pols, pst, env, cof, sites, wst, nodes[tgt].b);
-            site_add(src, toks, nodes, types, strs, flds, ntys, facs, terms, pols, pst, env, cof, sites, wst, nodes[tgt].a, nodes[tgt].b);
+            let i = m_expr(src, toks, nodes, types, strs, flds, ntys, facs, terms, pols, pst, env, cof, sites, wst, nodes[tgt].b);
+            let sp = site_add(src, toks, nodes, types, strs, flds, ntys, facs, terms, pols, pst, env, cof, sites, wst, nodes[tgt].a, nodes[tgt].b);
+            acc = pol_add(facs, terms, pols, pst, acc, i);
+            acc = pol_add(facs, terms, pols, pst, acc, sp);
         } else if nodes[tgt].kind == 69 && nodes[nodes[tgt].a].kind == 68 {
             let b = nodes[tgt].a;
-            m_expr(src, toks, nodes, types, strs, flds, ntys, facs, terms, pols, pst, env, cof, sites, wst, nodes[b].b);
-            site_add(src, toks, nodes, types, strs, flds, ntys, facs, terms, pols, pst, env, cof, sites, wst, nodes[b].a, nodes[b].b);
+            let i = m_expr(src, toks, nodes, types, strs, flds, ntys, facs, terms, pols, pst, env, cof, sites, wst, nodes[b].b);
+            let sp = site_add(src, toks, nodes, types, strs, flds, ntys, facs, terms, pols, pst, env, cof, sites, wst, nodes[b].a, nodes[b].b);
+            acc = pol_add(facs, terms, pols, pst, acc, i);
+            acc = pol_add(facs, terms, pols, pst, acc, sp);
         } else if nodes[tgt].kind == 65 {
             if ntys[tgt] >= 0 && (types[ntys[tgt]].kind == 5 || types[ntys[tgt]].kind == 6) {
                 wst[1] = 1;
@@ -1267,57 +1292,64 @@ fn m_stmt(src: &[u8], toks: &[Token], nodes: &[Node], types: &[Ty], strs: &[Str]
                 if e >= 0 { env[e].val = -1; }
             }
         }
-        return;
+        return acc;
     }
     if k == 92 || k == 93 {
         // one loop deep: a site inside two loops is where reuse lives, and reuse is what
         // `settle_moves` exists for
         if wst[11] != 0 {
             wst[1] = 1;
-            return;
+            return pol_zero(facs, terms, pols, pst);
         }
+        let saved = wst[0];
         wst[11] = 1;
+        let mut acc = pol_zero(facs, terms, pols, pst);
         if k == 92 {
-            m_expr(src, toks, nodes, types, strs, flds, ntys, facs, terms, pols, pst, env, cof, sites, wst, nodes[n].b);
-            m_expr(src, toks, nodes, types, strs, flds, ntys, facs, terms, pols, pst, env, cof, sites, wst, nodes[n].c);
+            let a = m_expr(src, toks, nodes, types, strs, flds, ntys, facs, terms, pols, pst, env, cof, sites, wst, nodes[n].b);
+            let b = m_expr(src, toks, nodes, types, strs, flds, ntys, facs, terms, pols, pst, env, cof, sites, wst, nodes[n].c);
             let lo = val_of(src, toks, nodes, facs, terms, pols, pst, env, wst, nodes[n].b);
             let hi = val_of(src, toks, nodes, facs, terms, pols, pst, env, wst, nodes[n].c);
             if lo < 0 || hi < 0 {
                 wst[1] = 1;
-                return;
+                return pol_zero(facs, terms, pols, pst);
             }
             wst[13] = pol_sub(facs, terms, pols, pst, hi, lo);
             wst[12] = nodes[n].a;
-            env_add(env, wst, nodes[n].a, -1, -1);
             wst[22] = nodes[n].d;
-            m_block(src, toks, nodes, types, strs, flds, ntys, facs, terms, pols, pst, env, cof, sites, wst, nodes[n].d);
+            env_add(env, wst, nodes[n].a, -1, -1);
+            let body = m_block(src, toks, nodes, types, strs, flds, ntys, facs, terms, pols, pst, env, cof, sites, wst, nodes[n].d);
+            acc = pol_add(facs, terms, pols, pst, a, b);
+            acc = pol_add(facs, terms, pols, pst, acc, body);
         } else {
             let t = while_trip(src, toks, nodes, facs, terms, pols, pst, env, wst, cof, n);
             if t < 0 {
                 wst[1] = 1;
-                return;
+                return pol_zero(facs, terms, pols, pst);
             }
-            m_expr(src, toks, nodes, types, strs, flds, ntys, facs, terms, pols, pst, env, cof, sites, wst, nodes[n].a);
-            m_expr(src, toks, nodes, types, strs, flds, ntys, facs, terms, pols, pst, env, cof, sites, wst, nodes[n].b);
+            let a = m_expr(src, toks, nodes, types, strs, flds, ntys, facs, terms, pols, pst, env, cof, sites, wst, nodes[n].a);
+            let b = m_expr(src, toks, nodes, types, strs, flds, ntys, facs, terms, pols, pst, env, cof, sites, wst, nodes[n].b);
             wst[13] = t;
             // a `while` with a measure has no loop variable at all, so nothing in it is known to
             // move contiguously; one with an induction variable has that variable
             wst[12] = wst[15];
             wst[22] = nodes[n].c;
-            m_block(src, toks, nodes, types, strs, flds, ntys, facs, terms, pols, pst, env, cof, sites, wst, nodes[n].c);
+            let body = m_block(src, toks, nodes, types, strs, flds, ntys, facs, terms, pols, pst, env, cof, sites, wst, nodes[n].c);
+            acc = pol_add(facs, terms, pols, pst, a, b);
+            acc = pol_add(facs, terms, pols, pst, acc, body);
         }
+        wst[0] = saved;
         wst[11] = 0;
         wst[12] = -1;
         wst[13] = -1;
         wst[22] = -1;
-        return;
+        return acc;
     }
-    if k == 94 { return; }
+    if k == 94 { return pol_zero(facs, terms, pols, pst); }
     if k == 95 || k == 96 {
-        m_expr(src, toks, nodes, types, strs, flds, ntys, facs, terms, pols, pst, env, cof, sites, wst, nodes[n].a);
-        return;
+        return m_expr(src, toks, nodes, types, strs, flds, ntys, facs, terms, pols, pst, env, cof, sites, wst, nodes[n].a);
     }
     wst[1] = 1;
+    pol_zero(facs, terms, pols, pst)
 }
 
 // The moves of a function that calls nothing: its sites, settled by the rule in §11. −1 when this
@@ -1349,29 +1381,7 @@ fn m_func(src: &[u8], toks: &[Token], nodes: &[Node], types: &[Ty], strs: &[Str]
         i += 1;
         p = nodes[p].next;
     }
-    m_block(src, toks, nodes, types, strs, flds, ntys, facs, terms, pols, pst, env, cof, sites, wst, nodes[f].d);
+    let total = m_block(src, toks, nodes, types, strs, flds, ntys, facs, terms, pols, pst, env, cof, sites, wst, nodes[f].d);
     if wst[1] != 0 { return -1; }
-
-    let b = pol_atom(facs, terms, pols, pst, 0);
-    let mut total = pol_zero(facs, terms, pols, pst);
-    let mut s = 0;
-    while s < wst[10] {
-        let mut one = b;
-        if sites[s].inloop != 0 {
-            let trip = sites[s].trip;
-            let c = if sites[s].coef < 0 { 0 - sites[s].coef } else { sites[s].coef };
-            let stride = c * sites[s].stride;
-            if sites[s].bad != 0 || sites[s].coef == 0 && sites[s].novar != 0 || stride >= 64 {
-                // a whole line per touch — and the same answer for an index the compiler cannot
-                // follow, which is the assumption that rounds up
-                one = pol_mul(facs, terms, pols, pst, trip, b);
-            } else if stride > 0 {
-                let slide = pol_scale(facs, terms, pols, pst, trip, stride, 1);
-                one = pol_add(facs, terms, pols, pst, b, slide);
-            }
-        }
-        total = pol_add(facs, terms, pols, pst, total, one);
-        s += 1;
-    }
     total
 }

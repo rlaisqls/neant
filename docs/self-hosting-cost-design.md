@@ -285,7 +285,7 @@ function with a call must say unknown.
 
 ### What building it changed
 
-**25 `moves` columns exact**, 35 declined, 8 differing. Seven of the eight are the AoS/SoA
+**26 `moves` columns exact**, 35 declined, and 7 differing — every one of them the AoS/SoA
 divergence §11 predicted before a line was written, which is the first time a prediction in one of
 these documents has survived contact unchanged.
 
@@ -304,9 +304,25 @@ these documents has survived contact unchanged.
   omission, in the same place, as the one the `work` slice found for a target that is a plain
   variable.
 
-**One difference nobody has explained.** `vm.nt`'s `run` — a bytecode interpreter dispatching
-through an `if`/`else if` chain — reports `3·B·fuel + B` from `neant cost` and `10·B·fuel + B`
-here. Ten is one site per (array, index, branch); three is exactly what ignoring the branch gives.
-But `peek` above *needs* the branch counted. Both readings of `analyze.rs`'s site identity cannot
-be right, and rather than pick the one that makes this corpus agree, it is listed in the test as
-`UNEXPLAINED_MOVES` — a difference nobody has explained, not one somebody chose.
+### The one difference that was mine
+
+`vm.nt`'s `run` — a bytecode interpreter dispatching through an `if`/`else if` chain — reported
+`3·B·fuel + B` from `neant cost` and `10·B·fuel + B` here, and the two readings of site identity
+that could explain it contradicted each other: three is what ignoring the branch gives, and `peek`
+needs the branch counted.
+
+It was listed as unexplained rather than excused, and then settled by **instrumenting the Rust
+compiler** — `NEANT_DEBUG_SITES=1` prints the site table — instead of reading it again. The Rust
+has **eleven** sites for `run`, not three. The three comes from somewhere else entirely:
+
+> **The arms of an `if` are alternatives, so their traffic is the larger and not the sum.**
+
+The same rule `work` follows, which had been in this file for two slices. Sites still carry a
+branch tag — two reads of one address on opposite sides of an `if` are two sites, which is what
+`peek` needs — but their *costs* combine with `max`, not `+`. Collecting sites into a flat list
+and settling them at the end cannot express that, so the moves walk now returns a polynomial per
+node and composes exactly as the work walk does.
+
+The lesson is about the method, not the rule: a difference that two readings of the source both
+fail to explain is a signal to *measure the source*, and a three-line `eprintln!` behind an
+environment variable answered in one run what an hour of reading had not.
