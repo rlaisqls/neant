@@ -85,8 +85,11 @@ the working set of *every* access site inside that loop, added together, is a kn
 bytes strictly less than `M`. The sum is what the M1 experiment forced: a tiled matrix product
 whose `a`-panel alone fits was measured re-reading it, because the `b` tiles streaming through
 the same loop level brought the total to exactly `M`. Strictly less, because a cache is never
-empty of everything else. A working set that still contains a size variable is assumed not to
-fit. This is why `matmul(n, ...)` analysed on its own reports
+empty of everything else. A working set that still contains a size variable is, today, assumed
+not to fit — which makes a function's own line the most pessimistic regime. That rule is being
+replaced by conditional costs, decided in [decisions.md](decisions.md) §2: an undecidable fit
+test forks the cost into `… if n·B < M` and `… otherwise`, with a lid of four regimes per
+function folded toward the pessimistic side. This is why `matmul(n, ...)` analysed on its own reports
 `B·n³ + 8n³ + 8n²` — a conservative bound in which nothing is reused — while the same function
 called from a `main` where `n = 1792` reports `8n³ + …`, because there the column of `b` is
 `1792` lines, that is a number, it is under `M`, and the walk down consecutive columns is seen to

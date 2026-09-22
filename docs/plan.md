@@ -153,6 +153,11 @@ arise — closures are inlined into their chain, and there are no function value
 
 ### M4 — Views, layout, regions
 
+**Before M4 starts**, two things from the 2026-09-22 design review: the aliasing hole (a shared
+and a mutable view of one array in the same call is accepted and emitted with `restrict` — a
+correctness bug), and conditional costs ([decisions.md](decisions.md) §2), without which the
+region bound below cannot be stated for a symbolic region size.
+
 The part of the design that makes the moves model apply to programs with structure in them.
 
 - **Structs and views.** `&xs[i]` and `&p.field` denote (collection, index) or (collection,
