@@ -412,3 +412,67 @@ three walks of the whole arena per run. The arena fits the 2 MiB L2 below `n = 1
   says so rather than guessing, because a condition in this calculus can compare a working set
   with the cache but not two size expressions with each other.
 
+## M5 — does in-place reuse move nothing, and a forced copy move `n`?
+
+**Question.** `ys = xs;` is decided once, from the text, never from a runtime value
+(m5-design.md §2): in place when no view of `xs` survives it (predicted `moves 0` for the
+statement itself), a copy when one does (predicted `moves 8·n`). Does the machine show the
+difference, and does it scale with `n` the way the model says?
+
+**Setup.** `tests/kernels/reassign_inplace.nt.in` and `reassign_copy.nt.in`: each repeat builds a
+fresh `xs` and `ys` of `n` `i64`s, reassigns, mutates one element, and sums the whole of `ys`
+(`reassign_copy` also reads a view of `xs` taken before the reassignment, which is what forces its
+copy) — the sum is there so nothing is dead-code-eliminated; an earlier version that only read
+`ys[0]` measured flat, near-zero traffic at every `n`, because gcc could prove the rest of both
+arrays was never read and dropped the writes that built them.
+
+| kernel | `n` | predicted | measured | ratio |
+|---|---:|---:|---:|---:|
+| reassign_inplace ×3 | 800 000 | 5.76e7 | 1.55e7 | 3.72 |
+| | 3 200 000 | 2.30e8 | 7.52e7 | 3.06 |
+| | 12 800 000 | 9.22e8 | 3.08e8 | 2.99 |
+| | *slope* | **1.00** | **1.02** | |
+| reassign_copy ×3 | 800 000 | 7.68e7 | 2.82e7 | 2.73 |
+| | 3 200 000 | 3.07e8 | 1.01e8 | 3.05 |
+| | 12 800 000 | 1.23e9 | 4.11e8 | 2.99 |
+| | *slope* | **1.00** | **1.01** | |
+
+`n = 200 000` is dropped from the table (both arrays under 1.6 MiB, near L2's 2 MiB — the same
+residency effect noted for `struct_soa` at that size, not the thing under test).
+
+**The copy's own marginal cost**, `reassign_copy` minus `reassign_inplace`, isolates the
+reassignment from the build-and-sum cost the two kernels share:
+
+| `n` | predicted delta | measured delta | ratio |
+|---:|---:|---:|---:|
+| 3 200 000 | 7.68e7 | 2.55e7 | 3.02 |
+| 12 800 000 | 3.07e8 | 1.03e8 | 2.99 |
+
+**Findings.**
+
+- **The exit tests pass.** In place, past L2, adds nothing to the measured traffic beyond the
+  build and the sum; forced to copy, the machine pays for it, and the extra bytes scale with `n`
+  at slope 1.00 — exactly the `8·n` the model predicts, not a fraction of it and not a different
+  power. The two kernels' own slopes (1.02, 1.01) track the model's (1.00) as closely as any
+  kernel in this file has.
+- **The ratio is the same ~3× on both kernels, so it is not about the copy.** 2.99–3.06 at the two
+  largest sizes, in place and copied alike, and the copy's own isolated delta lands at the same
+  2.99–3.02. This is the M1 read-stream finding (§3 above) plus one more effect these kernels have
+  that `sum`'s own sweep does not: `reassign_inplace`/`reassign_copy` `malloc` a fresh pair every
+  repeat rather than filling one array once outside the loop, so first touch of every page is a
+  kernel zero-fill fault the model has no line for. `sum` alone measures 2.2–2.8×; a pure read
+  stream on freshly faulted pages landing at 3.0× is consistent with both effects adding, not a
+  new one.
+- **The naive kernel is the honest one.** No attempt was made here to net out the shared
+  build-and-sum cost or the page-fault effect and report a "clean" ratio nearer 1×; the number
+  that matters is that the copy's *marginal* bytes, isolated by subtraction, scale exactly as
+  predicted, at the same constant factor the rest of the traffic does.
+- **A rough edge the kernels had to route around, not a measurement finding.** `let n = @N@; let
+  xs = [1; n]; let mut ys = [0; n];` fails to typecheck — `[e; n]` allocates a fresh `Size::Var`
+  for `n` on every use, even the same local `n`, so `xs` and `ys` end up with two different size
+  atoms and `ys = xs` sees them as different types. Both kernels build `[0; @N@]` / `[1; @N@]`
+  directly from the substituted literal instead, which gives both arrays `Size::Const` and steps
+  around it. Real code naming its arrays' size once and building several arrays from it
+  would hit this immediately; it is a gap in size-variable reuse for `[e; n]`, not in `ys = xs`
+  itself, and is worth fixing before this feature is asked to carry ordinary code.
+

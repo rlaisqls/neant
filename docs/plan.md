@@ -205,9 +205,19 @@ place. Inside a loop the copy is forced unconditionally when either name predate
 not solved (goldens `reassign_inplace`, `reassign_copy`, `reassign_loop`). The gap m5-design.md §4
 found in part 1 is closed the same way: `let ys = xs;` now rejects a move that leaves a view of the
 source alive (`err_move_view`) — `restrict` and the call-argument disjointness check depended on
-that being impossible, and until this it was not checked. Not done: the hardware measurement
-m5-design.md §7 asks for (exit tests 1–2, `perf` past L2) — the goldens are functional and cost-report
-only, the same gap M4's gate closed with a real measurement, not yet repeated here. Next: `span`.
+that being impossible, and until this it was not checked.
+
+**Measured, exit tests 1–2 passed** (docs/experiments.md, M5 — `tests/kernels/reassign_inplace.nt.in`,
+`reassign_copy.nt.in`, `perf` past L2 on the pinned core): in place adds nothing to the measured
+traffic beyond building and summing the pair; forced to copy, the machine pays for it, and the
+copy's own marginal cost — the copy kernel's bytes minus the in-place kernel's, isolating the
+reassignment from what both share — scales with `n` at slope 1.00 against `8·n`, at the model's
+usual ~3× counter gap (M1 §3's read-stream pairing, plus a fresh-`malloc`-every-repeat page-fault
+effect `sum`'s own sweep does not have). A rough edge found doing this, not part of the feature:
+`[e; n]` allocates a fresh size atom per use, so two arrays built from literally the same local `n`
+do not type-match for `ys = xs` — real code naming a size once and building several arrays from it
+would hit this; worth fixing before the feature is asked to carry ordinary code (not scheduled).
+Next: `span`.
 
 ## Self-hosting
 

@@ -1,0 +1,23 @@
+// ys = xs; each repeat gets a fresh pair and no view of xs survives it: in place, predicted
+// moves 0 for the reassignment itself. n*8 bytes still move once to build xs and once to build
+// ys, and once more to sum ys (so nothing is optimised away), but never a second n*8 for the
+// reassignment's own copy (m5-design.md exit test 1).
+fn sum(xs: &[i64]) -> i64 {
+    let mut s = 0;
+    for i in 0..xs.len() {
+        s += xs[i];
+    }
+    s
+}
+
+fn main() {
+    let mut t = 0;
+    for r in 0..@R@ {
+        let mut ys = [0; @N@];
+        let xs = [1; @N@];
+        ys = xs;
+        ys[0] += 1;
+        t += sum(&ys);
+    }
+    println(t);
+}

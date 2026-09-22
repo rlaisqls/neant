@@ -1,0 +1,22 @@
+// the same, but a view of xs survives the reassignment, forcing a copy: predicted n*8 bytes
+// more than reassign_inplace, the whole array written once into ys's own buffer (exit test 2).
+fn sum(xs: &[i64]) -> i64 {
+    let mut s = 0;
+    for i in 0..xs.len() {
+        s += xs[i];
+    }
+    s
+}
+
+fn main() {
+    let mut t = 0;
+    for r in 0..@R@ {
+        let mut ys = [0; @N@];
+        let xs = [1; @N@];
+        let v = &xs;
+        ys = xs;
+        ys[0] += 1;
+        t += sum(&ys) + v[0];
+    }
+    println(t);
+}
