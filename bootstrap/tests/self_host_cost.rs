@@ -42,11 +42,13 @@ const COPIES_INSTEAD: &[(&str, &str)] = &[
 const EXACT: usize = 71;
 
 /// The same for `moves`, whose slice is narrower: a function that calls anything is unknown,
-/// because a callee's traffic depends on what is already resident (design §11). Five of these are
+/// because a callee's traffic depends on what is already resident — which it now computes, so a
+/// call is unknown only inside a loop or into a callee whose own cost forks (design §14). Five of
+/// these are
 /// **piecewise** — a scattered walk costs the array's footprint when it fits in `M` and a line per
 /// touch when it does not — and their two regimes and the condition between them are compared as
 /// one string, exactly as the single-piece ones are (design §13).
-const EXACT_MOVES: usize = 31;
+const EXACT_MOVES: usize = 43;
 
 /// `(file, function)` where the self-hosted `moves` differs because **the self-hosted emitter
 /// always lays an array of structs out as AoS** (docs/self-hosting-arrays-design.md §4) while the
@@ -60,6 +62,9 @@ const AOS_INSTEAD: &[(&str, &str)] = &[
     ("structs.nt", "sum_x"),
     ("structs.nt", "sum_all"),
     ("structs.nt", "shift"),
+    // and the two callers that inherit it
+    ("particles.nt", "main"),
+    ("structs.nt", "main"),
 ];
 
 

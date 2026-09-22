@@ -33,11 +33,13 @@ fn main() {
     let mut terms = [Term { fac: 0, n_fac: 0, cn: 0, cd: 0 }; 262144];
     let mut pols = [Pol { term: 0, n_term: 0 }; 262144];
     let mut pst = [0, 0, 0, 0, 0, 0];
-    let mut env = [Env { name: 0, val: 0, len: 0 }; 4096];
-    let mut wst = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+    let mut env = [Env { name: 0, val: 0, len: 0, root: 0 }; 4096];
+    let mut wst = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
     let mut sites = [Site { arr: 0, idx: 0, inloop: 0, coef: 0, stride: 0, bad: 0, trip: 0, branch: 0, novar: 0 }; 4096];
     let mut fm = [-1; 4096];
     let mut cks = [Ck { fits: 0, nofit: 0, ws: 0 }; 65536];
+    let mut ffoot = [0; 65536];
+    let mut resid = [Res { root: 0, foot: 0 }; 128];
     let mut cof = [Cof { name: 0, c: 0 }; 256];
     let mut rargs = [-1; 64];
     let mut scratch = [0; 64];
@@ -58,7 +60,10 @@ fn main() {
         while f >= 0 {
             if nodes[f].kind == 110 {
                 fw[si] = w_func(&buf, &toks, &nodes, &types, &ntys, &sigs, &ptys, &fw, &mut facs, &mut terms, &mut pols, &mut pst, &mut env, &mut wst, &mut scratch, &mut cof, &mut rargs, &mut logs, &mut budget, f, si);
-                fm[si] = m_func(&buf, &toks, &nodes, &types, &strs, &flds, &ntys, &sigs, &ptys, &mut facs, &mut terms, &mut pols, &mut pst, &mut env, &mut cof, &mut sites, &mut cks, &mut budget, &mut wst, f, si);
+                fm[si] = m_func(&buf, &toks, &nodes, &types, &strs, &flds, &ntys, &sigs, &ptys, &fm, &ffoot, &mut facs, &mut terms, &mut pols, &mut pst, &mut env, &mut cof, &mut sites, &mut cks, &mut budget, &mut resid, &mut wst, f, si);
+                // after the walk, since it reads the sites the walk recorded; the second pass is
+                // what lets a call to a function declared later find them
+                foot_flags(&buf, &toks, &nodes, &sites, &mut ffoot, &wst, f, si);
                 si += 1;
             } else if nodes[f].kind == 116 {
                 si += 1;

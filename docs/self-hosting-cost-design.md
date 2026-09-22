@@ -475,7 +475,12 @@ The Rust's credit compares *ranges* with `dominates` in both directions, so a ca
 is the whole array or nothing, and a partial overlap makes the call unknown. `saxpy` and `stencil`
 are where that will first bite.
 
-### The first attempt, and why it was withdrawn
+### The first attempt, why it was withdrawn, and what the instrumentation said
+
+*(The account below stands as written. What follows it is what happened when the next step it
+named was actually taken.)*
+
+
 
 Implemented as described — a footprint flag per array parameter, a resident set replaced at every
 call, credit subtracted for arguments already resident — it took `moves` from 31 exact to 37, and
@@ -507,3 +512,35 @@ given up the only property that makes it worth having. `moves` stays at 31.
 `analyze.rs` — print the resident set and the credit at every call, the way `NEANT_DEBUG_SITES`
 prints the site table — and read the answer off a run instead of constructing rules that fit two
 data points and fail on the third.
+
+### Read off a run
+
+`NEANT_DEBUG_CALLS=1` prints `analyze.rs`'s resident set, the callee's footprints and the credit at
+every call. One run dissolved the contradiction: **there was none.** `repeat.nt` and `dot.nt` obey
+the same rule, and four things had been missing.
+
+1. **A view has a root.** `let v = &xs` makes `v` an alias of `xs`, and `dot(v, v)` is credited
+   against what `dot(&xs, &xs)` left resident. Matching residency by *name* rather than root was
+   the whole of `dot.nt`'s 3 200-byte error, and the whole of the apparent contradiction: without
+   roots, `dot.nt`'s last call looked as if it needed builds to make arrays resident.
+2. **The credit is a cross product.** Every footprint against every resident range. `dot(&xs, &xs)`
+   has two of each, so the credit is four times the array — and the intermediate really does go
+   negative, which is right, because the traffic it cancels was charged at an earlier call.
+3. **A walk shorter than a line still crosses one.** `arrays.nt`'s five-element loop covers 40
+   bytes; the slide floors at one line, so it costs `B`, not `40`.
+4. **An inexact footprint leaves nothing resident.** `ring.nt`'s `push_all` writes `buf[head]` — a
+   scatter — so the compiler cannot say what it brought in, and the following `sum_ring(&buf)` pays
+   in full. `vm.nt`'s negative constant was this: credit taken for a residency no one had
+   established.
+
+And one thing that had nothing to do with calls: **an array built inside a loop is built every
+lap.** A site's cost already carries its loop's trip count; a build is not a site, and was the one
+contribution the walk had to multiply itself.
+
+**43 `moves` columns exact**, up from 31. Every remaining difference is the AoS/SoA divergence —
+the seven leaves and the two `main`s that call them — and there are no unexplained ones.
+
+The method is now twice-proven and worth stating plainly: when two readings of the source
+contradict each other, stop reading and make the source say what it does. Both times a few lines of
+`eprintln!` behind an environment variable answered in one run what hours of reasoning had not, and
+both times the reasoning had produced something confident and wrong.

@@ -2017,6 +2017,19 @@ impl<'a, 'b, 'c> Fa<'a, 'b, 'c> {
                     let root = roots.get(f.param).copied().flatten()?;
                     Some((root, f.lo.subst_many(&map), f.hi.subst_many(&map), f.exact))
                 }).collect();
+                let dbg = std::env::var("NEANT_DEBUG_CALLS").is_ok() && !self.replay;
+                if dbg {
+                    eprintln!("call {} -> {} @{}", self.f.name, callee.name, e.line);
+                    eprintln!("   mv    {}", mv.display(&self.names));
+                    for (r, lo, hi, ex) in &feet {
+                        eprintln!("   foot  {} [{}, {}) exact={ex}", self.f.locals[*r].name,
+                            lo.display(&self.names), hi.display(&self.names));
+                    }
+                    for r in &self.resident {
+                        eprintln!("   resid {} [{}, {}) conds={}", self.f.locals[r.root].name,
+                            r.lo.display(&self.names), r.hi.display(&self.names), r.conds.len());
+                    }
+                }
                 // credit: what the callee reads that is already resident here pays nothing
                 for (root, lo, hi, exact) in &feet {
                     if !exact { continue; }
@@ -2047,11 +2060,14 @@ impl<'a, 'b, 'c> Fa<'a, 'b, 'c> {
                         if !self.notes.contains(&n2) { self.notes.push(n2); }
                     }
                 }
+                if dbg { eprintln!("   net   {}", mv.display(&self.names)); }
                 // after the call: what it leaves resident replaces what was
                 self.resident.clear();
                 if let (Some(cond), false) = (&callee.resident, declared_only) {
                     let cond = Cond { ws: cond.ws.subst_many(&map), fits: true };
                     for (root, lo, hi, exact) in feet { if exact { self.resident.push(Res { root, lo, hi, conds: vec![cond.clone()] }); } }
+                } else if dbg {
+                    eprintln!("   leaves nothing resident (callee.resident={})", callee.resident.is_some());
                 }
                 if !self.replay { self.work = self.work.add(&w); self.span = self.span.add(&sp); }
                 self.call_moves = self.call_moves.add(&mv);
