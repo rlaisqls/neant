@@ -103,6 +103,15 @@ fn val_of(src: &[u8], toks: &[Token], nodes: &[Node], facs: &mut [Fac], terms: &
         if pst[4] == 0 || d == 0 { return -1; }
         return pol_scale(facs, terms, pols, pst, a, 1, d);
     }
+    // **`min(a, b)` bounds above by either of them**, so a loop written to the shorter of two
+    // arrays is bounded by whichever length this pass can state — `size_of`'s `MinMax` case in
+    // `analyze.rs`, which takes `a` when it can and `b` otherwise. `.zip()` is the reason it is
+    // here: its rewritten loop runs to `min(a.len(), b.len())`.
+    if k == 71 && nodes[n].b >= 0 && name_is_min(src, toks, nodes[n].a) {
+        let fa = val_of(src, toks, nodes, facs, terms, pols, pst, env, wst, nodes[n].b);
+        if fa >= 0 { return fa; }
+        return val_of(src, toks, nodes, facs, terms, pols, pst, env, wst, nodes[nodes[n].b].next);
+    }
     -1
 }
 

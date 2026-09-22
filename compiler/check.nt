@@ -137,15 +137,24 @@ fn name_eq(src: &[u8], toks: &[Token], a: i64, b: i64) -> bool {
 // a token's span against a literal, one byte at a time — an array literal cannot be an argument,
 // so a `b"println"` to compare with is not available
 fn name_is_println(src: &[u8], toks: &[Token], t: i64) -> bool {
-    if toks[t].len != 7 { return false; }
+    if t < 0 || toks[t].len != 7 { return false; }
     let s = toks[t].start;
     src[s] == b'p' && src[s + 1] == b'r' && src[s + 2] == b'i' && src[s + 3] == b'n'
         && src[s + 4] == b't' && src[s + 5] == b'l' && src[s + 6] == b'n'
 }
+// **A call is found by the text of its name**, which a rewrite cannot write: `.zip()` runs to
+// `min(a.len(), b.len())` and there may be no `min` anywhere in the source to point at. So the two
+// builtins get a sentinel token apiece — the third and last thing a negative index means in this
+// tree, after a synthetic local (−k − 2) and a synthetic literal. They are placed far below any
+// synthetic name so the three spaces cannot meet.
 fn name_is_min(src: &[u8], toks: &[Token], t: i64) -> bool {
+    if t == 0 - 1000000 { return true; }
+    if t < 0 { return false; }
     toks[t].len == 3 && src[toks[t].start] == b'm' && src[toks[t].start + 1] == b'i' && src[toks[t].start + 2] == b'n'
 }
 fn name_is_max(src: &[u8], toks: &[Token], t: i64) -> bool {
+    if t == 0 - 1000001 { return true; }
+    if t < 0 { return false; }
     toks[t].len == 3 && src[toks[t].start] == b'm' && src[toks[t].start + 1] == b'a' && src[toks[t].start + 2] == b'x'
 }
 
@@ -266,6 +275,7 @@ fn nlit(nodes: &mut [Node], cst: &mut [i64], kind: i64, v: i64) -> i64 {
 
 fn nfresh(cst: &mut [i64]) -> i64 {
     let k = cst[17];
+    if k > 100000 { cst[2] = 1; return 0 - 2; }
     cst[17] = k + 1;
     0 - k - 2
 }
@@ -784,10 +794,24 @@ fn check_chain(src: &[u8], toks: &[Token], nodes: &mut [Node], types: &mut [Ty],
         if cst[2] != 0 { return 0 - 1; }
         et = mt;
     };
+    // `.zip(b)` must come first, directly after the source: it names the *other* array, and the
+    // loop then runs to the shorter of the two
+    let mut zname = 0 - 1;
+    let mut zelem = 0 - 1;
+    if st0 >= 2 && name_is(src, toks, nodes[cst[40 + st0 - 1]].b, b'z', b'i', b'p', 3) {
+        let zs = cst[40 + st0 - 1];
+        let za = nodes[zs].c;
+        if za < 0 || nodes[za].kind != 65 || nodes[za].next >= 0 { cst[2] = 1; return 0 - 1; }
+        let zsym = sym_find(src, toks, syms, cst, nodes[za].a);
+        if zsym < 0 || !is_arrayish(types, syms[zsym].ty) { cst[2] = 1; return 0 - 1; }
+        zname = nodes[za].a;
+        zelem = types[syms[zsym].ty].elem;
+        st0 -= 1;
+    };
     // **values flow through the stages as a list**, not one at a time: `.enumerate()` puts the index
     // in front of the element and the closure after it takes both. Two is all the corpus asks for.
-    let mut et1 = 0 - 1;
-    let mut nval = 1;
+    let mut et1 = if zname >= 0 { zelem } else { 0 - 1 };
+    let mut nval = if zname >= 0 { 2 } else { 1 };
     let mut k = st0 - 1;
     while k >= 1 && cst[2] == 0 {
         let stg = cst[40 + k];
@@ -895,8 +919,20 @@ fn check_chain(src: &[u8], toks: &[Token], nodes: &mut [Node], types: &mut [Ty],
     };
     let lo = nlit(nodes, cst, 60, 0);
     let sv = mk_var(nodes, cst, sname);
-    let hi = nnew(nodes, cst, 72);
-    nodes[hi].a = sv;
+    let hi0 = nnew(nodes, cst, 72);
+    nodes[hi0].a = sv;
+    let mut hi = hi0;
+    if zname >= 0 {
+        let zv = mk_var(nodes, cst, zname);
+        let hz = nnew(nodes, cst, 72);
+        nodes[hz].a = zv;
+        // `min(a.len(), b.len())`, through the sentinel name a rewrite can write
+        let mn = nnew(nodes, cst, 71);
+        nodes[mn].a = 0 - 1000000;
+        nodes[mn].b = hi0;
+        nodes[hi0].next = hz;
+        hi = mn;
+    };
     let body = nnew(nodes, cst, 76);
     let fo = nnew(nodes, cst, 92);
     nodes[fo].a = iv;
@@ -919,6 +955,17 @@ fn check_chain(src: &[u8], toks: &[Token], nodes: &mut [Node], types: &mut [Ty],
     let mut blk = body;
     let mut last = blk_add(nodes, blk, 0 - 1, mk_let(nodes, cst, ev, ix, 0));
     let mut cure = mk_var(nodes, cst, ev);
+    let mut cure1 = 0 - 1;
+    if zname >= 0 {
+        let zv2 = mk_var(nodes, cst, zname);
+        let iv3 = mk_var(nodes, cst, iv);
+        let zix = nnew(nodes, cst, 68);
+        nodes[zix].a = zv2;
+        nodes[zix].b = iv3;
+        let ev2 = nfresh(cst);
+        last = blk_add(nodes, blk, last, mk_let(nodes, cst, ev2, zix, 0));
+        cure1 = mk_var(nodes, cst, ev2);
+    };
     if comp >= 0 {
         if nodes[comp].d >= 0 {
             let inner0 = nnew(nodes, cst, 76);
@@ -933,7 +980,6 @@ fn check_chain(src: &[u8], toks: &[Token], nodes: &mut [Node], types: &mut [Ty],
         };
         cure = nodes[comp].a;
     };
-    let mut cure1 = 0 - 1;
     let mut j = st0 - 1;
     while j >= 1 {
         let stg = cst[40 + j];

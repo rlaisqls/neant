@@ -1734,3 +1734,32 @@ synthetic names and synthetic literals, and unlike those two it is about a *call
 value. It is small (a sentinel token value, and `name_is_min`/`name_is_max` learning it) but it
 should be taken deliberately: the number of "negative index means something special" rules in this
 tree is now three, and each one is a place where an integer field means two things.
+
+### `zip`: a rewrite that has to write a call
+
+`zip` matches now — `6·a.len() + 2` and `16·a.len() + 2·B`, `main` included, and the emitted loop
+prints what `neant run` prints.
+
+Two things it needed, and both are about a rewrite reaching for something only source text usually
+provides.
+
+**A sentinel name for `min`.** The loop runs to `min(a.len(), b.len())`, and a call is found by the
+*text* of its name — `name_is_min` compares bytes. There may be no `min` anywhere in the file to
+point a token at, so the two builtins get a sentinel token apiece, far below the synthetic-name
+space, and `nfresh` now refuses to allocate far enough down to meet them. That is the third and last
+thing a negative index means in this tree: a synthetic local, a synthetic literal, and now a
+builtin's name.
+
+**`min` as a size expression.** With the bound built, the cost pass still declined: `val_of` had no
+case for a call. `analyze.rs`'s `size_of` bounds `min(a, b)` above by *either* of them — it takes
+`a` when it can state it and `b` otherwise — which is why `zip` costs `6·a.len() + 2` and never
+mentions `b.len()`. The program checked and ran correctly the whole time it was declining, which is
+the useful shape of that failure: the rewrite was right and only the *cost of the thing it wrote*
+was unavailable.
+
+The `+ 2` is the `min` call itself, and it is the one place where a chain's cost is not the cost of
+the loop a reader would write by hand. It is not overhead the rewrite adds; it is the bound check
+`zip` means.
+
+What is left of `chains.nt` is one thing: `[e for x in xs]` used as a **value**, which allocates an
+array rather than reducing to a scalar. Every stage and terminal it uses is now built.
