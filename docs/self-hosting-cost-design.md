@@ -1202,3 +1202,43 @@ bound from being invented.
 Order: the single-loop case first, since it is most of the corpus; then the offset, which `tiles`
 alone pays for; then `image_size` over a nest for `stencil`; then the polynomial coefficient for
 `matmul`, last because it is the only one that needs a new reader of the index.
+
+### Which references count, measured — a block's tail is not recognised
+
+§22's table assumed every affine reference in a function contributes to the bound. It does not, and
+the rule took four measurements and one instrumented run to state, because three readings of the
+source each predicted something the corpus contradicted.
+
+```
+fn for_cond(xs: &[i64]) -> i64 {                 fn while_cond(xs: &[i64]) -> i64 {
+    let mut n = 0;                                   let mut i = 0; let mut n = 0;
+    for i in 0..xs.len() {                           while i < xs.len() {
+        if xs[i] > 0 { n += 1; }                         if xs[i] > 0 { n += 1; }
+    }                                                    i += 1;
+    n                                                }
+}                                                    n
+                                                 }
+        NO footprint bound                               moves 8·xs.len()
+```
+
+The same body, the same reference, two answers. It is not `for` versus `while` and it is not the
+`if`: **`recognise` is called on a block's *statements* and not on its tail expression.** In
+`for_cond` the `if` is the only thing in the loop body, so it is the block's tail; in `while_cond`
+the `i += 1` after it makes it a statement. `NEANT_DEBUG_IMG` printed the difference in one run —
+`recognise Expr in while_cond` with no counterpart in `for_cond` — after three rounds of reading
+`collect_refs` had produced three confident and wrong explanations.
+
+The same rule explains the rest of the corpus without special cases:
+
+- `arrayview`'s `tagged` bounds at `8·cs.len()` and not `9·cs.len()`: the `if` is the loop body's
+  tail, so the 1-byte `cs[i].tag` in its condition is never collected, while `n += cs[i].v` in its
+  arm is a statement of its own and is.
+- `words`' `upcase` bounds at `s.len()` for the same reason, from the arm's assignment alone.
+- `while.nt`'s `count_lt` and `first_zero` **do** count their `if` conditions, because `i += 1`
+  follows and makes the `if` a statement.
+
+A footprint bound is a *lower* bound, so a missed reference is sound — which is exactly why this
+rule has never had to be principled. It is one line to state and one line to reproduce: **a site
+inside a block's tail expression does not contribute.** Reproducing it is the cheaper and more
+honest choice than diverging, because a divergence here would have to be argued as an improvement,
+and "we count a reference `neant cost` forgets" is a claim about an accident, not about a model.
