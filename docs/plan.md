@@ -153,10 +153,13 @@ arise — closures are inlined into their chain, and there are no function value
 
 ### M4 — Views, layout, regions
 
-**Before M4 starts**, two things from the 2026-09-22 design review: the aliasing hole (a shared
-and a mutable view of one array in the same call is accepted and emitted with `restrict` — a
-correctness bug), and conditional costs ([decisions.md](decisions.md) §2), without which the
-region bound below cannot be stated for a symbolic region size.
+**Before M4 starts**: the exactness pass of [decisions.md](decisions.md) §3, in this order —
+the aliasing hole (a shared and a mutable view of one array in one call is accepted and emitted
+with `restrict`; views get a root and a range, disjointness is proved), `decreasing` measures
+verified rather than trusted, reaching definitions for entry values, symbolic summation for
+triangular loops and linear recurrences, exact divide-and-conquer constants, `max` in the cost
+algebra, and conditional costs with feasibility pruning and no silent lid (§2). Three to four
+days. M4's region bound cannot be stated without the last one.
 
 The part of the design that makes the moves model apply to programs with structure in them.
 
