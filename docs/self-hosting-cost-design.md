@@ -474,3 +474,36 @@ The Rust's credit compares *ranges* with `dominates` in both directions, so a ca
 `[0, n/2)` of an array the caller left resident over `[0, n)` gets partial credit. Here a footprint
 is the whole array or nothing, and a partial overlap makes the call unknown. `saxpy` and `stencil`
 are where that will first bite.
+
+### The first attempt, and why it was withdrawn
+
+Implemented as described — a footprint flag per array parameter, a resident set replaced at every
+call, credit subtracted for arguments already resident — it took `moves` from 31 exact to 37, and
+got the case §14 opens with **exactly right**: `repeat.nt`'s `main`, `4·B + 16824`, credit and all.
+
+It also got six other `main`s wrong, and the two answers cannot both be produced by any residency
+rule this author could construct:
+
+| | `neant cost` | this |
+|---|---|---|
+| `repeat.nt main` | `4·B + 16824` | `4·B + 16824` |
+| `dot.nt main` | `9·B + 896` | `9·B + 4096` |
+| `vm.nt main` | `615·B + 248` | `615·B − 56` |
+
+`repeat.nt`'s number requires that **building an array does not make it resident** — otherwise its
+first traversal would be free and the total short by 8 000. `dot.nt`'s requires that it **does** —
+its `896` is exactly the two small builds, the first `dot`, and the `xs` build, with every later
+traversal free, and `xs` is only ever made resident by its build. A rule cannot do both.
+
+`vm.nt`'s negative constant is the same disagreement with the sign flipped: the credit taken
+exceeded the traffic there was to credit.
+
+So it was **withdrawn**, not shipped with six differences listed as known. The distinction matters:
+`AOS_INSTEAD` and `COPIES_INSTEAD` are differences whose cause is understood and whose direction is
+chosen; these are six numbers nobody can account for, and a cost calculus that ships those has
+given up the only property that makes it worth having. `moves` stays at 31.
+
+**What to do next is known**, and it is what settled the last difference of this kind: instrument
+`analyze.rs` — print the resident set and the credit at every call, the way `NEANT_DEBUG_SITES`
+prints the site table — and read the answer off a run instead of constructing rules that fit two
+data points and fail on the third.
