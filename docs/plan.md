@@ -255,9 +255,25 @@ bound as qualified rather than exact.
 
 ## Self-hosting
 
-After M4, as a goal. The compiler in neant, the Rust compiler frozen as seed one, `bootstrap/neant.c`
-as seed two, the two-seed fixpoint in CI, and `compiler/costs.lock` as the compiler's own stated
-complexity. Not the coverage proof; the corpus for that is chosen in stage C.
+After M4 (M5 done too now), as a goal. The compiler in neant, the Rust compiler frozen as seed one,
+`bootstrap/neant.c` as seed two, the two-seed fixpoint in CI, and `compiler/costs.lock` as the
+compiler's own stated complexity. Not the coverage proof; the corpus for that is chosen in stage C.
+
+**Started, designed in [self-hosting-design.md](self-hosting-design.md).** The apparent conflict
+with "Not scheduled: strings and I/O beyond the harness" resolves narrower than it looks: every
+stage (lex, parse, types, ir, emit) is expressible with what M0–M5 already built — byte arrays as
+"strings," pre-sized arrays with a tracked count instead of growth (every pass has a known upper
+bound on what it produces), and M4's arena pattern (a flat array of scalar-field structs, children
+by index) for the tree, since structs still cannot nest or hold arrays. The one real gap is
+`extern fn` file I/O: an extern cannot return an owned array (the size-inference that lets a
+function-with-a-body do it never runs for one without), and `neant build`/`run` link only the one
+generated `.c` file. Fix, not a language feature: a small hand-written `bootstrap/rt.c` whose one
+function matches this language's own pointer+length calling convention exactly (`read_file(path:
+&[u8], buf: &mut [u8]) -> i64`, the caller pre-allocating `buf` and reading the real length off the
+return value), linked in by a fixed convention rather than a new flag. First milestone: the lexer
+alone (188 lines in Rust, no dependency on any other self-hosted stage), exit test a self-hosted
+`lex` matching `bootstrap/src/lex.rs`'s tokenisation of real `.nt` files and getting its own
+`neant cost` line. Not designed yet: the parser, checker, IR, emitter, or the fixpoint itself.
 
 ## M7 — the constant factor
 
