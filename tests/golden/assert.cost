@@ -1,3 +1,5 @@
 dot              work 6·a.len()                    moves 16·a.len() + 2·B             exact
-pairs            work 6·a.len()² + 2·a.len()       moves 8·a.len()² + 2·B·a.len()     exact
+pairs            work 6·a.len()² + 2·a.len()       moves                              exact  (2 regimes)
+                                               moves 16·a.len() + 2·B             if ≈ 8·a.len() < M
+                                               moves 8·a.len()² + 2·B·a.len()     if ≈ 8·a.len() ≥ M
 main             work 83                           moves 8·B + 40                     exact, io

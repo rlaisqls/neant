@@ -58,7 +58,9 @@ hidden. When a function's cost splits forty-seven ways the message is that it do
 
 ## 2 — Conditional costs: when the fit test cannot be decided, report both sides
 
-**Decided 2026-09-22. Not yet implemented; it goes in before M4, which depends on it.**
+**Decided 2026-09-22; implemented the same day with §3's rules (no lid, feasibility pruning,
+`if` as max).** The naive product's own line came out in exactly the three regimes below, with
+the thresholds `B·n < M` and `8·n² < M`; every concrete `main` kept its numbers to the byte.
 
 ### The problem
 

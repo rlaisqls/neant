@@ -153,7 +153,7 @@ arise — closures are inlined into their chain, and there are no function value
 
 ### M4 — Views, layout, regions
 
-**Before M4 starts**: the exactness pass of [decisions.md](decisions.md) §3, in this order —
+**Before M4 starts** (done 2026-09-22, seven commits): the exactness pass of [decisions.md](decisions.md) §3, in this order —
 the aliasing hole (a shared and a mutable view of one array in one call is accepted and emitted
 with `restrict`; views get a root and a range, disjointness is proved), `decreasing` measures
 verified rather than trusted, reaching definitions for entry values, symbolic summation for

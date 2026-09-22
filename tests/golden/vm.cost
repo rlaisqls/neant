@@ -1,2 +1,2 @@
-run              work 43·fuel + 7                  moves 13·B·fuel + B                exact
-main             work 8833                         moves 2655·B + 248                 exact, io
+run              work 19·fuel + 7                  moves 4·B·fuel + B                 exact
+main             work 3937                         moves 819·B + 248                  exact, io

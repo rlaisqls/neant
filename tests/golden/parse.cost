@@ -1,4 +1,4 @@
-peek             work 6                            moves 3·B                          exact
+peek             work 5                            moves 3·B                          exact
 number           unknown: the `decreasing` measure is not a size expression — it reads memory or a value the compiler cannot follow — so this loop has no static bound; `neant measure` can fit one (line 10)
 atom             unknown: calls `atom`, whose cost is unknown (mutually recursive with this function; only self-recursion is solved) (line 20)
 term             unknown: calls `term`, whose cost is unknown (mutually recursive with this function; only self-recursion is solved) (line 29)

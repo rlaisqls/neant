@@ -240,8 +240,9 @@ fn parse_bytes(s: Option<&String>) -> i128 {
     match num.parse::<i128>() { Ok(v) => v * mult, Err(_) => { eprintln!("bad size `{s}`"); process::exit(2) } }
 }
 
-/// `--eval n=1000,a.len()=1000`: every size variable of the function must be given.
-fn evaluate(c: &cost::FuncCost, work: &cost::size::Poly, moves: &cost::size::Poly, ev: &str, m: &cost::Machine) -> Option<(f64, f64)> {
+/// `--eval n=1000,a.len()=1000`: every size variable of the function must be given. Conditions
+/// are decided at the machine's `B` and `M`, and the applicable pieces' maximum is taken.
+fn evaluate(c: &cost::FuncCost, work: &cost::Cost, moves: &cost::Cost, ev: &str, m: &cost::Machine) -> Option<(f64, f64)> {
     use cost::size::Atom;
     let mut vals: Vec<(String, f64)> = Vec::new();
     for part in ev.split(',') {
@@ -259,5 +260,5 @@ fn evaluate(c: &cost::FuncCost, work: &cost::size::Poly, moves: &cost::size::Pol
             Atom::Log(_) => None, // handled inside eval
         }
     };
-    Some((work.eval(&f)?, moves.eval(&f)?))
+    Some((work.eval(&f, m)?, moves.eval(&f, m)?))
 }

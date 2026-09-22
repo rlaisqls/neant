@@ -1,6 +1,6 @@
 count_lt         work 6·xs.len() + 1               moves 8·xs.len() + B               exact
 first_zero       work 5·xs.len() + 1               moves 8·xs.len() + B               exact
-collatz_steps    work 9·fuel + 3                   moves 0                            exact
+collatz_steps    work 8·fuel + 3                   moves 0                            exact
 upper            work 10·s.len()                   moves 2·s.len() + 2·B              exact
 countdown        work 3·from/2 + 1                 moves 0                            exact
-main             work 18641/2                      moves 12·B + 64                    exact, io
+main             work 16641/2                      moves 12·B + 64                    exact, io

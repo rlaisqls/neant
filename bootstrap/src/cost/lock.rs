@@ -2,11 +2,51 @@
 //! generated and committed, so a change in a function's cost is a diff in review.
 
 use super::analyze::{CostResult, FuncCost, Machine};
+use super::piece::Cost;
 use super::size::{Atom, Poly};
 
 /// A polynomial for a report line: in full when short, its leading terms with `≈` otherwise.
-fn brief(p: &Poly, names: &[String]) -> String {
+fn brief_poly(p: &Poly, names: &[String]) -> String {
     if p.terms.len() <= 3 { p.display(names).to_string() } else { format!("≈ {}", p.leading().display(names)) }
+}
+/// A condition for the report: its working set's leading term, `≈` when that dropped something.
+fn brief_cond(k: &super::piece::Cond, names: &[String]) -> String {
+    let bytes = k.ws.mul_atom_pow(Atom::B, super::size::Rat::int(1));
+    let (lead, approx) = if bytes.terms.len() > 1 { (bytes.leading(), "≈ ") } else { (bytes.clone(), "") };
+    format!("{approx}{} {} M", lead.display(names), if k.fits { "<" } else { "≥" })
+}
+/// A cost for the report: one piece in full or leading terms; a piecewise cost as its two
+/// least-conditional pieces with abbreviated conditions and a count of the rest. The lockfile
+/// line keeps every piece exactly.
+fn brief(c: &Cost, names: &[String]) -> String {
+    match c.single() {
+        Some(p) => brief_poly(p, names),
+        None => {
+            let mut ps: Vec<&super::piece::Piece> = c.pieces.iter().collect();
+            ps.sort_by_key(|pc| pc.conds.len());
+            let shown: Vec<String> = ps.iter().take(2).map(|pc| {
+                let cond = if pc.conds.is_empty() { String::new() } else { format!(" if {}", pc.conds.iter().map(|k| brief_cond(k, names)).collect::<Vec<_>>().join(" and ")) };
+                format!("{}{cond}", brief_poly(&pc.poly, names))
+            }).collect();
+            let more = if ps.len() > 2 { format!(" (+{} regimes)", ps.len() - 2) } else { String::new() };
+            format!("{}{more}", shown.join(" | "))
+        }
+    }
+}
+/// The gap of every piece of a cost against a bound: `(condition text, ratio)`.
+fn gaps(moves: &Cost, bound: &Poly, m: &Machine, names: &[String]) -> Vec<(String, f64)> {
+    let mut ps: Vec<&super::piece::Piece> = moves.pieces.iter().collect();
+    ps.sort_by_key(|pc| pc.conds.len());
+    ps.iter().filter_map(|pc| {
+        let g = gap(&pc.poly, bound, m)?;
+        let cond = if pc.conds.is_empty() { String::new() } else { pc.conds.iter().map(|k| brief_cond(k, names)).collect::<Vec<_>>().join(" and ") };
+        Some((cond, g))
+    }).collect()
+}
+fn gap_text(gs: &[(String, f64)], suffix: &str) -> String {
+    if gs.is_empty() { return String::new(); }
+    if gs.len() == 1 && gs[0].0.is_empty() { return format!("   gap {:.0}×{suffix}", gs[0].1); }
+    format!("   gap {}{suffix}", gs.iter().map(|(c, g)| if c.is_empty() { format!("{g:.0}×") } else { format!("{g:.0}× if {c}") }).collect::<Vec<_>>().join("; "))
 }
 
 /// The ratio of two costs' leading terms, as a number at the machine's `B` and `M` when the
@@ -43,12 +83,13 @@ fn gap(moves: &Poly, bound: &Poly, m: &Machine) -> Option<f64> {
 }
 
 /// The full report for one function: its line, then any bound, note and suggestion under it.
+/// A piecewise cost is abbreviated here; `costs.lock` holds it in full.
 pub fn report(c: &FuncCost, m: &Machine) -> String {
-    let mut out = line(c);
+    let mut out = pretty_line(c);
     out.push('\n');
     for b in &c.bounds {
         let g = match &c.result {
-            CostResult::Exact { moves, .. } => gap(moves, &b.moves, m).map_or(String::new(), |g| format!("   gap {g:.0}× at M = {}, B = {}", human(m.m_bytes), m.b_bytes)),
+            CostResult::Exact { moves, .. } => gap_text(&gaps(moves, &b.moves, m, &c.names), &format!(" at M = {}, B = {}", human(m.m_bytes), m.b_bytes)),
             _ => String::new(),
         };
         out.push_str(&format!("{:<16} lower bound      moves {:<28} ({}, {}){g}\n", "", b.moves.display(&c.names).to_string(), b.kind, b.citation));
@@ -63,7 +104,7 @@ pub fn report(c: &FuncCost, m: &Machine) -> String {
         match &s.result {
             CostResult::Exact { work, moves } => {
                 // the gap is against the function's own bound: the rewrite does not change what is computed
-                let g = c.bounds.first().and_then(|b| gap(moves, &b.moves, m)).map_or(String::new(), |g| format!("   gap {g:.0}×"));
+                let g = c.bounds.first().map_or(String::new(), |b| gap_text(&gaps(moves, &b.moves, m, &c.names), ""));
                 out.push_str(&format!(
                     "{:<16} {:<16} work {:<28} moves {:<28} [--apply {}]{g}\n", "", s.label, brief(work, &c.names), brief(moves, &c.names), s.flag));
             }
@@ -94,6 +135,28 @@ pub fn line(c: &FuncCost) -> String {
 
 fn human(b: i128) -> String {
     if b % (1 << 20) == 0 { format!("{} MiB", b >> 20) } else if b % 1024 == 0 { format!("{} KiB", b >> 10) } else { b.to_string() }
+}
+
+/// The report's version of a function's line: piecewise costs abbreviated, then each piece on its
+/// own line underneath so the regimes can be read.
+pub fn pretty_line(c: &FuncCost) -> String {
+    let fx = if c.effects.is_empty() { String::new() } else { format!(", {}", c.effects.join(", ")) };
+    match &c.result {
+        CostResult::Exact { work, moves } => {
+            let mut s = format!("{:<16} work {:<28} moves {:<28} {}{fx}", c.name, brief(work, &c.names), brief_poly(moves.pieces.iter().min_by_key(|p| p.conds.len()).map(|p| &p.poly).unwrap_or(&Poly::zero()), &c.names), c.tier);
+            if moves.single().is_none() {
+                let mut ps: Vec<&super::piece::Piece> = moves.pieces.iter().collect();
+                ps.sort_by_key(|pc| pc.conds.len());
+                s = format!("{:<16} work {:<28} moves {:<28} {}{fx}  ({} regimes)", c.name, brief(work, &c.names), "", c.tier, ps.len());
+                for pc in ps {
+                    let cond = if pc.conds.is_empty() { "otherwise".to_string() } else { format!("if {}", pc.conds.iter().map(|k| brief_cond(k, &c.names)).collect::<Vec<_>>().join(" and ")) };
+                    s.push_str(&format!("\n{:<16}                               moves {:<28} {cond}", "", brief_poly(&pc.poly, &c.names)));
+                }
+            }
+            s
+        }
+        CostResult::Unknown { .. } => line(c),
+    }
 }
 
 /// Lines that differ between an existing lockfile and a fresh rendering, as `(old, new)` pairs

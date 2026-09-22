@@ -15,6 +15,7 @@ use crate::ir::*;
 
 use super::bounds::{self, Bound};
 use super::rewrite;
+use super::piece::{Cond, Cost};
 use super::size::{Atom, Poly, Rat};
 
 #[derive(Debug, Clone, Copy)]
@@ -27,7 +28,7 @@ pub struct Machine {
 
 #[derive(Debug, Clone)]
 pub enum CostResult {
-    Exact { work: Poly, moves: Poly },
+    Exact { work: Cost, moves: Cost },
     Unknown { reason: String, line: u32 },
 }
 
@@ -200,6 +201,9 @@ struct Site {
     aff: Option<Affine>,
     es: i128,
     path: Vec<usize>,
+    /// the `if` branches this site sits in, outermost first: sites on different sides of one
+    /// `if` are alternatives, and their moves combine by max, not sum
+    branch: Vec<(usize, bool)>,
 }
 
 /// What is remembered of a loop after it is popped.
@@ -217,6 +221,11 @@ impl LoopRec {
     fn sum(&self, p: &Poly) -> Poly {
         match self.atom { Some(a) => p.sum_over(a, &self.lo, self.step, &self.trip), None => p.mul(&self.trip) }
     }
+    fn sum_cost(&self, c: &Cost) -> Cost {
+        match self.atom { Some(a) => c.sum_over(a, &self.lo, self.step, &self.trip), None => c.mul_poly(&self.trip) }
+    }
+    /// The loop variable's last value.
+    fn last(&self) -> Poly { self.lo.add(&self.trip.sub(&Poly::constant(1)).scale(Rat::int(self.step))) }
 }
 
 struct Fa<'a, 'b, 'c> {
@@ -247,9 +256,12 @@ struct Fa<'a, 'b, 'c> {
     loops: Vec<Loop>,
     /// cost accumulated in the innermost open loop body (or the function body); when a loop is
     /// left, its frame is summed over the loop atom into the frame below
-    work: Poly,
-    moves: Poly,
-    saved: Vec<(Poly, Poly)>,
+    work: Cost,
+    moves: Cost,
+    saved: Vec<(Cost, Cost)>,
+    /// the `if` branches currently open, for tagging access sites
+    branch: Vec<(usize, bool)>,
+    next_if: usize,
 }
 
 impl<'a, 'b, 'c> Fa<'a, 'b, 'c> {
@@ -268,7 +280,7 @@ impl<'a, 'b, 'c> Fa<'a, 'b, 'c> {
         let mut fa = Fa {
             an, f, names, sites: vec![], loop_recs: vec![], bounds: vec![], notes: vec![], io: false, self_fid, rec_calls: vec![],
             local_size: HashMap::new(), local_affine: HashMap::new(), initial: HashMap::new(), at_entry: false,
-            loops: vec![], work: Poly::zero(), moves: Poly::zero(), saved: vec![],
+            loops: vec![], work: Cost::zero(), moves: Cost::zero(), saved: vec![], branch: vec![], next_if: 0,
         };
         // the caller's loops are entered like this function's own, so the body's cost is summed
         // over them when they are left at the end of `run`
@@ -319,11 +331,15 @@ impl<'a, 'b, 'c> Fa<'a, 'b, 'c> {
             };
             match &result {
                 CostResult::Exact { work, moves } => {
+                    // every piece must be dominated: the bound holds in every regime
                     let inferred = if which == "work" { work } else { moves };
-                    if !super::assert::dominated(inferred, &asserted) {
-                        violations.push(format!(
-                            "line {line}: `{}` is asserted {which} at most {} but its {which} is {}",
-                            self.f.name, asserted.display(&self.names), inferred.display(&self.names)));
+                    for piece in &inferred.pieces {
+                        if !super::assert::dominated(&piece.poly, &asserted) {
+                            let when = if piece.conds.is_empty() { String::new() } else { format!(" when {}", piece.conds.iter().map(|c| c.display(&self.names)).collect::<Vec<_>>().join(" and ")) };
+                            violations.push(format!(
+                                "line {line}: `{}` is asserted {which} at most {} but its {which} is {}{when}",
+                                self.f.name, asserted.display(&self.names), piece.poly.display(&self.names)));
+                        }
                     }
                 }
                 CostResult::Unknown { reason, .. } => {
@@ -340,7 +356,7 @@ impl<'a, 'b, 'c> Fa<'a, 'b, 'c> {
     /// or `hi − lo`. Shrinking by a constant with one call is a sum, `T = f·m/c`; with more
     /// calls it is exponential and refused. Shrinking by a factor `b` with `a` calls is the
     /// master theorem on the degree `d` of `f` in `m`.
-    fn solve_recurrence(&self) -> Result<(Poly, Poly), String> {
+    fn solve_recurrence(&self) -> Result<(Cost, Cost), String> {
         let mut a_poly = Poly::zero();
         for (_, o, _) in &self.rec_calls { a_poly = a_poly.add(o); }
         let a = match a_poly.as_const() {
@@ -450,7 +466,19 @@ impl<'a, 'b, 'c> Fa<'a, 'b, 'c> {
                     }
                 }
             };
-            return Ok((solve(&self.work)?, solve(&self.moves)?));
+            // each unconditional alternative of the body cost is solved on its own; a condition
+            // inside a recursive body would shift with the unrolling and is not solved yet
+            let solve_cost = |c: &Cost| -> Result<Cost, String> {
+                let mut out: Vec<super::piece::Piece> = Vec::new();
+                for piece in &c.pieces {
+                    if !piece.conds.is_empty() { return Err("a cache-dependent cost inside a recursive body is not solved yet".into()); }
+                    out.push(super::piece::Piece { conds: vec![], poly: solve(&piece.poly)? });
+                }
+                let mut r = Cost { pieces: out };
+                r.prune();
+                Ok(r)
+            };
+            return Ok((solve_cost(&self.work)?, solve_cost(&self.moves)?));
         }
         Err("no argument shrinks toward a base case across every recursive call; the measure must be an `i64` parameter, `xs.len() − p`, or `hi − lo`".into())
     }
@@ -469,7 +497,7 @@ impl<'a, 'b, 'c> Fa<'a, 'b, 'c> {
     }
     /// Cost of the current point, charged once; the enclosing loops sum it when they are left.
     fn add_work(&mut self, p: Poly) {
-        self.work = self.work.add(&p);
+        self.work = self.work.add_poly(&p);
     }
     /// A fresh size atom for a loop variable.
     fn new_atom(&mut self, name: &str) -> usize {
@@ -481,19 +509,26 @@ impl<'a, 'b, 'c> Fa<'a, 'b, 'c> {
         self.loop_recs.push(LoopRec { var: lp.var, atom: lp.atom, trip: lp.trip.clone(), lo: lp.lo.clone(), step: lp.step });
         let lp = Loop { id: self.loop_recs.len() - 1, ..lp };
         self.loops.push(lp);
-        self.saved.push((std::mem::take(&mut self.work), std::mem::take(&mut self.moves)));
+        self.push_frame();
+    }
+    fn push_frame(&mut self) {
+        self.saved.push((std::mem::replace(&mut self.work, Cost::zero()), std::mem::replace(&mut self.moves, Cost::zero())));
+    }
+    fn pop_frame(&mut self) -> (Cost, Cost) {
+        let (pw, pm) = self.saved.pop().unwrap();
+        (std::mem::replace(&mut self.work, pw), std::mem::replace(&mut self.moves, pm))
     }
     /// Leave a loop: sum its body frame over its variable into the frame below.
     fn leave_loop(&mut self) {
         let lp = self.loops.pop().unwrap();
+        let (w, m) = self.pop_frame();
         let rec = &self.loop_recs[lp.id];
-        let (w, m) = (rec.sum(&self.work), rec.sum(&self.moves));
-        let (pw, pm) = self.saved.pop().unwrap();
-        self.work = pw.add(&w);
-        self.moves = pm.add(&m);
+        let (w, m) = (rec.sum_cost(&w), rec.sum_cost(&m));
+        self.work = self.work.add(&w);
+        self.moves = self.moves.add(&m);
     }
     /// Add a cost that was already summed over every enclosing loop (an inherited-context call).
-    fn add_at_root(&mut self, w: &Poly, m: &Poly) {
+    fn add_at_root(&mut self, w: &Cost, m: &Cost) {
         match self.saved.first_mut() {
             Some((rw, rm)) => { *rw = rw.add(w); *rm = rm.add(m); }
             None => { self.work = self.work.add(w); self.moves = self.moves.add(m); }
@@ -603,7 +638,7 @@ impl<'a, 'b, 'c> Fa<'a, 'b, 'c> {
         let es = self.elem_bytes(arr);
         let aff = self.affine(idx);
         let path = self.loops.iter().map(|l| l.id).collect();
-        self.sites.push(Site { aff, es, path });
+        self.sites.push(Site { aff, es, path, branch: self.branch.clone() });
     }
 
     /// Lines touched by every access site over its loop nest, times B, added to moves. Level by
@@ -622,15 +657,15 @@ impl<'a, 'b, 'c> Fa<'a, 'b, 'c> {
     fn settle_moves(&mut self) {
         let m = self.machine();
         let nsites = self.sites.len();
-        // lines[(site, loop)] = lines the site touches over one full run of that loop
-        let mut lines: HashMap<(usize, usize), Poly> = HashMap::new();
-        // whether the lines a site touches over a loop form one contiguous region
-        let mut contig: HashMap<(usize, usize), bool> = HashMap::new();
-        let inner = |lines: &HashMap<(usize, usize), Poly>, s: usize, path: &[usize], pos: usize| -> Poly {
-            if pos + 1 < path.len() { lines[&(s, path[pos + 1])].clone() } else { Poly::constant(1) }
+        // for every (site, loop): the alternatives for the lines the site touches over one full
+        // run of that loop — each under the conditions that produced it, with whether they form
+        // one contiguous region
+        #[derive(Clone)]
+        struct LP { conds: Vec<Cond>, lines: Poly, contig: bool }
+        let mut table: HashMap<(usize, usize), Vec<LP>> = HashMap::new();
+        let inner = |table: &HashMap<(usize, usize), Vec<LP>>, s: usize, path: &[usize], pos: usize| -> Vec<LP> {
+            if pos + 1 < path.len() { table[&(s, path[pos + 1])].clone() } else { vec![LP { conds: vec![], lines: Poly::constant(1), contig: true }] }
         };
-        // loops in post-order: a loop's id is smaller than every loop nested in it, so
-        // descending id processes inner loops first
         let mut ids: Vec<usize> = (0..self.loop_recs.len()).collect();
         ids.sort_unstable_by(|a, b| b.cmp(a));
         for lid in ids {
@@ -639,64 +674,108 @@ impl<'a, 'b, 'c> Fa<'a, 'b, 'c> {
                 .collect();
             if members.is_empty() { continue; }
             let rec = &self.loop_recs[lid];
-            let mut ws = Poly::zero();
-            for &(s, pos) in &members {
-                ws = ws.add(&inner(&lines, s, &self.sites[s].path, pos));
-            }
-            // the working set may vary with this loop's own variable (a triangular inner loop):
-            // it fits when its largest value does, taken at the two ends of the range
-            let ws_max: Option<f64> = match rec.atom {
-                Some(a) if ws.mentions(a) => {
-                    let last = rec.lo.add(&rec.trip.sub(&Poly::constant(1)).scale(Rat::int(rec.step)));
-                    match (self.numeric(&ws.subst(a, &rec.lo)), self.numeric(&ws.subst(a, &last))) {
-                        (Some(x), Some(y)) => Some(x.max(y)),
-                        _ => None,
+            let inners: Vec<Vec<LP>> = members.iter().map(|&(s, pos)| inner(&table, s, &self.sites[s].path, pos)).collect();
+            let mut out: Vec<Vec<LP>> = vec![Vec::new(); members.len()];
+            // every feasible choice of one alternative per site is a working set to test
+            let mut choice = vec![0usize; members.len()];
+            loop {
+                let picks: Vec<&LP> = (0..members.len()).map(|i| &inners[i][choice[i]]).collect();
+                let mut conds: Vec<Cond> = Vec::new();
+                for lp in &picks { for c in &lp.conds { if !conds.contains(c) { conds.push(c.clone()); } } }
+                if super::piece::feasible(&conds) {
+                    let ws = picks.iter().fold(Poly::zero(), |acc, lp| acc.add(&lp.lines));
+                    // a working set that varies with this loop's variable is tested at its largest
+                    let test: Option<Poly> = match rec.atom {
+                        Some(a) if ws.mentions(a) => {
+                            let signs: Vec<i128> = ws.terms.iter().filter(|(mo, _)| mo.has_atom(&Atom::Var(a))).map(|(_, c)| c.n.signum()).collect();
+                            if signs.iter().all(|&x| x >= 0) { Some(ws.subst(a, &rec.last())) }
+                            else if signs.iter().all(|&x| x <= 0) { Some(ws.subst(a, &rec.lo)) }
+                            else { None }
+                        }
+                        _ => Some(ws.clone()),
+                    };
+                    // decided, or forked into the two outcomes
+                    let outcomes: Vec<(Vec<Cond>, bool)> = match &test {
+                        None => vec![(conds.clone(), false)],
+                        Some(t) => match self.numeric(t) {
+                            Some(l) => vec![(conds.clone(), (l * m.b_bytes as f64) < m.m_bytes as f64)],
+                            None => {
+                                let mut cf = conds.clone(); cf.push(Cond { ws: t.clone(), fits: true });
+                                let mut cn = conds.clone(); cn.push(Cond { ws: t.clone(), fits: false });
+                                let mut v = Vec::new();
+                                if super::piece::feasible(&cf) { v.push((cf, true)); }
+                                if super::piece::feasible(&cn) { v.push((cn, false)); }
+                                v
+                            }
+                        },
+                    };
+                    for (conds, fits) in outcomes {
+                        for (i, &(s, _)) in members.iter().enumerate() {
+                            let site = &self.sites[s];
+                            let lp = picks[i];
+                            let summed = rec.sum(&lp.lines);
+                            let same_set = || if rec.atom.is_some_and(|a| lp.lines.mentions(a)) { summed.clone() } else { lp.lines.clone() };
+                            let (total, contig) = if !fits {
+                                (summed.clone(), false)
+                            } else {
+                                let stride = site.aff.as_ref().map(|a| rec.var.and_then(|v| a.coeffs.get(&v).cloned()).unwrap_or_else(Poly::zero).scale(Rat::int(site.es)));
+                                match stride {
+                                    None => (summed.clone(), false),
+                                    Some(st) if st.is_zero() => (same_set(), lp.contig),
+                                    Some(st) => match self.numeric(&st) {
+                                        Some(sb) if sb.abs() >= m.b_bytes as f64 => (summed.clone(), false),
+                                        Some(sb) => {
+                                            let slide = rec.sum(&Poly::constant(1)).scale(Rat::new(sb.abs() as i128, 1)).mul_atom_pow(Atom::B, Rat::int(-1));
+                                            let slide = match self.numeric(&slide) { Some(v) if v < 1.0 => Poly::constant(1), _ => slide };
+                                            if lp.contig { (same_set().add(&slide), true) } else { (same_set().mul(&slide), false) }
+                                        }
+                                        None => (summed.clone(), false),
+                                    },
+                                }
+                            };
+                            let np = LP { conds: conds.clone(), lines: total, contig };
+                            if !out[i].iter().any(|x| x.conds == np.conds && x.lines == np.lines && x.contig == np.contig) { out[i].push(np); }
+                        }
                     }
                 }
-                _ => self.numeric(&ws),
-            };
-            let fits = ws_max.is_some_and(|l| (l * m.b_bytes as f64) < (m.m_bytes as f64));
-            for &(s, pos) in &members {
-                let site = &self.sites[s];
-                let in_lines = inner(&lines, s, &site.path, pos);
-                let was_contig = if pos + 1 < site.path.len() { contig[&(s, site.path[pos + 1])] } else { true };
-                // Σ over this loop of the inner lines, always eliminating this loop's atom
-                let summed = rec.sum(&in_lines);
-                let same_set = || if rec.atom.is_some_and(|a| in_lines.mentions(a)) { summed.clone() } else { in_lines.clone() };
-                let (total, now_contig) = if !fits {
-                    (summed.clone(), false)
-                } else {
-                    let stride = site.aff.as_ref().map(|a| rec.var.and_then(|v| a.coeffs.get(&v).cloned()).unwrap_or_else(Poly::zero).scale(Rat::int(site.es)));
-                    match stride {
-                        None => (summed.clone(), false),
-                        // the same lines every iteration
-                        Some(st) if st.is_zero() => (same_set(), was_contig),
-                        Some(st) => match self.numeric(&st) {
-                            // a whole line or more: fresh lines every iteration
-                            Some(sb) if sb.abs() >= m.b_bytes as f64 => (summed.clone(), false),
-                            Some(sb) => {
-                                // the inner set slides by |s| bytes per iteration. A contiguous set
-                                // (sequential inner loops) grows by the slide: in + Σ|s|/B. Separate
-                                // lines (a strided inner loop) each slide: in × Σ|s|/B. Never less
-                                // than one new line for the whole level.
-                                let slide = rec.sum(&Poly::constant(1)).scale(Rat::new(sb.abs() as i128, 1)).mul_atom_pow(Atom::B, Rat::int(-1));
-                                let slide = match self.numeric(&slide) { Some(v) if v < 1.0 => Poly::constant(1), _ => slide };
-                                if was_contig { (same_set().add(&slide), true) } else { (same_set().mul(&slide), false) }
-                            }
-                            None => (summed.clone(), false),
-                        },
-                    }
-                };
-                lines.insert((s, lid), total);
-                contig.insert((s, lid), now_contig);
+                // next combination
+                let mut k = 0;
+                loop {
+                    if k == members.len() { break; }
+                    choice[k] += 1;
+                    if choice[k] < inners[k].len() { break; }
+                    choice[k] = 0;
+                    k += 1;
+                }
+                if k == members.len() { break; }
+            }
+            for (i, &(s, _)) in members.iter().enumerate() {
+                table.insert((s, lid), std::mem::take(&mut out[i]));
             }
         }
-        let mut total = Poly::zero();
-        for (s, site) in self.sites.iter().enumerate() {
-            let l = match site.path.first() { Some(&l0) => lines[&(s, l0)].clone(), None => Poly::constant(1) };
-            total = total.add(&l);
+        // the total: sites add up, except that sites on the two sides of an `if` are alternatives
+        let top = |s: usize| -> Cost {
+            let site = &self.sites[s];
+            let lps = match site.path.first() { Some(&l0) => table[&(s, l0)].clone(), None => vec![LP { conds: vec![], lines: Poly::constant(1), contig: true }] };
+            let mut c = Cost { pieces: lps.into_iter().map(|lp| super::piece::Piece { conds: lp.conds, poly: lp.lines }).collect() };
+            c.prune();
+            c
+        };
+        fn group(sites: &[usize], depth: usize, all: &[Site], top: &dyn Fn(usize) -> Cost) -> Cost {
+            let mut total = Cost::zero();
+            for &s in sites { if all[s].branch.len() == depth { total = total.add(&top(s)); } }
+            let mut ifs: Vec<usize> = Vec::new();
+            for &s in sites { if all[s].branch.len() > depth { let id = all[s].branch[depth].0; if !ifs.contains(&id) { ifs.push(id); } } }
+            for id in ifs {
+                let t: Vec<usize> = sites.iter().copied().filter(|&s| all[s].branch.len() > depth && all[s].branch[depth] == (id, true)).collect();
+                let e: Vec<usize> = sites.iter().copied().filter(|&s| all[s].branch.len() > depth && all[s].branch[depth] == (id, false)).collect();
+                total = total.add(&group(&t, depth + 1, all, top).max(&group(&e, depth + 1, all, top)));
+            }
+            total
         }
-        self.moves = self.moves.add(&total.mul_atom_pow(Atom::B, Rat::int(1)));
+        let all: Vec<usize> = (0..nsites).collect();
+        let total = group(&all, 0, &self.sites, &top);
+        self.moves = self.moves.add(&total.mul_poly(&Poly::atom(Atom::B)));
     }
 
     /// The catalogue, entry one: is this statement a multiply-accumulate whose two indices form
@@ -731,7 +810,7 @@ impl<'a, 'b, 'c> Fa<'a, 'b, 'c> {
 
     /// A sequential pass over `n` elements of `es` bytes, once per enclosing iteration.
     fn stream(&mut self, n: &Poly, es: i128) {
-        self.moves = self.moves.add(&n.scale(Rat::int(es)));
+        self.moves = self.moves.add_poly(&n.scale(Rat::int(es)));
     }
 
     // ---- the walk ----
@@ -1042,10 +1121,23 @@ impl<'a, 'b, 'c> Fa<'a, 'b, 'c> {
                 // binary search would read as two calls per level and come out linear
                 let before = self.rec_calls.len();
                 let entry_init = self.initial.clone();
+                let if_id = self.next_if;
+                self.next_if += 1;
+                self.branch.push((if_id, true));
+                self.push_frame();
                 self.block(t)?;
+                let (wt, mt) = self.pop_frame();
+                self.branch.pop();
                 let then_calls: Vec<_> = self.rec_calls.drain(before..).collect();
                 let then_init = std::mem::replace(&mut self.initial, entry_init);
+                self.branch.push((if_id, false));
+                self.push_frame();
                 if let Some(b) = els { self.block(b)?; }
+                let (we, me) = self.pop_frame();
+                self.branch.pop();
+                // the two branches are alternatives: the cost is the larger, not the sum
+                self.work = self.work.add(&wt.max(&we));
+                self.moves = self.moves.add(&mt.max(&me));
                 // a local defined differently on the two sides may hold either value after
                 for (l, tv) in then_init {
                     let merged = match (tv, self.initial.get(&l).cloned().flatten()) {
@@ -1140,7 +1232,7 @@ impl<'a, 'b, 'c> Fa<'a, 'b, 'c> {
                 let mut mv = cm;
                 let cf = &self.an.m.funcs[*fid];
                 for (i, (a, &p)) in args.iter().zip(&cf.params).enumerate() {
-                    let used = w.terms.keys().chain(mv.terms.keys()).any(|m| m.factors.contains_key(&Atom::Var(i)));
+                    let used = w.mentions(i) || mv.mentions(i);
                     if !used { continue; }
                     let by = if cf.locals[p].ty.is_arrayish() {
                         match &a.kind { ExprKind::Ref(s, _) | ExprKind::Local(s) => self.local_size.get(s).cloned(), _ => None }
