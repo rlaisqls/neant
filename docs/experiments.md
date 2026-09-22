@@ -234,51 +234,109 @@ noise over the repeats — against a tolerance of one line. Confirmed; the lockf
 `declared  measured over n = 1000..16000: confirmed`, and `total`, which calls it, `rests on labs
 (declared, extern)`. A small thing measured; the shape of the chain is the point.
 
-## IOLB — the bounds from the tool, against the hand entry
+## Lower bounds — IOLB, and the compiler's own
 
 **Question.** With IOLB (Olivry et al. 2020) hooked up through `neant emit --scop` and
-`neant cost --iolb`, what does it say about the kernels, and was the hand entry right?
+`neant cost --iolb`, and the compiler deriving its own bounds (`bounds.rs`: the HBL exponent by
+an exact LP, and the footprint from cold), what do the three say about the kernels, and was the
+hand entry right?
 
 **Setup.** IOLB built from `gitlab.inria.fr/CORSE/iolb` inside its docker image, run under
 amd64 emulation on the arm64 host (`tonistiigi/binfmt --install amd64`; the image is x86 only).
 `tests/kernels/iolb.sh` copies the export into the checkout and runs `iolb-affine` with a
-wall-clock limit. Bounds in words with `S` the cache in words, converted with `S = M/8` and ×8.
+wall-clock limit. IOLB's bounds are in words with `S` the cache in words, converted with
+`S = M/8` and ×8. The native bounds are in bytes over `M` directly.
 
-| function | IOLB, words | in bytes over `M` | hand entry | function's own moves (leading) | gap |
+| function | own moves (leading) | footprint | HBL (native) | IOLB | best gap |
 |---|---|---|---|---|---|
-| `matmul` naive | `2·n³/√S` | `45.25·n³/√M` | `8·n³/√M` | `8·n³` (column fits), `B·n³` (not) | 256×, 2304× |
-| `matmul` tiled, `t = 64` | `3·n²` | `24·n²` | `8·n³/√M` | `n³/8 + …` | hand entry leads |
-| `dot` | `2·n` | `16·n` | — | `16·n` | 1× |
-| `saxpy` | `2·n` | `16·n` | — | `16·n` | 1× |
-| `sum` | `n` | `8·n` | — | `8·n` | 1× |
-| `transpose` | `n²` | `8·n²` | — | `16·n²` (fits), `72·n²` (not) | 2×, 9× |
-| `pairs` (triangular reduction) | `n²/(2S)` | `32·n²/M` | — | `8·n` | weak: below the input size |
-| `tiles` (`for ii in 0..n/4`) | none in 240 s | | | | timed out |
+| `matmul` naive | `8·n³` (column fits), `B·n³` (not) | `24·n²` | `8·n³/√M − M`, σ = 3/2 | `45.25·n³/√M` | 256×, 2304× |
+| `matmul` tiled by hand, `t = 64` | `≈ n³/8` | `24·n²` | `8·n³/√M − M`, σ = 3/2 | `45.25·n³/√M` after untiling, if `64 \| n` | 9× |
+| `dot` | `16·n` | `16·n` | σ = 1: none | `16·n` | 1× |
+| `saxpy` | `16·n` | `16·n` | σ = 1: none | `16·n` | 1× |
+| `sum` | `8·n` | `8·n` | σ = 1: none | `8·n` | 1× |
+| `transpose` | `16·n²` (fits), `72·n²` (not) | `16·n²` | σ = 1: none | `8·n²` | 1×, 4× |
+| `pairs` (triangular reduction) | `3·n²` … | `8·n` | `16·n²/M − M`, σ = 2 | `32·n²/M` | — |
+| `tiles` (`for ii in 0..n/4`) | `8·n` | `8·n` | σ = 1: none | none in 240 s | 1× |
 
 **Findings.**
 
 - **The hand entry's constant was `4·√2 ≈ 5.66×` too small.** `bounds.rs` carried
   Irony–Toledo–Tiskin's `N/(2√2·√S)` words; IOLB derives Smith–van de Geijn's `2·N/√S`. Both are
-  valid lower bounds and the second is the one to quote. The report now leads with IOLB's where
-  it answers, and every matmul gap in the README is `5.66×` smaller than printed before: the
-  tiled product at `M = 2 MiB` sits `4×` above the bound, not `23×`.
-- **On the streaming kernels the bound meets the model.** `dot`, `saxpy` and `sum` move exactly
-  their inputs once, and IOLB says nothing less is possible. That is the first external
-  confirmation that the moves rules are tight on the easy cases, not only that they agree with
-  the counters.
-- **IOLB does not see through the tiled nest.** A six-deep nest with a literal tile side returns
-  only the size of the data. That is the case the hand entry was written for, so it stays: both
-  bounds are reported and the asymptotically stronger one leads.
-- **Where the input is smaller than the iteration space, IOLB's bound can fall below the
-  input size** (`pairs`: `n²/(2S)` against `n` words that must be read). Reading the input is a
-  bound too, and the model's own footprint already gives it; whether to print it as a bound is
-  left open until a kernel needs it.
-- **Floors in loop bounds blow the search up.** `for ii in 0..n/4` did not finish in four
-  minutes; the same nest without the division returns at once. The export could rewrite
-  `0..n/4` with `ii·4 < n` in the inner bound, which is affine; not done, the case is rare.
+  valid lower bounds and the second is the one to quote. The native HBL bound reproduces the
+  Irony–Toledo–Tiskin constant from first principles — `σ = 3/2` out of the LP, `|I| = n³` out
+  of the summation — so the hand entry is now derived rather than written, and every matmul gap
+  quoted before this is `5.66×` smaller against IOLB's line.
+- **On the streaming kernels the bounds meet the model.** `dot`, `saxpy`, `sum` and `tiles` move
+  exactly their inputs once; the footprint bound says so, and IOLB agrees. That is the first
+  external confirmation that the moves rules are tight on the easy cases, not only that they
+  agree with the counters.
+- **The native bound sees through the tiled nest; IOLB does not, until the nest is untiled.** On
+  the hand-tiled product IOLB first returned only the size of the data, `3·n²` words. The export
+  now drops a tile-outer loop whose variable appears only in one inner loop's bounds and runs the
+  inner loop over the full range — the same computation when `T | n`, which the bound states —
+  and IOLB returns `2·n³/√S` for it. The native bound needed nothing: the six loop variables
+  project onto the three arrays with `σ = 3/2` regardless of the nesting.
+- **The accumulator had to be seen as the element it is stored into.** `acc += a·b` inside the
+  `k` loop references `a` and `b` only, and the LP over those two gives `σ = 2` — `n³/M`, a
+  bound weaker than the truth by `√M`. The compiler now reads `c[i·n + j] = acc` after the loop
+  as saying that `acc` *is* `c[i][j]` inside the block, and the statement references all three
+  arrays. Register promotion does not change the computation, so the bound is the same one.
+- **`pairs` was misreported here as a weakness of IOLB.** An earlier version of this section said
+  IOLB's bound for the triangular reduction fell below the input size. It was the parser's
+  choice: only the second-to-last line of IOLB's output, the asymptotic bound, is read, and its
+  last line adds the input size. The footprint bound now states the input size natively (`8·n`),
+  and both are printed.
+- **Floors in loop bounds blow IOLB's search up.** `for ii in 0..n/4` did not finish in four
+  minutes; the same nest without the division returns at once. That is why untiling emits the
+  full range with a divisibility assumption rather than `T·(n/T)`, which is exact and does not
+  return.
 - **Two things the export had to get right for PET to accept the file**, found by feeding it:
   the flat index `a[i*n+k]` crashes GiNaC with a pole error (hence delinearisation), and a
   statement with no effect — the function's tail expression printed as `(void)(s);` — made IOLB
   run for more than ten minutes on a two-line reduction; dropping it, the same file answers in a
   second.
+
+## The tile side — the model's choice against the machine
+
+**Question.** The tile side is now read off the model (cost-model § Rewrites): the tiled product
+analysed with its side `T` symbolic, the side the boundary of the fit condition of the cheapest
+regime. The model's first answer at `M = 2 MiB` was `T < √(M/8)`, 510 — the regime in which one
+tile fits and the other two operands stream, `32·n³/T` — which in the ideal cache exactly ties
+the regime in which every tile fits (`16·n³/T` at `T < √(M/32)`, 256), both `90.5·n³/√M`. Is
+the tie real?
+
+**Setup.** `tests/kernels/sweep.py matmul_tile_*`: the naive kernel with `--apply matmul:tile=T`
+for seven sides, `n` a multiple of 64 with an odd cofactor, `l2d_cache_refill × 64` on core 5.
+Predicted bytes are the model's; the ratio is predicted over measured.
+
+| `T` | working set of the tile level | `n = 1600` pred / meas | ratio | `n = 2496` pred / meas | ratio |
+|---|---|---|---|---|---|
+| 128 | `32·T²` = `M/4` | 8.38e8 / 7.60e8 | 1.10 | 2.74e9 / 2.87e9 | 0.96 |
+| **181** | **`M/2`** | 6.86e8 / **5.74e8** | 1.19 | 2.15e9 / **2.24e9** | 0.96 |
+| 256 | `M` (the boundary) | 9.40e8 / 7.44e8 | 1.26 | 2.96e9 / 2.79e9 | 1.06 |
+| 300 | one tile: `8·T²` = `M/3` | 8.68e8 / 1.14e9 | 0.77 | 2.68e9 / 4.33e9 | 0.62 |
+| 361 | `M/2` | 8.02e8 / 2.95e9 | 0.27 | 2.40e9 / 1.34e10 | 0.18 |
+| 420 | `2M/3` | 7.59e8 / 6.78e9 | 0.11 | 2.21e9 / 3.07e10 | 0.07 |
+| 510 | `M` (the model's first choice) | 7.19e8 / 1.69e10 | 0.04 | 2.02e9 / 6.76e10 | 0.03 |
+
+**Findings.**
+
+- **The tie is not real.** Every side at which all three tiles fit in `M` moved what the model
+  said (ratios 0.96–1.26, the M1 constants). Every side in the one-tile regime moved more than
+  the model said, by a factor that grows from `1.6×` at 300 to `30×` at 510 — the regime the
+  ideal cache computes correctly is one the machine does not have. One tile resident while two
+  operands stream is optimal replacement, not LRU; a working set larger than the cache with a
+  cyclic access pattern is the case LRU gets nothing from.
+- **The best measured side sits at half the cache.** 181 (`32·T² = M/2`) moved the least at both
+  sizes: 20% less than 256, which sits at the boundary and whose measured bytes fall between the
+  two regimes' predictions. This is the octave M1 saw the fit transition spread over, seen from
+  the other side, and it is Sleator–Tarjan's factor: an LRU cache of `M` is as good as the ideal
+  cache of `M/2`.
+- **The rule changed twice from this table.** The boundary is now taken at `M/2`, and among
+  candidates the model cannot tell apart the smaller side wins. The choice is `T < √M/8` at `M/2`,
+  178 once the edge lines are counted (181 without them), and the `2×` gain over the old square
+  of 256 that the model claimed for 510 is a measured `1.25×` at 181.
+- **The model's partial-fit regimes are optimistic for the machine**, and this is now written in
+  cost-model § What the model does not see. Nothing in the calculus corrects for it yet except
+  the tile choice.
 

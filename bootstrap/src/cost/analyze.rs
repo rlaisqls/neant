@@ -15,7 +15,7 @@ use crate::ir::*;
 
 use super::bounds::{self, Bound};
 use super::rewrite;
-use super::piece::{Cond, Cost};
+use super::piece::{Cond, Cost, Piece};
 use super::size::{Atom, Poly, Rat};
 
 #[derive(Debug, Clone, Copy)]
@@ -110,11 +110,17 @@ pub fn analyze(m: &Module, machine: &Machine) -> Vec<FuncCost> {
     for i in 0..m.funcs.len() {
         if an.done[i].as_ref().is_some_and(|c| !c.bounds.iter().any(|b| b.kind.starts_with("HBL"))) { continue; }
         let f = &m.funcs[i];
-        let t = rewrite::tile_side(machine.m_bytes, 8);
         let mut sugg = Vec::new();
+        // the tile side: read off the cost of the tiled program with the side symbolic, else the
+        // square that fits three tiles
+        let choice = tile_choice(&mut an, f);
+        let t = choice.as_ref().map_or_else(|| rewrite::tile_side(machine.m_bytes, 8), |c| c.t);
+        if let Some(c) = &choice {
+            sugg.push(Suggestion { label: format!("tile T < {}", c.side), flag: format!("{}:tile={}", f.name, c.t), result: CostResult::Exact { work: c.work.clone(), moves: c.moves.clone() } });
+        }
         if let Some(g) = rewrite::tile(f, t) {
             let r = Fa::new(&mut an, &g, None).run().result;
-            sugg.push(Suggestion { label: format!("tile by {t}"), flag: format!("{}:tile", f.name), result: r });
+            sugg.push(Suggestion { label: format!("tile by {t}"), flag: format!("{}:tile={t}", f.name), result: r });
         }
         if let Some(g) = rewrite::transpose(f) {
             let r = Fa::new(&mut an, &g, None).run().result;
@@ -125,13 +131,106 @@ pub fn analyze(m: &Module, machine: &Machine) -> Vec<FuncCost> {
     an.done.into_iter().map(|c| c.unwrap()).collect()
 }
 
-/// Apply `--apply` specs (`name:tile`, `name:transpose`) to a module before anything else sees it.
+/// The tile side the model prefers, and the tiled cost at it.
+struct TileChoice {
+    /// the side as an expression in `M` (and the sizes), e.g. `√(M/24)`
+    side: String,
+    /// the largest integer below it at this machine
+    t: i64,
+    work: Cost,
+    moves: Cost,
+}
+
+/// **Choosing the tile side from the model.** The tiled program is analysed with its side `T` as a
+/// size variable; its moves come out piecewise in `T`, each piece under fit conditions some of
+/// which bound `T` from above (`32·T² < M`: every tile fits). In a piece whose moves fall as `T`
+/// grows — every power of `T` non-positive — the best side is the largest the conditions allow,
+/// so each such condition is solved for `T` at its boundary and substituted; the other conditions
+/// of the piece, substituted too, must stay feasible and hold at the reference point. Two things
+/// the machine taught (docs/experiments.md, the tile-side sweep):
+///
+/// - the boundary is taken at **half the cache**. A fit the ideal cache decides at `M` is not
+///   one the machine honours: the tile at the edge of `M` moved twenty times what the model said,
+///   the tile at the edge of `M/2` moved what it said and the least of all sides tried. A fit
+///   decided at `M/2` is what an LRU cache of `M` can be relied on for (Sleator–Tarjan), and
+///   what M1 measured as the width of the transition.
+/// - among candidates the model cannot tell apart (within five percent at the reference point)
+///   the **smaller side** wins: the regime where one tile fits and the rest stream ties the regime
+///   where everything fits in the ideal cache and loses by an order of magnitude on the machine.
+///
+/// The integer recommended is the largest for which the working set, edge lines included, is
+/// strictly below `M/2`. This is the upper side of the I/O question — what the best tiling of
+/// this loop order moves — from the model's own exact cost rather than a separate cost formula,
+/// in closed form where IOUB solves numerically.
+fn tile_choice(an: &mut Analyzer, f: &Func) -> Option<TileChoice> {
+    let machine = an.machine;
+    let (g, tv) = rewrite::tile_sym(f)?;
+    let tvar = g.params.iter().position(|&p| p == tv)?;
+    let c = Fa::new(an, &g, None).run();
+    let CostResult::Exact { work, moves } = &c.result else { return None };
+    if std::env::var("NEANT_DEBUG_TILE").is_ok() { eprint!("{}", super::lock::report(&c, &machine)); }
+    // the reference point: this machine, every size a million — tiling is for large sizes
+    let point = |t: Option<f64>| move |a: Atom| match a { Atom::B => Some(machine.b_bytes as f64), Atom::M => Some(machine.m_bytes as f64), Atom::Var(v) if v == tvar => t, Atom::Var(_) => Some(1e6), Atom::Log(_) => None };
+    let holds = |conds: &[Cond]| conds.iter().all(|c| c.ws.eval(&point(None)).is_some_and(|ws| ((ws * (machine.b_bytes as f64)) < (machine.m_bytes as f64)) == c.fits));
+    let mut best: Option<(f64, Poly, bool, Poly, Piece)> = None;
+    let half = Poly::atom(Atom::M).scale(Rat::new(1, 2));
+    for piece in &moves.pieces {
+        let t_exps: Vec<Rat> = piece.poly.terms.keys().filter_map(|m| m.factors.get(&Atom::Var(tvar)).copied()).collect();
+        if t_exps.is_empty() || t_exps.iter().any(|e| e.n > 0) { continue; }
+        for (ci, cond) in piece.conds.iter().enumerate() {
+            if !cond.fits { continue; }
+            let bytes = cond.ws.mul_atom_pow(Atom::B, Rat::one());
+            // the term of the working set that grows fastest in T sets the side; the rest are
+            // edge lines, dropped from the expression and kept for the integer
+            let Some((mono, coef)) = bytes.terms.iter().filter_map(|(m, c)| m.factors.get(&Atom::Var(tvar)).map(|e| (*e, m, *c))).max_by(|a, b| a.0.cmp(&b.0)).map(|(_, m, c)| (m, c)) else { continue };
+            let k = mono.factors[&Atom::Var(tvar)];
+            if !(k.is_int() && k.n > 0) { continue; }
+            // c·rest·T^k = M/2  ⇒  T = (M / (2·c·rest))^(1/k)
+            let mut rest = mono.clone();
+            rest.factors.remove(&Atom::Var(tvar));
+            let mut rest_p = Poly::zero();
+            rest_p.terms.insert(rest, coef);
+            let Some(inv) = rest_p.inv_mono() else { continue };
+            let Some(side) = half.mul(&inv).root_mono(k.n) else { continue };
+            let poly = piece.poly.subst_pow(tvar, &side);
+            let conds: Vec<Cond> = piece.conds.iter().enumerate().filter(|(j, _)| *j != ci).map(|(_, c)| Cond { ws: c.ws.subst_pow(tvar, &side), fits: c.fits }).collect();
+            if !super::piece::feasible(&conds) || !holds(&conds) { continue; }
+            let score = poly.eval(&point(None)).unwrap_or(f64::INFINITY);
+            let side_at = side.eval(&point(None)).unwrap_or(f64::INFINITY);
+            let better = match &best {
+                None => true,
+                Some((b, bside, ..)) => {
+                    let bside_at = bside.eval(&point(None)).unwrap_or(f64::INFINITY);
+                    score < *b * 0.95 || (score <= *b * 1.05 && side_at < bside_at)
+                }
+            };
+            if better { best = Some((score, side, bytes.terms.len() > 1, bytes, Piece { conds, poly })); }
+        }
+    }
+    let (_, side, approx, bytes, piece) = best?;
+    // the integer side at this machine: the largest for which the working set, edge lines
+    // included, is strictly below M/2
+    let at: f64 = side.eval(&point(None))?;
+    let mut t = at.floor() as i64;
+    while t >= 2 && bytes.eval(&point(Some(t as f64))).is_some_and(|b| b >= machine.m_bytes as f64 / 2.0) { t -= 1; }
+    if (t as f64) >= at { t -= 1; }
+    if t < 2 { return None; }
+    let side_text = format!("{} (at M/2{})", side.display(&c.names), if approx { ", leading term" } else { "" });
+    let mut mv = Cost { pieces: vec![piece] };
+    mv.prune_at(&machine);
+    let mut wk = Cost { pieces: work.pieces.iter().map(|p| Piece { conds: p.conds.iter().map(|c| Cond { ws: c.ws.subst_pow(tvar, &side), fits: c.fits }).collect(), poly: p.poly.subst_pow(tvar, &side) }).collect() };
+    wk.prune_at(&machine);
+    Some(TileChoice { side: side_text, t, work: wk, moves: mv })
+}
+
+/// Apply `--apply` specs (`name:tile`, `name:tile=T`, `name:transpose`) to a module before anything else sees it.
 pub fn apply_rewrites(m: &mut Module, specs: &[String], machine: &Machine) -> Result<(), String> {
     for spec in specs {
         let Some((name, what)) = spec.split_once(':') else { return Err(format!("--apply takes `function:tile` or `function:transpose`, not `{spec}`")) };
         let Some(i) = m.funcs.iter().position(|f| f.name == name) else { return Err(format!("--apply: no function `{name}`")) };
         let g = match what {
             "tile" => rewrite::tile(&m.funcs[i], rewrite::tile_side(machine.m_bytes, 8)),
+            t if t.starts_with("tile=") => rewrite::tile(&m.funcs[i], t[5..].parse().map_err(|_| format!("--apply: `{t}` needs an integer tile side"))?),
             "transpose" => rewrite::transpose(&m.funcs[i]),
             other => return Err(format!("--apply: unknown rewrite `{other}`")),
         };
@@ -774,9 +873,12 @@ impl<'a, 'b, 'c> Fa<'a, 'b, 'c> {
             }
             ExprKind::Binary(BinOp::Div, a, b) => {
                 let pb = self.size_of(b, bound)?;
-                let d = pb.as_const()?;
-                if d.is_zero() || !d.is_int() { return None; }
-                Some(self.size_of(a, bound)?.scale(Rat::new(1, d.n)))
+                match pb.as_const() {
+                    Some(d) => { if d.is_zero() || !d.is_int() { return None; } Some(self.size_of(a, bound)?.scale(Rat::new(1, d.n))) }
+                    // a symbolic divisor that is one size, `n / T`: exact when it divides, and the
+                    // tile rewrite that produces it says so
+                    None => Some(self.size_of(a, bound)?.mul(&pb.inv_mono()?)),
+                }
             }
             ExprKind::Block(b) if b.stmts.is_empty() => self.size_of(b.tail.as_ref()?, bound),
             _ => None,
@@ -800,9 +902,10 @@ impl<'a, 'b, 'c> Fa<'a, 'b, 'c> {
             ExprKind::Binary(BinOp::Div, a, b) => {
                 let pb = self.affine(b)?;
                 if !pb.is_const() { return None; }
-                let d = pb.konst.as_const()?;
-                if d.is_zero() || !d.is_int() { return None; }
-                Some(self.affine(a)?.scale(&Poly::from_rat(Rat::new(1, d.n))))
+                match pb.konst.as_const() {
+                    Some(d) => { if d.is_zero() || !d.is_int() { return None; } Some(self.affine(a)?.scale(&Poly::from_rat(Rat::new(1, d.n)))) }
+                    None => Some(self.affine(a)?.scale(&pb.konst.inv_mono()?)),
+                }
             }
             ExprKind::Binary(BinOp::Add, a, b) => Some(self.affine(a)?.add(&self.affine(b)?)),
             ExprKind::Binary(BinOp::Sub, a, b) => {

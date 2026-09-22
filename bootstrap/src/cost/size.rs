@@ -292,6 +292,62 @@ impl Poly {
         out
     }
 
+    /// The one term of a single-term polynomial.
+    pub fn as_mono(&self) -> Option<(&Mono, Rat)> {
+        if self.terms.len() != 1 { return None; }
+        self.terms.iter().next().map(|(m, c)| (m, *c))
+    }
+    /// `1/p` for a single positive term.
+    pub fn inv_mono(&self) -> Option<Poly> {
+        let (m, c) = self.as_mono()?;
+        if c.n <= 0 { return None; }
+        let mut out = Poly::zero();
+        let mut f = m.clone();
+        for e in f.factors.values_mut() { *e = e.neg(); }
+        out.terms.insert(f, Rat::new(c.d, c.n));
+        Some(out)
+    }
+    /// `p^(1/k)` for a single positive term; a coefficient without an exact root is kept to
+    /// four decimals.
+    pub fn root_mono(&self, k: i128) -> Option<Poly> {
+        let (m, c) = self.as_mono()?;
+        if c.n <= 0 || k <= 0 { return None; }
+        let mut f = m.clone();
+        for e in f.factors.values_mut() { *e = e.mul(Rat::new(1, k)); }
+        let mut out = Poly::zero();
+        out.terms.insert(f, rat_pow(c, Rat::new(1, k)));
+        Some(out)
+    }
+    /// Substitute a single-term polynomial for a variable, at any rational power of it.
+    pub fn subst_pow(&self, var: usize, by: &Poly) -> Poly {
+        let Some((bm, bc)) = by.as_mono() else { return self.subst(var, by) };
+        let mut out = Poly::zero();
+        for (m, c) in &self.terms {
+            let mut rest = Mono::one();
+            let mut coef = *c;
+            for (a, e) in &m.factors {
+                match a {
+                    Atom::Var(v) if *v == var => {
+                        coef = coef.mul(rat_pow(bc, *e));
+                        for (ba, be) in &bm.factors {
+                            let ne = rest.factors.get(ba).map_or(be.mul(*e), |x| x.add(be.mul(*e)));
+                            if ne.is_zero() { rest.factors.remove(ba); } else { rest.factors.insert(ba.clone(), ne); }
+                        }
+                    }
+                    Atom::Log(inner) => { rest.factors.insert(Atom::Log(Box::new(inner.subst_pow(var, by))), *e); }
+                    other => {
+                        let ne = rest.factors.get(other).map_or(*e, |x| x.add(*e));
+                        if ne.is_zero() { rest.factors.remove(other); } else { rest.factors.insert(other.clone(), ne); }
+                    }
+                }
+            }
+            let mut t = Poly::zero();
+            t.terms.insert(rest, coef);
+            out = out.add(&t);
+        }
+        out
+    }
+
     pub fn display<'a>(&'a self, names: &'a [String]) -> PolyDisplay<'a> {
         PolyDisplay { p: self, names }
     }
@@ -376,3 +432,23 @@ impl<'a> fmt::Display for PolyDisplay<'a> {
         Ok(())
     }
 }
+
+/// `c^e` for a positive rational base: exact when `e` is an integer or the root is exact, else
+/// to four decimals.
+pub fn rat_pow(c: Rat, e: Rat) -> Rat {
+    if e.is_int() {
+        let mut r = Rat::one();
+        for _ in 0..e.n.abs() { r = r.mul(c); }
+        return if e.n < 0 { Rat::new(r.d, r.n) } else { r };
+    }
+    let exact = |x: i128| -> Option<i128> {
+        let r = (x as f64).powf(1.0 / e.d as f64).round() as i128;
+        let mut p = 1i128; for _ in 0..e.d { p *= r; }
+        if p == x { Some(r) } else { None }
+    };
+    if let (Some(n), Some(d)) = (exact(c.n.abs()), exact(c.d)) {
+        return rat_pow(Rat::new(n, d), Rat::int(e.n));
+    }
+    Rat::new((c.to_f64().powf(e.to_f64()) * 10000.0).round() as i128, 10000)
+}
+

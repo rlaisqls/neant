@@ -44,8 +44,10 @@ tiling removed 53× of measured traffic against 39× predicted and beat the hand
 `io` inferred, `#[cost]` by asymptotic dominance, `neant measure`, and a four-program corpus.
 Then the exactness pass: verified measures, reaching definitions, loop sums by Faulhaber, exact
 recurrence constants, and piecewise costs with `if` as max and fit tests that fork. After the
-literature review (decisions §5): lower bounds from IOLB through `emit --scop` and `cost --iolb`,
-the hand catalogue reduced to a fallback.
+literature review (decisions §5, §6): lower bounds derived by the compiler — the HBL exponent by
+an exact LP, the footprint from cold — with IOLB asked for the constant through `emit --scop`
+(untiled, delinearised) and `cost --iolb`; the tile side read off the model's own cost of the
+tiled program with the side symbolic, then corrected by measurement.
 
 What M0–M3 established is an analyser. Everything in it could have been built over a Rust subset
 or as an MLIR dialect. The coverage it reached on ordinary code is the number that governs what
@@ -167,9 +169,9 @@ Zero-copy persistence (unrelated to cost; out of the argument); generics beyond 
 need; strings and I/O beyond the harness; compile-time performance of the compiler.
 
 An option, not scheduled: an export of a rectangular fully-permutable nest to IOUB's DSL (loop
-dimensions, access functions, reuse directions, cache sizes), so that the tile the rewrite applies
-is the one IOUB recommends rather than `tile_side`'s square. The affine analysis already has every
-field the DSL asks for.
+dimensions, access functions, reuse directions, cache sizes) for the multi-level-cache tile
+recommendation. The single-level side is now read off the model itself (cost-model § Rewrites);
+the affine analysis already has every field the DSL asks for.
 
 ## Who switches, and why
 
@@ -192,8 +194,8 @@ bootstrap/              everything that builds the compiler from nothing
       size.rs           symbolic sizes and costs: rational polynomials over atoms, B and M
       piece.rs          piecewise costs: conditions, max, feasibility
       analyze.rs        the calculus, one walk (docs/cost-model.md is its spec)
-      bounds.rs         the one hand lower bound, the fallback
-      scop.rs           export of an affine function as a SCoP for IOLB, indices delinearised
+      bounds.rs         native lower bounds: the HBL exponent by an exact LP, the footprint from cold
+      scop.rs           export of an affine function as a SCoP for IOLB, indices delinearised, tiles undone
       iolb.rs           runs IOLB, parses its bound into bytes over M
       rewrite.rs        tile and transpose
       assert.rs         #[cost] parsing and dominance

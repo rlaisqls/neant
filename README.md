@@ -45,21 +45,28 @@ matmul           work 10·n³ + 5·n² + 2·n           moves                   
                                                moves 24·n² + 2·B·n                if ≈ 8·n² < M
                                                moves B·n³ + 8·n³ + 2·B·n²         if ≈ B·n + 8·n ≥ M
                                                moves 8·n³ + 16·n² + 2·B·n         if ≈ B·n + 8·n < M and ≈ 8·n² ≥ M
-                 lower bound      moves 8·n³/√M                      (matrix product, Hong–Kung 1981)   gap 13033× if ≈ B·n + 8·n ≥ M; 1448× if ≈ B·n 
+                 lower bound      moves 8·n³/√M − M                  (HBL, σ = 3/2, CDKSY 2013)   gap 13033× if ≈ B·n + 8·n ≥ M; 1448× if ≈ B·n + 8·n  …
+                 lower bound      moves 24·n²                        (footprint, every distinct element crosses once)   gap 1× if ≈ 8·n² < M at M = 2  …
                  `b` moves by 8·n bytes per iteration of the innermost loop: a new line every time (line 7)
-                 tile by 256      work ≈ 10.0509·n³                 moves ≈ 4.5776e-5·B·n³ + n³/8 if ≈ 8·n ≥ M  …
-                 transpose the column operand work ≈ 10·n³                      moves ≈ 16·n³ if ≈ 16·n ≥ M  …
+                 tile T < √M/8 (at M/2, leading term) work ≈ 88·n³/√M + 320·n³/M + 2560·n³/M^(3/2) + 10·n³ moves ≈ 128·n³/√M + 64·B·n³/M if ≈ 8·n ≥ M  …
+                 tile by 178      work ≈ 10.0733·n³                 moves ≈ 3.1562e-5·B·n³ + 0.0899·n³ if ≈ 8·n ≥ M | ≈ 0.0169·B·n² + 40·n² if ≈ 8·n²  …
+                 transpose the column operand work ≈ 10·n³                      moves ≈ 16·n³ if ≈ 16·n ≥ M | 48·n² + 4·B·n if ≈ 8·n² < M (+2 regimes)  …
 ```
 
 That is `neant cost` on the naive triple loop, as it prints today. The function's own line is
 **piecewise**: the calculus cannot decide, for a symbolic `n`, whether the column of `b` (`B·n`
 bytes) or the whole matrix (`8·n²`) stays in a cache of `M` bytes, so it says what happens in
-each case and where the thresholds are, and gives the gap to the Hong–Kung bound per regime —
-1448× where the column fits, 13033× where nothing does. A `main` that calls it with `n = 1984`
-decides every test with numbers and gets one piece: 6.27e10 bytes, a gap of 1453×, and 1.59e9
-after `--apply matmul:tile`. The two suggestions were not looked up: each is the rewrite applied
-to the IR and the calculus run again on the result, which is why the transpose is offered with
-its real cost and not with a slogan.
+each case and where the thresholds are, and gives the gap per regime to a lower bound it derived
+itself — the Hong–Kung exponent from the statement's array references, `8·n³/√M`: 1448× where
+the column fits, 13033× where nothing does. A `main` that calls it with `n = 1984` decides every
+test with numbers and gets one piece. The tile side was not looked up either: the tiled program
+was analysed with its side `T` symbolic and the side read off its own cost — then measured. The
+model's first choice, the side at which one tile just fits, moved thirty times what it predicted;
+the side at which every tile fits in half the cache, 178 here, moved the least of seven tried and
+`1.25×` less than the square of 256 a rule of thumb picks, so that is the rule now
+(docs/experiments.md). The suggestions are the rewrite applied to the IR and the calculus run
+again on the result, which is why the transpose is offered with its real cost and not with a
+slogan.
 
 ## What it looks like
 
@@ -200,17 +207,19 @@ was measured against pairs read streams and does not see write streams, so it wa
 model's unit. The linear kernels' slopes are near-trivial; the information is in the naive/tiled
 separation and in the two rules the data forced.
 
-**The bounds are not this project's.** Olivry et al. bound the I/O *complexity* from both sides:
-IOLB from below, for any schedule of any affine program, and IOUB from above, with the best tiled
-schedule of a perfectly nested rectangular band described by hand in a DSL. Bao et al. count what a
-given affine nest moves. The hand-written catalogue here has one entry, the matrix product, and it
-is not going to grow by hand: `neant cost --iolb` feeds the affine functions of a program to IOLB
-for the bound (its first answer: the hand entry's constant for the product was `5.7×` too small).
-What this compiler owns is the cost of the program *as written*, beyond affine nests, composed
-through signatures, locked, and audited to the boundary. Its tiling rewrite is a costed and
-measured transformation, not a search; where a nest is a rectangular band, IOUB's recommendation
-is the better tile, and an export to it is a small step. For code that is not affine no bound
-exists, and the compiler says what yours costs and cannot say what it should.
+**The bounds' constants are not this project's.** Olivry et al. bound the I/O *complexity* from
+both sides: IOLB from below, for any schedule of any affine program, and IOUB from above, with
+the best tiled schedule of a perfectly nested rectangular band described by hand in a DSL. Bao et
+al. count what a given affine nest moves. The compiler derives its own lower bound — the
+Brascamp–Lieb exponent of a statement's array references by an exact LP, and the footprint from a
+cold cache — which gives the right exponent on anything with injective affine references and
+sees through a tiled nest, but with Irony–Toledo–Tiskin's constant, `5.7×` looser than IOLB's
+on the product; `neant cost --iolb` asks IOLB for the constant where it is installed. The tile
+side is read off the model's own cost of the tiled program rather than searched, in closed form
+where IOUB solves numerically, for one cache level where IOUB does several. What this compiler
+owns is the cost of the program *as written*, beyond affine nests, composed through signatures,
+locked, and audited to the boundary. For code that is not affine no bound exists, and the
+compiler says what yours costs and cannot say what it should.
 
 **The exact tier covers less than the demo suggests.** On the four ordinary programs of the M3
 corpus — string processing, a stack machine, breadth-first search, a recursive-descent parser —

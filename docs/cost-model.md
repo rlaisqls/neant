@@ -186,6 +186,15 @@ absent, and the stronger statement where the tool does not see through a tiled n
 
 ## What the model does not see
 
+**Partial fits.** The model is the ideal cache: optimal replacement, a step at `M`. Where a
+working set fits entirely it agrees with the machine to within the constants M1 calibrated.
+Where only part of a level's working set fits — one tile resident while two stream — the ideal
+cache keeps the resident part and the model's regime says so; an LRU-like machine does not keep
+it, and the tile-side sweep measured the difference as an order of magnitude (docs/experiments.md).
+The regimes the model prints in that situation are correct for the ideal cache and optimistic for
+the machine; the tile choice compensates by deciding fits at `M/2` and preferring the side with
+the smaller working set, and nothing else in the calculus does yet.
+
 Each of these rounds up, so the reported cost stays an upper bound; each is a place where the
 measured number can come in under the prediction.
 
@@ -325,76 +334,135 @@ the calculus for that one function.
 
 ## Lower bounds
 
-The report can say how far a function is from what *any* program computing the same thing must
-move. The bounds come from **IOLB** (Olivry, Langou, Pouchet, Sadayappan, Rastello, PLDI 2020),
-an external tool that derives parametric data-movement lower bounds for affine programs, and from
-one hand entry that stands in when the tool is absent or cannot see through a nest.
+The report says how far a function is from what *any* program computing the same thing must
+move. Three bounds are derived, two by the compiler itself and one by an external tool; all are
+lower bounds on words touched, and words move inside lines, so each bounds the calculus's line
+traffic. The report prints them strongest first — a bound that dominates another asymptotically
+goes before it, and between two that do not, the larger at this machine with every size at a
+million — and the gap of a rewrite is measured against the first. A bound that is a number and
+not positive at this machine (`216/√M − M` for a 3×3 product) says nothing and is not printed.
 
-**Export.** `neant emit --scop f` writes `f` as the C that IOLB's front end (PET) reads: a loop
-nest with affine bounds and indices between `#pragma scop` and `#pragma endscop`. A flat row-major
-index `i·n + k` with a parametric row length is not affine in the polyhedral sense — a parameter
-times an iterator is not linear — so an array every one of whose indices has the form
-`v·row + w`, with `v` a loop variable and `row` free of loop variables, is **delinearised** into a
-two-dimensional parameter `double a[a_rows][row]` and the access into `a[v][w]`. Immutable scalars
-bound to a literal before any loop (`let t = 64`, a tile side) are written as the literal so the
-bounds stay affine. A call, a `while`, `break`, an array born inside the function, a
-data-dependent index or a mixed one- and two-dimensional use of one array refuses the export with
-the reason; the report carries the reason as a note.
+**Footprint (native).** Every distinct element of a parameter array the function reads was in
+slow memory when the function was called and crosses at least once; every distinct element it
+writes crosses back. For each array reference whose index is an injective affine map of the loop
+variables (below), the size of its image is the count of the loop variables it mentions, exact by
+summation when their bounds mention no other loop; per array the largest image among its
+references is taken, and the sum over parameter arrays, in bytes, is the bound. It is tight on
+every streaming kernel (`sum`, `dot`, `saxpy`: gap 1×) and on the product where everything fits.
+Arrays born inside the function do not count: they need never cross.
 
-**Running it.** `neant cost --iolb` exports every function it can and runs the command in
-`NEANT_IOLB`, with `{file}` standing for the exported C; `tests/kernels/iolb.sh {file}` runs the
-tool inside its docker image from a checkout in `IOLB_DIR`, with a wall-clock limit `IOLB_TIMEOUT`
-(default 120 s — IOLB's search is exponential in the worst case, and a nest it cannot finish
-yields no bound rather than a hang). The second-to-last line of IOLB's output is the asymptotic
-bound, a GiNaC expression in the parameters and `S`, the cache size in words: `2*n^3*S^(-1/2)`
-for the product. It is parsed into the function's atoms and converted: with 8-byte words
-`S = M/8`, so `S^e = 8^(-e)·M^e`, and the count is ×8 into bytes. `8^(1/2)` is irrational; the
-coefficient is kept to four decimals.
+**HBL (native).** For a statement inside a loop nest, take its array references as maps from
+the loop variables to array elements. When each is injective on the loop ranges it behaves as the
+coordinate projection `π_D` onto the loop variables `D` it mentions, and the discrete
+Brascamp–Lieb inequality (Bennett–Carbery–Christ–Tao; Christ, Demmel, Knight, Scanlon, Yelick
+2013, §6 for coordinate projections) gives `|V| ≤ ∏_j |π_{D_j}(V)|^{s_j}` for every finite set
+of iterations `V`, whenever `|S| ≤ Σ_j s_j·|S ∩ D_j|` for every subset `S` of the loop variables.
+Cut any execution into segments of `S` words moved: within a segment each array has at most `2S`
+accessible elements, so a segment runs at most `(2S)^σ` iterations with `σ = min Σ s_j`, and the
+`|I|` iterations need at least `|I|/(2S)^σ` segments.
+
+```
+  Q  ≥  |I| / (2^σ · S^(σ−1))  −  S     words      (S the cache in words; no recomputation)
+     =  |I| · 4^σ · M^(1−σ)    −  M     bytes      (8-byte words, S = M/8)
+```
+
+`σ` is found by an exact rational LP, the optimum enumerated over its vertices; `|I|` is the
+exact iteration count by summation, so a triangular nest is counted as a triangle. The product
+has `σ = 3/2` and gets `8·N/√M − M`: Hong–Kung with Irony–Toledo–Tiskin's constant, derived
+rather than written down. Details that make it work on code as written:
+
+- *Injectivity* is decided by the mixed-radix test: order the loop variables by the span each
+  contributes to the index (`|coefficient·step|`), and each coefficient must reach past the whole
+  span of the smaller ones, for all sizes ≥ 1 — `i·n + k` with `k < n` passes, `i + j` does not.
+  A reference that fails leaves its statement without an HBL bound; `a[i + j]` is IOLB's.
+- *A scalar accumulator is the element it is stored into.* `let mut acc = 0; for k { acc += … };
+  c[i·n + j] = acc` is `c[i][j] += …` with the element kept in a register, the same computation;
+  a scalar stored to or loaded from an array element by a statement of the enclosing block stands
+  for that element inside the block, and a statement using it references the element. Without
+  this the product's inner statement sees only `a` and `b` and gets `σ = 2`.
+- *Repetition loops* — loops no reference mentions and no inner bound depends on — are left out
+  of `|I|`; a loop an inner bound depends on stays in, and if no reference mentions it the LP is
+  infeasible and there is no HBL bound, which is right: repeating a computation proves nothing
+  about what the repetitions must move.
+- *Handing up.* A bound on a callee is a bound on the caller, once — repeated calls are not
+  multiplied, since a bound on any schedule of a part says nothing about what repetitions may
+  share. A footprint bound travels to a caller only for arrays the caller itself received.
+- The bound sees through a tiled nest: the six loop variables of the tiled product project onto
+  the three arrays with the same `σ = 3/2`.
+
+**IOLB (tool).** IOLB (Olivry, Langou, Pouchet, Sadayappan, Rastello, PLDI 2020) derives
+lower bounds for affine programs with better constants — Smith–van de Geijn's `2·N/√S` for the
+product, `4·√2 ≈ 5.66×` the HBL constant above — and handles references the native bound
+refuses. `neant emit --scop f` writes `f` as the C its front end (PET) reads: a loop nest with
+affine bounds and indices between `#pragma scop` and `#pragma endscop`. A flat row-major index
+`i·n + k` is not affine in the polyhedral sense, so an array every one of whose indices has the
+form `v·row + w` is **delinearised** into a two-dimensional parameter `double a[a_rows][row]`.
+Immutable scalars bound to a literal are written as the literal. A **tiled nest is untiled**
+first — a lower bound is a property of the computation, not of the loop order, and IOLB does not
+see through the tiles — with the divisibility assumption (`64 | n`) carried on the bound, because
+a floor in a loop bound makes IOLB's search run for hours. A call, a `while`, an array born
+inside the function or a data-dependent index refuses the export with the reason, which the
+report carries as a note. `neant cost --iolb` runs the command in `NEANT_IOLB` (`{file}` standing
+for the export; `tests/kernels/iolb.sh {file}` runs the docker image from a checkout in
+`IOLB_DIR`, under a wall-clock limit `IOLB_TIMEOUT`), takes the asymptotic bound from the
+second-to-last line of its output — a GiNaC expression in the parameters and `S` — and converts
+words to bytes with `S = M/8`, keeping an irrational coefficient to four decimals:
 
 ```
 2·n³/√S words  =  16·√8·n³/√M  ≈  45.2548·n³/√M bytes
 ```
 
-**The hand entry.** A statement `acc += A[ia] * B[ib]` — or `C[ic] += …` — inside a loop nest,
-whose two indices are affine in the loop variables, share at least one of them (the reduction)
-and each have one the other lacks, is a contraction. Whatever the loop order or tiling around it,
-the number of multiply-adds `N` is the product of the enclosing trip counts, and a cache of `M`
-bytes must move at least
-
-```
-8·N / √M   bytes          (Hong–Kung 1981, constant per Irony–Toledo–Tiskin, 8-byte elements)
-```
-
-IOLB's constant for the same product is `4·√2 ≈ 5.66×` larger (it is Smith–van de Geijn's
-`2·N/√S` words rather than Irony–Toledo–Tiskin's `N/(2√2·√S)`), so where IOLB answers, its bound
-is the tighter one. Where it does not — the tiled product, where IOLB returns only the size of
-the data, `3·n²` words — the contraction bound is the stronger statement. Both are valid lower
-bounds, so both are kept; the report leads with the one that dominates asymptotically, and the
-gap of a rewrite is measured against that one.
-
 **The gap** is the ratio of the function's leading moves term to the bound's, at the machine's
 `B` and `M`, when the size variables cancel, or the plain ratio when both are numbers, per
-regime. A specialised call hands its bounds up to the caller, scaled by how often it is called,
-so a concrete `main` gets a gap too.
-
-Under the hand bound, the report says what each operand does in the innermost loop when it moves
-by a whole line or more per iteration: that access is the one paying for the gap.
+regime. Under the bounds, the report says what each operand of a multiply-accumulate does in
+the innermost loop when it moves by a whole line or more per iteration: that access is the one
+paying for the gap.
 
 ## Rewrites
 
-A function with a recognised bound has two rewrites tried on it; each is costed by running the
+A function with an HBL bound (an exponent above one: reuse to be had) has two rewrites tried on it; each is costed by running the
 calculus on the rewritten IR, and the result is printed as a suggestion with the `--apply` flag
 that performs it. Nothing is applied silently. Both work on the naive shape the catalogue
 recognises — `for i { for j { let mut acc = 0; for k { acc += A·B } C = acc } }` — and are
 refused, with a sentence, on anything else.
 
-- **`name:tile`** — the three loops are split into tiles of side `T`, the largest power of two
-  with three `T×T` tiles of 8-byte elements strictly inside `M` (256 at 2 MiB). The tile loops
-  accumulate into `C` across the `kk` tiles, so `C` is cleared first; the result is the same
-  product. Tile edges use `min(ii·T + T, n)`, which the calculus reads as `T`.
+- **`name:tile`**, **`name:tile=T`** — the three loops are split into tiles of side `T`. The
+  tile loops accumulate into `C` across the `kk` tiles, so `C` is cleared first; the result is
+  the same product. Tile edges use `min(ii·T + T, n)`, which the calculus reads as `T`. Without
+  `=T` the side is the one the model chooses (below), or, when it cannot, the largest power of
+  two with three `T×T` tiles strictly inside `M`.
 - **`name:transpose`** — the operand walked down a column (the one whose index carries the
   innermost variable times a row length) is copied transposed before the nest, and the inner
   loop reads the copy along a row. The copy costs a transpose and `8·nk·nj` bytes of memory.
+
+**The tile side is read off the model.** The tiled program is analysed once more with its side
+`T` as a size variable — a fresh `i64` parameter, the tile count `n / T`, full tiles — and its
+moves come out piecewise in `T`: fifty regimes for the product, each under fit conditions some
+of which bound `T` from above (`8·T² < M`: a tile fits; `32·T² < M`: all of them do). In a piece
+whose moves fall as `T` grows — every power of `T` non-positive — the best side is the largest
+the conditions allow, so each such condition is solved for `T` at its boundary and substituted;
+the piece's other conditions, substituted too, must stay feasible and must hold at the reference
+point (this machine, every size a million: tiling is for large sizes). Among the candidates the
+smallest moves at the reference point wins, and among candidates within five percent of each
+other the **smaller side**. The boundary is taken at **half the cache**, `M/2`, not at `M`. Both
+rules came from the machine, not from the model (docs/experiments.md, the tile-side sweep): the
+model's first answer for the product was `T < √(M/8)`, 510, the regime in which one tile fits
+and the other two stream, which in the ideal cache ties the regime in which everything fits
+(`90.5·n³/√M` either way); the machine moved twenty times the prediction at 510, matched the
+prediction at every side with all tiles inside `M`, and moved the least at 181, the side at
+which everything fits in **half** of `M`. A fit the ideal cache decides at `M` is not one an LRU
+cache of `M` honours; one decided at `M/2` is (Sleator–Tarjan), and the octave-wide transition
+M1 measured is the same fact. The expression is printed from the working set's leading term in
+`T` when there are edge terms, and says so; the integer recommended is the largest for which the
+working set, edge lines included, is strictly below `M/2`. The report then shows the tiled cost at
+that side, symbolically, and the concrete `tile by T` line re-analysed at the integer, with the
+gap of each against the strongest bound. This is the upper side of the I/O question — what the
+best tiling of this loop order moves — from the model's own exact cost rather than a separate
+cost formula, in closed form where IOUB solves numerically, and corrected by the counters.
+
+For the product at `M = 2 MiB` the answer is `T < √M/8` at `M/2` — `√(M/64)`, 178 once the edge
+lines are counted — with moves `128·n³/√M`: `16×` above the HBL bound, `2.8×` above IOLB's,
+`1.25×` fewer measured bytes than the square of 256 the old rule picked.
 
 A tiled nest's `N` is counted on its rectangular hull — `(n+T−1)/T` tiles of `T` — so the bound
 printed for a rewritten function is over by `(1+T/n)³`. The suggestion lines take the gap against

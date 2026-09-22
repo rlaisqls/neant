@@ -4,6 +4,57 @@ Design decisions with the reasoning that produced them, so the reasoning is not 
 code is. Newest first. A decision is recorded when it was argued over, when it rejected
 alternatives worth remembering, or when a future reader would otherwise ask "why on earth".
 
+## 6 — Improving on the tools' logic where the compiler knows more, not where they know more
+
+**Decided 2026-09-22, after the question whether IOLB and IOUB should be reimplemented.**
+
+Reimplementing them was weighed in three layers and answered per layer. The exponent of a lower
+bound is an LP over the statement's array references and costs a few hundred lines on the
+existing rational arithmetic; the constants are the papers' lemmas, weeks of work whose failure
+mode is an unsound bound printed as fact, for a constant factor on a gap number; the full
+polyhedral machinery is a project. IOUB's upper bound is a cost formula in the tile side
+minimised numerically, and the model already has a better cost formula for the tiled program.
+
+Done, because the compiler has what the tools lack:
+
+- **Bounds are derived, not catalogued.** The Brascamp–Lieb exponent by an exact LP over
+  injective references, the exact iteration count by summation, the footprint from a cold cache
+  (`bounds.rs`, cost-model § Lower bounds). The one hand entry is now a special case that falls
+  out. IOLB stays for the constant where it is installed, `5.66×` tighter on the product.
+- **The schedule is erased before the tool is asked.** A lower bound is a property of the
+  computation; IOLB works on the loop nest and gave the data size for a tiled product. The
+  export untiles, with the divisibility assumption carried on the bound. The native bound never
+  needed it.
+- **The tile side is read off the model, not searched.** The tiled program is analysed with its
+  side symbolic; the side is the boundary of the fit condition of the cheapest regime, in closed
+  form; the integer recommended is checked against the exact working set. Where IOUB solves an
+  I/O formula numerically at fixed sizes, this is the model's own exact cost, symbolic in `M`.
+  What the machine then said about the choice is in § What the machine said and in
+  docs/experiments.md, and it changed the rule.
+
+### What the machine said
+
+The model's tile side for the product, `T < √(M/8)` = 510, moved thirty times what the model
+predicted on the machine; every side with all tiles inside `M` moved what it predicted; the side
+at which everything fits in half the cache, 181, moved the least (docs/experiments.md). The
+ideal cache's regime "one tile resident, two streaming" is optimal replacement and does not exist
+on an LRU-like machine. Two rules follow and are in the compiler: fits for a *choice* are decided
+at `M/2` (Sleator–Tarjan's factor, the octave M1 measured), and model ties go to the smaller
+side. The lesson is the M1 lesson again — a choice the model makes at the edge of its own
+approximation is the one to measure first — and it is the reason the tile choice was measured
+before it was written up as an improvement.
+
+Not done, and why: IOLB's constants (a lost race against a team that has spent a decade, for a
+constant), the full polyhedral layer (a project unrelated to the thesis), IOUB's DSL (its
+strength is multi-level caches and bandwidths, which is M7's problem, not a DSL's). A
+layout-aware line-granularity bound for pointer-chasing code under a layout the compiler chose
+is recorded as research for after M4: the theorem that a general schedule cannot use the rest of
+a fetched line is not written.
+
+Corrected in passing: this file and docs/experiments.md had called IOLB's bound on a triangular
+reduction weak; it was the parser reading the asymptotic line and not the full one. The footprint
+bound now states what that line stated.
+
 ## 5 — Against the literature: the bound side is IOLB's, the upper side and the composition are not in it
 
 **Decided 2026-09-22, after reading Olivry et al. (IOLB, 2020) and Elango et al. (POPL 2015) in

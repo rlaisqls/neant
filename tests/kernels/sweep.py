@@ -28,6 +28,15 @@ SWEEP = {
     # the naive kernel with the compiler's own rewrites applied: the M2 exit test
     "matmul_apply_tile":      ([448, 832, 1216, 1600, 1984], 1, "matmul_naive", ["--apply", "matmul:tile"]),
     "matmul_apply_transpose": ([448, 832, 1216, 1600, 1984], 1, "matmul_naive", ["--apply", "matmul:transpose"]),
+    # the tile side the model chooses (T < √(M/8) → 510 at M = 2 MiB) against the square that fits three tiles
+    "matmul_tile_256": ([1216, 1600, 1984, 2496], 1, "matmul_naive", ["--apply", "matmul:tile=256"]),
+    "matmul_tile_510": ([1216, 1600, 1984, 2496], 1, "matmul_naive", ["--apply", "matmul:tile=510"]),
+    "matmul_tile_128": ([1216, 1600, 1984, 2496], 1, "matmul_naive", ["--apply", "matmul:tile=128"]),
+    # where the cliff is: sides between "all tiles fit" (< √(M/32) = 256) and "one tile fits" (< √(M/8) = 512)
+    "matmul_tile_181": ([1600, 2496], 1, "matmul_naive", ["--apply", "matmul:tile=181"]),
+    "matmul_tile_300": ([1600, 2496], 1, "matmul_naive", ["--apply", "matmul:tile=300"]),
+    "matmul_tile_361": ([1600, 2496], 1, "matmul_naive", ["--apply", "matmul:tile=361"]),
+    "matmul_tile_420": ([1600, 2496], 1, "matmul_naive", ["--apply", "matmul:tile=420"]),
 }
 
 def run(cmd, **kw):

@@ -89,7 +89,14 @@ fn replace_at(b: &mut Block, path: &[usize], with: Vec<Stmt>) {
 
 /// Tile the three loops by `t`, accumulating into `C` across the `kk` tiles. `C` is cleared first,
 /// so the function still computes the product rather than adding to `C`'s old contents.
-pub fn tile(f: &Func, t: i64) -> Option<Func> {
+pub fn tile(f: &Func, t: i64) -> Option<Func> { tile_with(f, Some(t)).map(|(g, _)| g) }
+
+/// The tiled product with the tile side a fresh `i64` parameter `T` — so that the calculus
+/// gives the cost as a function of `T` and the best `T` can be read off. Assumes `T | n`: the
+/// tile count is `n / T` and the tiles are full, which is the form whose cost has no edge terms.
+pub fn tile_sym(f: &Func) -> Option<(Func, LocalId)> { tile_with(f, None) }
+
+fn tile_with(f: &Func, t: Option<i64>) -> Option<(Func, LocalId)> {
     let mut path = Vec::new();
     let nv = find_naive(f.body.as_ref()?, &mut path)?;
     let mut g = f.clone();
@@ -97,9 +104,14 @@ pub fn tile(f: &Func, t: i64) -> Option<Func> {
     let ii = new_local(&mut g, "ii", Ty::I64, false);
     let jj = new_local(&mut g, "jj", Ty::I64, false);
     let kk = new_local(&mut g, "kk", Ty::I64, false);
-    let tiles = |n: &Expr| bin(BinOp::Div, bin(BinOp::Add, n.clone(), int(t - 1, line)), int(t, line));
-    let lo = |v: LocalId| bin(BinOp::Mul, local(&g, v, line), int(t, line));
-    let hi = |v: LocalId, n: &Expr| minx(bin(BinOp::Add, lo(v), int(t, line)), n.clone());
+    let tv = match t { Some(_) => usize::MAX, None => { let tv = new_local(&mut g, "T", Ty::I64, false); g.params.push(tv); tv } };
+    let side = |g: &Func| match t { Some(t) => int(t, line), None => local(g, tv, line) };
+    let tiles = |n: &Expr| match t {
+        Some(t) => bin(BinOp::Div, bin(BinOp::Add, n.clone(), int(t - 1, line)), int(t, line)),
+        None => bin(BinOp::Div, n.clone(), side(&g)),
+    };
+    let lo = |v: LocalId| bin(BinOp::Mul, local(&g, v, line), side(&g));
+    let hi = |v: LocalId, n: &Expr| match t { Some(_) => minx(bin(BinOp::Add, lo(v), side(&g)), n.clone()), None => bin(BinOp::Add, lo(v), side(&g)) };
     let elem = g.locals[nv.acc].ty.clone();
 
     // clear C
@@ -127,7 +139,7 @@ pub fn tile(f: &Func, t: i64) -> Option<Func> {
         ], tail: None, ty: Ty::Unit } },
     ], tail: None, ty: Ty::Unit } };
     replace_at(g.body.as_mut().unwrap(), &nv.path, vec![clear, tiled]);
-    Some(g)
+    Some((g, tv))
 }
 
 /// Transpose the operand that is walked down a column: the one whose index has the innermost
