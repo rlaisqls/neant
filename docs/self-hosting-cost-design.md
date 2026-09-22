@@ -751,3 +751,37 @@ Three things the refactor needed that the single fork had hidden:
 And the compiler outgrew its own arenas: at 267 KB of source it no longer fitted the 256 KiB input
 buffer, and `build.sh` exited 5. The pre-sized-array discipline meeting its own limit, in the one
 program guaranteed to keep growing.
+
+### The level fork, attempted and not landed
+
+With the piece list in place, the remaining step looked like one change: where the per-level test
+finds a **symbolic** working set, fork instead of declining. It was built, and it did not converge.
+§16 had estimated one mechanism; it is at least four, and each was found only by the previous one
+being fixed:
+
+1. **A condition's working set is in bytes**, and the comparison against `M` must not scale it by a
+   line. That one is independently right and is kept — with `pol_num_at_b`, because `2·B` is a
+   number on this machine even though it is not a bare constant, and `pol_as_f64` called it
+   symbolic and forked on it.
+2. **A site that does not move with the inner loop** touches one line however many laps run —
+   `a[i]` inside `for j` is the same address every time. The first version handled only the
+   contiguous case and declined this one, which is `tri.nt`'s `pairs`.
+3. **The outer level sums, it does not multiply.** `for j in i..a.len()` runs a different number of
+   laps for each `i`, so the inner level's line count depends on the outer variable and multiplying
+   leaves that variable standing in the answer — visibly, as a term printed with no name.
+4. **And the condition must be taken at the loop's extreme.** Even summed, the *working set* still
+   mentions the outer variable, and `analyze.rs` substitutes its largest value before testing.
+   `pairs` still printed a loop atom in its condition after (3).
+
+Four is where it was reverted, with `pairs`' shape still wrong. The state kept is the one that was
+verified — 64 exact, 3 differing, 9 declined — plus (1).
+
+**What this says about the estimate.** §16 worked `tiles` by hand and concluded the rule was not
+the hard part. That was right about `tiles`, whose inner trip is the constant 4, and wrong about
+everything else: a constant inner trip hides (3) and (4) completely. Choosing the simplest example
+to validate a design made the design look finished.
+
+`matmul` needs a fifth thing regardless — **symbolic strides**. Its index `i*n + j` has a stride of
+`n` elements against `i`, and `idx_coef` returns integers. The Rust's `Affine` carries polynomial
+coefficients. That is not a layer on top of the four above; it is a different representation of an
+index, and it should be designed rather than discovered.

@@ -569,3 +569,33 @@ fn pol_div_atom(facs: &mut [Fac], terms: &mut [Term], pols: &mut [Pol], pst: &mu
     }
     pol_close(facs, terms, pols, pst, start)
 }
+
+// The value of a polynomial whose only atom is `B`, with `pst[7]` set when it has one. A working
+// set of `2·B` is a number on this machine even though it is not a bare constant, and deciding it
+// is the difference between reporting a regime and reporting an answer.
+fn pol_num_at_b(facs: &[Fac], terms: &[Term], pols: &[Pol], pst: &mut [i64], p: i64, b: f64) -> f64 {
+    pst[7] = 1;
+    let mut total = 0.0;
+    let mut i = 0;
+    while i < pols[p].n_term {
+        let t = pols[p].term + i;
+        let mut v = (terms[t].cn as f64) / (terms[t].cd as f64);
+        let mut f = 0;
+        while f < terms[t].n_fac {
+            if facs[terms[t].fac + f].atom != 0 { pst[7] = 0; };
+            let mut e = 0;
+            while e < facs[terms[t].fac + f].exp {
+                v = v * b;
+                e += 1;
+            }
+            while e > facs[terms[t].fac + f].exp {
+                v = v / b;
+                e -= 1;
+            }
+            f += 1;
+        }
+        total = total + v;
+        i += 1;
+    }
+    total
+}

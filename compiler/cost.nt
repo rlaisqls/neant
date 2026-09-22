@@ -1425,9 +1425,13 @@ fn ck_close(facs: &[Fac], terms: &mut [Term], pols: &mut [Pol], pst: &mut [i64],
         let mut alive = true;
         let mut ci = 0;
         while ci < pcs[d].n_cnd {
-            let w = pol_as_f64(facs, terms, pols, pst, cnds[pcs[d].cnd + ci].ws);
+            // a condition's working set is carried in **bytes** — it is what the report prints,
+            // `16·nodes.len() < M` — so it is compared with `M` directly and not scaled by a line.
+            // `pol_num_at_b` rather than `pol_as_f64` because `2·B` is a number on this machine
+            // even though it is not a bare constant.
+            let w = pol_num_at_b(facs, terms, pols, pst, cnds[pcs[d].cnd + ci].ws, 64.0);
             if pst[7] != 0 {
-                let holds = if w * 64.0 < 2097152.0 { 1 } else { 0 };
+                let holds = if w < 2097152.0 { 1 } else { 0 };
                 if holds != cnds[pcs[d].cnd + ci].fits { alive = false; }
             } else {
                 cnd_push(cnds, wst, cnds[pcs[d].cnd + ci].ws, cnds[pcs[d].cnd + ci].fits);
@@ -2530,7 +2534,7 @@ fn ck_eval(facs: &[Fac], terms: &[Term], pols: &[Pol], pst: &mut [i64], cnds: &[
         while j < pcs[p].n_cnd {
             let w = pol_eval(facs, terms, pols, pst, cnds[pcs[p].cnd + j].ws, b, m, size);
             if pst[6] != 0 { bad = 1; };
-            let fits = if w * b < m { 1 } else { 0 };
+            let fits = if w < m { 1 } else { 0 };
             if fits != cnds[pcs[p].cnd + j].fits { holds = false; }
             j += 1;
         }
