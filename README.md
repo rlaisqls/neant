@@ -221,13 +221,19 @@ owns is the cost of the program *as written*, beyond affine nests, composed thro
 locked, and audited to the boundary. For code that is not affine no bound exists, and the
 compiler says what yours costs and cannot say what it should.
 
-**The exact tier covers less than the demo suggests.** On the four ordinary programs of the M3
-corpus — string processing, a stack machine, breadth-first search, a recursive-descent parser —
-6 of 11 functions are exact, and 2 of those 6 only because a `decreasing` measure was declared;
-5 are unknown and go to the measured tier, which is a profiler with the boundary written down.
-Dense affine loop nests, where the calculus is at its best, are also where Halide, TVM and the
-polyhedral compilers already are. Whether the exact tier grows past half of ordinary code is the
-open question of the next stages, and the number will be kept in this document.
+**The exact tier covers less than the demo suggests, and the holes have not moved.** On the four
+ordinary programs of the M3 corpus — string processing, a stack machine, breadth-first search, a
+recursive-descent parser — 6 of 11 functions are exact, and 2 of those only because a `decreasing`
+measure was declared; 5 are unknown and go to the measured tier, which is a profiler with the
+boundary written down. M4's own corpus — particles, a grid stencil, an arena binary search tree,
+a ring buffer — is 9 of 9 exact, which takes the two together to **15 of 20**. Read that second
+number carefully: those nine programs were written after the rules that cost them, and they are
+dense array and arena code, which is what the calculus is built for. The five unknowns are
+unchanged and neither stage touched them: a worklist whose trip count is not a size expression,
+and mutual recursion with a measure that reads memory. Dense affine loop nests, where the
+calculus is at its best, are also where Halide, TVM and the polyhedral compilers already are.
+Whether the exact tier grows past ordinary code with a control flow the calculus does not model
+is still the open question, and the number will be kept in this document.
 
 **M0–M3 built the analyser, not yet the language.** Everything so far could have been an analysis
 over a Rust subset or an MLIR dialect. The bet that this is a language pays, if it pays, when the

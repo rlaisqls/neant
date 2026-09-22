@@ -161,6 +161,74 @@ Other moves:
 | `[e; n]`, `[a, b, c]` | a sequential write of the array: `n × elem_bytes` |
 | call | the callee's moves with its atoms substituted, less what is already resident of its footprint (rule two) |
 
+## Structs, layout and arenas
+
+A `struct S { f: T, … }` with scalar fields is a **value**: passed, returned and assigned by copy,
+living in registers, costing nothing to move. What costs is an array of them, and the shape of
+that array is the compiler's, because nothing in the language can hold an address into it — there
+is no `&ps[i]` and no `&p.x`, only `ps[i]` and `p.x`, which are values.
+
+**A site touches one thing and steps by another.** An access site records the bytes it reads or
+writes (`es`) and the bytes its address moves per unit of the index (`stride`). For a scalar array
+they are the same number. For one field of a struct array they are not, and the difference is
+what a layout costs:
+
+| | `es` | `stride` | a loop over `ps[i].x` |
+|---|---|---|---|
+| array of structs (AoS) | the field | the whole element | `24·n` bytes: every line fetched, a third of it wanted |
+| one array per field (SoA) | the field | the field | `8·n` bytes: one stream |
+
+The slide rule then charges the difference by itself: a stride-24 walk over `n` elements covers
+`24·n` bytes and so `24·n/B` lines, whatever it reads from each. Under SoA the field arrays are
+modelled as laid end to end, so field `f`'s addresses start at the size of the fields before it;
+their ranges are disjoint, and every rule about ranges — footprint, residue, disjointness — holds
+with no special case. A whole element read under SoA is a gather: one site per field.
+
+**Two accesses to one address are one site.** `ps[i].x` and `ps[i].y` in the same statement, or
+`a[i]` twice in one expression, touch the same lines; the second is a hit. Sites on the same array
+inside the same loops merge when their indices are equal — term by term when affine, and as
+expressions when not, so that `nodes[i].val` and `nodes[i].next` in a pointer chase are one
+element. Without this an array of structs would be charged once per field read and no loop reading
+a whole element could ever prefer that layout.
+
+**The layout is chosen, not declared.** For each struct type the program has one layout, and it is
+the one under which the program moves fewer bytes: the module is analysed twice per type, every
+function that touches the type is costed under each, and the totals are compared at a reference
+point (this machine, every size a million). Types are decided in declaration order, each with the
+others at their current choice. `#[layout(aos)]` / `#[layout(soa)]` fixes a type and the model is
+not asked. A tie is AoS, and the report says the model did not decide. The choice heads the report
+and the lockfile, because every moves line below it rests on the choice:
+
+```
+struct Particle  layout SoA  decided by step (32·n + 4·B, AoS 32·n + B), kinetic (16·n + 2·B, AoS 32·n + B), …
+```
+
+**Arenas and the region rule.** A linked structure here is a struct array whose links are indices
+into it. There is nothing to infer about where a node lives: it lives in the arena. What the model
+adds is a bound on the walk. A site whose index is not an affine function of the loops — `i` loaded
+from memory — costs a fresh line per step, but never more than the arena itself, because once every
+line of the arena has been touched nothing more is fetched, whatever the order:
+
+```
+sum_list   moves 16·nodes.len()     if 16·nodes.len() < M      -- the arena, once
+           moves B·nodes.len()      if 16·nodes.len() ≥ M      -- a line per step
+```
+
+The two pieces are the ordinary fork on a fit test, under the arena's own condition, and several
+sites walking one arena pay for it once. The rule applies when the walk is at least as long as the
+arena, which is a comparison between a trip count and a number of lines and so is decided at this
+machine's `B`. When the trip count and the arena are different sizes — a ring buffer written
+`xs.len()` times into `buf` — the rule cannot fire, because a condition in this calculus compares a
+working set with the cache and not two size expressions with each other. The model says the walk
+costs a line per step, and says it rather than guessing.
+
+**Owned arrays.** `[T]` as a return type is an array the caller owns. The callee's signature
+carries the size of what it returns, over the callee's own size atoms; a caller binds the result,
+becomes its root, and costs its loops with that size substituted through the call's arguments —
+so `doubled(&xs)` hands back something of `xs.len()` elements and the loop over it is exact. A
+size the callee cannot express leaves the caller's array unknown, and loops over it go to the
+measured tier, as everywhere else.
+
 ## Where these rules stand
 
 For affine loop nests there is an exact answer to the question these rules approximate: Bao,

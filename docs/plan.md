@@ -130,7 +130,35 @@ which `neant lock` preserves; every line names what it rests on, transitively (`
 calls no C, so it is still 6 of 11, and the domain corpus that would move the number does not exist
 yet — that is the first thing M4's work should be measured on.
 
-## M4 — views, layout, regions
+## Done: M4 — structs, layout, arenas, owned returns
+
+Built, in this order (the design ordered moves before SoA; the order here puts the gate first, so
+the kill condition is tested as early as possible): struct types with scalar fields and struct
+values by copy; field reads and writes on values and on elements; AoS emission; cost sites that
+record what they touch and how far they step, and that merge when they touch one address; SoA
+emission behind `#[layout(soa)]`; the layout chosen by the compiler from the module's own moves,
+reported and locked; the region rule for arenas; owned array returns whose size the signature
+carries. Goldens: `structs`, `arena`, `owned`, and the corpus `particles`, `stencil`, `tree`,
+`ring`.
+
+**The gate held.** `sum_x` over an array of three-field structs, built under both layouts and
+measured past L2: predicted `24·n` against `8·n`, measured 3.7–4.0× (docs/experiments.md). The
+region rule was measured too: where the arena does not fit, a chase over an LCG permutation pays
+what the model says within 1.2–1.4×; where it fits, the model is conservative by the number of
+walks, because a site whose index is loaded from memory claims no residue, and that is stated.
+
+**Deferred, with the reason.** Real moves (`let ys = xs`, arrays by value) are M5: today an array
+cannot be bound to another name at all, which is *stricter* than a move checker, not unsound, and
+nothing in the corpus needs to hand an array over except by returning it. Per-array layout needs
+monomorphisation (design §9). Owned returns of struct arrays are refused, since a SoA return is a
+tuple of pointers.
+
+**Coverage.** M4's corpus is 9 of 9 exact and the M3 corpus is unchanged at 6 of 11, so 15 of 20
+together — with the caveat the README carries: those nine were written after the rules that cost
+them. The two holes are untouched: a worklist whose trip count is not a size expression, and
+mutual recursion with a measure that reads memory.
+
+## M4 — views, layout, regions (as planned)
 
 Stands on stage A. Structs and views (`&xs[i]`, `&p.field` as (collection, index[, field]),
 never an address; projections do not return addresses, which is the one mechanism argument for
