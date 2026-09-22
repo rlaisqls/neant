@@ -118,11 +118,236 @@ fn pol_max(facs: &[Fac], terms: &mut [Term], pols: &mut [Pol], pst: &mut [i64], 
     a
 }
 
+// ---- `while`: the trip count the compiler has to find ----
+//
+// A `for` says its own trip count; a `while` does not, and there are exactly two ways to get one,
+// both copied from `analyze.rs`. Either the programmer wrote `decreasing <measure>`, and the trip
+// count is the measure's value at entry — with the promise *checked*, not taken — or the condition
+// compares a variable the body steps by a constant, and the trip count is the distance to the
+// bound over the step. A `while` that is neither has no static bound and is unknown.
+
+struct Cof { name: i64, c: i64 }
+
+// The measure as a linear form over locals: its coefficients into `cof`, count into wst[7].
+// False when the measure is not a linear form, which is the same set of shapes `min_decrease`
+// accepts in the Rust one.
+fn coef_collect(src: &[u8], toks: &[Token], nodes: &[Node], cof: &mut [Cof], wst: &mut [i64],
+                e: i64, sign: i64) -> bool {
+    if e < 0 { return false; }
+    let k = nodes[e].kind;
+    if k == 65 {
+        let mut i = 0;
+        let mut at = -1;
+        while i < wst[7] {
+            if at < 0 && name_eq(src, toks, cof[i].name, nodes[e].a) { at = i; }
+            i += 1;
+        }
+        if at < 0 {
+            cof[wst[7]].name = nodes[e].a;
+            cof[wst[7]].c = sign;
+            wst[7] = wst[7] + 1;
+        } else {
+            cof[at].c = cof[at].c + sign;
+        }
+        return true;
+    }
+    if k == 60 || k == 72 { return true; }
+    if k == 74 { return coef_collect(src, toks, nodes, cof, wst, nodes[e].a, sign); }
+    if k == 66 {
+        let op = nodes[e].ival;
+        if op == 0 {
+            return coef_collect(src, toks, nodes, cof, wst, nodes[e].a, sign)
+                && coef_collect(src, toks, nodes, cof, wst, nodes[e].b, sign);
+        }
+        if op == 1 {
+            return coef_collect(src, toks, nodes, cof, wst, nodes[e].a, sign)
+                && coef_collect(src, toks, nodes, cof, wst, nodes[e].b, 0 - sign);
+        }
+        if op == 2 {
+            if nodes[nodes[e].a].kind == 60 {
+                let c = int_value(src, toks, nodes[nodes[e].a].a);
+                return coef_collect(src, toks, nodes, cof, wst, nodes[e].b, sign * c);
+            }
+            if nodes[nodes[e].b].kind == 60 {
+                let c = int_value(src, toks, nodes[nodes[e].b].a);
+                return coef_collect(src, toks, nodes, cof, wst, nodes[e].a, sign * c);
+            }
+            return false;
+        }
+    }
+    false
+}
+
+// the constant a statement adds to `name`, or the "not a constant step" marker in wst[8]
+fn delta_of(src: &[u8], toks: &[Token], nodes: &[Node], wst: &mut [i64], n: i64) -> i64 {
+    wst[8] = 0;
+    let op = nodes[n].ival;
+    let e = nodes[n].b;
+    if op == 0 && nodes[e].kind == 60 { return int_value(src, toks, nodes[e].a); }
+    if op == 1 && nodes[e].kind == 60 { return 0 - int_value(src, toks, nodes[e].a); }
+    if op < 0 && nodes[e].kind == 66 && nodes[nodes[e].a].kind == 65
+        && name_eq(src, toks, nodes[nodes[e].a].a, nodes[nodes[n].a].a)
+        && nodes[nodes[e].b].kind == 60 {
+        let c = int_value(src, toks, nodes[nodes[e].b].a);
+        if nodes[e].ival == 0 { return c; }
+        if nodes[e].ival == 1 { return 0 - c; }
+    }
+    wst[8] = 1;
+    0
+}
+
+// How far the measure falls along the path through this block that falls the least.
+// wst[9]: 0 the block falls through, 1 every path leaves the loop, 2 the body cannot be followed.
+fn min_dec(src: &[u8], toks: &[Token], nodes: &[Node], cof: &[Cof], wst: &mut [i64], b: i64) -> i64 {
+    wst[9] = 0;
+    if b < 0 { return 0; }
+    let mut acc = 0;
+    let mut s = nodes[b].a;
+    let mut tail = false;
+    while s >= 0 {
+        let k = nodes[s].kind;
+        if k == 94 || k == 96 {
+            wst[9] = 1;
+            return 0;
+        }
+        if k == 91 && nodes[nodes[s].a].kind == 65 {
+            let mut i = 0;
+            let mut at = -1;
+            while i < wst[7] {
+                if at < 0 && cof[i].c != 0 && name_eq(src, toks, cof[i].name, nodes[nodes[s].a].a) { at = i; }
+                i += 1;
+            }
+            if at >= 0 {
+                let d = delta_of(src, toks, nodes, wst, s);
+                if wst[8] != 0 {
+                    wst[9] = 2;
+                    return 0;
+                }
+                // the measure changes by c·d, so it falls by −c·d
+                acc = acc - cof[at].c * d;
+            }
+        } else if k == 95 && nodes[nodes[s].a].kind == 75 {
+            let e = nodes[s].a;
+            let t = min_dec(src, toks, nodes, cof, wst, nodes[e].b);
+            let tk = wst[9];
+            if tk == 2 { return 0; }
+            let f = min_dec(src, toks, nodes, cof, wst, nodes[e].c);
+            let fk = if nodes[e].c < 0 { 0 } else { wst[9] };
+            if fk == 2 {
+                wst[9] = 2;
+                return 0;
+            }
+            wst[9] = 0;
+            if tk == 1 && fk == 1 {
+                wst[9] = 1;
+                return 0;
+            }
+            if tk == 1 { acc = acc + f; }
+            else if fk == 1 { acc = acc + t; }
+            else if t < f { acc = acc + t; }
+            else { acc = acc + f; }
+        } else if k == 92 || k == 93 {
+            // a nested loop may run no laps, so it helps only if it never hurts
+            let inner = if k == 92 { nodes[s].d } else { nodes[s].c };
+            let d = min_dec(src, toks, nodes, cof, wst, inner);
+            let dk = wst[9];
+            wst[9] = 0;
+            if dk == 2 || (dk == 0 && d < 0) {
+                wst[9] = 2;
+                return 0;
+            }
+        }
+        s = nodes[s].next;
+        if s < 0 && !tail {
+            // a block's tail is a statement to this analysis: an `if` in tail position still runs
+            tail = true;
+            if nodes[b].b >= 0 && nodes[nodes[b].b].kind == 75 {
+                let e = nodes[b].b;
+                let t = min_dec(src, toks, nodes, cof, wst, nodes[e].b);
+                let tk = wst[9];
+                let f = min_dec(src, toks, nodes, cof, wst, nodes[e].c);
+                let fk = if nodes[e].c < 0 { 0 } else { wst[9] };
+                wst[9] = 0;
+                if tk == 2 || fk == 2 {
+                    wst[9] = 2;
+                    return 0;
+                }
+                if tk == 1 && fk == 1 { wst[9] = 1; }
+                else if tk == 1 { acc = acc + f; }
+                else if fk == 1 { acc = acc + t; }
+                else if t < f { acc = acc + t; }
+                else { acc = acc + f; }
+            }
+        }
+    }
+    acc
+}
+
+// how many times, and by what constant, the body assigns to `name`: the count in wst[4], the step
+// in the return, and wst[8] set when a write is not a constant step
+fn step_scan(src: &[u8], toks: &[Token], nodes: &[Node], wst: &mut [i64], b: i64, name: i64,
+             nested: bool) -> i64 {
+    if b < 0 { return 0; }
+    let mut found = 0;
+    let mut s = nodes[b].a;
+    while s >= 0 {
+        let k = nodes[s].kind;
+        if k == 91 && nodes[nodes[s].a].kind == 65 && name_eq(src, toks, nodes[nodes[s].a].a, name) {
+            wst[4] = wst[4] + if nested { 2 } else { 1 };
+            let d = delta_of(src, toks, nodes, wst, s);
+            if wst[8] != 0 { wst[6] = 1; };
+            found = d;
+        } else if k == 92 || k == 93 {
+            let inner = if k == 92 { nodes[s].d } else { nodes[s].c };
+            let d = step_scan(src, toks, nodes, wst, inner, name, true);
+            if d != 0 { found = d; };
+        } else if k == 95 && nodes[nodes[s].a].kind == 75 {
+            let e = nodes[s].a;
+            let d1 = step_scan(src, toks, nodes, wst, nodes[e].b, name, nested);
+            let d2 = step_scan(src, toks, nodes, wst, nodes[e].c, name, nested);
+            if d1 != 0 { found = d1; };
+            if d2 != 0 { found = d2; };
+        }
+        s = nodes[s].next;
+    }
+    found
+}
+
+// does the body assign to any of the measure's or bound's variables
+fn assigns_any(src: &[u8], toks: &[Token], nodes: &[Node], cof: &[Cof], wst: &[i64], b: i64,
+               skip: i64) -> bool {
+    if b < 0 { return false; }
+    let mut hit = false;
+    let mut s = nodes[b].a;
+    while s >= 0 {
+        let k = nodes[s].kind;
+        if k == 91 && nodes[nodes[s].a].kind == 65 {
+            let nm = nodes[nodes[s].a].a;
+            if skip < 0 || !name_eq(src, toks, nm, skip) {
+                let mut i = 0;
+                while i < wst[7] {
+                    if name_eq(src, toks, cof[i].name, nm) { hit = true; }
+                    i += 1;
+                }
+            }
+        } else if k == 92 || k == 93 {
+            let inner = if k == 92 { nodes[s].d } else { nodes[s].c };
+            if assigns_any(src, toks, nodes, cof, wst, inner, skip) { hit = true; }
+        } else if k == 95 && nodes[nodes[s].a].kind == 75 {
+            let e = nodes[s].a;
+            if assigns_any(src, toks, nodes, cof, wst, nodes[e].b, skip) { hit = true; }
+            if assigns_any(src, toks, nodes, cof, wst, nodes[e].c, skip) { hit = true; }
+        }
+        s = nodes[s].next;
+    }
+    hit
+}
+
 // ---- the walk ----
 
 fn w_expr(src: &[u8], toks: &[Token], nodes: &[Node], types: &[Ty], ntys: &[i64], sigs: &[Sig],
           fw: &[i64], facs: &mut [Fac], terms: &mut [Term], pols: &mut [Pol], pst: &mut [i64],
-          env: &mut [Env], wst: &mut [i64], scratch: &mut [i64], n: i64) -> i64 {
+          env: &mut [Env], wst: &mut [i64], scratch: &mut [i64], cof: &mut [Cof], n: i64) -> i64 {
     if n < 0 || wst[1] != 0 { return pol_zero(facs, terms, pols, pst); }
     let k = nodes[n].kind;
     // a literal, a variable, a view and a length are all already in a register
@@ -130,20 +355,20 @@ fn w_expr(src: &[u8], toks: &[Token], nodes: &[Node], types: &[Ty], ntys: &[i64]
         return pol_zero(facs, terms, pols, pst);
     }
     if k == 66 {
-        let a = w_expr(src, toks, nodes, types, ntys, sigs, fw, facs, terms, pols, pst, env, wst, scratch, nodes[n].a);
-        let b = w_expr(src, toks, nodes, types, ntys, sigs, fw, facs, terms, pols, pst, env, wst, scratch, nodes[n].b);
+        let a = w_expr(src, toks, nodes, types, ntys, sigs, fw, facs, terms, pols, pst, env, wst, scratch, cof, nodes[n].a);
+        let b = w_expr(src, toks, nodes, types, ntys, sigs, fw, facs, terms, pols, pst, env, wst, scratch, cof, nodes[n].b);
         let s = pol_add(facs, terms, pols, pst, a, b);
         let one = pol_const(facs, terms, pols, pst, 1);
         return pol_add(facs, terms, pols, pst, s, one);
     }
     if k == 67 || k == 74 {
-        let a = w_expr(src, toks, nodes, types, ntys, sigs, fw, facs, terms, pols, pst, env, wst, scratch, nodes[n].a);
+        let a = w_expr(src, toks, nodes, types, ntys, sigs, fw, facs, terms, pols, pst, env, wst, scratch, cof, nodes[n].a);
         let one = pol_const(facs, terms, pols, pst, 1);
         return pol_add(facs, terms, pols, pst, a, one);
     }
     if k == 68 {
         // only the index is evaluated: the array is a register pair
-        let i = w_expr(src, toks, nodes, types, ntys, sigs, fw, facs, terms, pols, pst, env, wst, scratch, nodes[n].b);
+        let i = w_expr(src, toks, nodes, types, ntys, sigs, fw, facs, terms, pols, pst, env, wst, scratch, cof, nodes[n].b);
         let one = pol_const(facs, terms, pols, pst, 1);
         return pol_add(facs, terms, pols, pst, i, one);
     }
@@ -151,33 +376,33 @@ fn w_expr(src: &[u8], toks: &[Token], nodes: &[Node], types: &[Ty], ntys: &[i64]
         // `xs[i].f` is one load; a field of a value already in registers is free
         let base = nodes[n].a;
         if nodes[base].kind == 68 {
-            let i = w_expr(src, toks, nodes, types, ntys, sigs, fw, facs, terms, pols, pst, env, wst, scratch, nodes[base].b);
+            let i = w_expr(src, toks, nodes, types, ntys, sigs, fw, facs, terms, pols, pst, env, wst, scratch, cof, nodes[base].b);
             let one = pol_const(facs, terms, pols, pst, 1);
             return pol_add(facs, terms, pols, pst, i, one);
         }
-        return w_expr(src, toks, nodes, types, ntys, sigs, fw, facs, terms, pols, pst, env, wst, scratch, base);
+        return w_expr(src, toks, nodes, types, ntys, sigs, fw, facs, terms, pols, pst, env, wst, scratch, cof, base);
     }
     if k == 70 {
         let mut acc = pol_zero(facs, terms, pols, pst);
         let mut fi = nodes[n].b;
         while fi >= 0 {
-            let v = w_expr(src, toks, nodes, types, ntys, sigs, fw, facs, terms, pols, pst, env, wst, scratch, nodes[fi].b);
+            let v = w_expr(src, toks, nodes, types, ntys, sigs, fw, facs, terms, pols, pst, env, wst, scratch, cof, nodes[fi].b);
             acc = pol_add(facs, terms, pols, pst, acc, v);
             fi = nodes[fi].next;
         }
         return acc;
     }
-    if k == 71 { return w_call(src, toks, nodes, types, ntys, sigs, fw, facs, terms, pols, pst, env, wst, scratch, n); }
+    if k == 71 { return w_call(src, toks, nodes, types, ntys, sigs, fw, facs, terms, pols, pst, env, wst, scratch, cof, n); }
     if k == 75 {
-        let c = w_expr(src, toks, nodes, types, ntys, sigs, fw, facs, terms, pols, pst, env, wst, scratch, nodes[n].a);
+        let c = w_expr(src, toks, nodes, types, ntys, sigs, fw, facs, terms, pols, pst, env, wst, scratch, cof, nodes[n].a);
         let one = pol_const(facs, terms, pols, pst, 1);
         let base = pol_add(facs, terms, pols, pst, c, one);
-        let t = w_block(src, toks, nodes, types, ntys, sigs, fw, facs, terms, pols, pst, env, wst, scratch, nodes[n].b);
-        let e = w_block(src, toks, nodes, types, ntys, sigs, fw, facs, terms, pols, pst, env, wst, scratch, nodes[n].c);
+        let t = w_block(src, toks, nodes, types, ntys, sigs, fw, facs, terms, pols, pst, env, wst, scratch, cof, nodes[n].b);
+        let e = w_block(src, toks, nodes, types, ntys, sigs, fw, facs, terms, pols, pst, env, wst, scratch, cof, nodes[n].c);
         let m = pol_max(facs, terms, pols, pst, wst, t, e);
         return pol_add(facs, terms, pols, pst, base, m);
     }
-    if k == 76 { return w_block(src, toks, nodes, types, ntys, sigs, fw, facs, terms, pols, pst, env, wst, scratch, n); }
+    if k == 76 { return w_block(src, toks, nodes, types, ntys, sigs, fw, facs, terms, pols, pst, env, wst, scratch, cof, n); }
     if k == 77 || k == 78 {
         // an array literal is only ever a `let` initialiser, and `w_stmt` costs it there: the
         // element count is work the expression alone does not explain
@@ -192,14 +417,14 @@ fn w_expr(src: &[u8], toks: &[Token], nodes: &[Node], types: &[Ty], ntys: &[i64]
 // this call's argument sizes substituted for the callee's atoms.
 fn w_call(src: &[u8], toks: &[Token], nodes: &[Node], types: &[Ty], ntys: &[i64], sigs: &[Sig],
           fw: &[i64], facs: &mut [Fac], terms: &mut [Term], pols: &mut [Pol], pst: &mut [i64],
-          env: &mut [Env], wst: &mut [i64], scratch: &mut [i64], n: i64) -> i64 {
+          env: &mut [Env], wst: &mut [i64], scratch: &mut [i64], cof: &mut [Cof], n: i64) -> i64 {
     let name = nodes[n].a;
     let arg = nodes[n].b;
     let mut acc = pol_zero(facs, terms, pols, pst);
     let mut a = arg;
     let mut n_args = 0;
     while a >= 0 {
-        let w = w_expr(src, toks, nodes, types, ntys, sigs, fw, facs, terms, pols, pst, env, wst, scratch, a);
+        let w = w_expr(src, toks, nodes, types, ntys, sigs, fw, facs, terms, pols, pst, env, wst, scratch, cof, a);
         acc = pol_add(facs, terms, pols, pst, acc, w);
         n_args += 1;
         a = nodes[a].next;
@@ -283,18 +508,18 @@ fn mono_mentions(facs: &[Fac], terms: &[Term], pols: &[Pol], p: i64, atom: i64) 
 
 fn w_block(src: &[u8], toks: &[Token], nodes: &[Node], types: &[Ty], ntys: &[i64], sigs: &[Sig],
            fw: &[i64], facs: &mut [Fac], terms: &mut [Term], pols: &mut [Pol], pst: &mut [i64],
-           env: &mut [Env], wst: &mut [i64], scratch: &mut [i64], n: i64) -> i64 {
+           env: &mut [Env], wst: &mut [i64], scratch: &mut [i64], cof: &mut [Cof], n: i64) -> i64 {
     if n < 0 { return pol_zero(facs, terms, pols, pst); }
     let saved = wst[0];
     let mut acc = pol_zero(facs, terms, pols, pst);
     let mut s = nodes[n].a;
     while s >= 0 && wst[1] == 0 {
-        let w = w_stmt(src, toks, nodes, types, ntys, sigs, fw, facs, terms, pols, pst, env, wst, scratch, s);
+        let w = w_stmt(src, toks, nodes, types, ntys, sigs, fw, facs, terms, pols, pst, env, wst, scratch, cof, s);
         acc = pol_add(facs, terms, pols, pst, acc, w);
         s = nodes[s].next;
     }
     if nodes[n].b >= 0 && wst[1] == 0 {
-        let t = w_expr(src, toks, nodes, types, ntys, sigs, fw, facs, terms, pols, pst, env, wst, scratch, nodes[n].b);
+        let t = w_expr(src, toks, nodes, types, ntys, sigs, fw, facs, terms, pols, pst, env, wst, scratch, cof, nodes[n].b);
         acc = pol_add(facs, terms, pols, pst, acc, t);
     }
     wst[0] = saved;
@@ -303,7 +528,7 @@ fn w_block(src: &[u8], toks: &[Token], nodes: &[Node], types: &[Ty], ntys: &[i64
 
 fn w_stmt(src: &[u8], toks: &[Token], nodes: &[Node], types: &[Ty], ntys: &[i64], sigs: &[Sig],
           fw: &[i64], facs: &mut [Fac], terms: &mut [Term], pols: &mut [Pol], pst: &mut [i64],
-          env: &mut [Env], wst: &mut [i64], scratch: &mut [i64], n: i64) -> i64 {
+          env: &mut [Env], wst: &mut [i64], scratch: &mut [i64], cof: &mut [Cof], n: i64) -> i64 {
     let k = nodes[n].kind;
     if k == 90 {
         let init = nodes[n].c;
@@ -311,8 +536,8 @@ fn w_stmt(src: &[u8], toks: &[Token], nodes: &[Node], types: &[Ty], ntys: &[i64]
         if ik == 78 {
             // `[e; n]`: the element and the length are evaluated, then the fill costs one per
             // element — which is where a `let` first puts a size variable into the work
-            let a = w_expr(src, toks, nodes, types, ntys, sigs, fw, facs, terms, pols, pst, env, wst, scratch, nodes[init].a);
-            let b = w_expr(src, toks, nodes, types, ntys, sigs, fw, facs, terms, pols, pst, env, wst, scratch, nodes[init].b);
+            let a = w_expr(src, toks, nodes, types, ntys, sigs, fw, facs, terms, pols, pst, env, wst, scratch, cof, nodes[init].a);
+            let b = w_expr(src, toks, nodes, types, ntys, sigs, fw, facs, terms, pols, pst, env, wst, scratch, cof, nodes[init].b);
             let sz = val_of(src, toks, nodes, facs, terms, pols, pst, env, wst, nodes[init].b);
             if sz < 0 {
                 wst[1] = 1;
@@ -327,7 +552,7 @@ fn w_stmt(src: &[u8], toks: &[Token], nodes: &[Node], types: &[Ty], ntys: &[i64]
             let mut e = nodes[init].a;
             let mut count = 0;
             while e >= 0 {
-                let w = w_expr(src, toks, nodes, types, ntys, sigs, fw, facs, terms, pols, pst, env, wst, scratch, e);
+                let w = w_expr(src, toks, nodes, types, ntys, sigs, fw, facs, terms, pols, pst, env, wst, scratch, cof, e);
                 acc = pol_add(facs, terms, pols, pst, acc, w);
                 count += 1;
                 e = nodes[e].next;
@@ -344,7 +569,7 @@ fn w_stmt(src: &[u8], toks: &[Token], nodes: &[Node], types: &[Ty], ntys: &[i64]
             env_add(env, wst, nodes[n].a, -1, c);
             return c;
         }
-        let w = w_expr(src, toks, nodes, types, ntys, sigs, fw, facs, terms, pols, pst, env, wst, scratch, init);
+        let w = w_expr(src, toks, nodes, types, ntys, sigs, fw, facs, terms, pols, pst, env, wst, scratch, cof, init);
         // an array bound to another array or a view of one keeps its length; a scalar keeps its
         // value when it has one
         let t = ntys[init];
@@ -357,7 +582,7 @@ fn w_stmt(src: &[u8], toks: &[Token], nodes: &[Node], types: &[Ty], ntys: &[i64]
         return w;
     }
     if k == 91 {
-        let w = w_expr(src, toks, nodes, types, ntys, sigs, fw, facs, terms, pols, pst, env, wst, scratch, nodes[n].b);
+        let w = w_expr(src, toks, nodes, types, ntys, sigs, fw, facs, terms, pols, pst, env, wst, scratch, cof, nodes[n].b);
         let tgt = nodes[n].a;
         let tk = nodes[tgt].kind;
         let compound = nodes[n].ival >= 0;
@@ -387,14 +612,14 @@ fn w_stmt(src: &[u8], toks: &[Token], nodes: &[Node], types: &[Ty], ntys: &[i64]
             let e = env_find(src, toks, env, wst, nodes[tgt].a);
             if e >= 0 { env[e].val = -1; }
         } else if tk == 68 {
-            let i = w_expr(src, toks, nodes, types, ntys, sigs, fw, facs, terms, pols, pst, env, wst, scratch, nodes[tgt].b);
+            let i = w_expr(src, toks, nodes, types, ntys, sigs, fw, facs, terms, pols, pst, env, wst, scratch, cof, nodes[tgt].b);
             let c = pol_const(facs, terms, pols, pst, if compound { 3 } else { 1 });
             let s = pol_add(facs, terms, pols, pst, w, i);
             return pol_add(facs, terms, pols, pst, s, c);
         } else if tk == 69 {
             let base = nodes[tgt].a;
             if nodes[base].kind == 68 {
-                let i = w_expr(src, toks, nodes, types, ntys, sigs, fw, facs, terms, pols, pst, env, wst, scratch, nodes[base].b);
+                let i = w_expr(src, toks, nodes, types, ntys, sigs, fw, facs, terms, pols, pst, env, wst, scratch, cof, nodes[base].b);
                 let c = pol_const(facs, terms, pols, pst, if compound { 3 } else { 1 });
                 let s = pol_add(facs, terms, pols, pst, w, i);
                 return pol_add(facs, terms, pols, pst, s, c);
@@ -407,8 +632,8 @@ fn w_stmt(src: &[u8], toks: &[Token], nodes: &[Node], types: &[Ty], ntys: &[i64]
     if k == 92 {
         let lo = val_of(src, toks, nodes, facs, terms, pols, pst, env, wst, nodes[n].b);
         let hi = val_of(src, toks, nodes, facs, terms, pols, pst, env, wst, nodes[n].c);
-        let wlo = w_expr(src, toks, nodes, types, ntys, sigs, fw, facs, terms, pols, pst, env, wst, scratch, nodes[n].b);
-        let whi = w_expr(src, toks, nodes, types, ntys, sigs, fw, facs, terms, pols, pst, env, wst, scratch, nodes[n].c);
+        let wlo = w_expr(src, toks, nodes, types, ntys, sigs, fw, facs, terms, pols, pst, env, wst, scratch, cof, nodes[n].b);
+        let whi = w_expr(src, toks, nodes, types, ntys, sigs, fw, facs, terms, pols, pst, env, wst, scratch, cof, nodes[n].c);
         let outside = pol_add(facs, terms, pols, pst, wlo, whi);
         if lo < 0 || hi < 0 {
             wst[1] = 1;
@@ -421,30 +646,135 @@ fn w_stmt(src: &[u8], toks: &[Token], nodes: &[Node], types: &[Ty], ntys: &[i64]
         let av = pol_atom(facs, terms, pols, pst, atom);
         env_add(env, wst, nodes[n].a, av, -1);
         let two = pol_const(facs, terms, pols, pst, 2);
-        let body = w_block(src, toks, nodes, types, ntys, sigs, fw, facs, terms, pols, pst, env, wst, scratch, nodes[n].d);
+        let body = w_block(src, toks, nodes, types, ntys, sigs, fw, facs, terms, pols, pst, env, wst, scratch, cof, nodes[n].d);
         wst[0] = saved;
         let per = pol_add(facs, terms, pols, pst, two, body);
         let summed = pol_sum_over(facs, terms, pols, pst, per, atom, lo, 1, trip, scratch);
         return pol_add(facs, terms, pols, pst, outside, summed);
     }
     if k == 93 {
-        // a `while` is a recurrence, and recurrences are out of this slice (design §2)
-        wst[1] = 1;
-        return pol_zero(facs, terms, pols, pst);
+        return w_while(src, toks, nodes, types, ntys, sigs, fw, facs, terms, pols, pst, env, wst, scratch, cof, n);
     }
     if k == 94 { return pol_zero(facs, terms, pols, pst); }
     if k == 95 || k == 96 {
-        return w_expr(src, toks, nodes, types, ntys, sigs, fw, facs, terms, pols, pst, env, wst, scratch, nodes[n].a);
+        return w_expr(src, toks, nodes, types, ntys, sigs, fw, facs, terms, pols, pst, env, wst, scratch, cof, nodes[n].a);
     }
     wst[1] = 1;
     pol_zero(facs, terms, pols, pst)
+}
+
+// A `while`: its condition once, then the body a trip count of times, with the trip count found
+// one of the two ways `analyze.rs` finds it. The condition is charged once and the loop one unit
+// per lap, which is what that file does — the `+1` stands for the test.
+fn w_while(src: &[u8], toks: &[Token], nodes: &[Node], types: &[Ty], ntys: &[i64], sigs: &[Sig],
+           fw: &[i64], facs: &mut [Fac], terms: &mut [Term], pols: &mut [Pol], pst: &mut [i64],
+           env: &mut [Env], wst: &mut [i64], scratch: &mut [i64], cof: &mut [Cof], n: i64) -> i64 {
+    let cond = nodes[n].a;
+    let measure = nodes[n].b;
+    let body = nodes[n].c;
+    let wcond = w_expr(src, toks, nodes, types, ntys, sigs, fw, facs, terms, pols, pst, env, wst, scratch, cof, cond);
+    // the measure is an expression and is evaluated, once, like the condition
+    let wmeas = w_expr(src, toks, nodes, types, ntys, sigs, fw, facs, terms, pols, pst, env, wst, scratch, cof, measure);
+    let before = pol_add(facs, terms, pols, pst, wcond, wmeas);
+    let one = pol_const(facs, terms, pols, pst, 1);
+
+    let mut trip = -1;
+    let mut atom = -1;
+    let mut lo = -1;
+    let mut step = 1;
+    let mut var = -1;
+
+    if measure >= 0 {
+        // the programmer's measure. Its value at entry is the trip count — but only once the
+        // promise has been checked: a measure that is not shown to fall by at least one every lap
+        // is not a bound, it is a wish.
+        trip = val_of(src, toks, nodes, facs, terms, pols, pst, env, wst, measure);
+        wst[7] = 0;
+        if trip < 0 || !coef_collect(src, toks, nodes, cof, wst, measure, 1) {
+            wst[1] = 1;
+            return pol_zero(facs, terms, pols, pst);
+        }
+        let d = min_dec(src, toks, nodes, cof, wst, body);
+        // every path leaving the loop means it runs once, which needs no measure at all
+        if wst[9] == 2 || (wst[9] == 0 && d < 1) {
+            wst[1] = 1;
+            return pol_zero(facs, terms, pols, pst);
+        }
+        if wst[9] == 1 { trip = pol_const(facs, terms, pols, pst, 1); };
+    } else {
+        // an induction variable in the condition, stepped by a constant in the body
+        if nodes[cond].kind != 66 {
+            wst[1] = 1;
+            return pol_zero(facs, terms, pols, pst);
+        }
+        let op = nodes[cond].ival;
+        let l = nodes[cond].a;
+        let r = nodes[cond].b;
+        let mut bound = -1;
+        let mut asc = true;
+        if nodes[l].kind == 65 && (op == 7 || op == 8 || op == 6) { var = nodes[l].a; bound = r; asc = true; }
+        else if nodes[r].kind == 65 && (op == 9 || op == 10) { var = nodes[r].a; bound = l; asc = true; }
+        else if nodes[l].kind == 65 && (op == 9 || op == 10) { var = nodes[l].a; bound = r; asc = false; }
+        else if nodes[r].kind == 65 && (op == 7 || op == 8) { var = nodes[r].a; bound = l; asc = false; }
+        if bound < 0 {
+            wst[1] = 1;
+            return pol_zero(facs, terms, pols, pst);
+        }
+        wst[4] = 0;
+        wst[6] = 0;
+        wst[8] = 0;
+        step = step_scan(src, toks, nodes, wst, body, var, false);
+        if wst[4] != 1 || wst[6] != 0 || step == 0 {
+            wst[1] = 1;
+            return pol_zero(facs, terms, pols, pst);
+        }
+        if (asc && step < 0) || (!asc && step > 0) {
+            wst[1] = 1;
+            return pol_zero(facs, terms, pols, pst);
+        }
+        // the bound must hold still while the loop runs
+        wst[7] = 0;
+        if !coef_collect(src, toks, nodes, cof, wst, bound, 1)
+            || assigns_any(src, toks, nodes, cof, wst, body, var) {
+            wst[1] = 1;
+            return pol_zero(facs, terms, pols, pst);
+        }
+        let e = val_of(src, toks, nodes, facs, terms, pols, pst, env, wst, bound);
+        let ve = env_find(src, toks, env, wst, var);
+        let i0 = if ve >= 0 { env[ve].val } else { -1 };
+        if e < 0 || i0 < 0 {
+            wst[1] = 1;
+            return pol_zero(facs, terms, pols, pst);
+        }
+        let span = if asc { pol_sub(facs, terms, pols, pst, e, i0) }
+                   else { pol_sub(facs, terms, pols, pst, i0, e) };
+        let mag = if step < 0 { 0 - step } else { step };
+        trip = pol_scale(facs, terms, pols, pst, span, 1, mag);
+        atom = wst[2];
+        wst[2] = atom + 1;
+        lo = i0;
+    }
+
+    let saved = wst[0];
+    wst[3] = wst[3] + 1;
+    if atom >= 0 {
+        let av = pol_atom(facs, terms, pols, pst, atom);
+        env_add(env, wst, var, av, -1);
+    };
+    let body_w = w_block(src, toks, nodes, types, ntys, sigs, fw, facs, terms, pols, pst, env, wst, scratch, cof, body);
+    wst[3] = wst[3] - 1;
+    wst[0] = saved;
+    let per = pol_add(facs, terms, pols, pst, one, body_w);
+    let summed = if atom >= 0 { pol_sum_over(facs, terms, pols, pst, per, atom, lo, step, trip, scratch) }
+                 else { pol_mul(facs, terms, pols, pst, per, trip) };
+    pol_add(facs, terms, pols, pst, before, summed)
 }
 
 // One function's work, or −1 when this slice cannot say. The parameters become atoms 0..n−1,
 // which is what makes the printed polynomial read in the caller's own names.
 fn w_func(src: &[u8], toks: &[Token], nodes: &[Node], types: &[Ty], ntys: &[i64], sigs: &[Sig],
           ptys: &[i64], fw: &[i64], facs: &mut [Fac], terms: &mut [Term], pols: &mut [Pol],
-          pst: &mut [i64], env: &mut [Env], wst: &mut [i64], scratch: &mut [i64],
+          pst: &mut [i64], env: &mut [Env], wst: &mut [i64], scratch: &mut [i64], cof: &mut [Cof],
           f: i64, si: i64) -> i64 {
     wst[0] = 0;
     wst[1] = 0;
@@ -462,7 +792,7 @@ fn w_func(src: &[u8], toks: &[Token], nodes: &[Node], types: &[Ty], ntys: &[i64]
         i += 1;
         p = nodes[p].next;
     }
-    let w = w_block(src, toks, nodes, types, ntys, sigs, fw, facs, terms, pols, pst, env, wst, scratch, nodes[f].d);
+    let w = w_block(src, toks, nodes, types, ntys, sigs, fw, facs, terms, pols, pst, env, wst, scratch, cof, nodes[f].d);
     if wst[1] != 0 { return -1; }
     w
 }

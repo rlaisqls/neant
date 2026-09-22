@@ -43,7 +43,7 @@ by substitution.
   set is a footprint. Falls out with `moves`.
 - **Recurrences.** `while` with a `decreasing` measure, and self-recursion. The Rust pass solves
   these into closed forms; this slice reports **unknown** for them, which is what the Rust pass
-  does for `fib` too — just more often.
+  does for `fib` too — just more often. *(`while` came in afterwards: §10.)*
 - **`span`, bounds, IOLB, layout choice, `#[cost]` dominance, `costs.lock`.** Each is a consumer of
   the cost object, not part of computing one.
 
@@ -183,3 +183,35 @@ and there is no argv to select a mode with, so `poly.nt` and `cost.nt` are not i
 self-hosted compiler compiles them and computes identical polynomials, so nothing about them is
 outside the slice. What is missing is a way to *ask* for a cost report, and that is a question
 about the command line, not about the calculus.
+
+
+## 10. `while`, added after the first measurement
+
+The first slice left every `while` unknown, and the measurement said that was 14 of the 19 — too
+many to leave. So `while` came in next, and self-recursion did not: the two are called "recurrences"
+together but only one of them actually needs a recurrence solved.
+
+A `for` says its own trip count. A `while` does not, and `analyze.rs` has exactly two ways to find
+one, both of which are now here:
+
+- **The programmer's measure.** `while i < j decreasing j - i` — the trip count is the measure's
+  value at entry. The promise is **checked, not taken**: `min_dec` walks the body and asks how far
+  the measure falls along the path that falls least, taking the smaller side of an `if`, treating
+  `break` and `return` as leaving, and refusing a nested loop that could make the measure rise. A
+  measure that is not shown to fall by at least one every lap is not a bound, it is a wish.
+- **An induction variable.** `while i < n` with `i += 1` in the body — the condition names a
+  variable, the body steps it by a constant *exactly once*, the bound holds still while the loop
+  runs, and the entry value is known. The trip count is the distance over the step.
+
+**67 work columns exact**, up from 53. The five that remain are self-recursion — `fact`, `sum_from`,
+`msum`, `bsearch` — and those want a recurrence *solved*, which is a different machine from a trip
+count found.
+
+What the build changed:
+
+- **The measure is an expression and costs its own work.** `is_palindrome` came out `7·s.len() − 5`
+  against `7·s.len() − 4`: exactly one unit, the `j - i` in `decreasing j - i`. Its caller was then
+  out by two, because it calls it twice — which is the pleasant property of an exact model, that an
+  error shows up multiplied rather than smeared.
+- **A block's tail is a statement to this analysis.** An `if` in tail position still runs, and
+  `min_dec` has to walk it or a measure that falls only in the tail reads as not falling at all.

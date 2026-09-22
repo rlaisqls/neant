@@ -346,9 +346,11 @@ describes. **The cost calculus's first slice is now self-hosted too** —
 [self-hosting-cost-design.md](self-hosting-cost-design.md), `compiler/poly.nt` and
 `compiler/cost.nt`: `work` as a polynomial over size atoms with rational coefficients, walked over
 the parse tree (the work table in `analyze.rs` is per-node and local, so no IR is needed), loops
-summed by Faulhaber, `if` by dominance. **53 golden functions' `work` columns come out string for
-string identical to `neant cost`'s**; 19 it declines, every one of them a `while` or a
-self-recursion, which the slice puts out; and 4 differ *on purpose*, because `ys = xs` costs 1 when
+summed by Faulhaber, `if` by dominance, and `while` by the two ways `analyze.rs` finds a trip count
+— the programmer's `decreasing` measure, whose promise is checked rather than taken, or an
+induction variable the body steps by a constant exactly once. **67 golden functions' `work` columns come out string for
+string identical to `neant cost`'s**; 5 it declines, every one of them a self-recursion, which
+wants a recurrence *solved* rather than a trip count found; and 4 differ *on purpose*, because `ys = xs` costs 1 when
 in place and the array's length when copied — the self-hosted emitter has no uniqueness proof and
 always copies, so its cost says so. Charging 1 for parity would have been a cost report for code
 this compiler does not emit. `moves`, regimes, recurrences, span are still out — nor are M5's moves and uniqueness (the emitter takes the safe branch and copies),

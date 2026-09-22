@@ -4,9 +4,9 @@
 //! String equality is deliberately strict: it catches `n²/2 − n/2` written as `0.5·n² − 0.5·n`,
 //! and a term order that happens to agree on this corpus and not in general.
 //!
-//! Where the Rust compiler solves a recurrence — a `while` with a measure, or self-recursion — the
-//! self-hosted pass must say **unknown** rather than a number. A cost calculus that guesses is
-//! worse than one that declines, so that is asserted and not merely tolerated.
+//! Where the Rust compiler solves a recurrence the self-hosted pass cannot — self-recursion — it
+//! must say **unknown** rather than a number. A cost calculus that guesses is worse than one that
+//! declines, so that is asserted and not merely tolerated.
 //!
 //! One group of functions differs **on purpose**, and is listed by name. `ys = xs` on whole arrays
 //! costs 1 when the compiler can prove the assignment is in place and the array's length when it
@@ -39,100 +39,12 @@ const COPIES_INSTEAD: &[(&str, &str)] = &[
 
 /// The number of functions whose `work` the self-hosted pass reproduces exactly. In the test so
 /// that widening the slice means changing a number someone has to look at.
-const EXACT: usize = 53;
+const EXACT: usize = 67;
 
+/// The driver is a committed fragment, not a string in this file: a test that embeds the program
+/// it runs drifts from it silently, which this one did once.
 fn driver() -> String {
-    format!(r#"extern fn read_stdin(buf: &mut [u8]) -> i64 uses io, unbounded;
-extern fn write_stdout(buf: &[u8], n: i64) -> i64 uses io, unbounded;
-
-fn main() {{
-    let mut buf = [b'\0'; 262144];
-    let n = read_stdin(&mut buf);
-    let mut toks = [Token {{ kind: 0, start: 0, len: 0, ival: 0 }}; 262144];
-    let n_toks = lex(&buf, n, &mut toks);
-    let mut nodes = [Node {{ kind: 0, a: 0, b: 0, c: 0, d: 0, ival: 0, next: 0 }}; 262144];
-    let mut st = [0, 0, 0, 0, 0];
-    let first = parse_program(&buf, &toks, n_toks, &mut st, &mut nodes);
-    let mut types = [Ty {{ kind: 0, elem: 0, mutable: 0, size: 0 }}; 65536];
-    let mut syms = [Sym {{ name: 0, ty: 0, mutable: 0 }}; 65536];
-    let mut sigs = [Sig {{ name: -1, params: 0, n_params: 0, ret: 0, ext: 0 }}; 4096];
-    let mut strs = [Str {{ name: 0, fields: 0, n_fields: 0 }}; 1024];
-    let mut flds = [Fld {{ name: 0, ty: 0 }}; 4096];
-    let mut ptys = [0; 16384];
-    let mut ntys = [-1; 262144];
-    let mut cst = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
-    let bad = check_program(&buf, &toks, &nodes, &mut types, &mut syms, &mut sigs, &mut ptys, &mut strs, &mut flds, &mut ntys, &mut cst, first);
-
-    let mut facs = [Fac {{ atom: 0, exp: 0 }}; 262144];
-    let mut terms = [Term {{ fac: 0, n_fac: 0, cn: 0, cd: 0 }}; 262144];
-    let mut pols = [Pol {{ term: 0, n_term: 0 }}; 262144];
-    let mut pst = [0, 0, 0, 0, 0];
-    let mut env = [Env {{ name: 0, val: 0, len: 0 }}; 4096];
-    let mut wst = [0, 0, 0, 0];
-    let mut scratch = [0; 64];
-    let mut order = [0; 4096];
-    let mut fw = [-1; 4096];
-    let mut pnames = [0; 256];
-    let mut parr = [0; 256];
-    let mut out = [b'\0'; 262144];
-    let mut est = [0, 0, 0];
-
-    // two passes, so a call to a function declared later still finds its work
-    let mut pass = 0;
-    while pass < 2 {{
-        let mut f = first;
-        let mut si = 0;
-        while f >= 0 {{
-            if nodes[f].kind == 110 {{
-                fw[si] = w_func(&buf, &toks, &nodes, &types, &ntys, &sigs, &ptys, &fw, &mut facs, &mut terms, &mut pols, &mut pst, &mut env, &mut wst, &mut scratch, f, si);
-                si += 1;
-            }} else if nodes[f].kind == 116 {{
-                si += 1;
-            }}
-            f = nodes[f].next;
-        }}
-        pass += 1;
-    }}
-
-    let mut f = first;
-    let mut si = 0;
-    while f >= 0 {{
-        if nodes[f].kind == 110 {{
-            emit_span(&mut out, &mut est, &buf, &toks, nodes[f].a);
-            emit_b(&mut out, &mut est, b'\t');
-            if fw[si] < 0 {{
-                let u = b"unknown";
-                emit_bytes(&mut out, &mut est, &u);
-            }} else {{
-                let mut p = nodes[f].b;
-                let mut i = 0;
-                while p >= 0 {{
-                    pnames[i] = nodes[p].a;
-                    let t = ptys[sigs[si].params + i];
-                    parr[i] = if t >= 0 && (types[t].kind == 5 || types[t].kind == 6) {{ 1 }} else {{ 0 }};
-                    i += 1;
-                    p = nodes[p].next;
-                }}
-                let before = est[2];
-                pol_print(&mut out, &mut est, &buf, &toks, &facs, &terms, &pols, &pnames, &parr, fw[si], &mut order);
-                if est[2] != before {{
-                    est[2] = before;
-                    let u = b" [unprintable]";
-                    emit_bytes(&mut out, &mut est, &u);
-                }}
-            }}
-            emit_b(&mut out, &mut est, b'\n');
-            si += 1;
-        }} else if nodes[f].kind == 116 {{
-            si += 1;
-        }}
-        f = nodes[f].next;
-    }}
-    println(bad);
-    println(st[2]);
-    write_stdout(&out, est[0]);
-}}
-"#)
+    std::fs::read_to_string(repo("compiler/costdump.nt")).unwrap()
 }
 
 /// `neant cost`'s report, as `function -> Some(work)` or `None` when it says `unknown`.
