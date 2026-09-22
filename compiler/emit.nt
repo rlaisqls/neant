@@ -192,9 +192,17 @@ fn emit_expr(out: &mut [u8], est: &mut [i64], src: &[u8], toks: &[Token], nodes:
     if n < 0 { return; }
     let k = nodes[n].kind;
     if k == 60 {
-        emit_span_digits(out, est, src, toks, nodes[n].a);
+        // a literal the checker made has no span to copy; its value is its token index
+        if nodes[n].a < 0 - 1 { emit_int(out, est, 0 - nodes[n].a - 2); }
+        else { emit_span_digits(out, est, src, toks, nodes[n].a); };
     } else if k == 61 {
-        emit_span(out, est, src, toks, nodes[n].a);
+        if nodes[n].a < 0 - 1 {
+            emit_int(out, est, 0 - nodes[n].a - 2);
+            let d = b".0";
+            emit_bytes(out, est, &d);
+        } else {
+            emit_span(out, est, src, toks, nodes[n].a);
+        };
     } else if k == 62 {
         if nodes[n].ival == 1 { let s = b"true"; emit_bytes(out, est, &s); }
         else { let s = b"false"; emit_bytes(out, est, &s); }

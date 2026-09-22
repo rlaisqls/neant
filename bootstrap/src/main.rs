@@ -403,7 +403,19 @@ mod parsedump {
                 o.push(72);
                 expr(recv, o)
             }
-            ExprKind::MethodCall(..) => Err("a method call or chain".into()),
+            // a chain stage or terminal; the self-hosted parser gives it node kind 81, receiver
+            // first and then the arguments, and the checker rewrites it into a loop afterwards.
+            // The slice is declared by *stage*, not by "method call", so that the three comparisons
+            // agree: a stage the checker cannot rewrite is not in the parser's slice either.
+            ExprKind::MethodCall(_, m, _)
+                if !matches!(m.as_str(), "iter" | "map" | "filter" | "sum" | "count") =>
+                Err(format!("a `.{m}()` chain stage")),
+            ExprKind::MethodCall(recv, _, args) => {
+                o.push(81);
+                expr(recv, o)?;
+                for a in args { expr(a, o)?; }
+                Ok(())
+            }
             ExprKind::ArrayLit(es) => {
                 o.push(77);
                 for e in es { expr(e, o)?; }
@@ -414,7 +426,12 @@ mod parsedump {
                 expr(e, o)?;
                 expr(n, o)
             }
-            ExprKind::Lambda(..) => Err("a closure".into()),
+            ExprKind::Lambda(ps, body) => {
+                o.push(79);
+                for _ in ps { o.push(111); }
+                expr(body, o)
+            }
+            // the parser reads a comprehension; the checker does not rewrite one yet
             ExprKind::Comprehension { .. } => Err("a comprehension".into()),
         }
     }

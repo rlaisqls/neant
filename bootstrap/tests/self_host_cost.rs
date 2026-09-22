@@ -50,9 +50,15 @@ const COPIES_INSTEAD: &[(&str, &str)] = &[];
 /// which is a change to the walk, not to the footprint.
 const FOOTPRINT_NARROWER: &[(&str, &str)] = &[("parse.nt", "number")];
 
+/// The same for the **footprint lower bound**: stated where `neant cost` states one and this pass
+/// states none. A `while` loop is given no loop atom by this pass — only a `for` mints one — so a
+/// site inside one has no image to count and no bound follows from it. `moves` for both of these is
+/// exact; it is only the bound that is missing, and in the safe direction.
+const BOUND_NARROWER: &[(&str, &str)] = &[("while.nt", "count_lt"), ("while.nt", "first_zero")];
+
 /// The number of functions whose `work` the self-hosted pass reproduces exactly. In the test so
 /// that widening the slice means changing a number someone has to look at.
-const EXACT: usize = 81;
+const EXACT: usize = 91;
 
 /// The same for `moves`, whose slice is narrower: a function that calls anything is unknown,
 /// because a callee's traffic depends on what is already resident — which it now computes, so a
@@ -69,19 +75,19 @@ const EXACT: usize = 81;
 /// **Nothing is declined.** Every `moves` column either matches or is one of the four in
 /// `COPIES_INSTEAD` — a footprint is a range now, so a callee that reads two fields of a four-field
 /// particle leaves half the array resident and the next call over the other half pays in full.
-const EXACT_MOVES: usize = 81;
+const EXACT_MOVES: usize = 91;
 
 /// The same for the **footprint**: one entry per array parameter and the condition under which the
 /// whole of it is resident on return, whitespace-normalised so the report's column padding is not
 /// part of the comparison. Counted over every function, so one that should state no footprint and
 /// states none counts too.
-const EXACT_FOOT: usize = 94;
+const EXACT_FOOT: usize = 104;
 
 /// The same for the **footprint lower bound** — `moves` cannot be less than the distinct bytes a
 /// function's parameter arrays reach. Counted over every function, so a `main` that should have no
 /// bound and gets none counts too: a bound invented where `neant cost` states none is as wrong as
 /// a missing one, and only one of those two shows up as a difference.
-const EXACT_BOUNDS: usize = 95;
+const EXACT_BOUNDS: usize = 103;
 
 
 
@@ -298,6 +304,11 @@ fn self_hosted_work_agrees_with_bootstrap() {
             }
         }
         for (fname, g) in &got_bounds {
+            if BOUND_NARROWER.contains(&(name.as_str(), fname)) && *g == "none" {
+                assert!(want_bounds.contains_key(*fname),
+                    "{name} {fname} is listed as a narrower bound, but `neant cost` states none");
+                continue;
+            }
             match (want_bounds.get(*fname), *g) {
                 (None, "none") => exact_bounds += 1,
                 (None, other) => failures.push(format!("{name} {fname}: `neant cost` states no \

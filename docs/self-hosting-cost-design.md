@@ -1606,3 +1606,49 @@ the value carried on the node.
 
 Worth saying because §25's build order did not see it: "the checker rewrites the tree" is not one
 convention but two, and the second one is about values rather than names.
+
+### Step 2b done: a chain is a loop
+
+`iter → map/filter → sum/count` is rewritten, and `while.nt`, `decl.nt` and `err_budget.nt` come
+into the slice. **work 81 → 91, moves 81 → 91, bound 95 → 103, footprint 94 → 104**, all exact.
+`err_budget` brought the numeric `sizes` budget with it, as §25 predicted: a bound with `sizes` is
+compared as *numbers* at the declared size and this machine's `B` and `M`, so `sum` is allowed 1024
+bytes and needs `8·256 + 64 = 2112`.
+
+The chain's own node is overwritten by the block that replaces it, so the emitter and the cost pass
+see a plain loop and neither knows what a chain is. A `filter` nests what follows inside an `if`,
+which is how a chain says "skip" in a language with no `continue`.
+
+Four things the build corrected, three of them mine.
+
+**A loop variable's token may now be negative**, and the cost pass tested `lv >= 0` to mean "this
+loop has a variable". A synthetic counter is negative, so every site in a rewritten loop looked like
+a walk with no loop variable at all — scattered, forked, `B·xs.len()` where the answer is
+`8·xs.len() + B`. `−1` alone means "no variable" now, and the test is `!= −1`.
+
+**`has_assign` followed `a` on every node kind.** On a `Var` or an `Int` that field is a *token*
+index, not a node, so the purity check walked whatever node happened to share the number — and the
+checker died with no output. It dispatches on kind now. The bug is the same shape as the one the
+parse test's `dump_node` avoids by construction, which is worth noticing: the tree has two kinds of
+integer field and nothing in the types tells them apart.
+
+**`name_is` only ever worked for `iter`.** It compared three bytes and a hardcoded `'r'` at the
+fourth, so `filter` and `count` never matched and every chain was refused. Three bytes and the
+length tell all five stage names apart; the fourth byte was a shortcut that happened to fit the
+first name tried.
+
+**And the slice is declared by *stage*, not by "method call".** Letting the parser's slice admit
+every method call put `chains.nt` and `par.nt` into a comparison the checker then refused, which is
+three levels disagreeing about what is in. `parsedump` now names the stage it will not take.
+
+**A chain's closure must be a pure function of its arguments**, which is `types.rs`'s `in_closure`
+check: fusing every stage into one loop is the only form the construct has, so a stage that writes
+outside itself would have its writes reordered by a rewrite it cannot see. `err_closure_assign.nt`
+is the golden for it, and `m5-span-design.md` notes this same check is, for free, the proof a
+`.par()` chain needs.
+
+Two narrowings, listed by name. `err_budget.nt` joins `err_assert.nt` in `NEEDS_THE_COST_PASS` —
+a budget breach is a check error and the checker-only driver cannot see one. And `while.nt`'s
+`count_lt` and `first_zero` get no footprint bound: a `while` is given no loop atom by this pass, so
+a site inside one has no image to count. Their `moves` is exact; only the bound is missing, and in
+the safe direction.

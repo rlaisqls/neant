@@ -1976,7 +1976,7 @@ fn idx_coef(src: &[u8], toks: &[Token], nodes: &[Node], wst: &mut [i64], e: i64,
     let k = nodes[e].kind;
     if k == 60 { return 0; }
     if k == 65 {
-        if lv >= 0 && name_eq(src, toks, nodes[e].a, lv) { return 1; }
+        if lv != 0 - 1 && name_eq(src, toks, nodes[e].a, lv) { return 1; }
         // a variable the body assigns is not a constant offset: `buf[head]` with `head` stepped
         // inside the loop walks the array in a way this slice does not follow, and the assumption
         // that rounds up is a whole line per touch
@@ -2050,7 +2050,7 @@ fn idx_coef_pol(src: &[u8], toks: &[Token], nodes: &[Node], facs: &mut [Fac], te
     let k = nodes[e].kind;
     if k == 60 { return pol_zero(facs, terms, pols, pst); }
     if k == 65 {
-        if lv >= 0 && name_eq(src, toks, nodes[e].a, lv) {
+        if lv != 0 - 1 && name_eq(src, toks, nodes[e].a, lv) {
             return pol_const(facs, terms, pols, pst, 1);
         }
         if assigns_var(src, toks, nodes, wst[22], nodes[e].a) { return 0 - 1; }
@@ -2312,7 +2312,7 @@ fn site_add(src: &[u8], toks: &[Token], nodes: &[Node], types: &[Ty], strs: &[St
     sites[s].bad = wst[14];
     sites[s].trip = wst[13];
     sites[s].branch = wst[20];
-    sites[s].novar = if wst[12] < 0 { 1 } else { 0 };
+    sites[s].novar = if wst[12] == 0 - 1 { 1 } else { 0 };
     sites[s].p0 = if wst[11] > 0 { wst[42] } else { -1 };
     sites[s].p1 = if wst[11] > 1 { wst[43] } else { -1 };
     sites[s].p2 = if wst[11] > 2 { wst[44] } else { -1 };
@@ -2534,7 +2534,7 @@ fn settle_one(src: &[u8], toks: &[Token], facs: &mut [Fac], terms: &mut [Term], 
     let coef = site_coef(sites, wst, s, pos);
     // a `while` with no induction variable gives nothing to move against, exactly as a coefficient
     // the compiler could not read does
-    let scattered = wst[14] == 2 || lp_var(wst, lid) < 0;
+    let scattered = wst[14] == 2 || lp_var(wst, lid) == 0 - 1;
     // affine, but the stride is not a number: never compared with `B`, always a whole line or more
     let symbolic = wst[14] == 1;
 
@@ -3726,6 +3726,30 @@ fn asym_dominated(facs: &[Fac], terms: &[Term], pols: &[Pol], inferred: i64, ass
     all
 }
 
+// the number in `sizes = "xs.len() <= 256"`, or −1. One bound is all the corpus writes, and a
+// second would need the sizes told apart rather than substituted alike.
+fn sizes_bound(src: &[u8], toks: &[Token], t: i64) -> i64 {
+    let lo = toks[t].start;
+    let hi = lo + toks[t].len;
+    let mut i = lo;
+    let mut at = 0 - 1;
+    while i + 1 < hi {
+        if at < 0 && src[i] == b'<' && src[i + 1] == b'=' { at = i + 2; };
+        i += 1;
+    }
+    if at < 0 { return 0 - 1; }
+    while at < hi && src[at] == b' ' { at += 1; }
+    let mut v = 0;
+    let mut any = false;
+    while at < hi && src[at] >= b'0' && src[at] <= b'9' {
+        v = v * 10 + ((src[at] as i64) - 48);
+        any = true;
+        at += 1;
+    }
+    if !any { return 0 - 1; }
+    v
+}
+
 // Does this function keep every `#[cost]` bound it carries? Both columns are checked whether the
 // attribute is a declaration or an assertion — only the *reporting* differs between them — and a
 // `moves` bound is checked against every regime, since a cost that forks must stay within it in
@@ -3735,9 +3759,37 @@ fn asserts_hold(src: &[u8], toks: &[Token], nodes: &[Node], facs: &mut [Fac], te
                 iw: i64, im: i64, f: i64) -> bool {
     let at = nodes[f].ival;
     if at < 0 { return true; }
-    // a bound in real units at declared sizes is a different check, and no golden in this slice
-    // carries one — `err_budget.nt` needs chains before it can be read at all
-    if nodes[at].c >= 0 { return true; }
+    // **A bound with `sizes` is a budget in real units**, not an order of growth: the inferred cost
+    // and the bound are both evaluated at the declared size and this machine's `B` and `M`, and the
+    // comparison is between two numbers. `sum` in `err_budget.nt` is allowed 1024 bytes at
+    // `xs.len() <= 256` and needs `8·256 + 64 = 2112`.
+    if nodes[at].c >= 0 {
+        let sz = sizes_bound(src, toks, nodes[at].c);
+        if sz < 0 { return true; }
+        let mut fits = true;
+        if nodes[at].a >= 0 && iw >= 0 {
+            let aw = c_read(src, toks, nodes, facs, terms, pols, pst, ds, f, nodes[at].a);
+            if aw < 0 { fits = false; }
+            else if pol_eval(facs, terms, pols, pst, iw, 64.0, 2097152.0, sz as f64)
+                  > pol_eval(facs, terms, pols, pst, aw, 64.0, 2097152.0, sz as f64) { fits = false; };
+        };
+        if nodes[at].b >= 0 && im >= 0 {
+            let am = c_read(src, toks, nodes, facs, terms, pols, pst, ds, f, nodes[at].b);
+            if am < 0 {
+                fits = false;
+            } else {
+                let cap = pol_eval(facs, terms, pols, pst, am, 64.0, 2097152.0, sz as f64);
+                let mut pi = 0;
+                while pi < cks[im].n_pce {
+                    let v = pol_eval(facs, terms, pols, pst, pcs[cks[im].pce + pi].poly,
+                                     64.0, 2097152.0, sz as f64);
+                    if v > cap { fits = false; };
+                    pi += 1;
+                }
+            };
+        };
+        return fits;
+    }
     let mut ok = true;
     if nodes[at].a >= 0 && iw >= 0 {
         let aw = c_read(src, toks, nodes, facs, terms, pols, pst, ds, f, nodes[at].a);

@@ -155,7 +155,7 @@ fn self_hosted_check_agrees_with_bootstrap() {
         // Both halves of `#[cost]` are done and the rule *is* tested — by `self_host_cost.rs`,
         // which runs the cost pass and requires every in-slice program `neant check` rejects to be
         // rejected there too. What is listed here is the driver's blind spot, not a missing rule.
-        const NEEDS_THE_COST_PASS: &[&str] = &["err_assert.nt"];
+        const NEEDS_THE_COST_PASS: &[&str] = &["err_assert.nt", "err_budget.nt"];
         if NEEDS_THE_COST_PASS.contains(&name.as_str()) {
             assert!(!want_ok, "{name} is listed as needing the cost pass, but `neant check` accepts it");
             continue;

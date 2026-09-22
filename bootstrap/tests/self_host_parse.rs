@@ -45,6 +45,16 @@ fn dump_node(nodes: &[Node], n: i64) {
         dump_node(nodes, nodes[n].b);
         dump_node(nodes, nodes[n].c);
         dump_node(nodes, nodes[n].d);
+    } else if k == 81 {
+        dump_node(nodes, nodes[n].a);
+        dump_list(nodes, nodes[n].c);
+    } else if k == 79 {
+        dump_list(nodes, nodes[n].a);
+        dump_node(nodes, nodes[n].b);
+    } else if k == 80 {
+        dump_node(nodes, nodes[n].a);
+        dump_node(nodes, nodes[n].c);
+        dump_node(nodes, nodes[n].d);
     } else if k == 71 {
         dump_list(nodes, nodes[n].b);
     } else if k == 116 {
