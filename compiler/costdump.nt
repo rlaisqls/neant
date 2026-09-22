@@ -35,9 +35,11 @@ fn main() {
     let mut pst = [0, 0, 0, 0, 0, 0, 0, 0];
     let mut env = [Env { name: 0, val: 0, len: 0, root: 0 }; 4096];
     let mut lpes = [Lpe { cnd: 0, n_cnd: 0, lines: 0, contig: 0 }; 65536];
+    let mut imgs = [Img { arr: 0, fld: 0, poly: 0 }; 1024];
+    let mut fb = [-1; 4096];
     let mut sc = [0; 40960];
     let mut wst = [0; 4096];
-    let mut sites = [Site { arr: 0, idx: 0, inloop: 0, coef: 0, stride: 0, bad: 0, trip: 0, branch: 0, novar: 0, field: -1, p0: -1, p1: -1, p2: -1, c0: 0, c1: 0, c2: 0, b0: 0, b1: 0, b2: 0, alen: -1, es: 0, base: 0 }; 4096];
+    let mut sites = [Site { arr: 0, idx: 0, inloop: 0, coef: 0, stride: 0, bad: 0, trip: 0, branch: 0, novar: 0, field: -1, p0: -1, p1: -1, p2: -1, c0: 0, c1: 0, c2: 0, b0: 0, b1: 0, b2: 0, alen: -1, es: 0, base: 0, touch: 0, fldname: -1, tail: 0, pc0: -1, pc1: -1, pc2: -1 }; 4096];
     let mut fm = [-1; 4096];
     let mut cks = [Ck { pce: 0, n_pce: 0 }; 262144];
     let mut cnds = [Cnd { ws: 0, fits: 0 }; 262144];
@@ -70,7 +72,8 @@ fn main() {
         while f >= 0 {
             if nodes[f].kind == 110 {
                 fw[si] = w_func(&buf, &toks, &nodes, &types, &ntys, &sigs, &ptys, &fw, &mut facs, &mut terms, &mut pols, &mut pst, &mut env, &mut wst, &mut scratch, &mut cof, &mut rargs, &mut logs, &mut budget, f, si);
-                fm[si] = m_func(&buf, &toks, &nodes, &types, &strs, &flds, &ntys, &sigs, &ptys, &fm, &ffoot, &mut facs, &mut terms, &mut pols, &mut pst, &mut env, &mut cof, &mut sites, &mut cks, &mut cnds, &mut pcs, &mut budget, &mut resid, &mut rargs, &mut logs, &mut scratch, &mut subst, &slay, &mut lpes, &mut sc, &mut wst, f, si);
+                fm[si] = m_func(&buf, &toks, &nodes, &types, &strs, &flds, &ntys, &sigs, &ptys, &fm, &ffoot, &mut facs, &mut terms, &mut pols, &mut pst, &mut env, &mut cof, &mut sites, &mut cks, &mut cnds, &mut pcs, &mut budget, &mut resid, &mut rargs, &mut logs, &mut scratch, &mut subst, &slay, &mut lpes, &mut imgs, &mut sc, &mut wst, f, si);
+                fb[si] = wst[50];
                 // after the walk, since it reads the sites the walk recorded; the second pass is
                 // what lets a call to a function declared later find them
                 foot_flags(&buf, &toks, &nodes, &sites, &mut ffoot, &wst, f, si);
@@ -158,6 +161,22 @@ fn main() {
                     }
                     pi += 1;
                 }
+                if est[2] != before {
+                    est[2] = before;
+                    let u = b"[unprintable]";
+                    emit_bytes(&mut out, &mut est, &u);
+                }
+            }
+            // the fourth column: the footprint lower bound, or `none` where the function has no
+            // parameter array whose image this slice can state
+            emit_b(&mut out, &mut est, b'\t');
+            if fb[si] < 0 {
+                let u = b"none";
+                emit_bytes(&mut out, &mut est, &u);
+            } else {
+                let before = est[2];
+                pol_print(&mut out, &mut est, &buf, &toks, &facs, &terms, &pols, &logs, &pnames,
+                          &parr, fb[si], &mut order, 0);
                 if est[2] != before {
                     est[2] = before;
                     let u = b"[unprintable]";

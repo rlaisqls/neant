@@ -1834,7 +1834,8 @@ fn ck_max(facs: &[Fac], terms: &mut [Term], pols: &mut [Pol], pst: &mut [i64], b
 // the region rule needs the footprint of an array whose binding is out of scope by settle time.
 struct Site { arr: i64, idx: i64, inloop: i64, coef: i64, stride: i64, bad: i64, trip: i64, branch: i64,
              novar: i64, field: i64, p0: i64, p1: i64, p2: i64,
-             c0: i64, c1: i64, c2: i64, b0: i64, b1: i64, b2: i64, alen: i64, es: i64, base: i64 }
+             c0: i64, c1: i64, c2: i64, b0: i64, b1: i64, b2: i64, alen: i64, es: i64, base: i64,
+             touch: i64, fldname: i64, tail: i64, pc0: i64, pc1: i64, pc2: i64 }
 
 // the id of the loop this site sits in at depth `d`, or −1
 fn site_lp(sites: &[Site], s: i64, d: i64) -> i64 {
@@ -1852,6 +1853,14 @@ fn site_coef(sites: &[Site], wst: &mut [i64], s: i64, d: i64) -> i64 {
     if d == 2 { wst[14] = sites[s].b2; return sites[s].c2; }
     wst[14] = 2;
     0
+}
+
+// the same coefficient as a polynomial, or −1
+fn site_coef_pol(sites: &[Site], s: i64, d: i64) -> i64 {
+    if d == 0 { return sites[s].pc0; }
+    if d == 1 { return sites[s].pc1; }
+    if d == 2 { return sites[s].pc2; }
+    0 - 1
 }
 
 // **A loop record that outlives its loop** — `LoopRec` in `analyze.rs`. The per-depth state in
@@ -2027,6 +2036,58 @@ fn idx_coef(src: &[u8], toks: &[Token], nodes: &[Node], wst: &mut [i64], e: i64,
     0
 }
 
+// **The coefficient of a loop variable in an index, as a polynomial.** `moves` never needs this —
+// §17 measured that a symbolic stride is never compared with `B` and is only ever a three-way tag —
+// but the footprint bound does: `injective_dims` orders the loop variables by unit stride and
+// `image_size` multiplies trip counts, so `a[i*n + k]` needs `n` itself and not a flag saying there
+// is one. A second reader rather than a widening of `idx_coef`, whose answer is exactly right for
+// the walk that uses it. −1 when there is no polynomial to be had.
+fn idx_coef_pol(src: &[u8], toks: &[Token], nodes: &[Node], facs: &mut [Fac], terms: &mut [Term],
+                pols: &mut [Pol], pst: &mut [i64], env: &[Env], wst: &mut [i64], e: i64,
+                lv: i64) -> i64 {
+    if e < 0 { return 0 - 1; }
+    let k = nodes[e].kind;
+    if k == 60 { return pol_zero(facs, terms, pols, pst); }
+    if k == 65 {
+        if lv >= 0 && name_eq(src, toks, nodes[e].a, lv) {
+            return pol_const(facs, terms, pols, pst, 1);
+        }
+        if assigns_var(src, toks, nodes, wst[22], nodes[e].a) { return 0 - 1; }
+        return pol_zero(facs, terms, pols, pst);
+    }
+    if k == 72 { return pol_zero(facs, terms, pols, pst); }
+    if k == 74 { return idx_coef_pol(src, toks, nodes, facs, terms, pols, pst, env, wst, nodes[e].a, lv); }
+    if k == 66 {
+        let op = nodes[e].ival;
+        if op == 0 || op == 1 {
+            let a = idx_coef_pol(src, toks, nodes, facs, terms, pols, pst, env, wst, nodes[e].a, lv);
+            let b = idx_coef_pol(src, toks, nodes, facs, terms, pols, pst, env, wst, nodes[e].b, lv);
+            if a < 0 || b < 0 { return 0 - 1; }
+            if op == 0 { return pol_add(facs, terms, pols, pst, a, b); }
+            return pol_sub(facs, terms, pols, pst, a, b);
+        }
+        if op == 2 {
+            let ca = idx_coef_pol(src, toks, nodes, facs, terms, pols, pst, env, wst, nodes[e].a, lv);
+            let cb = idx_coef_pol(src, toks, nodes, facs, terms, pols, pst, env, wst, nodes[e].b, lv);
+            if ca < 0 || cb < 0 { return 0 - 1; }
+            // one factor must not move with `lv`; its value scales the other's coefficient, and
+            // two that both move make the index quadratic there and not affine at all
+            if pol_is_zero(pols, ca) {
+                let va = val_of(src, toks, nodes, facs, terms, pols, pst, env, wst, nodes[e].a);
+                if va < 0 { return 0 - 1; }
+                return pol_mul(facs, terms, pols, pst, va, cb);
+            }
+            if pol_is_zero(pols, cb) {
+                let vb = val_of(src, toks, nodes, facs, terms, pols, pst, env, wst, nodes[e].b);
+                if vb < 0 { return 0 - 1; }
+                return pol_mul(facs, terms, pols, pst, vb, ca);
+            }
+            return 0 - 1;
+        }
+    }
+    0 - 1
+}
+
 // is this array's element a struct the module has chosen SoA for
 fn is_soa(types: &[Ty], slay: &[i64], t: i64) -> bool {
     if t < 0 { return false; }
@@ -2179,6 +2240,14 @@ fn site_add(src: &[u8], toks: &[Token], nodes: &[Node], types: &[Ty], strs: &[St
     sites[s].p1 = if wst[11] > 1 { wst[43] } else { -1 };
     sites[s].p2 = if wst[11] > 2 { wst[44] } else { -1 };
     sites[s].es = es;
+    // the bytes one touch covers — a field's own size where a field is named, the element's
+    // otherwise, whatever the layout. `touch_bytes` in `analyze.rs`, and what the footprint lower
+    // bound multiplies an image by.
+    sites[s].touch = if fld >= 0 { field_bytes(src, toks, types, strs, flds, t, fld) } else { es };
+    sites[s].fldname = fld;
+    // a site in a block's **tail** is not a statement, and `recognise` is called on statements
+    // only — so it contributes nothing to the bound (design §22)
+    sites[s].tail = wst[48];
     sites[s].base = if soa && sfld >= 0 { field_base(src, toks, types, strs, flds, t, sfld) } else { 0 };
     sites[s].alen = arg_len(src, toks, nodes, env, wst, arr);
     // The coefficient against every enclosing loop, taken here because `idx_coef` asks whether a
@@ -2200,6 +2269,46 @@ fn site_add(src: &[u8], toks: &[Token], nodes: &[Node], types: &[Ty], strs: &[St
         };
         sites[s].c1 = a1;
         sites[s].b1 = wst[14];
+    };
+    // the same coefficients as polynomials, for the footprint bound — chained through an inner
+    // loop's lower bound exactly as the integer ones are
+    if nd > 2 {
+        sites[s].pc2 = idx_coef_pol(src, toks, nodes, facs, terms, pols, pst, env, wst, idx,
+                                    lp_var(wst, wst[44]));
+    };
+    if nd > 1 {
+        let mut q1 = idx_coef_pol(src, toks, nodes, facs, terms, pols, pst, env, wst, idx,
+                                  lp_var(wst, wst[43]));
+        if nd > 2 && q1 >= 0 && sites[s].pc2 >= 0 {
+            let o = idx_coef_pol(src, toks, nodes, facs, terms, pols, pst, env, wst,
+                                 lp_lonode(wst, wst[44]), lp_var(wst, wst[43]));
+            if o < 0 { q1 = 0 - 1; } else {
+                let m = pol_mul(facs, terms, pols, pst, sites[s].pc2, o);
+                q1 = pol_add(facs, terms, pols, pst, q1, m);
+            };
+        };
+        sites[s].pc1 = q1;
+    };
+    if nd > 0 {
+        let mut q0 = idx_coef_pol(src, toks, nodes, facs, terms, pols, pst, env, wst, idx,
+                                  lp_var(wst, wst[42]));
+        if nd > 1 && q0 >= 0 && sites[s].pc1 >= 0 {
+            let o = idx_coef_pol(src, toks, nodes, facs, terms, pols, pst, env, wst,
+                                 lp_lonode(wst, wst[43]), lp_var(wst, wst[42]));
+            if o < 0 { q0 = 0 - 1; } else {
+                let m = pol_mul(facs, terms, pols, pst, sites[s].pc1, o);
+                q0 = pol_add(facs, terms, pols, pst, q0, m);
+            };
+        };
+        if nd > 2 && q0 >= 0 && sites[s].pc2 >= 0 {
+            let o2 = idx_coef_pol(src, toks, nodes, facs, terms, pols, pst, env, wst,
+                                  lp_lonode(wst, wst[44]), lp_var(wst, wst[42]));
+            if o2 < 0 { q0 = 0 - 1; } else {
+                let m2 = pol_mul(facs, terms, pols, pst, sites[s].pc2, o2);
+                q0 = pol_add(facs, terms, pols, pst, q0, m2);
+            };
+        };
+        sites[s].pc0 = q0;
     };
     if nd > 0 {
         wst[14] = 0;
@@ -2905,13 +3014,18 @@ fn m_block(src: &[u8], toks: &[Token], nodes: &[Node], types: &[Ty], strs: &[Str
     if n < 0 || wst[1] != 0 { return ck_zero(facs, terms, pols, pst, budget, cnds, pcs, cks, wst); }
     let saved = wst[0];
     let mut acc = ck_zero(facs, terms, pols, pst, budget, cnds, pcs, cks, wst);
+    // a block's statements are statements however deeply this block is nested inside a tail
+    let stail = wst[48];
+    wst[48] = 0;
     let mut s = nodes[n].a;
     while s >= 0 && wst[1] == 0 {
         let w = m_stmt(src, toks, nodes, types, strs, flds, ntys, sigs, ptys, fm, ffoot, facs, terms, pols, pst, env, cof, sites, cks, cnds, pcs, budget, resid, rargs, subst, slay, wst, s);
         acc = ck_add(facs, terms, pols, pst, budget, cnds, pcs, cks, wst, acc, w);
         s = nodes[s].next;
     }
+    wst[48] = 1;
     let t = m_expr(src, toks, nodes, types, strs, flds, ntys, sigs, ptys, fm, ffoot, facs, terms, pols, pst, env, cof, sites, cks, cnds, pcs, budget, resid, rargs, subst, slay, wst, nodes[n].b);
+    wst[48] = stail;
     wst[0] = saved;
     ck_add(facs, terms, pols, pst, budget, cnds, pcs, cks, wst, acc, t)
 }
@@ -3099,6 +3213,175 @@ fn m_stmt(src: &[u8], toks: &[Token], nodes: &[Node], types: &[Ty], strs: &[Str]
     ck_zero(facs, terms, pols, pst, budget, cnds, pcs, cks, wst)
 }
 
+// ---------------------------------------------------------------------------------------------
+// **The footprint lower bound** (design §22): every distinct element of a parameter array crosses
+// once from cold, so a function's `moves` cannot be less than the bytes its references reach.
+//
+// Per reference: the loop variables its index is **injective** on, how many distinct values that
+// is, and the bytes one touch covers. Kept per (array, field) — two fields of one struct array are
+// two entries, which is why `kinetic` bounds at `16·ps.len()` and `centroid_x` at `8·ps.len()` —
+// and summed over the parameters.
+
+struct Img { arr: i64, fld: i64, poly: i64 }
+
+// **The mixed-radix argument.** Sort the loop variables by the bytes the index moves per lap of
+// each, ascending; a variable is a digit of its own only if its unit clears everything the smaller
+// ones already span, `unit ≥ covered + 1`. `for i in ii*4..ii*4+4` makes `a[i]` injective on both,
+// because `i`'s own start moves by 4 a lap of `ii` and 4 ≥ 3 + 1 exactly. `injective_dims` in
+// `analyze.rs`. The answer is the count of injective levels, left in `wst[49]`, with their depths
+// written into `sc`.
+fn injective_dims(facs: &mut [Fac], terms: &mut [Term], pols: &mut [Pol], pst: &mut [i64],
+                  budget: &mut [f64], sites: &[Site], sc: &mut [i64], wst: &mut [i64],
+                  s: i64) -> bool {
+    let mut nd = 0;
+    let mut d = 0;
+    while d < sites[s].inloop {
+        let c = site_coef_pol(sites, s, d);
+        if c < 0 { return false; }
+        if !pol_is_zero(pols, c) {
+            sc[36864 + nd] = d;
+            sc[37888 + nd] = c;
+            nd += 1;
+        };
+        d += 1;
+    }
+    if nd == 0 { return false; }
+    // ascending by unit stride, which dominance orders: `1` before `n`, and `1` before `4`
+    let mut i = 1;
+    while i < nd {
+        let mut j = i;
+        let mut going = true;
+        while going && j > 0 {
+            let a = sc[37888 + j];
+            let b = sc[37888 + j - 1];
+            if pol_dominates(facs, terms, pols, pst, budget, b, a)
+                && !pol_eq(facs, terms, pols, a, b) {
+                let td = sc[36864 + j];
+                sc[36864 + j] = sc[36864 + j - 1];
+                sc[37888 + j] = b;
+                sc[36864 + j - 1] = td;
+                sc[37888 + j - 1] = a;
+                j -= 1;
+            } else {
+                going = false;
+            };
+        }
+        i += 1;
+    }
+    let mut covered = pol_zero(facs, terms, pols, pst);
+    let mut k = 0;
+    let mut ok = true;
+    while k < nd {
+        let unit = sc[37888 + k];
+        let one = pol_const(facs, terms, pols, pst, 1);
+        let need = pol_add(facs, terms, pols, pst, covered, one);
+        if !pol_dominates(facs, terms, pols, pst, budget, unit, need) { ok = false; }
+        let id = site_lp(sites, s, sc[36864 + k]);
+        let t1 = pol_sub(facs, terms, pols, pst, lp_trip(wst, id), one);
+        let span = pol_mul(facs, terms, pols, pst, unit, t1);
+        covered = pol_add(facs, terms, pols, pst, covered, span);
+        k += 1;
+    }
+    wst[49] = nd;
+    ok
+}
+
+// How many distinct values those levels take: summed over each in turn, innermost outwards. A
+// level the index does *not* move with contributes nothing — unless what has been counted so far
+// mentions it, in which case the count is not a number of its own and there is no image.
+fn image_size(facs: &mut [Fac], terms: &mut [Term], pols: &mut [Pol], pst: &mut [i64],
+              sites: &[Site], sc: &[i64], scratch: &mut [i64], wst: &mut [i64], s: i64,
+              nd: i64) -> i64 {
+    let mut count = pol_const(facs, terms, pols, pst, 1);
+    let mut d = sites[s].inloop - 1;
+    while d >= 0 {
+        let id = site_lp(sites, s, d);
+        let mut inj = false;
+        let mut k = 0;
+        while k < nd {
+            if sc[36864 + k] == d { inj = true; };
+            k += 1;
+        }
+        let a = lp_atom(wst, id);
+        if inj {
+            if a < 0 { return 0 - 1; }
+            count = lp_sum(facs, terms, pols, pst, scratch, wst, id, count);
+        } else if a >= 0 && (mono_mentions(facs, terms, pols, count, a)
+                             || mono_mentions(facs, terms, pols, lp_trip(wst, id), a)) {
+            return 0 - 1;
+        };
+        d -= 1;
+    }
+    // no loop atom may survive into the answer
+    let mut d2 = 0;
+    while d2 < sites[s].inloop {
+        let a2 = lp_atom(wst, site_lp(sites, s, d2));
+        if a2 >= 0 && mono_mentions(facs, terms, pols, count, a2) { return 0 - 1; }
+        d2 += 1;
+    }
+    count
+}
+
+fn bound_moves(src: &[u8], toks: &[Token], nodes: &[Node], facs: &mut [Fac], terms: &mut [Term],
+               pols: &mut [Pol], pst: &mut [i64], budget: &mut [f64], sites: &[Site],
+               imgs: &mut [Img], sc: &mut [i64], scratch: &mut [i64], wst: &mut [i64],
+               f: i64) -> i64 {
+    let mut n_img = 0;
+    let mut s = 0;
+    while s < wst[10] {
+        // a site with no readable index, one in a block's tail, and one outside every loop each
+        // contribute nothing — `ring`'s `buf[head]` beside its `xs[i]` is the first case
+        if sites[s].tail == 0 && sites[s].inloop > 0
+            && sites[s].touch > 0 && injective_dims(facs, terms, pols, pst, budget, sites, sc, wst, s) {
+            let img = image_size(facs, terms, pols, pst, sites, sc, scratch, wst, s, wst[49]);
+            if img >= 0 {
+                let bytes = pol_scale(facs, terms, pols, pst, img, sites[s].touch, 1);
+                let mut i = 0;
+                let mut at = 0 - 1;
+                while i < n_img {
+                    // a whole-element site has no field token, and −1 is not a token to compare
+                    // — `stencil`'s four reads of `src` are one entry, not four
+                    let same_fld = if imgs[i].fld < 0 || sites[s].fldname < 0 {
+                        imgs[i].fld < 0 && sites[s].fldname < 0
+                    } else {
+                        name_eq(src, toks, imgs[i].fld, sites[s].fldname)
+                    };
+                    if name_eq(src, toks, imgs[i].arr, sites[s].arr) && same_fld { at = i; };
+                    i += 1;
+                }
+                if at < 0 {
+                    imgs[n_img].arr = sites[s].arr;
+                    imgs[n_img].fld = sites[s].fldname;
+                    imgs[n_img].poly = bytes;
+                    n_img += 1;
+                } else if pol_dominates(facs, terms, pols, pst, budget, bytes, imgs[at].poly) {
+                    imgs[at].poly = bytes;
+                };
+            };
+        };
+        s += 1;
+    }
+    // only the parameters: what a caller hands in was in slow memory when the call began
+    let mut total = pol_zero(facs, terms, pols, pst);
+    let mut any = false;
+    let mut i2 = 0;
+    while i2 < n_img {
+        let mut p = nodes[f].b;
+        let mut is_param = false;
+        while p >= 0 {
+            if name_eq(src, toks, nodes[p].a, imgs[i2].arr) { is_param = true; };
+            p = nodes[p].next;
+        }
+        if is_param {
+            total = pol_add(facs, terms, pols, pst, total, imgs[i2].poly);
+            any = true;
+        };
+        i2 += 1;
+    }
+    if !any { return 0 - 1; }
+    total
+}
+
 // The moves of a function that calls nothing: its sites, settled by the rule in §11. −1 when this
 // slice cannot say, which a call, a second loop, an array built here or a `moves 0` that was never
 // looked for all produce.
@@ -3108,7 +3391,8 @@ fn m_func(src: &[u8], toks: &[Token], nodes: &[Node], types: &[Ty], strs: &[Str]
           pols: &mut [Pol], pst: &mut [i64], env: &mut [Env], cof: &mut [Cof],
           sites: &mut [Site], cks: &mut [Ck], cnds: &mut [Cnd], pcs: &mut [Pce], budget: &mut [f64], resid: &mut [Res],
           rargs: &mut [i64], logs: &mut [i64], scratch: &mut [i64], subst: &mut [i64],
-          slay: &[i64], lpes: &mut [Lpe], sc: &mut [i64], wst: &mut [i64], f: i64, si: i64) -> i64 {
+          slay: &[i64], lpes: &mut [Lpe], imgs: &mut [Img], sc: &mut [i64], wst: &mut [i64],
+          f: i64, si: i64) -> i64 {
     wst[0] = 0;
     wst[1] = 0;
     wst[10] = 0;
@@ -3141,6 +3425,10 @@ fn m_func(src: &[u8], toks: &[Token], nodes: &[Node], types: &[Ty], strs: &[Str]
     let sm = settle_moves(src, toks, facs, terms, pols, pst, budget, cnds, pcs, cks, sites, lpes,
                           sc, scratch, wst);
     let total = ck_add(facs, terms, pols, pst, budget, cnds, pcs, cks, wst, walked, sm);
+    // the footprint lower bound, from the same sites — a function whose cost this slice cannot
+    // state may still have one, so it is taken before the cost is given up on
+    wst[50] = bound_moves(src, toks, nodes, facs, terms, pols, pst, budget, sites, imgs, sc,
+                          scratch, wst, f);
     if wst[1] != 0 { return -1; }
     if wst[23] == 0 { return total; }
     // the same solver the `work` column uses; a forked body would need the recurrence solved in
@@ -3204,7 +3492,7 @@ fn choose_layouts(src: &[u8], toks: &[Token], nodes: &[Node], types: &[Ty], strs
     let mut pst = [0, 0, 0, 0, 0, 0, 0, 0];
     let mut env = [Env { name: 0, val: 0, len: 0, root: 0 }; 4096];
     let mut cof = [Cof { name: 0, c: 0 }; 256];
-    let mut sites = [Site { arr: 0, idx: 0, inloop: 0, coef: 0, stride: 0, bad: 0, trip: 0, branch: 0, novar: 0, field: -1, p0: -1, p1: -1, p2: -1, c0: 0, c1: 0, c2: 0, b0: 0, b1: 0, b2: 0, alen: -1, es: 0, base: 0 }; 4096];
+    let mut sites = [Site { arr: 0, idx: 0, inloop: 0, coef: 0, stride: 0, bad: 0, trip: 0, branch: 0, novar: 0, field: -1, p0: -1, p1: -1, p2: -1, c0: 0, c1: 0, c2: 0, b0: 0, b1: 0, b2: 0, alen: -1, es: 0, base: 0, touch: 0, fldname: -1, tail: 0, pc0: -1, pc1: -1, pc2: -1 }; 4096];
     let mut cks = [Ck { pce: 0, n_pce: 0 }; 262144];
     let mut cnds = [Cnd { ws: 0, fits: 0 }; 262144];
     let mut pcs = [Pce { cnd: 0, n_cnd: 0, poly: 0 }; 262144];
@@ -3216,6 +3504,7 @@ fn choose_layouts(src: &[u8], toks: &[Token], nodes: &[Node], types: &[Ty], strs
     let mut ffoot = [0; 262144];
     let mut fm = [-1; 4096];
     let mut lpes = [Lpe { cnd: 0, n_cnd: 0, lines: 0, contig: 0 }; 65536];
+    let mut imgs = [Img { arr: 0, fld: 0, poly: 0 }; 1024];
     let mut sc = [0; 40960];
     let mut wst = [0; 4096];
 
@@ -3247,8 +3536,8 @@ fn choose_layouts(src: &[u8], toks: &[Token], nodes: &[Node], types: &[Ty], strs
                                         &ffoot, &mut facs, &mut terms, &mut pols, &mut pst, &mut env,
                                         &mut cof, &mut sites, &mut cks, &mut cnds, &mut pcs,
                                         &mut budget, &mut resid, &mut rargs, &mut logs,
-                                        &mut scratch, &mut subst, slay, &mut lpes, &mut sc,
-                                        &mut wst, f, si);
+                                        &mut scratch, &mut subst, slay, &mut lpes, &mut imgs,
+                                        &mut sc, &mut wst, f, si);
                         foot_flags(src, toks, nodes, &sites, &mut ffoot, &wst, f, si);
                         if pass == 1 && fm[si] >= 0
                             && touches_struct(src, toks, nodes, types, sigs, ptys, sid, f, si) {

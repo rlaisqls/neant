@@ -1242,3 +1242,34 @@ rule has never had to be principled. It is one line to state and one line to rep
 inside a block's tail expression does not contribute.** Reproducing it is the cheaper and more
 honest choice than diverging, because a divergence here would have to be argued as an improvement,
 and "we count a reference `neant cost` forgets" is a claim about an accident, not about a model.
+
+### Built: 90 bound columns, and nothing invented
+
+**Done, and the fourth column agrees everywhere.** 90 functions, counting the ones that must have
+*no* bound and get none — a bound invented where `neant cost` states none is as wrong as a missing
+one, and only one of those two would otherwise show up as a difference.
+
+The order §22 set held, and each step cost what it predicted:
+
+- the single-loop case, which is most of the corpus;
+- **the loop's offset**, which `tiles` alone pays for — `for i in ii*4..ii*4+4` makes `a[i]`
+  injective on both `i` and `ii` because `i`'s own start moves 4 a lap of `ii`, the units 1 and 4
+  nest exactly (`4 ≥ 3 + 1`), and the image is `4 · n/4 = n`. The settle pass already chained that
+  number for the stride at each level; the bound wanted the same number for a different purpose;
+- `image_size` over a nest, for `stencil`;
+- **the polynomial coefficient**, last, for `matmul`. `idx_coef_pol` is a second reader of an index
+  rather than a widening of `idx_coef` — §17's three-way tag is exactly right for the walk that
+  uses it, and exactly not enough here.
+
+Two things the build corrected.
+
+**`injective_dims` orders by dominance, not by size.** The first version compared integer units,
+which cannot order `1` against `n`. Sorting by `pol_dominates` puts `1` before `n` and `1` before
+`4` alike, which is what `analyze.rs`'s comparator does and what the mixed-radix argument needs:
+each unit must clear everything the smaller ones already span.
+
+**−1 is not a token, and comparing it as one made `stencil` 2.5× too large.** The images table is
+keyed by `(array, field)`, and a whole-element site has no field. Comparing the two `−1`s with
+`name_eq` read outside the token array, so `stencil`'s four reads of `src` became four entries
+instead of one and the bound came out `40·n² − 160·n + 160` against the wanted
+`16·n² − 64·n + 64` — five arrays' worth where there are two. The ratio was what gave it away.
