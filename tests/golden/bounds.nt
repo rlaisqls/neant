@@ -1,0 +1,6 @@
+fn main() {
+    let xs = [1, 2, 3];
+    let i = 3;
+    println(xs[0]);
+    println(xs[i]);
+}

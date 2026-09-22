@@ -1,0 +1,11 @@
+fn main() {
+    println(42);
+    println(-7);
+    println(3.5);
+    println(6.0);
+    println(0.1);
+    println(1.0 / 3.0);
+    println(1e20);
+    println(true);
+    println(false);
+}

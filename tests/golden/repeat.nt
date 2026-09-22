@@ -1,0 +1,27 @@
+fn fill(out: &mut [f64], v: f64) {
+    for i in 0..out.len() {
+        out[i] = v * i as f64;
+    }
+}
+
+fn total(xs: &[f64]) -> f64 {
+    let mut s = 0.0;
+    for i in 0..xs.len() {
+        s += xs[i];
+    }
+    s
+}
+
+fn main() {
+    let n = 1000;
+    let mut xs = [0.0; n];
+    println(xs.len());
+    println(total(&xs));
+    fill(&mut xs, 0.5);
+    println(total(&xs));
+    let zeros = [0; 3];
+    println(zeros[2]);
+    let m = xs.len() / 10;
+    let ys = [7; m];
+    println(ys.len());
+}

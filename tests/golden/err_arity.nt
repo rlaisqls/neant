@@ -1,0 +1,2 @@
+fn f(a: i64) -> i64 { a }
+fn main() { println(f(1, 2)); }

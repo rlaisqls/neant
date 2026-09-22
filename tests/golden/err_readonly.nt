@@ -1,0 +1,2 @@
+fn f(xs: &[i64]) { xs[0] = 1; }
+fn main() { let xs = [1]; f(&xs); }

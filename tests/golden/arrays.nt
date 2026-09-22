@@ -1,0 +1,17 @@
+fn main() {
+    let xs = [3, 1, 4, 1, 5];
+    println(xs.len());
+    println(xs[0]);
+    println(xs[4]);
+    let mut ys = [0.5, 1.5];
+    ys[1] = ys[0] * 4.0;
+    println(ys[1]);
+    let mut total = 0;
+    for i in 0..xs.len() {
+        total += xs[i];
+    }
+    println(total);
+    let v = &xs;
+    println(v[2]);
+    println(v.len());
+}

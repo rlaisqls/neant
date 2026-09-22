@@ -1,1 +1,5 @@
 /target
+/stage0/target
+*.o
+/tests/golden/*.bin
+/tests/golden/*.c

@@ -1,0 +1,27 @@
+// c = a * b, all n×n row-major in flat arrays
+fn matmul(n: i64, a: &[f64], b: &[f64], c: &mut [f64]) {
+    for i in 0..n {
+        for j in 0..n {
+            let mut acc = 0.0;
+            for k in 0..n {
+                acc += a[i * n + k] * b[k * n + j];
+            }
+            c[i * n + j] = acc;
+        }
+    }
+}
+
+fn main() {
+    let n = 3;
+    let mut a = [0.0; 9];
+    let mut b = [0.0; 9];
+    let mut c = [0.0; 9];
+    for i in 0..9 {
+        a[i] = (i + 1) as f64;
+        b[i] = if i % 4 == 0 { 1.0 } else { 0.0 };
+    }
+    matmul(n, &a, &b, &mut c);
+    for i in 0..9 {
+        println(c[i]);
+    }
+}

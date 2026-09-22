@@ -1,0 +1,5 @@
+fn f(xs: &mut [i64]) { xs[0] = 1; }
+fn main() {
+    let xs = [1, 2];
+    f(&mut xs);
+}

@@ -1,0 +1,16 @@
+fn saxpy(a: f64, x: &[f64], y: &mut [f64]) {
+    for i in 0..x.len() {
+        y[i] += a * x[i];
+    }
+}
+
+fn main() {
+    let x = [1.0, 2.0, 3.0, 4.0];
+    let mut y = [10.0, 20.0, 30.0, 40.0];
+    saxpy(2.0, &x, &mut y);
+    for i in 0..y.len() {
+        println(y[i]);
+    }
+    saxpy(-1.0, &y, &mut y);
+    println(y[3]);
+}

@@ -1,0 +1,16 @@
+fn main() {
+    println(1 + 2 * 3);
+    println((1 + 2) * 3);
+    println(7 / 2);
+    println(-7 / 2);
+    println(7 % 3);
+    println(-7 % 3);
+    println(2.5 * 4.0 - 1.0);
+    println(7 as f64 / 2.0);
+    println(3.99 as i64);
+    println(-3.99 as i64);
+    println(1 < 2 && 2 < 3);
+    println(1 < 2 && 3 < 2 || true);
+    println(!(1 == 1));
+    println(2 != 3);
+}

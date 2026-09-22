@@ -1,0 +1,20 @@
+fn dot(a: &[f64], b: &[f64]) -> f64 {
+    let mut acc = 0.0;
+    for i in 0..a.len() {
+        acc += a[i] * b[i];
+    }
+    acc
+}
+
+fn main() {
+    let a = [1.0, 2.0, 3.0];
+    let b = [4.0, 5.0, 6.0];
+    println(dot(&a, &b));
+    println(dot(&a, &a));
+    let n = 100;
+    let mut xs = [1.0; n];
+    println(dot(&xs, &xs));
+    xs[0] = 100.0;
+    let v = &xs;
+    println(dot(v, v));
+}
