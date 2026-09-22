@@ -14,7 +14,7 @@ pub enum Tok {
     Bytes(Vec<u8>),
     /// `"..."` — only inside attributes for now
     Str(String),
-    Fn, Let, Mut, If, Else, For, In, Return, True, False, As, While, Break, Decreasing, Extern, Uses,
+    Fn, Let, Mut, If, Else, For, In, Return, True, False, As, While, Break, Decreasing, Extern, Uses, Struct,
     LParen, RParen, LBracket, RBracket, LBrace, RBrace,
     Comma, Semi, Colon, Arrow, Dot, DotDot,
     Eq, EqEq, Ne, Lt, Le, Gt, Ge,
@@ -115,7 +115,7 @@ pub fn lex(src: &str) -> Result<Vec<Token>> {
                 "else" => Tok::Else, "for" => Tok::For, "in" => Tok::In, "return" => Tok::Return,
                 "true" => Tok::True, "false" => Tok::False, "as" => Tok::As,
                 "while" => Tok::While, "break" => Tok::Break, "decreasing" => Tok::Decreasing,
-                "extern" => Tok::Extern, "uses" => Tok::Uses,
+                "extern" => Tok::Extern, "uses" => Tok::Uses, "struct" => Tok::Struct,
                 _ => Tok::Ident(word),
             };
             push!(tok, l, cl);

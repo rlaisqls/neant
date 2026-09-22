@@ -6,17 +6,37 @@ use crate::diag::{err, Result};
 use crate::lex::{Tok, Token};
 
 pub fn parse(toks: Vec<Token>) -> Result<Program> {
-    let mut p = Parser { toks, pos: 0 };
-    let mut funcs = Vec::new();
-    while p.peek() != &Tok::Eof {
-        funcs.push(p.func()?);
+    // struct names first, so `S { … }` can be told from a block wherever a struct literal may stand
+    let mut struct_names = Vec::new();
+    for w in toks.windows(2) {
+        if let (Tok::Struct, Tok::Ident(n)) = (&w[0].tok, &w[1].tok) { struct_names.push(n.clone()); }
     }
-    Ok(Program { funcs })
+    let mut p = Parser { toks, pos: 0, struct_names, no_struct_lit: 0 };
+    let mut funcs = Vec::new();
+    let mut structs = Vec::new();
+    while p.peek() != &Tok::Eof {
+        let attrs = p.attributes()?;
+        if p.at(&Tok::Struct) { structs.push(p.struct_def(attrs)?); } else { funcs.push(p.func(attrs)?); }
+    }
+    Ok(Program { funcs, structs })
+}
+
+/// `#[name(key = "value", …)]` or `#[name(word)]`
+struct Attr {
+    name: String,
+    pairs: Vec<(String, String, u32, u32)>,
+    words: Vec<String>,
+    line: u32,
+    col: u32,
 }
 
 struct Parser {
     toks: Vec<Token>,
     pos: usize,
+    struct_names: Vec<String>,
+    /// inside an `if`/`while` condition or a `for` range: `S {` is not a struct literal there, the
+    /// `{` opens the body
+    no_struct_lit: usize,
 }
 
 enum Item {
@@ -50,24 +70,65 @@ impl Parser {
         }
     }
 
-    fn func(&mut self) -> Result<Func> {
-        let mut asserts = Vec::new();
+    fn attributes(&mut self) -> Result<Vec<Attr>> {
+        let mut out = Vec::new();
         while self.at(&Tok::Hash) {
+            let (line, col) = self.here();
             self.next();
             self.expect(Tok::LBracket, "`[`")?;
-            let (attr, al, ac) = self.ident("attribute name")?;
-            if attr != "cost" { return err(al, ac, format!("unknown attribute `{attr}`; only `#[cost(...)]` exists")); }
+            let (name, _, _) = self.ident("attribute name")?;
+            let mut pairs = Vec::new();
+            let mut words = Vec::new();
             self.expect(Tok::LParen, "`(`")?;
             while !self.at(&Tok::RParen) {
-                let (key, kl, kc) = self.ident("`work_at_most` or `moves_at_most`")?;
-                self.expect(Tok::Eq, "`=`")?;
-                let (vl, vc) = self.here();
-                let Tok::Str(val) = self.next().tok else { return err(vl, vc, "a cost bound is a string: `\"n log n\"`") };
-                asserts.push((key, val, kl, kc));
+                let (key, kl, kc) = self.ident("an attribute key")?;
+                if self.eat(&Tok::Eq) {
+                    let (vl, vc) = self.here();
+                    let Tok::Str(val) = self.next().tok else { return err(vl, vc, "an attribute value is a string: `\"n log n\"`") };
+                    pairs.push((key, val, kl, kc));
+                } else {
+                    words.push(key);
+                }
                 if !self.eat(&Tok::Comma) { break; }
             }
             self.expect(Tok::RParen, "`)`")?;
             self.expect(Tok::RBracket, "`]`")?;
+            out.push(Attr { name, pairs, words, line, col });
+        }
+        Ok(out)
+    }
+
+    fn struct_def(&mut self, attrs: Vec<Attr>) -> Result<StructDef> {
+        let mut layout = None;
+        for a in attrs {
+            if a.name != "layout" { return err(a.line, a.col, format!("`#[{}]` does not apply to a struct; only `#[layout(aos)]` / `#[layout(soa)]`", a.name)); }
+            match a.words.as_slice() {
+                [w] if w == "aos" || w == "soa" => layout = Some(w.clone()),
+                _ => return err(a.line, a.col, "`#[layout(...)]` takes `aos` or `soa`"),
+            }
+        }
+        let (line, col) = self.here();
+        self.expect(Tok::Struct, "`struct`")?;
+        let (name, _, _) = self.ident("struct name")?;
+        self.expect(Tok::LBrace, "`{`")?;
+        let mut fields = Vec::new();
+        while !self.at(&Tok::RBrace) {
+            let (f, fl, fc) = self.ident("field name")?;
+            self.expect(Tok::Colon, "`:`")?;
+            let ty = self.type_expr()?;
+            fields.push((f, ty, fl, fc));
+            if !self.eat(&Tok::Comma) { break; }
+        }
+        self.expect(Tok::RBrace, "`}`")?;
+        Ok(StructDef { name, fields, layout, line, col })
+    }
+
+    fn func(&mut self, attrs: Vec<Attr>) -> Result<Func> {
+        let mut asserts = Vec::new();
+        for a in attrs {
+            if a.name != "cost" { return err(a.line, a.col, format!("unknown attribute `{}` on a function; only `#[cost(...)]` exists", a.name)); }
+            if !a.words.is_empty() { return err(a.line, a.col, "`#[cost(...)]` takes `key = \"expr\"` pairs"); }
+            asserts.extend(a.pairs);
         }
         let (line, col) = self.here();
         let is_extern = self.eat(&Tok::Extern);
@@ -165,9 +226,11 @@ impl Parser {
                 self.next();
                 let (var, _, _) = self.ident("loop variable")?;
                 self.expect(Tok::In, "`in`")?;
+                self.no_struct_lit += 1;
                 let start = self.expr()?;
                 self.expect(Tok::DotDot, "`..`")?;
                 let end = self.expr()?;
+                self.no_struct_lit -= 1;
                 let body = self.block()?;
                 Ok(Item::Stmt(Stmt::For { var, start, end, body, line, col }))
             }
@@ -179,8 +242,10 @@ impl Parser {
             }
             Tok::While => {
                 self.next();
+                self.no_struct_lit += 1;
                 let cond = self.expr()?;
                 let decreasing = if self.eat(&Tok::Decreasing) { Some(self.expr()?) } else { None };
+                self.no_struct_lit -= 1;
                 let body = self.block()?;
                 Ok(Item::Stmt(Stmt::While { cond, decreasing, body, line, col }))
             }
@@ -303,10 +368,13 @@ impl Parser {
                 }
                 Tok::Dot => {
                     self.next();
-                    let (name, _, _) = self.ident("method name")?;
-                    self.expect(Tok::LParen, "`(`")?;
-                    let args = self.args()?;
-                    e = Expr { kind: ExprKind::MethodCall(Box::new(e), name, args), line: l, col: c };
+                    let (name, _, _) = self.ident("a field or method name")?;
+                    if self.eat(&Tok::LParen) {
+                        let args = self.args()?;
+                        e = Expr { kind: ExprKind::MethodCall(Box::new(e), name, args), line: l, col: c };
+                    } else {
+                        e = Expr { kind: ExprKind::Field(Box::new(e), name), line: l, col: c };
+                    }
                 }
                 _ => return Ok(e),
             }
@@ -337,6 +405,22 @@ impl Parser {
                     self.next();
                     let args = self.args()?;
                     mk(ExprKind::Call(name, args))
+                } else if self.at(&Tok::LBrace) && self.no_struct_lit == 0 && self.struct_names.contains(&name) {
+                    self.next();
+                    let mut fields = Vec::new();
+                    while !self.at(&Tok::RBrace) {
+                        let (f, _, _) = self.ident("field name")?;
+                        self.expect(Tok::Colon, "`:`")?;
+                        // the body of a block is parsed normally: `S { f: if c { 1 } else { 2 } }` is fine
+                        let saved = self.no_struct_lit;
+                        self.no_struct_lit = 0;
+                        let v = self.expr()?;
+                        self.no_struct_lit = saved;
+                        fields.push((f, v));
+                        if !self.eat(&Tok::Comma) { break; }
+                    }
+                    self.expect(Tok::RBrace, "`}`")?;
+                    mk(ExprKind::StructLit(name, fields))
                 } else {
                     mk(ExprKind::Var(name))
                 }
@@ -377,7 +461,9 @@ impl Parser {
             }
             Tok::If => {
                 self.next();
+                self.no_struct_lit += 1;
                 let cond = self.expr()?;
+                self.no_struct_lit -= 1;
                 let then = self.block()?;
                 let els = if self.eat(&Tok::Else) {
                     if self.at(&Tok::If) {
@@ -434,7 +520,7 @@ fn describe(t: &Tok) -> String {
                 Tok::MinusEq => "-=", Tok::StarEq => "*=", Tok::SlashEq => "/=", Tok::Amp => "&",
                 Tok::AmpAmp => "&&", Tok::Pipe => "|", Tok::PipePipe => "||", Tok::Bang => "!", Tok::Hash => "#",
                 Tok::While => "while", Tok::Break => "break", Tok::Decreasing => "decreasing",
-                Tok::Extern => "extern", Tok::Uses => "uses",
+                Tok::Extern => "extern", Tok::Uses => "uses", Tok::Struct => "struct",
                 _ => "?",
             };
             format!("`{s}`")

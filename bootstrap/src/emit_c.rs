@@ -36,6 +36,7 @@ struct Emitter<'a> {
 pub fn emit(m: &Module, opts: &Options) -> String {
     let mut e = Emitter { m, f: None, opts, out: String::new(), indent: 0, tmp: 0 };
     e.prelude();
+    e.structs();
     for f in &m.funcs {
         e.f = Some(f);
         e.prototype(f);
@@ -50,14 +51,15 @@ pub fn emit(m: &Module, opts: &Options) -> String {
     e.out
 }
 
-fn c_ty(t: &Ty) -> &'static str {
+fn c_ty(m: &Module, t: &Ty) -> String {
     match t {
-        Ty::I64 => "int64_t",
-        Ty::F64 => "double",
-        Ty::Bool => "bool",
-        Ty::U8 => "uint8_t",
-        Ty::Unit => "void",
-        Ty::Array(e, _) | Ty::Slice(e, _, _) => c_ty(e),
+        Ty::I64 => "int64_t".into(),
+        Ty::F64 => "double".into(),
+        Ty::Bool => "bool".into(),
+        Ty::U8 => "uint8_t".into(),
+        Ty::Unit => "void".into(),
+        Ty::Struct(i) => format!("struct nt_{}", m.structs[*i].name),
+        Ty::Array(e, _) | Ty::Slice(e, _, _) => c_ty(m, e),
     }
 }
 
@@ -114,6 +116,19 @@ static void nt_println_f64(double v) {
 "#);
     }
 
+    /// One C struct per struct type, in declaration order; fields in declaration order, so the
+    /// layout is C's and `Module::size_of` describes it.
+    fn structs(&mut self) {
+        for sd in &self.m.structs {
+            let _ = writeln!(self.out, "struct nt_{} {{", sd.name);
+            for (f, t) in &sd.fields {
+                let _ = writeln!(self.out, "    {} {f};", c_ty(self.m, t));
+            }
+            self.out.push_str("};\n");
+        }
+        if !self.m.structs.is_empty() { self.out.push('\n'); }
+    }
+
     fn local_name(&self, id: LocalId) -> String {
         let l = &self.f.unwrap().locals[id];
         // compiler-made locals are `base#n`; the id suffix already makes every name unique
@@ -121,7 +136,7 @@ static void nt_println_f64(double v) {
     }
 
     fn prototype(&mut self, f: &Func) {
-        let ret = c_ty(&f.ret);
+        let ret = c_ty(self.m, &f.ret);
         // an extern names the C symbol itself; our own functions are prefixed and static
         if f.body.is_none() { let _ = write!(self.out, "{ret} {}(", f.name); }
         else { let _ = write!(self.out, "static {ret} nt_{}(", f.name); }
@@ -135,9 +150,9 @@ static void nt_println_f64(double v) {
             match &l.ty {
                 Ty::Slice(e, m, _) => {
                     let cst = if *m { "" } else { "const " };
-                    let _ = write!(self.out, "{cst}{} *restrict {nm}_p, int64_t {nm}_n", c_ty(e));
+                    let _ = write!(self.out, "{cst}{} *restrict {nm}_p, int64_t {nm}_n", c_ty(self.m, e));
                 }
-                t => { let _ = write!(self.out, "{} {nm}", c_ty(t)); }
+                t => { let _ = write!(self.out, "{} {nm}", c_ty(self.m, t)); }
             }
         }
         self.out.push(')');
@@ -192,11 +207,11 @@ static void nt_println_f64(double v) {
                 let nm = self.local_name(*id);
                 let ty = self.f.unwrap().locals[*id].ty.clone();
                 match self.expr(e) {
-                    CVal::Scalar(v) => self.line(&format!("{} {nm} = {v};", c_ty(&ty))),
+                    CVal::Scalar(v) => self.line(&format!("{} {nm} = {v};", c_ty(self.m, &ty))),
                     CVal::Arr(p, n) => {
                         let cst = matches!(ty, Ty::Slice(_, false, _));
                         let cst = if cst { "const " } else { "" };
-                        self.line(&format!("{cst}{} *{nm}_p = {p};", c_ty(&ty)));
+                        self.line(&format!("{cst}{} *{nm}_p = {p};", c_ty(self.m, &ty)));
                         self.line(&format!("int64_t {nm}_n = {n};"));
                     }
                 }
@@ -205,14 +220,14 @@ static void nt_println_f64(double v) {
                 let nm = self.local_name(*id);
                 let ty = self.f.unwrap().locals[*id].ty.clone();
                 let vals: Vec<String> = elems.iter().map(|e| self.expr(e).scalar()).collect();
-                self.line(&format!("{} {nm}_buf[{}] = {{{}}};", c_ty(&ty), vals.len(), vals.join(", ")));
-                self.line(&format!("{} *{nm}_p = {nm}_buf;", c_ty(&ty)));
+                self.line(&format!("{} {nm}_buf[{}] = {{{}}};", c_ty(self.m, &ty), vals.len(), vals.join(", ")));
+                self.line(&format!("{} *{nm}_p = {nm}_buf;", c_ty(self.m, &ty)));
                 self.line(&format!("int64_t {nm}_n = {};", vals.len()));
             }
             Stmt::LetBuild { id, len, var, body } => {
                 let nm = self.local_name(*id);
                 let ty = self.f.unwrap().locals[*id].ty.clone();
-                let cty = c_ty(&ty);
+                let cty = c_ty(self.m, &ty);
                 let nv = self.expr(len).scalar();
                 let k = self.local_name(*var);
                 self.line(&format!("int64_t {nm}_n = {nv};"));
@@ -226,7 +241,7 @@ static void nt_println_f64(double v) {
             Stmt::LetRepeat(id, e, n) => {
                 let nm = self.local_name(*id);
                 let ty = self.f.unwrap().locals[*id].ty.clone();
-                let cty = c_ty(&ty);
+                let cty = c_ty(self.m, &ty);
                 let nv = self.expr(n).scalar();
                 self.line(&format!("int64_t {nm}_n = {nv};"));
                 self.line(&format!("{cty} *{nm}_p = nt_alloc({nm}_n, sizeof({cty}));"));
@@ -246,6 +261,18 @@ static void nt_println_f64(double v) {
                         let nm = self.local_name(*id);
                         let i = self.expr(idx).scalar();
                         self.line(&format!("{nm}_p[nt_idx({i}, {nm}_n, {line})] {opstr}= {v};"));
+                    }
+                    LValue::Field(id, fi) => {
+                        let nm = self.local_name(*id);
+                        let f = self.field_name(self.f.unwrap().locals[*id].ty.clone(), *fi);
+                        self.line(&format!("{nm}.{f} {opstr}= {v};"));
+                    }
+                    LValue::IndexField(id, idx, fi, line) => {
+                        let nm = self.local_name(*id);
+                        let i = self.expr(idx).scalar();
+                        let elem = self.f.unwrap().locals[*id].ty.elem().unwrap().clone();
+                        let f = self.field_name(elem, *fi);
+                        self.line(&format!("{nm}_p[nt_idx({i}, {nm}_n, {line})].{f} {opstr}= {v};"));
                     }
                 }
             }
@@ -347,6 +374,16 @@ static void nt_println_f64(double v) {
                 s(format!("{nm}_p[nt_idx({i}, {nm}_n, {})]", e.line))
             }
             ExprKind::Len(id) => s(format!("{}_n", self.local_name(*id))),
+            ExprKind::Field(base, fi) => {
+                let f = self.field_name(base.ty.clone(), *fi);
+                let b = self.expr(base).scalar();
+                s(format!("({b}).{f}"))
+            }
+            ExprKind::StructLit(sid, vals) => {
+                let parts: Vec<String> = self.m.structs[*sid].fields.iter().map(|(f, _)| f.clone())
+                    .zip(vals.iter().map(|v| self.expr(v).scalar())).map(|(f, v)| format!(".{f} = {v}")).collect();
+                s(format!("((struct nt_{}){{{}}})", self.m.structs[*sid].name, parts.join(", ")))
+            }
             ExprKind::Ref(id, _) => {
                 let nm = self.local_name(*id);
                 CVal::Arr(format!("{nm}_p"), format!("{nm}_n"))
@@ -370,11 +407,11 @@ static void nt_println_f64(double v) {
             }
             ExprKind::Cast(a, ty) => {
                 let v = self.expr(a).scalar();
-                s(format!("(({})({v}))", c_ty(ty)))
+                s(format!("(({})({v}))", c_ty(self.m, ty)))
             }
             ExprKind::MinMax(is_min, a, b) => {
                 let (av, bv) = (self.expr(a).scalar(), self.expr(b).scalar());
-                let t = c_ty(&e.ty);
+                let t = c_ty(self.m, &e.ty);
                 let op = if *is_min { "<" } else { ">" };
                 let x = self.fresh("m");
                 s(format!("({{ {t} {x}a = {av}, {x}b = {bv}; {x}a {op} {x}b ? {x}a : {x}b; }})"))
@@ -402,7 +439,7 @@ static void nt_println_f64(double v) {
                 let rc = r.clone();
                 s(self.stmt_expr(|this| {
                     let target = if ty == Ty::Unit { Target::Discard } else {
-                        this.line(&format!("{} {rc};", c_ty(&ty)));
+                        this.line(&format!("{} {rc};", c_ty(self.m, &ty)));
                         Target::Assign(rc.clone())
                     };
                     this.line(&format!("if ({cv}) {{"));
@@ -425,13 +462,19 @@ static void nt_println_f64(double v) {
                     if ty == Ty::Unit {
                         this.block_body(b, Target::Discard);
                     } else {
-                        this.line(&format!("{} {rc};", c_ty(&ty)));
+                        this.line(&format!("{} {rc};", c_ty(self.m, &ty)));
                         this.block_body(b, Target::Assign(rc.clone()));
                         this.line(&format!("{rc};"));
                     }
                 }))
             }
         }
+    }
+
+    /// The C name of field `fi` of a struct type (or of a struct array's element type).
+    fn field_name(&self, t: Ty, fi: usize) -> String {
+        let t = match t { Ty::Array(e, _) | Ty::Slice(e, _, _) => *e, t => t };
+        match t { Ty::Struct(i) => self.m.structs[i].fields[fi].0.clone(), _ => unreachable!("field of a non-struct") }
     }
 
     /// Run `body` with output redirected, and wrap what it wrote as `({ ... })`.

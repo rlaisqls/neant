@@ -59,7 +59,7 @@ pub fn export(m: &Module, f: &Func) -> Result<(String, Vec<String>), String> {
 }
 
 fn c_ty(t: &Ty) -> &'static str {
-    match t { Ty::I64 => "long", Ty::F64 => "double", Ty::Bool => "int", Ty::U8 => "unsigned char", Ty::Unit => "void", Ty::Array(e, _) | Ty::Slice(e, _, _) => c_ty(e) }
+    match t { Ty::I64 => "long", Ty::F64 => "double", Ty::Bool => "int", Ty::U8 => "unsigned char", Ty::Unit | Ty::Struct(_) => "void", Ty::Array(e, _) | Ty::Slice(e, _, _) => c_ty(e) }
 }
 
 struct Ex<'a> {
@@ -120,6 +120,7 @@ impl<'a> Ex<'a> {
             ExprKind::If(c, t, els) => { self.scan_expr(c)?; self.scan_block(t)?; if let Some(b) = els { self.scan_block(b)?; } Ok(()) }
             ExprKind::Block(b) => self.scan_block(b),
             ExprKind::Println(_) => Err("`println` is not part of a SCoP".into()),
+            ExprKind::Field(..) | ExprKind::StructLit(..) => Err("a struct is not part of a SCoP: the polyhedral model reads arrays of scalars".into()),
             _ => Ok(()),
         }
     }
@@ -244,7 +245,11 @@ impl<'a> Ex<'a> {
             Stmt::Assign(lv, op, e) => {
                 let v = self.expr(e);
                 let o = op.map_or(String::new(), |o| o.c_str().to_string());
-                let target = match lv { LValue::Var(l) => self.name(*l), LValue::Index(a, i, _) => self.index(*a, i) };
+                let target = match lv {
+                    LValue::Var(l) => self.name(*l),
+                    LValue::Index(a, i, _) => self.index(*a, i),
+                    LValue::Field(..) | LValue::IndexField(..) => return Err("a struct field is not an affine array reference the polyhedral model reads".into()),
+                };
                 self.line(&format!("{target} {o}= {v};"));
                 Ok(())
             }
@@ -306,7 +311,7 @@ impl<'a> Ex<'a> {
             ExprKind::If(c, t, els) => format!("({} ? {} : {})", self.expr(c), t.tail.as_ref().map_or("0".to_string(), |x| self.expr(x)), els.as_ref().and_then(|b| b.tail.as_ref()).map_or("0".to_string(), |x| self.expr(x))),
             ExprKind::Block(b) => b.tail.as_ref().map_or("0".to_string(), |x| self.expr(x)),
             ExprKind::Ref(a, _) => self.f.locals[*a].name.clone(),
-            ExprKind::Call(..) | ExprKind::Println(_) => "0".into(),
+            ExprKind::Call(..) | ExprKind::Println(_) | ExprKind::Field(..) | ExprKind::StructLit(..) => "0".into(),
         }
     }
 }

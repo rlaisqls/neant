@@ -1,0 +1,4 @@
+struct Inner { a: i64 }
+struct Outer { i: Inner }
+
+fn main() { println(1); }

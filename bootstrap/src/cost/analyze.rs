@@ -177,6 +177,7 @@ fn tile_choice(an: &mut Analyzer, f: &Func) -> Option<TileChoice> {
     for piece in &moves.pieces {
         let t_exps: Vec<Rat> = piece.poly.terms.keys().filter_map(|m| m.factors.get(&Atom::Var(tvar)).copied()).collect();
         if t_exps.is_empty() || t_exps.iter().any(|e| e.n > 0) { continue; }
+
         for (ci, cond) in piece.conds.iter().enumerate() {
             if !cond.fits { continue; }
             let bytes = cond.ws.mul_atom_pow(Atom::B, Rat::one());
@@ -190,6 +191,12 @@ fn tile_choice(an: &mut Analyzer, f: &Func) -> Option<TileChoice> {
             rest.factors.remove(&Atom::Var(tvar));
             let mut rest_p = Poly::zero();
             rest_p.terms.insert(rest, coef);
+            // A regime that keeps *part* of a level resident — one tile in cache while the
+            // others stream — is one the ideal cache computes and an LRU machine does not
+            // deliver: the sweep measured such sides at up to thirty times their prediction.
+            // Two working sets of the same degree in `T` belong to the same level, so if one of
+            // them does not fit, this side is a partial fit and is not recommended.
+            if piece.conds.iter().any(|c| !c.fits && degree_in(&c.ws, tvar) == k) { continue; }
             let Some(inv) = rest_p.inv_mono() else { continue };
             let Some(side) = half.mul(&inv).root_mono(k.n) else { continue };
             let poly = piece.poly.subst_pow(tvar, &side);
@@ -221,6 +228,11 @@ fn tile_choice(an: &mut Analyzer, f: &Func) -> Option<TileChoice> {
     let mut wk = Cost { pieces: work.pieces.iter().map(|p| Piece { conds: p.conds.iter().map(|c| Cond { ws: c.ws.subst_pow(tvar, &side), fits: c.fits }).collect(), poly: p.poly.subst_pow(tvar, &side) }).collect() };
     wk.prune_at(&machine);
     Some(TileChoice { side: side_text, t, work: wk, moves: mv })
+}
+
+/// The largest power of `Var(v)` in any term.
+fn degree_in(p: &Poly, v: usize) -> Rat {
+    p.terms.keys().filter_map(|m| m.factors.get(&Atom::Var(v)).copied()).max().unwrap_or_else(Rat::zero)
 }
 
 /// Apply `--apply` specs (`name:tile`, `name:tile=T`, `name:transpose`) to a module before anything else sees it.
@@ -340,7 +352,13 @@ enum Fail {
 struct Site {
     arr: LocalId,
     aff: Option<Affine>,
+    /// bytes the site actually touches: the element's size, or one field's under AoS
     es: i128,
+    /// bytes the address moves per unit of the index: the element's size in memory. They differ
+    /// for a field of a struct array, and that difference is what a layout costs.
+    stride: i128,
+    /// which field, when the site is one field of a struct element
+    field: Option<usize>,
     path: Vec<usize>,
     /// the `if` branches this site sits in, outermost first: sites on different sides of one
     /// `if` are alternatives, and their moves combine by max, not sum
@@ -377,13 +395,15 @@ struct Fa<'a, 'b, 'c> {
     sites: Vec<Site>,
     loop_recs: Vec<LoopRec>,
     bounds: Vec<Bound>,
-    /// per array root, the largest injective image (bytes) any reference to it has: the footprint bound
-    images: HashMap<LocalId, Poly>,
+    /// per array root **and field**, the largest injective image (bytes) any reference to it
+    /// has. Two fields of one struct array are disjoint words, so they add; two references to
+    /// the same field cover each other, so the larger stands.
+    images: HashMap<(LocalId, Option<usize>), Poly>,
     /// A scalar that a statement of the enclosing block stores into, or loads from, an array
     /// element (`c[i·n + j] = acc`): inside that block the scalar *is* that element's running
     /// value, and a statement using it references the element. Register promotion does not
     /// change the computation, so the bound over the element's projection holds.
-    scalar_alias: HashMap<LocalId, (LocalId, Expr)>,
+    scalar_alias: HashMap<LocalId, (LocalId, Expr, Option<usize>)>,
     alias_scopes: Vec<Vec<LocalId>>,
     notes: Vec<String>,
     io: bool,
@@ -548,9 +568,9 @@ impl<'a, 'b, 'c> Fa<'a, 'b, 'c> {
         let effects = if self.io { vec!["io"] } else { vec![] };
         // the footprint bound: distinct elements of parameter arrays, each crossing once from cold
         let mut foot = Poly::zero();
-        let mut roots: Vec<&LocalId> = self.images.keys().collect();
-        roots.sort();
-        for r in roots { if self.f.params.contains(r) { foot = foot.add(&self.images[r]); } }
+        let mut keys: Vec<&(LocalId, Option<usize>)> = self.images.keys().collect();
+        keys.sort();
+        for k in keys { if self.f.params.contains(&k.0) { foot = foot.add(&self.images[k]); } }
         if !foot.is_zero() {
             self.bounds.push(Bound { kind: "footprint".into(), citation: "every distinct element crosses once".into(), moves: foot, line: self.f.line, cold: true });
         }
@@ -574,8 +594,8 @@ impl<'a, 'b, 'c> Fa<'a, 'b, 'c> {
             let (a, b) = (c.mul(&rec.lo), c.mul(&rec.last()));
             if negative { lo = lo.add(&b); hi = hi.add(&a); } else { lo = lo.add(&a); hi = hi.add(&b); }
         }
-        let es = Rat::int(site.es);
-        Some((lo.scale(es), hi.add(&Poly::constant(1)).scale(es)))
+        let st = Rat::int(site.stride);
+        Some((lo.scale(st), hi.scale(st).add(&Poly::constant(site.es))))
     }
 
     /// The function's footprint over its parameters, and the condition under which all of it is
@@ -923,19 +943,44 @@ impl<'a, 'b, 'c> Fa<'a, 'b, 'c> {
         }
     }
 
+    /// Bytes of one element of the array `l` in memory — a struct's size under AoS.
     fn elem_bytes(&self, l: LocalId) -> i128 {
-        self.f.locals[l].ty.elem().map_or(8, |t| t.elem_bytes())
+        self.f.locals[l].ty.elem().map_or(8, |t| self.an.m.size_of(t))
+    }
+    /// What a site on `l` touches: one field's bytes, or the whole element.
+    fn touch_bytes(&self, l: LocalId, field: Option<usize>) -> i128 {
+        match (self.f.locals[l].ty.elem(), field) {
+            (Some(Ty::Struct(s)), Some(fi)) => self.an.m.structs[*s].fields[fi].1.elem_bytes(),
+            _ => self.elem_bytes(l),
+        }
     }
 
     // ---- the moves rule ----
 
     /// Record an access site; its moves are settled with everyone else's at the end.
-    fn access(&mut self, arr: LocalId, idx: &Expr) {
+    /// Record an access site. Two accesses to the same array at the same index inside the same
+    /// loops touch the same lines — `ps[i].x` and `ps[i].y` are one element, `a[i]` twice in one
+    /// expression is one load — so they are **one site**, widened to cover both fields. Counting
+    /// them apart would charge an array of structs once per field read and no loop reading a
+    /// whole element could ever prefer that layout.
+    fn access(&mut self, arr: LocalId, idx: &Expr, field: Option<usize>) {
         if self.replay { return; }
-        let es = self.elem_bytes(arr);
+        let es = self.touch_bytes(arr, field);
+        let stride = self.elem_bytes(arr);
         let aff = self.affine(idx);
-        let path = self.loops.iter().map(|l| l.id).collect();
-        self.sites.push(Site { arr, aff, es, path, branch: self.branch.clone() });
+        let path: Vec<usize> = self.loops.iter().map(|l| l.id).collect();
+        let root = self.local_root.get(&arr).copied().unwrap_or(arr);
+        if let Some(prev) = self.sites.iter_mut().find(|s| {
+            let sroot = s.arr;
+            sroot == arr && s.stride == stride && s.path == path && s.branch == self.branch
+                && s.aff.is_some() && s.aff == aff
+        }) {
+            let _ = root;
+            // the same element: the span the two fields cover together, which is the element
+            if prev.field != field { prev.es = stride; }
+            return;
+        }
+        self.sites.push(Site { arr, aff, es, stride, field, path, branch: self.branch.clone() });
     }
 
     /// Lines touched by every access site over its loop nest, times B, added to moves. Level by
@@ -1015,7 +1060,7 @@ impl<'a, 'b, 'c> Fa<'a, 'b, 'c> {
                             let (total, contig) = if !fits {
                                 (summed.clone(), false)
                             } else {
-                                let stride = site.aff.as_ref().map(|a| rec.var.and_then(|v| a.coeffs.get(&v).cloned()).unwrap_or_else(Poly::zero).scale(Rat::int(site.es)));
+                                let stride = site.aff.as_ref().map(|a| rec.var.and_then(|v| a.coeffs.get(&v).cloned()).unwrap_or_else(Poly::zero).scale(Rat::int(site.stride)));
                                 match stride {
                                     None => (summed.clone(), false),
                                     Some(st) if st.is_zero() => (same_set(), lp.contig),
@@ -1083,9 +1128,16 @@ impl<'a, 'b, 'c> Fa<'a, 'b, 'c> {
     fn recognise(&mut self, s: &Stmt) {
         if self.replay { return; }
         // the references, reads and writes alike
-        let mut refs: Vec<(LocalId, &Expr)> = Vec::new();
+        let mut refs: Vec<(LocalId, &Expr, Option<usize>)> = Vec::new();
         match s {
-            Stmt::Assign(lv, _, e) => { if let LValue::Index(a, i, _) = lv { refs.push((*a, i)); } collect_refs(e, &mut refs); }
+            Stmt::Assign(lv, _, e) => {
+                match lv {
+                    LValue::Index(a, i, _) => refs.push((*a, i, None)),
+                    LValue::IndexField(a, i, fi, _) => refs.push((*a, i, Some(*fi))),
+                    _ => {}
+                }
+                collect_refs(e, &mut refs);
+            }
             Stmt::Let(_, e) | Stmt::Expr(e) => collect_refs(e, &mut refs),
             _ => {}
         }
@@ -1096,15 +1148,15 @@ impl<'a, 'b, 'c> Fa<'a, 'b, 'c> {
             Stmt::Let(_, e) | Stmt::Expr(e) => collect_scalars(e, &mut scalars),
             _ => {}
         }
-        let aliased: Vec<(LocalId, Expr)> = scalars.iter().filter_map(|v| self.scalar_alias.get(v).cloned()).collect();
-        for (arr, idx) in &aliased { refs.push((*arr, idx)); }
+        let aliased: Vec<(LocalId, Expr, Option<usize>)> = scalars.iter().filter_map(|v| self.scalar_alias.get(v).cloned()).collect();
+        for (arr, idx, fi) in &aliased { refs.push((*arr, idx, *fi)); }
         if refs.is_empty() { return; }
         let line = match s { Stmt::Assign(_, _, e) | Stmt::Let(_, e) | Stmt::Expr(e) => e.line, _ => 0 };
         // loop variables in scope with atoms, outermost first
         let nest: Vec<(LocalId, usize, usize)> = self.loops.iter().enumerate().filter_map(|(k, l)| Some((l.var?, l.atom?, k))).collect();
         let mut all_injective = true;
         let mut dim_sets: Vec<u32> = Vec::new();
-        for (arr, idx) in &refs {
+        for (arr, idx, fi) in &refs {
             let Some(aff) = self.affine(idx) else { all_injective = false; continue };
             let Some(dims) = self.injective_dims(&aff, &nest) else { all_injective = false; continue };
             let mut mask = 0u32;
@@ -1114,8 +1166,8 @@ impl<'a, 'b, 'c> Fa<'a, 'b, 'c> {
             // when their bounds mention no other loop
             if let Some(img) = self.image_size(&dims, &nest) {
                 let root = self.local_root.get(arr).copied().unwrap_or(*arr);
-                let bytes = img.scale(Rat::int(self.elem_bytes(*arr)));
-                let e = self.images.entry(root).or_insert_with(Poly::zero);
+                let bytes = img.scale(Rat::int(self.touch_bytes(*arr, *fi)));
+                let e = self.images.entry((root, *fi)).or_insert_with(Poly::zero);
                 if bounds_dominates(&bytes, e) { *e = bytes; }
             }
         }
@@ -1228,20 +1280,25 @@ impl<'a, 'b, 'c> Fa<'a, 'b, 'c> {
         let mut opened: Vec<LocalId> = Vec::new();
         let mut conflicted: Vec<LocalId> = Vec::new();
         let scalar_of = |e: &Expr| -> Option<LocalId> { match &e.kind { ExprKind::Local(v) => Some(*v), ExprKind::Cast(x, _) => if let ExprKind::Local(v) = &x.kind { Some(*v) } else { None }, _ => None } };
-        let mut found: Vec<(LocalId, LocalId, Expr)> = Vec::new();
+        let mut found: Vec<(LocalId, LocalId, Expr, Option<usize>)> = Vec::new();
         for st in &b.stmts {
             match st {
-                Stmt::Assign(LValue::Index(arr, idx, _), _, e) => { if let Some(v) = scalar_of(e) { found.push((v, *arr, idx.clone())); } }
-                Stmt::Let(v, e) | Stmt::Assign(LValue::Var(v), None, e) => { if let ExprKind::Index(arr, idx) = &e.kind { found.push((*v, *arr, (**idx).clone())); } }
+                Stmt::Assign(LValue::Index(arr, idx, _), _, e) => { if let Some(v) = scalar_of(e) { found.push((v, *arr, idx.clone(), None)); } }
+                Stmt::Assign(LValue::IndexField(arr, idx, fi, _), _, e) => { if let Some(v) = scalar_of(e) { found.push((v, *arr, idx.clone(), Some(*fi))); } }
+                Stmt::Let(v, e) | Stmt::Assign(LValue::Var(v), None, e) => match &e.kind {
+                    ExprKind::Index(arr, idx) => found.push((*v, *arr, (**idx).clone(), None)),
+                    ExprKind::Field(base, fi) => { if let ExprKind::Index(arr, idx) = &base.kind { found.push((*v, *arr, (**idx).clone(), Some(*fi))); } }
+                    _ => {}
+                },
                 _ => {}
             }
         }
-        for (v, arr, idx) in found {
+        for (v, arr, idx, fi) in found {
             if !self.f.locals[v].ty.is_scalar() || conflicted.contains(&v) { continue; }
             match self.scalar_alias.get(&v) {
-                Some((a2, i2)) if *a2 == arr && self.affine(i2).is_some() && self.affine(i2) == self.affine(&idx) => {}
+                Some((a2, i2, f2)) if *a2 == arr && *f2 == fi && self.affine(i2).is_some() && self.affine(i2) == self.affine(&idx) => {}
                 Some(_) => { self.scalar_alias.remove(&v); conflicted.push(v); opened.retain(|x| *x != v); }
-                None => { self.scalar_alias.insert(v, (arr, idx)); opened.push(v); }
+                None => { self.scalar_alias.insert(v, (arr, idx, fi)); opened.push(v); }
             }
         }
         self.alias_scopes.push(opened);
@@ -1326,7 +1383,13 @@ impl<'a, 'b, 'c> Fa<'a, 'b, 'c> {
                     LValue::Index(arr, idx, _) => {
                         self.expr(idx)?;
                         self.add_work_n(if op.is_some() { 3 } else { 1 });
-                        self.access(*arr, idx);
+                        self.access(*arr, idx, None);
+                    }
+                    LValue::Field(..) => self.add_work_n(if op.is_some() { 1 } else { 0 }),
+                    LValue::IndexField(arr, idx, fi, _) => {
+                        self.expr(idx)?;
+                        self.add_work_n(if op.is_some() { 3 } else { 1 });
+                        self.access(*arr, idx, Some(*fi));
                     }
                 }
                 Ok(())
@@ -1472,7 +1535,7 @@ impl<'a, 'b, 'c> Fa<'a, 'b, 'c> {
                         // m changes by k·delta, so it decreases by −k·delta
                         acc = acc.add(k.mul(Rat::int(delta)).neg());
                     }
-                    Stmt::Assign(LValue::Var(_), _, _) | Stmt::Assign(LValue::Index(..), _, _) | Stmt::Let(..) | Stmt::LetArray(..) | Stmt::LetRepeat(..) | Stmt::LetBuild { .. } => {}
+                    Stmt::Assign(LValue::Var(_) | LValue::Index(..) | LValue::Field(..) | LValue::IndexField(..), _, _) | Stmt::Let(..) | Stmt::LetArray(..) | Stmt::LetRepeat(..) | Stmt::LetBuild { .. } => {}
                     Stmt::Expr(Expr { kind: ExprKind::If(_, t, e), .. }) => {
                         let bt = block(t, coef, f)?;
                         let be = match e { Some(e) => block(e, coef, f)?, None => Some(Rat::zero()) };
@@ -1544,9 +1607,22 @@ impl<'a, 'b, 'c> Fa<'a, 'b, 'c> {
             ExprKind::Index(arr, idx) => {
                 self.expr(idx)?;
                 self.add_work_n(1);
-                self.access(*arr, idx);
+                self.access(*arr, idx, None);
                 Ok(())
             }
+            // `xs[i].f` is one load of one field, not of the element: the site touches the field
+            // and steps by the element, which is what makes AoS and SoA differ
+            ExprKind::Field(base, fi) => match &base.kind {
+                ExprKind::Index(arr, idx) => {
+                    self.expr(idx)?;
+                    self.add_work_n(1);
+                    self.access(*arr, idx, Some(*fi));
+                    Ok(())
+                }
+                // a field of a value in registers is free
+                _ => self.expr(base),
+            },
+            ExprKind::StructLit(_, vals) => { for v in vals { self.expr(v)?; } Ok(()) }
             ExprKind::If(c, t, els) => {
                 self.expr(c)?;
                 self.add_work_n(1);
@@ -1767,9 +1843,14 @@ fn bound_mentions(e: &Expr, l: LocalId) -> bool {
 }
 
 /// Every `x[i]` in an expression tree, reads only (the write is the statement's left side).
-fn collect_refs<'e>(e: &'e Expr, out: &mut Vec<(LocalId, &'e Expr)>) {
+fn collect_refs<'e>(e: &'e Expr, out: &mut Vec<(LocalId, &'e Expr, Option<usize>)>) {
     match &e.kind {
-        ExprKind::Index(a, i) => { out.push((*a, i)); collect_refs(i, out); }
+        ExprKind::Index(a, i) => { out.push((*a, i, None)); collect_refs(i, out); }
+        ExprKind::Field(base, fi) => match &base.kind {
+            ExprKind::Index(a, i) => { out.push((*a, i, Some(*fi))); collect_refs(i, out); }
+            _ => collect_refs(base, out),
+        },
+        ExprKind::StructLit(_, vals) => for v in vals { collect_refs(v, out); },
         ExprKind::Binary(_, a, b) | ExprKind::MinMax(_, a, b) => { collect_refs(a, out); collect_refs(b, out); }
         ExprKind::Unary(_, a) | ExprKind::Cast(a, _) | ExprKind::Println(a) => collect_refs(a, out),
         ExprKind::Call(_, args) => for a in args { collect_refs(a, out); },
@@ -1793,6 +1874,8 @@ fn collect_scalars(e: &Expr, out: &mut Vec<LocalId>) {
         ExprKind::Binary(_, a, b) | ExprKind::MinMax(_, a, b) => { collect_scalars(a, out); collect_scalars(b, out); }
         ExprKind::Unary(_, a) | ExprKind::Cast(a, _) | ExprKind::Println(a) => collect_scalars(a, out),
         ExprKind::Call(_, args) => for a in args { collect_scalars(a, out); },
+        ExprKind::Field(base, _) => collect_scalars(base, out),
+        ExprKind::StructLit(_, vals) => for v in vals { collect_scalars(v, out); },
         ExprKind::If(c, t, els) => { collect_scalars(c, out); for b in std::iter::once(t).chain(els.iter()) { if let Some(x) = &b.tail { collect_scalars(x, out); } } }
         ExprKind::Block(b) => { if let Some(x) = &b.tail { collect_scalars(x, out); } }
         _ => {}

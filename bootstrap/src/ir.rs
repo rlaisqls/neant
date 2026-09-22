@@ -27,11 +27,49 @@ pub enum Ty {
     Array(Box<Ty>, Size),
     /// A view `&[T]` / `&mut [T]`. Carries the size of what it views.
     Slice(Box<Ty>, bool, Size),
+    /// A struct value, by index into the module's table. Passed and returned by copy.
+    Struct(StructId),
+}
+
+pub type StructId = usize;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Layout { Aos, Soa }
+
+#[derive(Debug, Clone)]
+pub struct StructDef {
+    pub name: String,
+    /// scalar fields, in declaration order
+    pub fields: Vec<(String, Ty)>,
+    /// the layout of every array of this struct in the program: fixed by `#[layout]` when
+    /// `fixed`, else the compiler's choice (AoS until the layout analysis runs)
+    pub layout: Layout,
+    pub fixed: bool,
+}
+
+impl StructDef {
+    /// C's rules for the AoS element: each field aligned to its size, the whole padded to the
+    /// largest alignment.
+    pub fn size(&self) -> i128 {
+        let mut off = 0i128;
+        let mut align = 1i128;
+        for (_, t) in &self.fields {
+            let sz = t.elem_bytes();
+            off = (off + sz - 1) / sz * sz;
+            off += sz;
+            align = align.max(sz);
+        }
+        (off + align - 1) / align * align
+    }
+    pub fn field(&self, name: &str) -> Option<usize> { self.fields.iter().position(|(f, _)| f == name) }
 }
 
 impl Ty {
     pub fn is_scalar(&self) -> bool { matches!(self, Ty::I64 | Ty::F64 | Ty::Bool | Ty::U8) }
+    /// A value that lives in registers and is copied: a scalar or a struct.
+    pub fn is_value(&self) -> bool { self.is_scalar() || matches!(self, Ty::Struct(_)) }
     pub fn is_numeric(&self) -> bool { matches!(self, Ty::I64 | Ty::F64 | Ty::U8) }
+    /// Bytes of a scalar; a struct's size needs the module (`Module::size_of`).
     pub fn elem_bytes(&self) -> i128 { match self { Ty::Bool | Ty::U8 => 1, _ => 8 } }
     pub fn is_arrayish(&self) -> bool { matches!(self, Ty::Array(..) | Ty::Slice(..)) }
     pub fn elem(&self) -> Option<&Ty> {
@@ -62,6 +100,7 @@ impl fmt::Display for Ty {
             Ty::Array(t, Size::Var(_)) => write!(f, "[{t}; n]"),
             Ty::Slice(t, false, _) => write!(f, "&[{t}]"),
             Ty::Slice(t, true, _) => write!(f, "&mut [{t}]"),
+            Ty::Struct(i) => write!(f, "struct#{i}"),
         }
     }
 }
@@ -69,6 +108,22 @@ impl fmt::Display for Ty {
 #[derive(Debug, Clone)]
 pub struct Module {
     pub funcs: Vec<Func>,
+    pub structs: Vec<StructDef>,
+}
+
+impl Module {
+    /// Bytes of one element of type `t` in memory: a scalar's size, or the struct's AoS size.
+    pub fn size_of(&self, t: &Ty) -> i128 {
+        match t { Ty::Struct(i) => self.structs[*i].size(), Ty::Array(e, _) | Ty::Slice(e, _, _) => self.size_of(e), t => t.elem_bytes() }
+    }
+    pub fn type_name(&self, t: &Ty) -> String {
+        match t {
+            Ty::Struct(i) => self.structs[*i].name.clone(),
+            Ty::Array(e, s) => format!("[{}; {}]", self.type_name(e), match s { Size::Const(n) => n.to_string(), Size::Var(_) => "n".into() }),
+            Ty::Slice(e, m, _) => format!("&{}[{}]", if *m { "mut " } else { "" }, self.type_name(e)),
+            t => t.to_string(),
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -131,6 +186,10 @@ pub enum Stmt {
 pub enum LValue {
     Var(LocalId),
     Index(LocalId, Expr, u32),
+    /// `v.f`, `v` a struct local
+    Field(LocalId, usize),
+    /// `xs[i].f`
+    IndexField(LocalId, Expr, usize, u32),
 }
 
 #[derive(Debug, Clone)]
@@ -150,6 +209,10 @@ pub enum ExprKind {
     Binary(crate::ast::BinOp, Box<Expr>, Box<Expr>),
     Unary(crate::ast::UnOp, Box<Expr>),
     Index(LocalId, Box<Expr>),
+    /// `e.f` by field position
+    Field(Box<Expr>, usize),
+    /// `S { … }` with every field, in declaration order
+    StructLit(StructId, Vec<Expr>),
     Call(FuncId, Vec<Expr>),
     Println(Box<Expr>),
     Len(LocalId),

@@ -10,7 +10,25 @@ use crate::diag::{err, Result};
 use crate::ir::*;
 
 pub fn check(prog: &ast::Program) -> Result<Module> {
-    // signatures first, so calls can go in any order
+    // struct types first: fields are scalar, names unique
+    let mut struct_ids: HashMap<String, StructId> = HashMap::new();
+    let mut structs: Vec<StructDef> = Vec::new();
+    for sd in &prog.structs {
+        if struct_ids.contains_key(&sd.name) { return err(sd.line, sd.col, format!("struct `{}` is defined twice", sd.name)); }
+        if matches!(sd.name.as_str(), "i64" | "f64" | "bool" | "u8") { return err(sd.line, sd.col, format!("`{}` is a builtin type", sd.name)); }
+        let mut fields: Vec<(String, Ty)> = Vec::new();
+        for (f, t, fl, fc) in &sd.fields {
+            if fields.iter().any(|(g, _)| g == f) { return err(*fl, *fc, format!("field `{f}` is declared twice")); }
+            let ty = resolve_type(t, &struct_ids, *fl, *fc)?;
+            if !ty.is_scalar() { return err(*fl, *fc, format!("a field is a scalar (`i64 f64 bool u8`); `{f}` is not")); }
+            fields.push((f.clone(), ty));
+        }
+        if fields.is_empty() { return err(sd.line, sd.col, format!("struct `{}` has no fields", sd.name)); }
+        let (layout, fixed) = match sd.layout.as_deref() { Some("soa") => (Layout::Soa, true), Some(_) => (Layout::Aos, true), None => (Layout::Aos, false) };
+        struct_ids.insert(sd.name.clone(), structs.len());
+        structs.push(StructDef { name: sd.name.clone(), fields, layout, fixed });
+    }
+    // signatures next, so calls can go in any order
     let mut sigs: HashMap<String, (FuncId, Vec<Ty>, Ty)> = HashMap::new();
     for (i, f) in prog.funcs.iter().enumerate() {
         if sigs.contains_key(&f.name) {
@@ -21,13 +39,13 @@ pub fn check(prog: &ast::Program) -> Result<Module> {
         }
         let mut ptys = Vec::new();
         for p in &f.params {
-            let ty = resolve_type(&p.ty, p.line, p.col)?;
+            let ty = resolve_type(&p.ty, &struct_ids, p.line, p.col)?;
             match ty {
                 Ty::Array(..) => return err(p.line, p.col, "arrays are passed as views: write `&[T]` or `&mut [T]`"),
                 _ => ptys.push(ty),
             }
         }
-        let ret = resolve_type(&f.ret, f.line, f.col)?;
+        let ret = resolve_type(&f.ret, &struct_ids, f.line, f.col)?;
         if ret.is_arrayish() {
             return err(f.line, f.col, "functions return scalars or `()` for now; write into an `&mut [T]` parameter");
         }
@@ -48,14 +66,14 @@ pub fn check(prog: &ast::Program) -> Result<Module> {
 
     let mut funcs = Vec::new();
     for f in &prog.funcs {
-        funcs.push(check_func(f, &sigs)?);
+        funcs.push(check_func(f, &sigs, &structs, &struct_ids)?);
     }
-    Ok(Module { funcs })
+    Ok(Module { funcs, structs })
 }
 
 /// Only the size-free part of a type expression; sizes are attached by the checker where a
 /// value is created.
-fn resolve_type(t: &ast::TypeExpr, line: u32, col: u32) -> Result<Ty> {
+fn resolve_type(t: &ast::TypeExpr, structs: &HashMap<String, StructId>, line: u32, col: u32) -> Result<Ty> {
     Ok(match t {
         ast::TypeExpr::Unit => Ty::Unit,
         ast::TypeExpr::Named(n) => match n.as_str() {
@@ -63,19 +81,19 @@ fn resolve_type(t: &ast::TypeExpr, line: u32, col: u32) -> Result<Ty> {
             "f64" => Ty::F64,
             "bool" => Ty::Bool,
             "u8" => Ty::U8,
-            other => return err(line, col, format!("unknown type `{other}`")),
+            other => match structs.get(other) { Some(i) => Ty::Struct(*i), None => return err(line, col, format!("unknown type `{other}`")) },
         },
         ast::TypeExpr::Slice(elem, m) => {
-            let e = resolve_type(elem, line, col)?;
-            if !e.is_scalar() {
-                return err(line, col, "element type of a slice must be scalar for now");
+            let e = resolve_type(elem, structs, line, col)?;
+            if !e.is_value() {
+                return err(line, col, "element type of a slice must be a scalar or a struct");
             }
             Ty::Slice(Box::new(e), *m, Size::Const(-1))
         }
         ast::TypeExpr::Array(elem, n) => {
-            let e = resolve_type(elem, line, col)?;
-            if !e.is_scalar() {
-                return err(line, col, "element type of an array must be scalar for now");
+            let e = resolve_type(elem, structs, line, col)?;
+            if !e.is_value() {
+                return err(line, col, "element type of an array must be a scalar or a struct");
             }
             match n.kind {
                 ast::ExprKind::Int(k) if k >= 0 => Ty::Array(Box::new(e), Size::Const(k)),
@@ -87,6 +105,8 @@ fn resolve_type(t: &ast::TypeExpr, line: u32, col: u32) -> Result<Ty> {
 
 struct Ctx<'a> {
     sigs: &'a HashMap<String, (FuncId, Vec<Ty>, Ty)>,
+    structs: &'a [StructDef],
+    struct_ids: &'a HashMap<String, StructId>,
     locals: Vec<Local>,
     scopes: Vec<HashMap<String, LocalId>>,
     sizes: Vec<SizeInfo>,
@@ -102,9 +122,9 @@ struct Ctx<'a> {
     root: HashMap<LocalId, LocalId>,
 }
 
-fn check_func(f: &ast::Func, sigs: &HashMap<String, (FuncId, Vec<Ty>, Ty)>) -> Result<Func> {
+fn check_func(f: &ast::Func, sigs: &HashMap<String, (FuncId, Vec<Ty>, Ty)>, structs: &[StructDef], struct_ids: &HashMap<String, StructId>) -> Result<Func> {
     let (_, ptys, ret) = &sigs[&f.name];
-    let mut cx = Ctx { sigs, locals: vec![], scopes: vec![HashMap::new()], sizes: vec![], ret: ret.clone(), in_loop: 0, in_closure: 0, fresh: 0, pending_lets: vec![], root: HashMap::new() };
+    let mut cx = Ctx { sigs, structs, struct_ids, locals: vec![], scopes: vec![HashMap::new()], sizes: vec![], ret: ret.clone(), in_loop: 0, in_closure: 0, fresh: 0, pending_lets: vec![], root: HashMap::new() };
     let mut params = Vec::new();
     for (p, ty) in f.params.iter().zip(ptys) {
         // a slice parameter's size is its own variable, named after the parameter
@@ -195,7 +215,7 @@ impl<'a> Ctx<'a> {
         match s {
             ast::Stmt::Let { name, mutable, ty, init, line, col } => {
                 let declared = match ty {
-                    Some(t) => Some(resolve_type(t, *line, *col)?),
+                    Some(t) => Some(resolve_type(t, self.struct_ids, *line, *col)?),
                     None => None,
                 };
                 // arrays are born here and only here
@@ -211,8 +231,8 @@ impl<'a> Ctx<'a> {
                         let mut out = Vec::new();
                         for e in elems {
                             let ce = self.expr(e)?;
-                            if !ce.ty.is_scalar() {
-                                return err(e.line, e.col, "array elements must be scalar");
+                            if !ce.ty.is_value() {
+                                return err(e.line, e.col, "array elements must be scalars or structs");
                             }
                             if let Some(first) = out.first() {
                                 let f: &Expr = first;
@@ -244,8 +264,8 @@ impl<'a> Ctx<'a> {
                         let x = self.declare(var, src_elem.clone(), false);
                         let load = Expr { kind: ExprKind::Index(src, Box::new(Expr { kind: ExprKind::Local(k), ty: Ty::I64, line: init.line })), ty: src_elem, line: init.line };
                         let ce = self.expr(elem)?;
-                        if !ce.ty.is_scalar() {
-                            return err(elem.line, elem.col, "comprehension elements must be scalar");
+                        if !ce.ty.is_value() {
+                            return err(elem.line, elem.col, "comprehension elements must be scalars or structs");
                         }
                         self.scopes.pop();
                         let body = Block { stmts: vec![Stmt::Let(x, load)], tail: Some(Box::new(ce.clone())), ty: ce.ty.clone() };
@@ -257,8 +277,8 @@ impl<'a> Ctx<'a> {
                     }
                     ast::ExprKind::ArrayRepeat(e, n) => {
                         let ce = self.expr(e)?;
-                        if !ce.ty.is_scalar() {
-                            return err(e.line, e.col, "array elements must be scalar");
+                        if !ce.ty.is_value() {
+                            return err(e.line, e.col, "array elements must be scalars or structs");
                         }
                         let cn = self.expr(n)?;
                         if cn.ty != Ty::I64 {
@@ -338,7 +358,35 @@ impl<'a> Ctx<'a> {
                         };
                         (LValue::Index(id, ci, target.line), elem)
                     }
-                    _ => return err(*line, *col, "assignment target must be a variable or an element"),
+                    ast::ExprKind::Field(base, fname) => match &base.kind {
+                        // `v.f = e`
+                        ast::ExprKind::Var(n) => {
+                            let id = self.lookup(n).map_or_else(|| err(base.line, base.col, format!("unknown variable `{n}`")), Ok)?;
+                            let l = &self.locals[id];
+                            let Ty::Struct(sid) = l.ty else { return err(target.line, target.col, format!("`{n}` is not a struct; it has no field `{fname}`")) };
+                            if !l.mutable { return err(target.line, target.col, format!("`{n}` is not mutable; declare it with `let mut`")); }
+                            let Some(fi) = self.structs[sid].field(fname) else { return err(target.line, target.col, format!("`{}` has no field `{fname}`", self.structs[sid].name)) };
+                            (LValue::Field(id, fi), self.structs[sid].fields[fi].1.clone())
+                        }
+                        // `xs[i].f = e`
+                        ast::ExprKind::Index(arr, idx) => {
+                            let id = self.local_by_expr(arr, "the array being indexed")?;
+                            let ci = self.expr(idx)?;
+                            if ci.ty != Ty::I64 { return err(idx.line, idx.col, format!("index must be `i64`, found `{}`", ci.ty)); }
+                            let l = &self.locals[id];
+                            let elem = match &l.ty {
+                                Ty::Array(e, _) => { if !l.mutable { return err(target.line, target.col, format!("`{}` is not mutable; declare it with `let mut`", l.name)); } (**e).clone() }
+                                Ty::Slice(e, true, _) => (**e).clone(),
+                                Ty::Slice(_, false, _) => return err(target.line, target.col, format!("`{}` is a `&[T]` view; writing needs `&mut [T]`", l.name)),
+                                t => return err(target.line, target.col, format!("cannot index a value of type `{t}`")),
+                            };
+                            let Ty::Struct(sid) = elem else { return err(target.line, target.col, format!("elements of `{}` are not structs; there is no field `{fname}`", l.name)) };
+                            let Some(fi) = self.structs[sid].field(fname) else { return err(target.line, target.col, format!("`{}` has no field `{fname}`", self.structs[sid].name)) };
+                            (LValue::IndexField(id, ci, fi, target.line), self.structs[sid].fields[fi].1.clone())
+                        }
+                        _ => return err(*line, *col, "a field can be assigned on a variable (`v.f`) or an element (`xs[i].f`)"),
+                    },
+                    _ => return err(*line, *col, "assignment target must be a variable, an element or a field"),
                 };
                 if let Some(op) = op {
                     if !tty.is_numeric() {
@@ -491,6 +539,29 @@ impl<'a> Ctx<'a> {
                 };
                 mk(ExprKind::Index(id, Box::new(ci)), elem)
             }
+            ast::ExprKind::Field(base, fname) => {
+                let cb = self.expr(base)?;
+                let Ty::Struct(sid) = cb.ty else { return err(e.line, e.col, format!("`.{fname}` on a `{}`, which is not a struct", cb.ty)) };
+                let Some(fi) = self.structs[sid].field(fname) else { return err(e.line, e.col, format!("`{}` has no field `{fname}`", self.structs[sid].name)) };
+                let ty = self.structs[sid].fields[fi].1.clone();
+                mk(ExprKind::Field(Box::new(cb), fi), ty)
+            }
+            ast::ExprKind::StructLit(name, fields) => {
+                let Some(&sid) = self.struct_ids.get(name) else { return err(e.line, e.col, format!("unknown struct `{name}`")) };
+                let def = &self.structs[sid];
+                let mut vals: Vec<Option<Expr>> = vec![None; def.fields.len()];
+                for (f, v) in fields {
+                    let Some(fi) = def.field(f) else { return err(v.line, v.col, format!("`{name}` has no field `{f}`")) };
+                    if vals[fi].is_some() { return err(v.line, v.col, format!("field `{f}` is given twice")); }
+                    let cv = self.expr(v)?;
+                    if cv.ty != def.fields[fi].1 { return err(v.line, v.col, format!("field `{f}` is `{}`, given `{}`", def.fields[fi].1, cv.ty)); }
+                    vals[fi] = Some(cv);
+                }
+                if let Some(k) = vals.iter().position(|v| v.is_none()) {
+                    return err(e.line, e.col, format!("`{name}` literal is missing field `{}`", def.fields[k].0));
+                }
+                mk(ExprKind::StructLit(sid, vals.into_iter().map(|v| v.unwrap()).collect()), Ty::Struct(sid))
+            }
             ast::ExprKind::Call(name, args) if name == "min" || name == "max" => {
                 if args.len() != 2 {
                     return err(e.line, e.col, format!("`{name}` takes two arguments"));
@@ -593,7 +664,7 @@ impl<'a> Ctx<'a> {
             }
             ast::ExprKind::Cast(inner, ty) => {
                 let ci = self.expr(inner)?;
-                let target = resolve_type(ty, e.line, e.col)?;
+                let target = resolve_type(ty, self.struct_ids, e.line, e.col)?;
                 if !ci.ty.is_numeric() || !target.is_numeric() {
                     return err(e.line, e.col, format!("`as` converts between `i64`, `f64` and `u8`; found `{}` as `{target}`", ci.ty));
                 }

@@ -3,6 +3,18 @@
 #[derive(Debug, Clone)]
 pub struct Program {
     pub funcs: Vec<Func>,
+    pub structs: Vec<StructDef>,
+}
+
+/// `struct S { f: T, … }` with scalar fields; `#[layout(aos|soa)]` fixes the layout the compiler
+/// would otherwise choose.
+#[derive(Debug, Clone)]
+pub struct StructDef {
+    pub name: String,
+    pub fields: Vec<(String, TypeExpr, u32, u32)>,
+    pub layout: Option<String>,
+    pub line: u32,
+    pub col: u32,
 }
 
 #[derive(Debug, Clone)]
@@ -78,6 +90,10 @@ pub enum ExprKind {
     Binary(BinOp, Box<Expr>, Box<Expr>),
     Unary(UnOp, Box<Expr>),
     Index(Box<Expr>, Box<Expr>),
+    /// `e.f`
+    Field(Box<Expr>, String),
+    /// `S { f: e, … }`
+    StructLit(String, Vec<(String, Expr)>),
     Call(String, Vec<Expr>),
     MethodCall(Box<Expr>, String, Vec<Expr>),
     /// `&e` / `&mut e`

@@ -1,0 +1,39 @@
+// structs: values by copy, fields of elements, and what a layout costs
+struct Point { x: f64, y: f64, z: f64 }
+
+fn norm2(p: Point) -> f64 { p.x * p.x + p.y * p.y + p.z * p.z }
+
+// one field of every element: under AoS the whole element's line is fetched
+fn sum_x(ps: &[Point]) -> f64 {
+    let mut s = 0.0;
+    for i in 0..ps.len() {
+        s += ps[i].x;
+    }
+    s
+}
+
+// every field of every element: one stream either way
+fn sum_all(ps: &[Point]) -> f64 {
+    let mut s = 0.0;
+    for i in 0..ps.len() {
+        s += ps[i].x + ps[i].y + ps[i].z;
+    }
+    s
+}
+
+fn shift(ps: &mut [Point], d: f64) {
+    for i in 0..ps.len() {
+        ps[i].x += d;
+    }
+}
+
+fn main() {
+    let mut ps = [Point { x: 1.0, y: 2.0, z: 3.0 }; 4];
+    ps[2].y = 9.0;
+    let q = ps[2];
+    println(q.y);
+    println(norm2(q));
+    shift(&mut ps, 0.5);
+    println(sum_x(&ps));
+    println(sum_all(&ps));
+}

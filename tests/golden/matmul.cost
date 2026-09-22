@@ -6,8 +6,8 @@ matmul           work 10·n³ + 5·n² + 2·n           moves                   
                  lower bound      moves 24·n²                        (footprint, every distinct element crosses once)   gap 1× if ≈ 8·n² < M at M = 2 MiB, B = 64
                  footprint        a: [0, 8·n²)  b: [0, 8·n²)  c: [0, 8·n²)   resident after if 24·n² < M
                  `b` moves by 8·n bytes per iteration of the innermost loop: a new line every time (line 7)
-                 tile T < √M/8 (at M/2, leading term) work ≈ 88·n³/√M + 320·n³/M + 2560·n³/M^(3/2) + 10·n³ moves ≈ 128·n³/√M + 64·B·n³/M if ≈ 8·n ≥ M [--apply matmul:tile=178]   gap 16× if ≈ 8·n ≥ M
-                 tile by 178      work ≈ 10.0733·n³                 moves ≈ 3.1562e-5·B·n³ + 0.0899·n³ if ≈ 8·n ≥ M | ≈ 0.0169·B·n² + 40·n² if ≈ 8·n² < M (+2 regimes) [--apply matmul:tile=178]   gap 17× if ≈ 8·n ≥ M; 17× if ≈ 8·n < M and ≈ B·n + 2848·n ≥ M; 8× if ≈ 8·n² ≥ M and ≈ B·n + 2848·n < M
+                 tile T < 0.1443·√M (at M/2, leading term) work ≈ 76.2301·n³/√M + 240.1250·n³/M + 1664.0678·n³/M^(3/2) + 10·n³ moves ≈ 110.8801·n³/√M + 48.0250·B·n³/M if ≈ 8·n ≥ M [--apply matmul:tile=206]   gap 14× if ≈ 8·n ≥ M
+                 tile by 206      work ≈ 10.0633·n³                 moves ≈ 2.3565e-5·B·n³ + 0.0777·n³ if ≈ 8·n ≥ M | ≈ 0.0097·B·n² + 32·n² if ≈ 8·n² < M (+2 regimes) [--apply matmul:tile=206]   gap 14× if ≈ 8·n ≥ M; 14× if ≈ 8·n < M and ≈ B·n + 3296·n ≥ M; 7× if ≈ 8·n² ≥ M and ≈ B·n + 3296·n < M
                  transpose the column operand work ≈ 10·n³                      moves ≈ 16·n³ if ≈ 16·n ≥ M | 48·n² + 4·B·n if ≈ 8·n² < M (+2 regimes) [--apply matmul:transpose]   gap 2896× if ≈ 16·n ≥ M; 1448× if ≈ B·n + 8·n ≥ M and ≈ 16·n < M; 1448× if ≈ B·n + 8·n < M and ≈ 8·n² ≥ M
 main             work 467                          moves 9·B + 648                    exact, io
                  in `matmul`: `b` moves by 8·n bytes per iteration of the innermost loop: a new line every time (line 7)

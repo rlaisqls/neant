@@ -37,6 +37,8 @@ SWEEP = {
     "matmul_tile_300": ([1600, 2496], 1, "matmul_naive", ["--apply", "matmul:tile=300"]),
     "matmul_tile_361": ([1600, 2496], 1, "matmul_naive", ["--apply", "matmul:tile=361"]),
     "matmul_tile_420": ([1600, 2496], 1, "matmul_naive", ["--apply", "matmul:tile=420"]),
+    # the side the model chooses once partial fits are excluded
+    "matmul_tile_206": ([1600, 2496], 1, "matmul_naive", ["--apply", "matmul:tile=206"]),
 }
 
 def run(cmd, **kw):
