@@ -707,6 +707,29 @@ fn mk_var(nodes: &mut [Node], cst: &mut [i64], name: i64) -> i64 {
     n
 }
 
+fn mk_bin(nodes: &mut [Node], cst: &mut [i64], op: i64, a: i64, b: i64) -> i64 {
+    let n = nnew(nodes, cst, 66);
+    nodes[n].a = a;
+    nodes[n].b = b;
+    nodes[n].ival = op;
+    n
+}
+
+fn mk_bool(nodes: &mut [Node], cst: &mut [i64], v: i64) -> i64 {
+    let n = nnew(nodes, cst, 62);
+    nodes[n].ival = v;
+    n
+}
+
+// `LHS <op>= RHS`, or a plain assignment when `op` is −1
+fn mk_assign(nodes: &mut [Node], cst: &mut [i64], tgt: i64, val: i64, op: i64) -> i64 {
+    let n = nnew(nodes, cst, 91);
+    nodes[n].a = tgt;
+    nodes[n].b = val;
+    nodes[n].ival = op;
+    n
+}
+
 fn check_chain(src: &[u8], toks: &[Token], nodes: &mut [Node], types: &mut [Ty], syms: &mut [Sym],
                sigs: &[Sig], ptys: &[i64], strs: &[Str], flds: &[Fld], ntys: &mut [i64],
                cst: &mut [i64], n: i64) -> i64 {
@@ -718,14 +741,27 @@ fn check_chain(src: &[u8], toks: &[Token], nodes: &mut [Node], types: &mut [Ty],
         st0 += 1;
         cur = nodes[cur].a;
     }
-    if nodes[cur].kind == 81 || st0 < 2 { cst[2] = 1; return 0 - 1; }
-    // the innermost stage must be `.iter()` over a named array
-    let it = cst[40 + st0 - 1];
-    if !name_is(src, toks, nodes[it].b, b'i', b't', b'e', 4) || nodes[cur].kind != 65 {
-        cst[2] = 1;
-        return 0 - 1;
+    if nodes[cur].kind == 81 || st0 < 1 { cst[2] = 1; return 0 - 1; }
+    // **A comprehension is the same loop**: its condition is a filter and its element a map, both
+    // over the variable it names, pushed in front of whatever follows. `[x*x for x in xs if x>0].sum()`
+    // needs nothing of its own beyond that.
+    let mut comp = 0 - 1;
+    let mut sname = 0 - 1;
+    if nodes[cur].kind == 80 {
+        comp = cur;
+        if nodes[nodes[cur].c].kind != 65 { cst[2] = 1; return 0 - 1; }
+        sname = nodes[nodes[cur].c].a;
+        if st0 < 1 { cst[2] = 1; return 0 - 1; }
+    } else {
+        if st0 < 2 { cst[2] = 1; return 0 - 1; }
+        let it = cst[40 + st0 - 1];
+        if !name_is(src, toks, nodes[it].b, b'i', b't', b'e', 4) || nodes[cur].kind != 65 {
+            cst[2] = 1;
+            return 0 - 1;
+        }
+        sname = nodes[cur].a;
+        st0 -= 1;
     }
-    let sname = nodes[cur].a;
     let ss = sym_find(src, toks, syms, cst, sname);
     if ss < 0 || !is_arrayish(types, syms[ss].ty) { cst[2] = 1; return 0 - 1; }
     let elem = types[syms[ss].ty].elem;
@@ -734,8 +770,21 @@ fn check_chain(src: &[u8], toks: &[Token], nodes: &mut [Node], types: &mut [Ty],
     // accumulator's first value is `0` or `0.0` by it. The closure bodies are checked here with
     // their parameter bound, and again when the finished loop is checked; they agree by
     // construction, since the rewrite binds the parameter to exactly this type.
+    // a comprehension's own condition and element are checked as if they were stages
     let mut et = elem;
-    let mut k = st0 - 2;
+    if comp >= 0 {
+        let saved0 = cst[1];
+        declare(syms, cst, nodes[comp].b, et, 0, 0 - 1);
+        if nodes[comp].d >= 0 {
+            let ct = check_expr(src, toks, nodes, types, syms, sigs, ptys, strs, flds, ntys, cst, nodes[comp].d);
+            if cst[2] == 0 && ct != 2 { cst[2] = 1; };
+        };
+        let mt = check_expr(src, toks, nodes, types, syms, sigs, ptys, strs, flds, ntys, cst, nodes[comp].a);
+        cst[1] = saved0;
+        if cst[2] != 0 { return 0 - 1; }
+        et = mt;
+    };
+    let mut k = st0 - 1;
     while k >= 1 && cst[2] == 0 {
         let stg = cst[40 + k];
         let lam = nodes[stg].c;
@@ -763,15 +812,34 @@ fn check_chain(src: &[u8], toks: &[Token], nodes: &mut [Node], types: &mut [Ty],
     let term = cst[40];
     let is_sum = name_is(src, toks, nodes[term].b, b's', b'u', b'm', 3);
     let is_cnt = name_is(src, toks, nodes[term].b, b'c', b'o', b'u', 5);
-    if !is_sum && !is_cnt || nodes[term].c >= 0 { cst[2] = 1; return 0 - 1; }
-    let acc_ty = if is_cnt { 0 } else { et };
-    if acc_ty != 0 && acc_ty != 1 { cst[2] = 1; return 0 - 1; }
+    let is_max = name_is(src, toks, nodes[term].b, b'm', b'a', b'x', 3);
+    let is_min = name_is(src, toks, nodes[term].b, b'm', b'i', b'n', 3);
+    let is_any = name_is(src, toks, nodes[term].b, b'a', b'n', b'y', 3);
+    let is_all = name_is(src, toks, nodes[term].b, b'a', b'l', b'l', 3);
+    if !is_sum && !is_cnt && !is_max && !is_min && !is_any && !is_all { cst[2] = 1; return 0 - 1; }
+    if nodes[term].c >= 0 { cst[2] = 1; return 0 - 1; }
+    // `any` and `all` want a `bool` an element at a time; `max` and `min` want a number
+    if is_any || is_all {
+        if et != 2 { cst[2] = 1; return 0 - 1; }
+    } else if is_max || is_min {
+        if et != 0 && et != 1 { cst[2] = 1; return 0 - 1; }
+    };
+    let acc_ty = if is_cnt { 0 } else if is_any || is_all { 2 } else { et };
+    if acc_ty != 0 && acc_ty != 1 && acc_ty != 2 { cst[2] = 1; return 0 - 1; }
 
     // ---- build ----
     let iv = nfresh(cst);
     let av = nfresh(cst);
-    let zero = nlit(nodes, cst, if acc_ty == 1 { 61 } else { 60 }, 0);
+    let sn = nfresh(cst);
+    let zero = if acc_ty == 2 { mk_bool(nodes, cst, if is_all { 1 } else { 0 }) }
+               else { nlit(nodes, cst, if acc_ty == 1 { 61 } else { 60 }, 0) };
     let l0 = mk_let(nodes, cst, av, zero, 1);
+    // `max` and `min` keep a `seen` flag beside the accumulator: the first element wins outright,
+    // there being no identity to start from — which is also why `.par()` refuses them
+    if is_max || is_min {
+        let f0 = mk_bool(nodes, cst, 0);
+        nodes[l0].next = mk_let(nodes, cst, sn, f0, 1);
+    };
     let lo = nlit(nodes, cst, 60, 0);
     let sv = mk_var(nodes, cst, sname);
     let hi = nnew(nodes, cst, 72);
@@ -792,11 +860,27 @@ fn check_chain(src: &[u8], toks: &[Token], nodes: &mut [Node], types: &mut [Ty],
     // **the element is always bound**, even when nothing looks at it: `xs.iter().count()` reads
     // each element in `analyze.rs`'s model, and a desugaring that skipped the read would cost 3 per
     // element where the answer is 4 and move nothing where the answer is `8·xs.len() + B`
-    let ev = nfresh(cst);
+    // a comprehension binds the element to the variable it names, since both its condition and its
+    // element expression are written in terms of that name
+    let ev = if comp >= 0 { nodes[comp].b } else { nfresh(cst) };
     let mut blk = body;
     let mut last = blk_add(nodes, blk, 0 - 1, mk_let(nodes, cst, ev, ix, 0));
     let mut cure = mk_var(nodes, cst, ev);
-    let mut j = st0 - 2;
+    if comp >= 0 {
+        if nodes[comp].d >= 0 {
+            let inner0 = nnew(nodes, cst, 76);
+            let if0 = nnew(nodes, cst, 75);
+            nodes[if0].a = nodes[comp].d;
+            nodes[if0].b = inner0;
+            let es0 = nnew(nodes, cst, 95);
+            nodes[es0].a = if0;
+            last = blk_add(nodes, blk, last, es0);
+            blk = inner0;
+            last = 0 - 1;
+        };
+        cure = nodes[comp].a;
+    };
+    let mut j = st0 - 1;
     while j >= 1 {
         let stg = cst[40 + j];
         let lam = nodes[stg].c;
@@ -820,19 +904,44 @@ fn check_chain(src: &[u8], toks: &[Token], nodes: &mut [Node], types: &mut [Ty],
         };
         j -= 1;
     }
-    // ACC += <element>, or += 1 for a count
+    // the terminal
     let tgt = mk_var(nodes, cst, av);
-    let add = nnew(nodes, cst, 91);
-    nodes[add].a = tgt;
-    nodes[add].b = if is_cnt { nlit(nodes, cst, 60, 1) } else { cure };
-    nodes[add].ival = 0;
-    blk_add(nodes, blk, last, add);
+    if is_max || is_min {
+        // `if !seen || cur <cmp> acc { acc = cur; seen = true; }`
+        let sv3 = mk_var(nodes, cst, sn);
+        let nots = nnew(nodes, cst, 67);
+        nodes[nots].a = sv3;
+        nodes[nots].ival = 1;
+        let better = mk_bin(nodes, cst, if is_max { 9 } else { 7 }, cure, tgt);
+        let cond = mk_bin(nodes, cst, 12, nots, better);
+        let inner = nnew(nodes, cst, 76);
+        let t2 = mk_var(nodes, cst, av);
+        let set = mk_assign(nodes, cst, t2, cure, 0 - 1);
+        let s2 = mk_var(nodes, cst, sn);
+        let tru = mk_bool(nodes, cst, 1);
+        nodes[set].next = mk_assign(nodes, cst, s2, tru, 0 - 1);
+        nodes[inner].a = set;
+        let iff = nnew(nodes, cst, 75);
+        nodes[iff].a = cond;
+        nodes[iff].b = inner;
+        let es2 = nnew(nodes, cst, 95);
+        nodes[es2].a = iff;
+        blk_add(nodes, blk, last, es2);
+    } else if is_any || is_all {
+        // `acc = acc || cur` / `acc = acc && cur`
+        let t3 = mk_var(nodes, cst, av);
+        let comb = mk_bin(nodes, cst, if is_any { 12 } else { 11 }, tgt, cure);
+        blk_add(nodes, blk, last, mk_assign(nodes, cst, t3, comb, 0 - 1));
+    } else {
+        let v = if is_cnt { nlit(nodes, cst, 60, 1) } else { cure };
+        blk_add(nodes, blk, last, mk_assign(nodes, cst, tgt, v, 0));
+    };
 
     // the chain's own node becomes the block that replaces it
     nodes[n].kind = 76;
     nodes[n].a = l0;
     // a `for` is a statement already; only an `if` needs wrapping to become one
-    nodes[l0].next = fo;
+    if nodes[l0].next >= 0 { nodes[nodes[l0].next].next = fo; } else { nodes[l0].next = fo; };
     nodes[n].b = mk_var(nodes, cst, av);
     nodes[n].c = 0 - 1;
     nodes[n].d = 0 - 1;

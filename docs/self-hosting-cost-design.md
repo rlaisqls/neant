@@ -1679,3 +1679,33 @@ which leaves every already-matching form unchanged — binding a register costs 
 them does more than compare and assign, and guessing it would be exactly the kind of invented rule
 this project keeps out. They stay unbuilt until measured, along with `zip`, `enumerate`, `fold` and
 the array-valued comprehension that `owned.nt` needs.
+
+### Step 3 built: max, min, any, all and comprehensions
+
+All five now desugar, and each matches `neant cost` exactly — `max` and `min` at 7 per element,
+`any` and `all` at 5, a comprehension with a condition at 7, one without at 6. The emitted chain
+also *runs*: nine chain forms through the whole self-hosted pipeline print what `neant run` prints,
+byte for byte, which is the check that matters for a rewrite that changes emitted code.
+
+**`max`'s shape was read, not guessed.** Two candidate loops both hit 7 per element and both matched
+on `moves` as well, so measurement could not separate them — and at that point the question stopped
+being "what rule does the corpus imply" and became "what does this function build", which is a
+question to answer by reading. `types.rs` keeps a `seen` flag beside the accumulator:
+
+```
+let mut acc = 0.0; let mut seen = false;
+for i { let e = xs[i]; if !seen || e > acc { acc = e; seen = true; } }
+```
+
+The flag is there because *the first element wins outright* — there is no identity to start a max
+from, which is the same reason `.par()` refuses `max` and `min` while taking `sum`, `count`, `any`
+and `all`. One fact explaining both a cost and a restriction is usually the sign of a real rule
+rather than an accident.
+
+**A comprehension needed no machinery of its own.** Its condition is a filter and its element a map,
+over the variable it names, pushed in front of whatever follows — so `[x*x for x in xs if x>0.0].sum()`
+is built by the same code path as `xs.iter().filter(..).map(..).sum()` and comes out at the same 7.
+
+Still outstanding, and still not guessed at: `zip`, `enumerate`, `fold` (all needing two-parameter
+closures) and the array-valued comprehension `owned.nt` wants, which allocates rather than reduces.
+`chains.nt` needs every one of them, so it stays out of the slice until they are all there.
