@@ -51,6 +51,32 @@ pub struct FuncCost {
     pub tier: &'static str,
     /// `#[cost]` bounds this function breaks, as sentences.
     pub violations: Vec<String>,
+    /// What the function touches, by parameter, in bytes — the part of its cost a caller can
+    /// credit when the data is already resident.
+    pub footprint: Vec<Foot>,
+    /// The condition under which the whole footprint is resident when the function returns
+    /// (its total working set, in lines, under `M`); `None` when some range is not exact, so
+    /// no residue is claimed.
+    pub resident: Option<Cond>,
+}
+
+/// A byte range of one parameter's array: `[lo, hi)`.
+#[derive(Debug, Clone)]
+pub struct Foot {
+    pub param: usize,
+    pub lo: Poly,
+    pub hi: Poly,
+    /// false when the range is the whole array because the exact range could not be found
+    pub exact: bool,
+}
+
+/// A resident range in the caller's arrays, and under what conditions it is resident.
+#[derive(Debug, Clone)]
+struct Res {
+    root: LocalId,
+    lo: Poly,
+    hi: Poly,
+    conds: Vec<Cond>,
 }
 
 #[derive(Debug, Clone)]
@@ -73,11 +99,11 @@ pub fn analyze(m: &Module, machine: &Machine) -> Vec<FuncCost> {
         let t = rewrite::tile_side(machine.m_bytes, 8);
         let mut sugg = Vec::new();
         if let Some(g) = rewrite::tile(f, t) {
-            let r = Fa::new(&mut an, &g, None, vec![], None).run().result;
+            let r = Fa::new(&mut an, &g, None).run().result;
             sugg.push(Suggestion { label: format!("tile by {t}"), flag: format!("{}:tile", f.name), result: r });
         }
         if let Some(g) = rewrite::transpose(f) {
-            let r = Fa::new(&mut an, &g, None, vec![], None).run().result;
+            let r = Fa::new(&mut an, &g, None).run().result;
             sugg.push(Suggestion { label: "transpose the column operand".into(), flag: format!("{}:transpose", f.name), result: r });
         }
         an.done[i].as_mut().unwrap().suggestions = sugg;
@@ -121,10 +147,11 @@ impl<'a> Analyzer<'a> {
                     names: param_names(f),
                     result: CostResult::Unknown { reason: "mutually recursive with another function; only self-recursion is solved".into(), line: f.line },
                     bounds: vec![], notes: vec![], suggestions: vec![], effects: vec![], violations: vec![], tier: "unknown",
+                    footprint: vec![], resident: None,
                 });
             } else {
                 self.active[fid] = true;
-                let fc = Fa::new(self, f, None, vec![], Some(fid)).run();
+                let fc = Fa::new(self, f, Some(fid)).run();
                 self.active[fid] = false;
                 self.done[fid] = Some(fc);
             }
@@ -198,6 +225,7 @@ enum Fail {
 /// for all sites together once the body has been walked, because whether a level reuses its
 /// lines depends on every site sharing that loop.
 struct Site {
+    arr: LocalId,
     aff: Option<Affine>,
     es: i128,
     path: Vec<usize>,
@@ -207,6 +235,7 @@ struct Site {
 }
 
 /// What is remembered of a loop after it is popped.
+#[derive(Clone)]
 struct LoopRec {
     var: Option<LocalId>,
     atom: Option<usize>,
@@ -262,36 +291,36 @@ struct Fa<'a, 'b, 'c> {
     /// the `if` branches currently open, for tagging access sites
     branch: Vec<(usize, bool)>,
     next_if: usize,
+    /// the array a view local looks into (parameters and arrays are their own root)
+    local_root: HashMap<LocalId, LocalId>,
+    /// what is resident in this function's arrays at the current point, from calls and loop
+    /// nests already walked — what a call here may be credited for
+    resident: Vec<Res>,
+    /// moves of calls, kept apart from the function's own sites: a loop body is walked a second
+    /// time with the residue of its first iteration to cost the iterations after the first
+    call_moves: Cost,
+    saved_calls: Vec<Cost>,
+    /// the second walk: only call moves are recounted; work, sites, recursion and effects are not
+    replay: bool,
+    /// whether the innermost open frame has called anything (a loop then needs the second walk)
+    has_call: Vec<bool>,
 }
 
 impl<'a, 'b, 'c> Fa<'a, 'b, 'c> {
-    /// With `bindings`, the function is analysed for one call site: each parameter's size is
-    /// the caller's polynomial rather than the parameter's own atom, so every fit and stride
-    /// decision inside is made with the caller's numbers. The result is then already in the
-    /// caller's atom space.
-    fn new(an: &'b mut Analyzer<'a>, f: &'c Func, bindings: Option<&[Poly]>, inherited: Vec<Loop>, self_fid: Option<FuncId>) -> Self {
-        // in a specialised analysis the polynomials live in the caller's atom space: fresh loop
-        // atoms must be allocated above anything the bindings or inherited trips mention
-        let mut names = param_names(f);
-        let mut top = names.len();
-        if let Some(b) = bindings { for p in b { if let Some(m) = p.max_var() { top = top.max(m + 1); } } }
-        for l in &inherited { if let Some(m) = l.trip.max_var() { top = top.max(m + 1); } }
-        while names.len() < top { names.push("?".into()); }
+    fn new(an: &'b mut Analyzer<'a>, f: &'c Func, self_fid: Option<FuncId>) -> Self {
         let mut fa = Fa {
-            an, f, names, sites: vec![], loop_recs: vec![], bounds: vec![], notes: vec![], io: false, self_fid, rec_calls: vec![],
+            an, f, names: param_names(f), sites: vec![], loop_recs: vec![], bounds: vec![], notes: vec![], io: false, self_fid, rec_calls: vec![],
             local_size: HashMap::new(), local_affine: HashMap::new(), initial: HashMap::new(), at_entry: false,
             loops: vec![], work: Cost::zero(), moves: Cost::zero(), saved: vec![], branch: vec![], next_if: 0,
+            local_root: HashMap::new(), resident: vec![], call_moves: Cost::zero(), saved_calls: vec![], replay: false, has_call: vec![],
         };
-        // the caller's loops are entered like this function's own, so the body's cost is summed
-        // over them when they are left at the end of `run`
-        for l in inherited { fa.enter_loop(l); }
         for (i, &p) in f.params.iter().enumerate() {
             let l = &f.locals[p];
-            let size = bindings.map_or_else(|| Poly::var(i), |b| b[i].clone());
             if l.ty.is_arrayish() {
-                fa.local_size.insert(p, size);
+                fa.local_size.insert(p, Poly::var(i));
+                fa.local_root.insert(p, p);
             } else if l.ty == Ty::I64 {
-                fa.local_affine.insert(p, Affine::constant(size));
+                fa.local_affine.insert(p, Affine::constant(Poly::var(i)));
             }
         }
         fa
@@ -300,11 +329,12 @@ impl<'a, 'b, 'c> Fa<'a, 'b, 'c> {
     fn run(mut self) -> FuncCost {
         let mut tier = "exact";
         let walked = self.block(&self.f.body);
-        // leave the inherited loops: their frames sum the body over the caller's iterations
-        while !self.loops.is_empty() { self.leave_loop(); }
+        let (footprint, resident) = self.signature_footprint();
         let result = match walked {
             Ok(()) => {
                 self.settle_moves();
+                let calls = std::mem::replace(&mut self.call_moves, Cost::zero());
+                self.moves = self.moves.add(&calls);
                 let m = self.machine();
                 self.work.prune_at(&m);
                 self.moves.prune_at(&m);
@@ -351,7 +381,59 @@ impl<'a, 'b, 'c> Fa<'a, 'b, 'c> {
             }
         }
         let effects = if self.io { vec!["io"] } else { vec![] };
-        FuncCost { name: self.f.name.clone(), names: self.names, result, bounds: self.bounds, notes: self.notes, suggestions: vec![], effects, violations, tier }
+        FuncCost { name: self.f.name.clone(), names: self.names, result, bounds: self.bounds, notes: self.notes, suggestions: vec![], effects, violations, tier, footprint, resident }
+    }
+
+    /// The byte range one access site covers over its loop nest, from its affine index and the
+    /// ranges of the loop variables it mentions; `None` when a coefficient's sign is not known or
+    /// the index is not affine.
+    fn site_range(&self, site: &Site) -> Option<(Poly, Poly)> {
+        let aff = site.aff.as_ref()?;
+        let mut lo = aff.konst.clone();
+        let mut hi = aff.konst.clone();
+        for (v, c) in &aff.coeffs {
+            let rec = site.path.iter().map(|&l| &self.loop_recs[l]).find(|r| r.var == Some(*v))?;
+            let negative = match self.numeric(c) {
+                Some(x) => x < 0.0,
+                None => { if c.terms.values().all(|k| k.n >= 0) { false } else { return None; } }
+            };
+            let (a, b) = (c.mul(&rec.lo), c.mul(&rec.last()));
+            if negative { lo = lo.add(&b); hi = hi.add(&a); } else { lo = lo.add(&a); hi = hi.add(&b); }
+        }
+        let es = Rat::int(site.es);
+        Some((lo.scale(es), hi.add(&Poly::constant(1)).scale(es)))
+    }
+
+    /// The function's footprint over its parameters, and the condition under which all of it is
+    /// resident on return. A site whose range is not exact makes its parameter's range the whole
+    /// array and forfeits the residue.
+    fn signature_footprint(&self) -> (Vec<Foot>, Option<Cond>) {
+        let mut feet: HashMap<usize, (Poly, Poly, bool)> = HashMap::new();
+        let mut total = Poly::zero();
+        let mut all_exact = true;
+        for site in &self.sites {
+            let root = self.local_root.get(&site.arr).copied().unwrap_or(site.arr);
+            let whole = |r: LocalId| (Poly::zero(), self.local_size.get(&r).cloned().unwrap_or_else(Poly::zero).scale(Rat::int(site.es)));
+            let Some(pi) = self.f.params.iter().position(|&p| p == root) else {
+                // an internal array: competes for the cache, invisible to the caller
+                let (_, h) = whole(root);
+                if !feet.contains_key(&(usize::MAX - root)) { feet.insert(usize::MAX - root, (Poly::zero(), h, true)); }
+                continue;
+            };
+            let (lo, hi, exact) = match self.site_range(site) { Some((l, h)) => (l, h, true), None => { let (l, h) = whole(root); (l, h, false) } };
+            match feet.get_mut(&pi) {
+                None => { feet.insert(pi, (lo, hi, exact)); }
+                Some(e) => {
+                    // two ranges on one parameter: exact only if identical, else the whole array
+                    if !(exact && e.2 && e.0 == lo && e.1 == hi) { let (l, h) = whole(root); *e = (l, h, false); }
+                }
+            }
+        }
+        for (_, (lo, hi, exact)) in &feet { total = total.add(&hi.sub(lo)); if !exact { all_exact = false; } }
+        let mut out: Vec<Foot> = feet.into_iter().filter(|(k, _)| *k < usize::MAX / 2).map(|(param, (lo, hi, exact))| Foot { param, lo, hi, exact }).collect();
+        out.sort_by_key(|f| f.param);
+        let resident = if all_exact && !out.is_empty() { Some(Cond { ws: total.mul_atom_pow(Atom::B, Rat::int(-1)), fits: true }) } else { None };
+        (out, resident)
     }
 
     /// The body's own cost `f` (self-calls charged nothing) and the self-calls make a
@@ -500,7 +582,7 @@ impl<'a, 'b, 'c> Fa<'a, 'b, 'c> {
     }
     /// Cost of the current point, charged once; the enclosing loops sum it when they are left.
     fn add_work(&mut self, p: Poly) {
-        self.work = self.work.add_poly(&p);
+        if !self.replay { self.work = self.work.add_poly(&p); }
     }
     /// A fresh size atom for a loop variable.
     fn new_atom(&mut self, name: &str) -> usize {
@@ -516,26 +598,59 @@ impl<'a, 'b, 'c> Fa<'a, 'b, 'c> {
     }
     fn push_frame(&mut self) {
         self.saved.push((std::mem::replace(&mut self.work, Cost::zero()), std::mem::replace(&mut self.moves, Cost::zero())));
+        self.saved_calls.push(std::mem::replace(&mut self.call_moves, Cost::zero()));
+        self.has_call.push(false);
     }
+    /// Pop a frame (an `if` branch): its calls count once, into the frame below.
     fn pop_frame(&mut self) -> (Cost, Cost) {
         let (pw, pm) = self.saved.pop().unwrap();
+        let pc = self.saved_calls.pop().unwrap();
+        let had = self.has_call.pop().unwrap_or(false);
+        if let Some(h) = self.has_call.last_mut() { *h |= had; }
+        let calls = std::mem::replace(&mut self.call_moves, pc);
+        self.call_moves = self.call_moves.add(&calls);
         (std::mem::replace(&mut self.work, pw), std::mem::replace(&mut self.moves, pm))
     }
-    /// Leave a loop: sum its body frame over its variable into the frame below.
-    fn leave_loop(&mut self) {
+    /// Leave a loop. The body frame is summed over the loop variable. Calls in the body are costed
+    /// twice: as walked (cold, the first iteration) and again with the residue the first iteration
+    /// left (the iterations after it), so a call that re-reads what the last one left in cache
+    /// pays once.
+    fn leave_loop(&mut self, body: &Block) -> Result<(), Fail> {
         let lp = self.loops.pop().unwrap();
-        let (w, m) = self.pop_frame();
-        let rec = &self.loop_recs[lp.id];
-        let (w, m) = (rec.sum_cost(&w), rec.sum_cost(&m));
-        self.work = self.work.add(&w);
-        self.moves = self.moves.add(&m);
-    }
-    /// Add a cost that was already summed over every enclosing loop (an inherited-context call).
-    fn add_at_root(&mut self, w: &Cost, m: &Cost) {
-        match self.saved.first_mut() {
-            Some((rw, rm)) => { *rw = rw.add(w); *rm = rm.add(m); }
-            None => { self.work = self.work.add(w); self.moves = self.moves.add(m); }
+        let (pw, pm) = self.saved.pop().unwrap();
+        let pc = self.saved_calls.pop().unwrap();
+        let had_call = self.has_call.pop().unwrap_or(false);
+        let cold_calls = std::mem::replace(&mut self.call_moves, pc);
+        let (w, m) = (std::mem::replace(&mut self.work, pw), std::mem::replace(&mut self.moves, pm));
+        let rec = self.loop_recs[lp.id].clone();
+        self.work = self.work.add(&rec.sum_cost(&w));
+        self.moves = self.moves.add(&rec.sum_cost(&m));
+        if had_call {
+            let first = match rec.atom { Some(a) => cold_calls.subst(a, &rec.lo), None => cold_calls.clone() };
+            let warm = if self.numeric(&rec.trip).is_some_and(|t| t <= 1.0) { Cost::zero() } else {
+                self.loops.push(Loop { id: lp.id, ..lp });
+                let outer_replay = self.replay;
+                self.replay = true;
+                self.push_frame();
+                let r = self.block(body);
+                // keep only the recounted call moves; everything else returns to what it was
+                let (pw, pm) = self.saved.pop().unwrap();
+                let pc = self.saved_calls.pop().unwrap();
+                self.has_call.pop();
+                let warm_body = std::mem::replace(&mut self.call_moves, pc);
+                self.work = pw;
+                self.moves = pm;
+                self.replay = outer_replay;
+                self.loops.pop();
+                r?;
+                let rest_lo = rec.lo.add(&Poly::constant(rec.step));
+                let rest_trip = rec.trip.sub(&Poly::constant(1));
+                match rec.atom { Some(a) => warm_body.sum_over(a, &rest_lo, rec.step, &rest_trip), None => warm_body.mul_poly(&rest_trip) }
+            };
+            self.call_moves = self.call_moves.add(&first).add(&warm);
+            if let Some(h) = self.has_call.last_mut() { *h = true; }
         }
+        Ok(())
     }
     fn add_work_n(&mut self, n: i128) { self.add_work(Poly::constant(n)); }
 
@@ -638,10 +753,11 @@ impl<'a, 'b, 'c> Fa<'a, 'b, 'c> {
 
     /// Record an access site; its moves are settled with everyone else's at the end.
     fn access(&mut self, arr: LocalId, idx: &Expr) {
+        if self.replay { return; }
         let es = self.elem_bytes(arr);
         let aff = self.affine(idx);
         let path = self.loops.iter().map(|l| l.id).collect();
-        self.sites.push(Site { aff, es, path, branch: self.branch.clone() });
+        self.sites.push(Site { arr, aff, es, path, branch: self.branch.clone() });
     }
 
     /// Lines touched by every access site over its loop nest, times B, added to moves. Level by
@@ -784,6 +900,7 @@ impl<'a, 'b, 'c> Fa<'a, 'b, 'c> {
     /// The catalogue, entry one: is this statement a multiply-accumulate whose two indices form
     /// a contraction over the enclosing loops? Then the Hong–Kung bound applies to the whole nest.
     fn recognise(&mut self, s: &Stmt) {
+        if self.replay { return; }
         let Some(mac) = bounds::as_mac(s) else { return };
         let (Some(aa), Some(ab)) = (self.affine(mac.ia), self.affine(mac.ib)) else { return };
         let va: Vec<LocalId> = aa.coeffs.keys().copied().collect();
@@ -813,7 +930,7 @@ impl<'a, 'b, 'c> Fa<'a, 'b, 'c> {
 
     /// A sequential pass over `n` elements of `es` bytes, once per enclosing iteration.
     fn stream(&mut self, n: &Poly, es: i128) {
-        self.moves = self.moves.add_poly(&n.scale(Rat::int(es)));
+        if !self.replay { self.moves = self.moves.add_poly(&n.scale(Rat::int(es))); }
     }
 
     // ---- the walk ----
@@ -834,6 +951,7 @@ impl<'a, 'b, 'c> Fa<'a, 'b, 'c> {
                     if let Some(sz) = src.and_then(|s| self.local_size.get(&s).cloned()) {
                         self.local_size.insert(*id, sz);
                     }
+                    if let Some(s0) = src { let r = self.local_root.get(&s0).copied().unwrap_or(s0); self.local_root.insert(*id, r); }
                 } else if l.ty == Ty::I64 && !l.mutable {
                     if let Some(a) = self.affine(e) { self.local_affine.insert(*id, a); }
                 } else if l.ty == Ty::I64 {
@@ -850,12 +968,13 @@ impl<'a, 'b, 'c> Fa<'a, 'b, 'c> {
                 let es = self.elem_bytes(*id);
                 self.stream(&size, es);
                 self.local_size.insert(*id, size.clone());
+                self.local_root.insert(*id, *id);
                 let atom = self.new_atom(&self.f.locals[*var].name.clone());
                 self.enter_loop(Loop { id: 0, var: Some(*var), atom: Some(atom), trip: size, lo: Poly::zero(), step: 1, offset: Some(Affine::constant(Poly::zero())) });
                 self.add_work_n(3); // store, increment, compare-and-branch
                 let r = self.block(body);
-                self.leave_loop();
-                r
+                r?;
+                self.leave_loop(body)
             }
             Stmt::LetRepeat(id, e, n) => {
                 self.expr(e)?;
@@ -867,6 +986,7 @@ impl<'a, 'b, 'c> Fa<'a, 'b, 'c> {
                 let es = self.elem_bytes(*id);
                 self.stream(&size, es);
                 self.local_size.insert(*id, size);
+                self.local_root.insert(*id, *id);
                 Ok(())
             }
             Stmt::LetArray(id, elems) => {
@@ -876,6 +996,7 @@ impl<'a, 'b, 'c> Fa<'a, 'b, 'c> {
                 let es = self.elem_bytes(*id);
                 self.stream(&Poly::constant(k), es);
                 self.local_size.insert(*id, Poly::constant(k));
+                self.local_root.insert(*id, *id);
                 Ok(())
             }
             Stmt::Assign(lv, op, e) => {
@@ -923,8 +1044,8 @@ impl<'a, 'b, 'c> Fa<'a, 'b, 'c> {
                 self.enter_loop(Loop { id: 0, var: Some(*var), atom: Some(atom), trip, lo, step: 1, offset: a_lo });
                 self.add_work_n(2); // increment, compare-and-branch, per iteration
                 let r = self.block(body);
-                self.leave_loop();
-                r
+                r?;
+                self.leave_loop(body)
             }
             Stmt::Break => Ok(()),
             Stmt::While { cond, decreasing, body, line } => {
@@ -971,8 +1092,8 @@ impl<'a, 'b, 'c> Fa<'a, 'b, 'c> {
                 self.enter_loop(Loop { id: 0, var, atom, trip, lo, step, offset });
                 self.add_work_n(1);
                 let r = self.block(body);
-                self.leave_loop();
-                r
+                r?;
+                self.leave_loop(body)
             }
             Stmt::Expr(e) => self.expr(e),
             Stmt::Return(Some(e)) => self.expr(e),
@@ -1109,7 +1230,7 @@ impl<'a, 'b, 'c> Fa<'a, 'b, 'c> {
             ExprKind::Binary(_, a, b) => { self.expr(a)?; self.expr(b)?; self.add_work_n(1); Ok(()) }
             ExprKind::MinMax(_, a, b) => { self.expr(a)?; self.expr(b)?; self.add_work_n(2); Ok(()) } // compare, select
             ExprKind::Unary(_, a) | ExprKind::Cast(a, _) => { self.expr(a)?; self.add_work_n(1); Ok(()) }
-            ExprKind::Println(a) => { self.expr(a)?; self.add_work_n(1); self.io = true; Ok(()) }
+            ExprKind::Println(a) => { self.expr(a)?; self.add_work_n(1); if !self.replay { self.io = true; } Ok(()) }
             ExprKind::Index(arr, idx) => {
                 self.expr(idx)?;
                 self.add_work_n(1);
@@ -1161,6 +1282,7 @@ impl<'a, 'b, 'c> Fa<'a, 'b, 'c> {
                 for a in args { self.expr(a)?; }
                 self.add_work_n(2); // call and return; arguments are register moves
                 if Some(*fid) == self.self_fid {
+                    if self.replay { return Ok(()); }
                     let cf = &self.an.m.funcs[*fid];
                     let sizes: Vec<Option<Poly>> = args.iter().zip(&cf.params).map(|(a, &p)| {
                         if cf.locals[p].ty.is_arrayish() {
@@ -1171,59 +1293,11 @@ impl<'a, 'b, 'c> Fa<'a, 'b, 'c> {
                     self.rec_calls.push((sizes, o, e.line));
                     return Ok(());
                 }
-                let cf = &self.an.m.funcs[*fid];
-                // every argument's size, when this call site knows them all — unless the callee
-                // recurses, whose cost is a recurrence in its own parameters and must stay symbolic
-                let bindings: Option<Vec<Poly>> = if calls_itself(cf, *fid) { None } else { args.iter().zip(&cf.params).map(|(a, &p)| {
-                    if cf.locals[p].ty.is_arrayish() {
-                        match &a.kind { ExprKind::Ref(s, _) | ExprKind::Local(s) => self.local_size.get(s).cloned(), _ => None }
-                    } else if cf.locals[p].ty == Ty::I64 {
-                        self.size_of(a, Dir::Upper)
-                    } else {
-                        Some(Poly::zero()) // not a size; never read
-                    }
-                }).collect() };
-                if let Some(b) = bindings {
-                    if self.an.active[*fid] {
-                        return Err(Fail::Unknown(format!("calls `{}`, whose cost is unknown (mutually recursive with this function; only self-recursion is solved)", cf.name), e.line));
-                    }
-                    // the caller's loops go with the call when no argument depends on them,
-                    // as loops without a variable: every access inside reuses across them if it fits
-                    let invariant = args.iter().all(|a| matches!(a.kind, ExprKind::Ref(..)) || self.affine(a).is_some_and(|af| af.is_const()));
-                    // an inherited loop's trip may mention this function's loop atoms; the callee
-                    // is analysed in the same atom space, and its result is summed here as usual
-                    let inherited: Vec<Loop> = if invariant {
-                        self.loops.iter().map(|l| Loop { id: 0, var: None, atom: None, trip: l.trip.clone(), lo: Poly::zero(), step: 1, offset: None }).collect()
-                    } else { vec![] };
-                    let inherits = !inherited.is_empty();
-                    self.an.active[*fid] = true;
-                    let fc = Fa::new(self.an, cf, Some(&b), inherited, Some(*fid)).run();
-                    self.an.active[*fid] = false;
-                    if fc.effects.contains(&"io") { self.io = true; }
-                    // a bound found in the callee counts once per time this call runs
-                    let o = if inherits { Poly::constant(1) } else { self.times_here() };
-                    for bd in fc.bounds {
-                        self.bounds.push(Bound { moves: bd.moves.mul(&o), ..bd });
-                    }
-                    for n in fc.notes {
-                        if !self.notes.contains(&n) { self.notes.push(format!("in `{}`: {n}", cf.name)); }
-                    }
-                    let (w, mv) = match fc.result {
-                        CostResult::Exact { work, moves } => (work, moves),
-                        CostResult::Unknown { reason, .. } => {
-                            let reason = if reason.starts_with("calls `") { reason }
-                                else { format!("calls `{}`, whose cost is unknown ({reason})", cf.name) };
-                            return Err(Fail::Unknown(reason, e.line));
-                        }
-                    };
-                    // an inherited context already summed the callee's cost over these loops
-                    if inherits { self.add_at_root(&w, &mv); } else { self.work = self.work.add(&w); self.moves = self.moves.add(&mv); }
-                    return Ok(());
-                }
-                // otherwise: the callee's symbolic cost, with the atoms it uses substituted
+                // the callee's signature, and this call's argument sizes for its atoms
                 let callee = self.an.func(*fid).clone();
-                if callee.effects.contains(&"io") { self.io = true; }
-                let (cw, cm) = match &callee.result {
+                if !self.replay && callee.effects.contains(&"io") { self.io = true; }
+                let cf = &self.an.m.funcs[*fid];
+                let (mut w, mut mv) = match &callee.result {
                     CostResult::Exact { work, moves } => (work.clone(), moves.clone()),
                     CostResult::Unknown { reason, .. } => {
                         let reason = if reason.starts_with("calls `") { reason.clone() }
@@ -1231,28 +1305,68 @@ impl<'a, 'b, 'c> Fa<'a, 'b, 'c> {
                         return Err(Fail::Unknown(reason, e.line));
                     }
                 };
-                let mut w = cw;
-                let mut mv = cm;
-                let cf = &self.an.m.funcs[*fid];
+                let mut map: Vec<(usize, Poly)> = Vec::new();
+                let mut roots: Vec<Option<LocalId>> = Vec::new();
                 for (i, (a, &p)) in args.iter().zip(&cf.params).enumerate() {
-                    let used = w.mentions(i) || mv.mentions(i);
-                    if !used { continue; }
-                    let by = if cf.locals[p].ty.is_arrayish() {
-                        match &a.kind { ExprKind::Ref(s, _) | ExprKind::Local(s) => self.local_size.get(s).cloned(), _ => None }
-                    } else {
-                        self.size_of(a, Dir::Upper)
-                    };
-                    let Some(by) = by else {
-                        return Err(Fail::Unknown(
-                            format!("argument {} to `{}` is not a size expression, and `{}`'s cost depends on it", i + 1, callee.name, callee.name),
-                            a.line,
-                        ));
-                    };
-                    w = w.subst(i, &by);
-                    mv = mv.subst(i, &by);
+                    let (by, root) = if cf.locals[p].ty.is_arrayish() {
+                        match &a.kind {
+                            ExprKind::Ref(s, _) | ExprKind::Local(s) => (self.local_size.get(s).cloned(), Some(self.local_root.get(s).copied().unwrap_or(*s))),
+                            _ => (None, None),
+                        }
+                    } else { (self.size_of(a, Dir::Upper), None) };
+                    roots.push(root);
+                    match by {
+                        Some(b) => map.push((i, b)),
+                        None => {
+                            let used = w.mentions(i) || mv.mentions(i) || callee.footprint.iter().any(|f| f.param == i || f.lo.mentions(i) || f.hi.mentions(i));
+                            if used {
+                                return Err(Fail::Unknown(
+                                    format!("argument {} to `{}` is not a size expression, and `{}`'s cost depends on it", i + 1, callee.name, callee.name),
+                                    a.line,
+                                ));
+                            }
+                        }
+                    }
                 }
-                self.work = self.work.add(&w);
-                self.moves = self.moves.add(&mv);
+                w = w.subst_many(&map);
+                mv = mv.subst_many(&map);
+                // the callee's footprint in this function's arrays
+                let feet: Vec<(LocalId, Poly, Poly, bool)> = callee.footprint.iter().filter_map(|f| {
+                    let root = roots.get(f.param).copied().flatten()?;
+                    Some((root, f.lo.subst_many(&map), f.hi.subst_many(&map), f.exact))
+                }).collect();
+                // credit: what the callee reads that is already resident here pays nothing
+                for (root, lo, hi, exact) in &feet {
+                    if !exact { continue; }
+                    for r in &self.resident {
+                        if r.root != *root { continue; }
+                        // the callee's range within the resident range, or the reverse
+                        let overlap = if super::piece::dominates(&lo, &r.lo) && super::piece::dominates(&r.hi, &hi) { hi.sub(lo) }
+                            else if super::piece::dominates(&r.lo, &lo) && super::piece::dominates(&hi, &r.hi) { r.hi.sub(&r.lo) }
+                            else { continue };
+                        mv = mv.add_under(&r.conds, &overlap.scale(Rat::int(-1)));
+                    }
+                }
+                // a bound found in the callee counts once per time this call runs
+                if !self.replay {
+                    let o = self.times_here();
+                    for bd in &callee.bounds {
+                        self.bounds.push(Bound { moves: bd.moves.subst_many(&map).mul(&o), ..bd.clone() });
+                    }
+                    for n in &callee.notes {
+                        let n2 = format!("in `{}`: {n}", callee.name);
+                        if !self.notes.contains(&n2) { self.notes.push(n2); }
+                    }
+                }
+                // after the call: what it leaves resident replaces what was
+                self.resident.clear();
+                if let Some(cond) = &callee.resident {
+                    let cond = Cond { ws: cond.ws.subst_many(&map), fits: true };
+                    for (root, lo, hi, exact) in feet { if exact { self.resident.push(Res { root, lo, hi, conds: vec![cond.clone()] }); } }
+                }
+                if !self.replay { self.work = self.work.add(&w); }
+                self.call_moves = self.call_moves.add(&mv);
+                if let Some(h) = self.has_call.last_mut() { *h = true; }
                 Ok(())
             }
         }
@@ -1314,35 +1428,4 @@ fn bound_mentions(e: &Expr, l: LocalId) -> bool {
         ExprKind::Unary(_, a) | ExprKind::Cast(a, _) => bound_mentions(a, l),
         _ => false,
     }
-}
-
-/// Does `f`'s body call function `fid` — itself?
-fn calls_itself(f: &Func, fid: FuncId) -> bool {
-    fn in_block(b: &Block, fid: FuncId) -> bool {
-        b.stmts.iter().any(|s| in_stmt(s, fid)) || b.tail.as_ref().is_some_and(|e| in_expr(e, fid))
-    }
-    fn in_stmt(s: &Stmt, fid: FuncId) -> bool {
-        match s {
-            Stmt::Let(_, e) | Stmt::Expr(e) | Stmt::Return(Some(e)) => in_expr(e, fid),
-            Stmt::LetRepeat(_, a, b) => in_expr(a, fid) || in_expr(b, fid),
-            Stmt::LetArray(_, es) => es.iter().any(|e| in_expr(e, fid)),
-            Stmt::LetBuild { len, body, .. } => in_expr(len, fid) || in_block(body, fid),
-            Stmt::Assign(lv, _, e) => in_expr(e, fid) || matches!(lv, LValue::Index(_, i, _) if in_expr(i, fid)),
-            Stmt::For { start, end, body, .. } => in_expr(start, fid) || in_expr(end, fid) || in_block(body, fid),
-            Stmt::While { cond, decreasing, body, .. } => in_expr(cond, fid) || decreasing.as_ref().is_some_and(|d| in_expr(d, fid)) || in_block(body, fid),
-            Stmt::Break | Stmt::Return(None) => false,
-        }
-    }
-    fn in_expr(e: &Expr, fid: FuncId) -> bool {
-        match &e.kind {
-            ExprKind::Call(f, args) => *f == fid || args.iter().any(|a| in_expr(a, fid)),
-            ExprKind::Binary(_, a, b) | ExprKind::MinMax(_, a, b) => in_expr(a, fid) || in_expr(b, fid),
-            ExprKind::Unary(_, a) | ExprKind::Cast(a, _) | ExprKind::Println(a) => in_expr(a, fid),
-            ExprKind::Index(_, i) => in_expr(i, fid),
-            ExprKind::If(c, t, els) => in_expr(c, fid) || in_block(t, fid) || els.as_ref().is_some_and(|b| in_block(b, fid)),
-            ExprKind::Block(b) => in_block(b, fid),
-            _ => false,
-        }
-    }
-    in_block(&f.body, fid)
 }

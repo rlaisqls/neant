@@ -1,2 +1,3 @@
 run              work 19·fuel + 7                  moves 4·B·fuel + B                 exact
+                 footprint        code: [0, 8·code.len()) (whole array)  stack: [0, 8·stack.len()) (whole array)   no residue claimed
 main             work 3937                         moves 819·B + 248                  exact, io

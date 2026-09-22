@@ -94,6 +94,15 @@ pub fn report(c: &FuncCost, m: &Machine) -> String {
         };
         out.push_str(&format!("{:<16} lower bound      moves {:<28} ({}, {}){g}\n", "", b.moves.display(&c.names).to_string(), b.kind, b.citation));
     }
+    // the signature's footprint: what a caller may be credited for, and when it stays resident
+    if !c.footprint.is_empty() {
+        let feet: Vec<String> = c.footprint.iter().map(|f| {
+            let name = c.names.get(f.param).cloned().unwrap_or_default().trim_end_matches(".len()").to_string();
+            format!("{name}: [{}, {}){}", f.lo.display(&c.names), f.hi.display(&c.names), if f.exact { "" } else { " (whole array)" })
+        }).collect();
+        let res = match &c.resident { Some(k) => format!("   resident after if {}", brief_cond(k, &c.names)), None => "   no residue claimed".to_string() };
+        out.push_str(&format!("{:<16} footprint        {}{res}\n", "", feet.join("  ")));
+    }
     for n in &c.notes {
         out.push_str(&format!("{:<16} {n}\n", ""));
     }

@@ -33,7 +33,7 @@ pub fn driver(m: &Module, fid: FuncId, n: i64, repeat: i64, shapes: &[Shape]) ->
     let line = f.line;
     let mut locals: Vec<Local> = Vec::new();
     let mut stmts: Vec<Stmt> = Vec::new();
-    let mut new_local = |locals: &mut Vec<Local>, name: &str, ty: Ty, mutable: bool| -> LocalId {
+    let new_local = |locals: &mut Vec<Local>, name: &str, ty: Ty, mutable: bool| -> LocalId {
         locals.push(Local { name: name.into(), ty, mutable }); locals.len() - 1
     };
     let int = |v: i64| Expr { kind: ExprKind::Int(v), ty: Ty::I64, line };

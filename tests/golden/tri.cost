@@ -1,5 +1,7 @@
 pairs            work 3·a.len()² + 5·a.len()       moves                              exact  (2 regimes)
                                                moves 4·a.len()² + 2·B·a.len() + 4·a.len() if ≈ 8·a.len() ≥ M
                                                moves ≈ 4·a.len()²                 if ≈ 8·a.len() < M
+                 footprint        a: [0, 8·a.len()) (whole array)   no residue claimed
 tiles            work 21·n/4 + 1                   moves 8·n + 2·B                    exact
-main             work 102                          moves 8·B + 200                    exact, io
+                 footprint        a: [32·ii, 32·ii + 8·n)   resident after if 8·n < M
+main             work 102                          moves 6·B + 248                    exact, io

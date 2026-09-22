@@ -158,6 +158,29 @@ impl Cost {
         }).collect())
     }
     pub fn subst(&self, var: usize, by: &Poly) -> Cost { self.subst_many(&[(var, by.clone())]) }
+    /// Every piece's polynomial shifted by `d` (a credit is a negative `d`), under extra conditions.
+    pub fn add_under(&self, conds: &[Cond], d: &Poly) -> Cost {
+        let mut out = self.pieces.clone();
+        for p in &mut out {
+            let mut cs = p.conds.clone();
+            cs.extend(conds.iter().cloned());
+            if !feasible(&cs) { continue; }
+            p.conds = cs;
+            p.poly = p.poly.add(d);
+        }
+        // pieces where the extra conditions fail keep their old value
+        let neg: Vec<Cond> = conds.iter().map(|c| Cond { ws: c.ws.clone(), fits: !c.fits }).collect();
+        if !conds.is_empty() {
+            for p in &self.pieces {
+                for n in &neg {
+                    let mut cs = p.conds.clone(); cs.push(n.clone());
+                    if feasible(&cs) { out.push(Piece { conds: cs, poly: p.poly.clone() }); }
+                }
+            }
+        }
+        Cost::from_pieces(out)
+    }
+
     /// Restrict to pieces compatible with `conds` and add `conds` to them.
     pub fn under(&self, conds: &[Cond]) -> Cost {
         let mut out = Vec::new();
@@ -189,7 +212,18 @@ impl Cost {
             Some(hi.ceil())
         };
         let mut kept: Vec<Piece> = Vec::new();
-        for p in std::mem::take(&mut self.pieces) {
+        'pieces: for mut p in std::mem::take(&mut self.pieces) {
+            // a condition without size variables is a fact at this machine: drop it if true,
+            // drop the piece if false
+            let mut conds = Vec::new();
+            for c in p.conds {
+                if c.ws.has_vars() { conds.push(c); continue; }
+                match c.ws.eval(&at) {
+                    Some(w) => { if ((w * m.b_bytes as f64) < m.m_bytes as f64) != c.fits { continue 'pieces; } }
+                    None => conds.push(c),
+                }
+            }
+            p.conds = conds;
             let vars: Vec<usize> = p.conds.iter().flat_map(|c| c.ws.vars()).collect();
             let single = vars.first().copied().filter(|v| vars.iter().all(|x| x == v));
             let Some(v) = single else { kept.push(p); continue };

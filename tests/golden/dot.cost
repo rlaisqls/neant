@@ -1,2 +1,3 @@
 dot              work 6·a.len()                    moves 16·a.len() + 2·B             exact
-main             work 1355                         moves 13·B + 4048                  exact, io
+                 footprint        a: [0, 8·a.len())  b: [0, 8·a.len())   resident after if 16·a.len() < M
+main             work 1355                         moves 9·B + 896                    exact, io

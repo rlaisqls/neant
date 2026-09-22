@@ -9,5 +9,5 @@ pub mod piece;
 pub mod rewrite;
 pub mod size;
 
-pub use analyze::{analyze, CostResult, FuncCost, Machine, Suggestion};
+pub use analyze::{analyze, CostResult, FuncCost, Machine};
 pub use piece::Cost;

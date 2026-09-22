@@ -1,6 +1,9 @@
 peek             work 5                            moves 3·B                          exact
+                 footprint        s: [0, s.len()) (whole array)  pos: [0, 8)   no residue claimed
 number           unknown: the `decreasing` measure is not a size expression — it reads memory or a value the compiler cannot follow — so this loop has no static bound; `neant measure` can fit one (line 10)
-atom             unknown: calls `atom`, whose cost is unknown (mutually recursive with this function; only self-recursion is solved) (line 20)
-term             unknown: calls `term`, whose cost is unknown (mutually recursive with this function; only self-recursion is solved) (line 29)
-expr             unknown: calls `expr`, whose cost is unknown (mutually recursive with this function; only self-recursion is solved) (line 38)
-main             unknown: calls `expr`, whose cost is unknown (mutually recursive with this function; only self-recursion is solved) (line 49)
+                 footprint        pos: [0, 8)   resident after if 8 < M
+atom             unknown: calls `atom`, whose cost is unknown (mutually recursive with another function; only self-recursion is solved) (line 20)
+                 footprint        pos: [0, 8)   resident after if 8 < M
+term             unknown: calls `atom`, whose cost is unknown (mutually recursive with another function; only self-recursion is solved) (line 29)
+expr             unknown: calls `atom`, whose cost is unknown (mutually recursive with another function; only self-recursion is solved) (line 38)
+main             unknown: calls `atom`, whose cost is unknown (mutually recursive with another function; only self-recursion is solved) (line 49)

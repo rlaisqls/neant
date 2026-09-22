@@ -75,6 +75,11 @@ numbers reproduced as a by-product.
 Then "cost lives in the signature" is withdrawn, the README is rewritten around a whole-program
 analysis tool, and M4 is reconsidered from there.
 
+**Status: passed, 2026-09-22.** Rules two and three deleted; the signature carries footprint and
+residue; `main` calling `matmul(1984, …)` costs the same bytes from the signature as the
+re-analysis did; twenty scans of a fitting array cost one; kernel predictions unchanged
+([experiments.md](experiments.md), Stage A).
+
 ## Stage B — declarations first
 
 **Claim.** A caller can be checked against a callee's declaration alone.

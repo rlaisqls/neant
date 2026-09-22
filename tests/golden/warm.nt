@@ -1,0 +1,17 @@
+fn sum(xs: &[f64]) -> f64 {
+    let mut s = 0.0;
+    for i in 0..xs.len() { s += xs[i]; }
+    s
+}
+fn main() {
+    let n = 200000;
+    let xs = [1.0; n];
+    let mut t = 0.0;
+    for r in 0..20 { t += sum(&xs); }
+    println(t);
+    let m = 4000000;
+    let ys = [1.0; m];
+    let mut u = 0.0;
+    for r in 0..20 { u += sum(&ys); }
+    println(u);
+}

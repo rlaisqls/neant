@@ -1,6 +1,9 @@
 fact             work 6·n + 6                      moves 0                            recurrence
 sum_from         work −7·i + 7·xs.len() + 7        moves −B·i + B·xs.len() + B        recurrence
+                 footprint        xs: [8·i, 8·i + 8)   resident after if 8 < M
 msum             work 20·hi − 20·lo − 10           moves 2·B·hi − 2·B·lo − B          recurrence
+                 footprint        xs: [8·lo, 8·lo + 8)   resident after if 8 < M
 bsearch          work 15·log(hi − lo) + 15         moves 2·B·log(hi − lo) + 2·B       recurrence
+                 footprint        xs: [4·hi + 4·lo, 4·hi + 4·lo + 8)   resident after if 8 < M
 fib              unknown: 2 recursive calls each shrinking `n` by a constant: exponential (line 28)
 main             unknown: calls `fib`, whose cost is unknown (2 recursive calls each shrinking `n` by a constant: exponential) (line 40), io

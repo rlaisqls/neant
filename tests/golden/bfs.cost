@@ -1,2 +1,3 @@
 bfs              unknown: loop bound is not a size expression (line 16)
+                 footprint        offsets: [0, 8·offsets.len()) (whole array)  dist: [0, 8·dist.len()) (whole array)  queue: [0, 8·queue.len()) (whole array)   no residue claimed
 main             unknown: calls `bfs`, whose cost is unknown (loop bound is not a size expression) (line 35)

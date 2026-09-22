@@ -133,25 +133,33 @@ of an `if` are alternatives too, and their lines combine by max in the final tot
 loop, the working-set sum still counts the sites of both branches: a branch-dependent working
 set is bounded by the sum.)
 
-That is the second rule: **a call whose argument sizes are all known at the call site is analysed
-again for that call site**, with the parameters bound to the caller's polynomials, so every fit
-and stride decision inside is made with the caller's numbers. The function's own line in the
-report and in `costs.lock` is its symbolic, piecewise one.
+That is the second rule, and it is about **calls**. A function's signature carries, besides its
+work and moves, its **footprint** — for each array parameter, the byte range it touches, computed
+exactly from the affine indices and loop ranges when it can be, and marked as the whole array when
+it cannot — and its **residue**: the condition under which that footprint is still resident when
+it returns (its total working set, including internal arrays, under `M`). A range that is not exact
+forfeits the residue: the footprint may be over-approximated for a fit test, never for a credit.
 
-And the third: when such a call sits inside the caller's loops and **none of its arguments moves
-with those loops** — `for r in 0..20 { sum(&xs) }` — the callee is analysed *inside* them. The
-caller's loops appear to the callee as levels with no variable, so every access in the callee
-sees them as stride-0 levels and reuses across them when its working set fits. A twenty-fold
-repeat over an array that fits `M` is then charged one pass, not twenty. When an argument does
-depend on a caller loop, nothing is inherited and the call is charged in full per iteration.
+A call composes the callee's signature: the callee's cost, with this call's argument sizes
+substituted for its atoms, and its footprint mapped onto this function's arrays through the
+views passed. What the callee will read that is **already resident** — left there by the previous
+call or loop nest, under the conditions that made it resident — is credited: the callee's moves
+are reduced by the overlap, as a conditional piece. After the call, what it left resident replaces
+what was. The callee is never re-analysed; `matmul` called with `n = 1984` from a `main` costs, to
+the byte, what a re-analysis with `n = 1984` cost before this rule replaced it.
+
+A loop that calls is walked twice: once as written, which costs the first iteration with whatever
+was resident at entry, and once more with the residue its own body leaves, which costs every
+iteration after the first — only the calls are recounted in the second walk. `for r in 0..20 {
+sum(&xs) }` over an array that fits `M` is then one scan and nineteen line-touches, not twenty
+scans; over an array that does not fit, twenty.
 
 Other moves:
 
 | construct | moves |
 |---|---|
 | `[e; n]`, `[a, b, c]` | a sequential write of the array: `n × elem_bytes` |
-| call, arguments loop-invariant | the callee's moves analysed inside the caller's loops (rule three) |
-| call, an argument moves with a loop | the callee's moves, times the enclosing trip counts — no reuse across calls |
+| call | the callee's moves with its atoms substituted, less what is already resident of its footprint (rule two) |
 
 ## What the model does not see
 

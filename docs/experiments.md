@@ -203,3 +203,23 @@ refills. Full-line store streams on this core go into write-streaming mode and b
 allocation; a write-only pass is invisible to `l2d_cache_refill`. Reads pair up (M1), stores
 vanish: what the counter calls a refill is a narrower thing than what the model calls a move,
 and the difference is stable per access kind.
+
+
+## Stage A — is moves a composable quantity?
+
+**Claim under test.** A caller can compute its cost from a callee's signature — work, moves,
+footprint, residue — without re-analysing the callee's body. The kill condition: if the numbers
+the old call-site re-analysis produced cannot be reproduced from signatures, moves is not
+composable and "cost lives in the signature" is withdrawn.
+
+**Result.** Call-site specialisation and inherited loops were deleted. The naive product called
+from `main` with `n = 1984` costs **62,696,939,712 bytes from the signature — the same figure to
+the byte** the re-analysis gave, because the callee's piecewise cost, substituted and decided at
+the machine's `B` and `M`, is the re-analysis. Twenty scans of a 1.6 MiB array cost one scan and
+nineteen line-touches through the residue rule; twenty scans of a 32 MiB array cost twenty. The M1
+and M2 kernel predictions (`sweep.py --dry`) are unchanged at every size. The exit criterion is
+met; the kill condition is not.
+
+**What changed in the numbers.** Sequential calls now credit each other: `dot(&a, &b)` followed by
+`dot(&a, &a)` pays for `a` once. The goldens' `main` lines moved down by those credits and by
+nothing else.
