@@ -23,12 +23,24 @@ itself was not obtainable without library access.**
   along; on `dot`, `saxpy` and `sum` the bound equals the function's own moves to the leading
   term (gap 1×); on the tiled product it returns only the data size, so the hand entry stays as
   the stronger statement there and both are reported.
-- **The upper side is what this compiler owns.** IOLB computes what any schedule must move, not
-  what this program moves. The gap needs both. Bao 2018 computes the upper side exactly for affine
-  nests in set-associative caches; the moves rules here are an approximation of that count where
-  the nest is affine, and cover what it does not — calls, `while`, recursion, data-dependent
-  access, and a whole function as one composable object. The plan holds a place for replacing the
-  rules by the exact polyhedral count inside affine nests.
+- **The program as written is what this compiler owns; the complexity's two ends are not.**
+  Three questions are distinct. What must any schedule move: IOLB, from below. What does the best
+  tiled schedule move: IOUB (IOOpt, Olivry, Iooss, Tollenaere, Rountev, Sadayappan, Rastello,
+  PLDI 2021), from above, for a perfectly nested rectangular fully-permutable band described by
+  hand in a YAML DSL with its reuse directions, for multi-level caches with bandwidths, solved
+  numerically for fixed sizes, with the permutation and tile sizes recommended. What does *this*
+  program move: Bao 2018, exactly, inside affine nests in set-associative caches, and nobody
+  outside them. The gap needs the first and the third. The moves rules here are an approximation
+  of Bao's count where the nest is affine, and cover what it does not — calls, `while`, recursion,
+  data-dependent access, and a whole function as one composable object. The plan holds a place for
+  replacing the rules by the exact polyhedral count inside affine nests. (This bullet first read
+  "the upper side is what this compiler owns", which IOUB's existence made ambiguous; corrected the
+  same day.)
+- **The tiling rewrite is a costed transformation, not a search.** `--apply tile` earns its place
+  by being computed in the model, locked and measured on the machine, not by finding the optimum;
+  IOUB chooses tile sizes better, over more cache levels. Where a nest is a rectangular band the
+  affine analysis already knows its reuse directions, so an export to IOUB's DSL is a small step,
+  recorded in the plan as an option.
 - **Composition is not in the literature.** Elango's "composition" assembles a program's lower
   bound from its sub-computations' bounds; nobody composes a function's cost from a signature
   with a footprint and a residue, checks callers against declarations alone, or audits the

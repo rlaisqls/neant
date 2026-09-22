@@ -174,7 +174,8 @@ site, which is not composition but whole-program analysis, and is said so.
 | cache-oblivious algorithms | the theory, complete | any language; they are library code |
 | Tofte–Talpin / MLKit | region inference | a cost model to serve |
 | Koka / Lean 4 | Perceus in-place reuse | reporting whether it happened |
-| IOLB (Olivry et al., 2020) | automatic, parametric, non-asymptotic **lower bounds** on data movement for any affine program; proofs that a kernel cannot be tiled | the upper side: what *this* program moves |
+| IOLB (Olivry et al., PLDI 2020) | automatic, parametric, non-asymptotic **lower bounds** on data movement for any affine program; proofs that a kernel cannot be tiled | what *this* program, as written, moves |
+| IOUB / IOOpt (Olivry et al., PLDI 2021) | the **upper bound** of the I/O complexity: what the best tiled schedule (permutation and tile sizes) of a perfectly nested rectangular band moves, for multi-level caches, with the tiling recommended; the band is described by hand in a DSL with its reuse directions | the program as written rather than its best schedule; anything that is not a rectangular band; a compiler around it |
 | Elango et al. (POPL 2015) | lower bounds of a program composed from the bounds of its sub-computations | costs composed from function signatures |
 | Bao et al. (POPL 2018) | exact, closed-form cache-miss counts for affine programs in set-associative caches, parametric in the cache | anything outside affine control: calls, `while`, recursion, data-dependent access; a language around it |
 
@@ -199,14 +200,17 @@ was measured against pairs read streams and does not see write streams, so it wa
 model's unit. The linear kernels' slopes are near-trivial; the information is in the naive/tiled
 separation and in the two rules the data forced.
 
-**The lower bounds are not this project's.** The hand-written catalogue has one entry, the
-matrix product, and it is not going to grow by hand: IOLB derives parametric lower bounds for any
-affine program automatically, matches Hong–Kung on the product, improves on every other published
-hand bound in PolyBench, and proves two kernels untileable. What this compiler owns is the other
-side of the gap — what the program as written moves — and `neant cost --iolb` feeds the affine
-functions of a program to IOLB for the bound rather than writing bounds down (its first answer:
-the hand entry's constant for the product was `5.7×` too small). For code that is not affine no
-bound exists, and the compiler says what yours costs and cannot say what it should.
+**The bounds are not this project's.** Olivry et al. bound the I/O *complexity* from both sides:
+IOLB from below, for any schedule of any affine program, and IOUB from above, with the best tiled
+schedule of a perfectly nested rectangular band described by hand in a DSL. Bao et al. count what a
+given affine nest moves. The hand-written catalogue here has one entry, the matrix product, and it
+is not going to grow by hand: `neant cost --iolb` feeds the affine functions of a program to IOLB
+for the bound (its first answer: the hand entry's constant for the product was `5.7×` too small).
+What this compiler owns is the cost of the program *as written*, beyond affine nests, composed
+through signatures, locked, and audited to the boundary. Its tiling rewrite is a costed and
+measured transformation, not a search; where a nest is a rectangular band, IOUB's recommendation
+is the better tile, and an export to it is a small step. For code that is not affine no bound
+exists, and the compiler says what yours costs and cannot say what it should.
 
 **The exact tier covers less than the demo suggests.** On the four ordinary programs of the M3
 corpus — string processing, a stack machine, breadth-first search, a recursive-descent parser —

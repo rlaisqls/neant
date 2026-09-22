@@ -174,7 +174,10 @@ accesses whose lines overlap by accident). Where a nest is affine, the honest re
 rules is that computation, and the plan holds a place for it. What the rules cover that the
 polyhedral count does not is everything around the nest: calls with footprints and residues,
 `while` with a measure, recursion, data-dependent access under the region rule, and a whole
-function's cost as one object a caller composes.
+function's cost as one object a caller composes. A third quantity is not what these rules compute
+at all: IOUB (Olivry et al., PLDI 2021) bounds the I/O complexity from above with the best tiled
+schedule of a rectangular band, which is a statement about the computation, not about the program
+as written. The rules here answer for the program as written.
 
 On the other side of the gap, lower bounds: IOLB (Olivry, Langou, Pouchet, Sadayappan, Rastello,
 2020) derives them automatically for any affine program, and `neant cost --iolb` obtains them

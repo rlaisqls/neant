@@ -166,6 +166,11 @@ here — as the search space LLVM does not expose, not as better heuristics.
 Zero-copy persistence (unrelated to cost; out of the argument); generics beyond what the stages
 need; strings and I/O beyond the harness; compile-time performance of the compiler.
 
+An option, not scheduled: an export of a rectangular fully-permutable nest to IOUB's DSL (loop
+dimensions, access functions, reuse directions, cache sizes), so that the tile the rewrite applies
+is the one IOUB recommends rather than `tile_side`'s square. The affine analysis already has every
+field the DSL asks for.
+
 ## Who switches, and why
 
 Nobody has to, and the plan does not assume anyone will. This is a general-purpose language judged
