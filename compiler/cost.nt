@@ -587,6 +587,17 @@ fn bytes_len(src: &[u8], toks: &[Token], t: i64) -> i64 {
     n
 }
 
+// does this function walk any array it is given
+fn walks_anything(ffoot: &[i64], sigs: &[Sig], si: i64) -> bool {
+    let mut p = 0;
+    let mut any = false;
+    while p < sigs[si].n_params {
+        if ffoot[si * 16 + p] != 0 { any = true; }
+        p += 1;
+    }
+    any
+}
+
 // the length a name is bound to, when the walk knows it
 fn arg_len_of(src: &[u8], toks: &[Token], env: &[Env], wst: &[i64], name: i64) -> i64 {
     let e = env_find(src, toks, env, wst, name);
@@ -1503,6 +1514,11 @@ fn site_add(src: &[u8], toks: &[Token], nodes: &[Node], types: &[Ty], strs: &[St
             facs: &mut [Fac], terms: &mut [Term], pols: &mut [Pol],
             pst: &mut [i64], env: &mut [Env], cof: &mut [Cof], sites: &mut [Site], cks: &mut [Ck], budget: &mut [f64],
             resid: &mut [Res], rargs: &mut [i64], wst: &mut [i64], arr: i64, idx: i64) -> i64 {
+    // a site two loops deep needs the per-level working set this slice does not compute
+    if wst[11] > 1 {
+        wst[1] = 1;
+        return ck_zero(facs, terms, pols, pst, cks, budget, wst);
+    }
     let t = ntys[arr];
     let es = elem_bytes(types, strs, flds, t);
     if es < 0 || nodes[arr].kind != 65 {
@@ -1606,17 +1622,23 @@ fn m_expr(src: &[u8], toks: &[Token], nodes: &[Node], types: &[Ty], strs: &[Str]
             || name_is_max(src, toks, nodes[n].a) {
             return acc;
         }
-        // a call inside a loop needs the callee's traffic per lap against what the previous lap
-        // left resident, which is `leave_loop`'s cold/warm replay and is not here
-        if wst[11] != 0 {
-            wst[1] = 1;
-            return acc;
-        }
         let mut si = -1;
         let mut i = 0;
         while sigs[i].name >= 0 {
             if si < 0 && name_eq(src, toks, sigs[i].name, nodes[n].a) { si = i; }
             i += 1;
+        }
+        // A call inside a loop needs the callee's traffic per lap against what the previous lap
+        // left resident, which is `leave_loop`'s cold/warm replay and is not here — **unless the
+        // callee touches nothing**, in which case there is nothing to replay. `count_words` calls
+        // `is_space` on every byte and that is the whole of its difficulty.
+        if wst[11] != 0 {
+            if si >= 0 && si != wst[24] && fm[si] >= 0 && cks[fm[si]].ws < 0
+                && pol_is_zero(pols, cks[fm[si]].fits) && !walks_anything(ffoot, sigs, si) {
+                return acc;
+            }
+            wst[1] = 1;
+            return acc;
         }
         if si == wst[24] {
             // a self-call: the recurrence is solved once the body is walked, so the call itself
@@ -1908,14 +1930,15 @@ fn m_stmt(src: &[u8], toks: &[Token], nodes: &[Node], types: &[Ty], strs: &[Str]
         return acc;
     }
     if k == 92 || k == 93 {
-        // one loop deep: a site inside two loops is where reuse lives, and reuse is what
-        // `settle_moves` exists for
-        if wst[11] != 0 {
-            wst[1] = 1;
-            return ck_zero(facs, terms, pols, pst, cks, budget, wst);
-        }
+        // A *site* inside two loops is where reuse lives, and reuse is what `settle_moves` exists
+        // for — but a nested loop that touches no array has no reuse to get wrong, and refusing it
+        // was refusing arithmetic. `site_add` is where the depth is actually checked.
         let saved = wst[0];
-        wst[11] = 1;
+        let depth = wst[11];
+        let svar = wst[12];
+        let strip = wst[13];
+        let sbody = wst[22];
+        wst[11] = depth + 1;
         let mut acc = ck_zero(facs, terms, pols, pst, cks, budget, wst);
         if k == 92 {
             let a = m_expr(src, toks, nodes, types, strs, flds, ntys, sigs, ptys, fm, ffoot, facs, terms, pols, pst, env, cof, sites, cks, budget, resid, rargs, wst, nodes[n].b);
@@ -1929,7 +1952,12 @@ fn m_stmt(src: &[u8], toks: &[Token], nodes: &[Node], types: &[Ty], strs: &[Str]
             wst[13] = pol_sub(facs, terms, pols, pst, hi, lo);
             wst[12] = nodes[n].a;
             wst[22] = nodes[n].d;
-            env_add(env, wst, nodes[n].a, -1, -1);
+            // the loop variable is bound to an atom, as it is in the work walk: a nested loop's
+            // bound may name it, and `for j in i..4` is unbounded without it
+            let atom = wst[2];
+            wst[2] = atom + 1;
+            let av = pol_atom(facs, terms, pols, pst, atom);
+            env_add(env, wst, nodes[n].a, av, -1);
             let body = m_block(src, toks, nodes, types, strs, flds, ntys, sigs, ptys, fm, ffoot, facs, terms, pols, pst, env, cof, sites, cks, budget, resid, rargs, wst, nodes[n].d);
             acc = ck_add(facs, terms, pols, pst, cks, budget, wst, a, b);
             acc = ck_add(facs, terms, pols, pst, cks, budget, wst, acc, body);
@@ -1951,10 +1979,10 @@ fn m_stmt(src: &[u8], toks: &[Token], nodes: &[Node], types: &[Ty], strs: &[Str]
             acc = ck_add(facs, terms, pols, pst, cks, budget, wst, acc, body);
         }
         wst[0] = saved;
-        wst[11] = 0;
-        wst[12] = -1;
-        wst[13] = -1;
-        wst[22] = -1;
+        wst[11] = depth;
+        wst[12] = svar;
+        wst[13] = strip;
+        wst[22] = sbody;
         return acc;
     }
     if k == 94 { return ck_zero(facs, terms, pols, pst, cks, budget, wst); }
@@ -1983,6 +2011,7 @@ fn m_func(src: &[u8], toks: &[Token], nodes: &[Node], types: &[Ty], strs: &[Str]
     wst[13] = -1;
     wst[24] = si;
     wst[26] = 0;
+    wst[2] = 1003;
     wst[20] = 0;
     wst[21] = 0;
     wst[22] = -1;

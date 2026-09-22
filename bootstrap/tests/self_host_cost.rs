@@ -48,7 +48,7 @@ const EXACT: usize = 71;
 /// **piecewise** — a scattered walk costs the array's footprint when it fits in `M` and a line per
 /// touch when it does not — and their two regimes and the condition between them are compared as
 /// one string, exactly as the single-piece ones are (design §13).
-const EXACT_MOVES: usize = 51;
+const EXACT_MOVES: usize = 54;
 
 /// `(file, function)` where the self-hosted `moves` differs because **the self-hosted emitter
 /// always lays an array of structs out as AoS** (docs/self-hosting-arrays-design.md §4) while the

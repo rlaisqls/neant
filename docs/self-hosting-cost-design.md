@@ -585,3 +585,21 @@ declined are nested loops, calls inside loops, and whole-array reassignment.
 
 **51 exact, 13 differing in two understood families, 12 declined** — and the twelve are three
 things: nested loops (`matmul`, `stencil`, `tri`), a call inside a loop (`words`), and `msum`.
+
+### Two more refusals that were doing no work
+
+`moves` 51 → 54, and the boundary is now clean: the nine declines are **nested loops with an array
+access in them**, and `msum`.
+
+- **A call inside a loop, into a callee that touches nothing.** The replay `leave_loop` does exists
+  to weigh a callee's traffic on the first lap against the later ones. A callee with no traffic has
+  none to weigh, and `words.nt`'s `count_words` calls `is_space` on every byte and was declined for
+  it.
+- **A nested loop with no sites in it.** Refusing every second loop was refusing arithmetic:
+  `forsum.nt`'s `main` counts pairs in a double loop and touches no array at all. The depth check
+  belongs on the *site*, not on the loop, and moving it there also required the moves walk to bind
+  a loop variable to an atom the way the work walk already did — `for j in i..4` has no bound
+  otherwise.
+
+What remains is one mechanism, honestly: the per-level working set, which is what `settle_moves` is
+for and what `matmul`, `stencil` and `tri` need. Everything cheaper than it is done.
