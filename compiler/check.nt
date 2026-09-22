@@ -1,0 +1,516 @@
+// The third self-hosted stage (docs/self-hosting-checker-design.md), the first slice of
+// bootstrap/src/types.rs: name resolution and type checking over exactly the grammar
+// `compiler/parse.nt` produces. **A fragment**, like parse.nt: it uses lex.nt's `Token` and
+// parse.nt's `Node` and node kinds, and is compiled by concatenating lex.nt, parse.nt, this, and
+// a driver.
+//
+// Out of this slice (design §1): size variables, chain desugaring, moves/uniqueness/layout, and
+// building a typed IR — every one of them feeds a stage that does not exist self-hosted yet.
+//
+// Type kinds:  0 i64  1 f64  2 bool  3 u8  4 unit  5 array  6 slice
+// The five scalars are interned first, so their indices are 0..4 and a scalar comparison is an
+// integer comparison.
+//
+// `cst` is the checker's state, the same one-element-array idiom the parser uses:
+//   cst[0] next free type   cst[1] symbol table length   cst[2] error flag
+//   cst[3] signature count  cst[4] next free param type  cst[5] loop depth
+//   cst[6] the current function's return type
+
+struct Ty { kind: i64, elem: i64, mutable: i64 }
+struct Sym { name: i64, ty: i64, mutable: i64 }
+struct Sig { name: i64, params: i64, n_params: i64, ret: i64 }
+
+// ---- types ----
+
+fn intern_scalars(types: &mut [Ty], cst: &mut [i64]) {
+    let mut k = 0;
+    while k < 5 {
+        types[k].kind = k;
+        types[k].elem = -1;
+        types[k].mutable = 0;
+        k += 1;
+    }
+    cst[0] = 5;
+}
+
+fn new_ty(types: &mut [Ty], cst: &mut [i64], kind: i64, elem: i64, mutable: i64) -> i64 {
+    let i = cst[0];
+    types[i].kind = kind;
+    types[i].elem = elem;
+    types[i].mutable = mutable;
+    cst[0] = i + 1;
+    i
+}
+
+fn is_scalar(types: &[Ty], t: i64) -> bool {
+    t >= 0 && types[t].kind < 4
+}
+fn is_numeric(types: &[Ty], t: i64) -> bool {
+    t >= 0 && (types[t].kind == 0 || types[t].kind == 1 || types[t].kind == 3)
+}
+fn is_arrayish(types: &[Ty], t: i64) -> bool {
+    t >= 0 && (types[t].kind == 5 || types[t].kind == 6)
+}
+
+// structural equality; a slice's mutability is part of it, and `elem` is compared recursively
+fn same_ty(types: &[Ty], a: i64, b: i64) -> bool {
+    if a < 0 || b < 0 { return false; }
+    if a == b { return true; }
+    if types[a].kind != types[b].kind { return false; }
+    if types[a].kind == 6 && types[a].mutable != types[b].mutable { return false; }
+    if types[a].kind == 5 || types[a].kind == 6 {
+        return same_ty(types, types[a].elem, types[b].elem);
+    }
+    false
+}
+
+// ---- names ----
+
+// two identifier tokens name the same thing when their spans hold the same bytes: lex.nt kept
+// `(start, len)` into the source rather than copying, so this is the comparison
+fn name_eq(src: &[u8], toks: &[Token], a: i64, b: i64) -> bool {
+    if a < 0 || b < 0 { return false; }
+    if toks[a].len != toks[b].len { return false; }
+    let mut i = 0;
+    let mut ok = true;
+    while i < toks[a].len {
+        if src[toks[a].start + i] != src[toks[b].start + i] { ok = false; }
+        i += 1;
+    }
+    ok
+}
+
+// a token's span against a literal, one byte at a time — an array literal cannot be an argument,
+// so a `b"println"` to compare with is not available
+fn name_is_println(src: &[u8], toks: &[Token], t: i64) -> bool {
+    if toks[t].len != 7 { return false; }
+    let s = toks[t].start;
+    src[s] == b'p' && src[s + 1] == b'r' && src[s + 2] == b'i' && src[s + 3] == b'n'
+        && src[s + 4] == b't' && src[s + 5] == b'l' && src[s + 6] == b'n'
+}
+fn name_is_min(src: &[u8], toks: &[Token], t: i64) -> bool {
+    toks[t].len == 3 && src[toks[t].start] == b'm' && src[toks[t].start + 1] == b'i' && src[toks[t].start + 2] == b'n'
+}
+fn name_is_max(src: &[u8], toks: &[Token], t: i64) -> bool {
+    toks[t].len == 3 && src[toks[t].start] == b'm' && src[toks[t].start + 1] == b'a' && src[toks[t].start + 2] == b'x'
+}
+
+// the type name a `TyNamed` node spells, or −1 if it is not one of the four scalars
+fn scalar_named(src: &[u8], toks: &[Token], t: i64) -> i64 {
+    let s = toks[t].start;
+    let n = toks[t].len;
+    if n == 3 && src[s] == b'i' && src[s + 1] == b'6' && src[s + 2] == b'4' { return 0; }
+    if n == 3 && src[s] == b'f' && src[s + 1] == b'6' && src[s + 2] == b'4' { return 1; }
+    if n == 4 && src[s] == b'b' && src[s + 1] == b'o' && src[s + 2] == b'o' && src[s + 3] == b'l' { return 2; }
+    if n == 2 && src[s] == b'u' && src[s + 1] == b'8' { return 3; };
+    -1
+}
+
+// the innermost symbol with this name, or −1: searched backwards, so an inner `let` shadows
+fn sym_find(src: &[u8], toks: &[Token], syms: &[Sym], cst: &[i64], name: i64) -> i64 {
+    let mut i = cst[1] - 1;
+    let mut found = -1;
+    while i >= 0 {
+        if found < 0 && name_eq(src, toks, syms[i].name, name) { found = i; }
+        i -= 1;
+    }
+    found
+}
+
+fn declare(syms: &mut [Sym], cst: &mut [i64], name: i64, ty: i64, mutable: i64) {
+    let i = cst[1];
+    syms[i].name = name;
+    syms[i].ty = ty;
+    syms[i].mutable = mutable;
+    cst[1] = i + 1;
+}
+
+// ---- type expressions ----
+
+fn resolve_ty(src: &[u8], toks: &[Token], nodes: &[Node], types: &mut [Ty], cst: &mut [i64], n: i64) -> i64 {
+    if n < 0 { return 4; }
+    let k = nodes[n].kind;
+    if k == 100 {
+        let s = scalar_named(src, toks, nodes[n].a);
+        if s < 0 { cst[2] = 1; return -1; }
+        return s;
+    }
+    if k == 101 { return 4; }
+    if k == 104 {
+        let e = resolve_ty(src, toks, nodes, types, cst, nodes[n].a);
+        return new_ty(types, cst, 5, e, 0);
+    }
+    if k == 102 {
+        let e = resolve_ty(src, toks, nodes, types, cst, nodes[n].a);
+        return new_ty(types, cst, 5, e, 0);
+    }
+    if k == 103 {
+        let e = resolve_ty(src, toks, nodes, types, cst, nodes[n].a);
+        return new_ty(types, cst, 6, e, nodes[n].ival);
+    }
+    cst[2] = 1;
+    -1
+}
+
+// ---- expressions ----
+
+// every expression's type is recorded in `ntys`, indexed by node — the table a next stage would
+// read, and what the type dump prints. The rules are in `check_expr_inner`; this only records.
+fn check_expr(src: &[u8], toks: &[Token], nodes: &[Node], types: &mut [Ty], syms: &mut [Sym],
+              sigs: &[Sig], ptys: &[i64], ntys: &mut [i64], cst: &mut [i64], n: i64) -> i64 {
+    let t = check_expr_inner(src, toks, nodes, types, syms, sigs, ptys, ntys, cst, n);
+    if n >= 0 { ntys[n] = t; }
+    t
+}
+
+fn check_expr_inner(src: &[u8], toks: &[Token], nodes: &[Node], types: &mut [Ty], syms: &mut [Sym],
+              sigs: &[Sig], ptys: &[i64], ntys: &mut [i64], cst: &mut [i64], n: i64) -> i64 {
+    if cst[2] != 0 || n < 0 { return -1; }
+    let k = nodes[n].kind;
+    if k == 60 { return 0; }
+    if k == 61 { return 1; }
+    if k == 62 { return 2; }
+    if k == 63 { return 3; }
+    if k == 64 { return new_ty(types, cst, 5, 3, 0); }
+    if k == 65 {
+        let s = sym_find(src, toks, syms, cst, nodes[n].a);
+        if s < 0 { cst[2] = 1; return -1; }
+        return syms[s].ty;
+    }
+    if k == 66 {
+        let a = check_expr(src, toks, nodes, types, syms, sigs, ptys, ntys, cst, nodes[n].a);
+        let b = check_expr(src, toks, nodes, types, syms, sigs, ptys, ntys, cst, nodes[n].b);
+        if cst[2] != 0 { return -1; }
+        if !same_ty(types, a, b) { cst[2] = 1; return -1; }
+        let op = nodes[n].ival;
+        if op <= 4 {
+            if !is_numeric(types, a) { cst[2] = 1; return -1; }
+            return a;
+        }
+        if op <= 10 {
+            if !is_scalar(types, a) { cst[2] = 1; return -1; }
+            // an ordering comparison on `bool` is refused, as the Rust checker refuses it
+            if op >= 7 && types[a].kind == 2 { cst[2] = 1; return -1; }
+            return 2;
+        }
+        if types[a].kind != 2 { cst[2] = 1; return -1; }
+        return 2;
+    }
+    if k == 67 {
+        let a = check_expr(src, toks, nodes, types, syms, sigs, ptys, ntys, cst, nodes[n].a);
+        if cst[2] != 0 { return -1; }
+        if nodes[n].ival == 0 {
+            if !is_numeric(types, a) { cst[2] = 1; return -1; }
+            return a;
+        }
+        if a != 2 { cst[2] = 1; return -1; }
+        return 2;
+    }
+    if k == 68 {
+        // the Rust checker indexes a variable, not an arbitrary expression
+        if nodes[nodes[n].a].kind != 65 { cst[2] = 1; return -1; }
+        let base = check_expr(src, toks, nodes, types, syms, sigs, ptys, ntys, cst, nodes[n].a);
+        let idx = check_expr(src, toks, nodes, types, syms, sigs, ptys, ntys, cst, nodes[n].b);
+        if cst[2] != 0 { return -1; }
+        if !is_arrayish(types, base) { cst[2] = 1; return -1; }
+        if idx != 0 { cst[2] = 1; return -1; }
+        return types[base].elem;
+    }
+    if k == 69 {
+        // a field access needs a struct type, and this slice has none
+        cst[2] = 1;
+        return -1;
+    }
+    if k == 71 { return check_call(src, toks, nodes, types, syms, sigs, ptys, ntys, cst, n); }
+    if k == 73 {
+        if nodes[nodes[n].a].kind != 65 { cst[2] = 1; return -1; }
+        let s = sym_find(src, toks, syms, cst, nodes[nodes[n].a].a);
+        if s < 0 { cst[2] = 1; return -1; }
+        let t = syms[s].ty;
+        if !is_arrayish(types, t) { cst[2] = 1; return -1; }
+        let m = nodes[n].ival;
+        // `&mut` of something that is not `let mut`, or of a `&[T]`, is refused
+        if m == 1 {
+            if types[t].kind == 5 && syms[s].mutable == 0 { cst[2] = 1; return -1; }
+            if types[t].kind == 6 && types[t].mutable == 0 { cst[2] = 1; return -1; }
+        }
+        return new_ty(types, cst, 6, types[t].elem, m);
+    }
+    if k == 74 {
+        let a = check_expr(src, toks, nodes, types, syms, sigs, ptys, ntys, cst, nodes[n].a);
+        let t = resolve_ty(src, toks, nodes, types, cst, nodes[n].b);
+        if cst[2] != 0 { return -1; }
+        if !is_numeric(types, a) || !is_numeric(types, t) { cst[2] = 1; return -1; }
+        return t;
+    }
+    if k == 75 {
+        let c = check_expr(src, toks, nodes, types, syms, sigs, ptys, ntys, cst, nodes[n].a);
+        if cst[2] == 0 && c != 2 { cst[2] = 1; return -1; }
+        let t = check_block(src, toks, nodes, types, syms, sigs, ptys, ntys, cst, nodes[n].b);
+        if nodes[n].c < 0 {
+            if cst[2] == 0 && t != 4 { cst[2] = 1; return -1; }
+            return 4;
+        }
+        let e = check_block(src, toks, nodes, types, syms, sigs, ptys, ntys, cst, nodes[n].c);
+        if cst[2] != 0 { return -1; }
+        if !same_ty(types, t, e) { cst[2] = 1; return -1; }
+        return t;
+    }
+    if k == 76 { return check_block(src, toks, nodes, types, syms, sigs, ptys, ntys, cst, n); }
+    cst[2] = 1;
+    -1
+}
+
+fn check_call(src: &[u8], toks: &[Token], nodes: &[Node], types: &mut [Ty], syms: &mut [Sym],
+              sigs: &[Sig], ptys: &[i64], ntys: &mut [i64], cst: &mut [i64], n: i64) -> i64 {
+    let name = nodes[n].a;
+    if name_is_println(src, toks, name) {
+        let a = check_expr(src, toks, nodes, types, syms, sigs, ptys, ntys, cst, nodes[n].b);
+        if cst[2] != 0 { return -1; }
+        if nodes[n].b < 0 || nodes[nodes[n].b].next >= 0 { cst[2] = 1; return -1; }
+        if !is_scalar(types, a) { cst[2] = 1; return -1; }
+        return 4;
+    }
+    if name_is_min(src, toks, name) || name_is_max(src, toks, name) {
+        let first = nodes[n].b;
+        if first < 0 { cst[2] = 1; return -1; }
+        let second = nodes[first].next;
+        if second < 0 || nodes[second].next >= 0 { cst[2] = 1; return -1; }
+        let a = check_expr(src, toks, nodes, types, syms, sigs, ptys, ntys, cst, first);
+        let b = check_expr(src, toks, nodes, types, syms, sigs, ptys, ntys, cst, second);
+        if cst[2] != 0 { return -1; }
+        if !same_ty(types, a, b) || !is_numeric(types, a) { cst[2] = 1; return -1; }
+        return a;
+    }
+    // a declared function: its signature, by name
+    let mut si = -1;
+    let mut i = 0;
+    while i < cst[3] {
+        if si < 0 && name_eq(src, toks, sigs[i].name, name) { si = i; }
+        i += 1;
+    }
+    if si < 0 { cst[2] = 1; return -1; }
+    let mut arg = nodes[n].b;
+    let mut k = 0;
+    while cst[2] == 0 && arg >= 0 {
+        let at = check_expr(src, toks, nodes, types, syms, sigs, ptys, ntys, cst, arg);
+        if cst[2] == 0 {
+            if k >= sigs[si].n_params {
+                cst[2] = 1;
+            } else {
+                let want = ptys[sigs[si].params + k];
+                // a `&mut [T]` argument satisfies a `&[T]` parameter, not the other way round
+                let ok = if same_ty(types, at, want) {
+                    true
+                } else if at >= 0 && want >= 0 && types[at].kind == 6 && types[want].kind == 6 {
+                    types[at].mutable == 1 && types[want].mutable == 0 && same_ty(types, types[at].elem, types[want].elem)
+                } else {
+                    false
+                };
+                if !ok { cst[2] = 1; }
+            }
+        }
+        k += 1;
+        arg = nodes[arg].next;
+    }
+    if cst[2] == 0 && k != sigs[si].n_params { cst[2] = 1; }
+    if cst[2] != 0 { return -1; }
+    sigs[si].ret
+}
+
+// ---- statements and blocks ----
+
+// a block's own scope is the symbol table's length: entering saves it, leaving restores it
+fn check_block(src: &[u8], toks: &[Token], nodes: &[Node], types: &mut [Ty], syms: &mut [Sym],
+               sigs: &[Sig], ptys: &[i64], ntys: &mut [i64], cst: &mut [i64], n: i64) -> i64 {
+    if cst[2] != 0 || n < 0 { return -1; }
+    let saved = cst[1];
+    let mut s = nodes[n].a;
+    while cst[2] == 0 && s >= 0 {
+        check_stmt(src, toks, nodes, types, syms, sigs, ptys, ntys, cst, s);
+        s = nodes[s].next;
+    }
+    let mut t = 4;
+    if nodes[n].b >= 0 {
+        t = check_expr(src, toks, nodes, types, syms, sigs, ptys, ntys, cst, nodes[n].b);
+    }
+    cst[1] = saved;
+    // recorded here rather than in `check_expr`'s wrapper: a function body, a loop body and an
+    // `if` arm reach this directly, without being an expression themselves
+    ntys[n] = t;
+    t
+}
+
+fn check_stmt(src: &[u8], toks: &[Token], nodes: &[Node], types: &mut [Ty], syms: &mut [Sym],
+              sigs: &[Sig], ptys: &[i64], ntys: &mut [i64], cst: &mut [i64], n: i64) {
+    if cst[2] != 0 || n < 0 { return; }
+    let k = nodes[n].kind;
+    if k == 90 {
+        let t = check_expr(src, toks, nodes, types, syms, sigs, ptys, ntys, cst, nodes[n].c);
+        if cst[2] != 0 { return; }
+        if t == 4 { cst[2] = 1; return; }
+        if nodes[n].b >= 0 {
+            let d = resolve_ty(src, toks, nodes, types, cst, nodes[n].b);
+            if cst[2] != 0 { return; }
+            if !same_ty(types, d, t) { cst[2] = 1; return; }
+        }
+        declare(syms, cst, nodes[n].a, t, nodes[n].ival);
+        return;
+    }
+    if k == 91 {
+        let tgt = nodes[n].a;
+        let tk = nodes[tgt].kind;
+        if tk == 65 {
+            let s = sym_find(src, toks, syms, cst, nodes[tgt].a);
+            if s < 0 { cst[2] = 1; return; }
+            if syms[s].mutable == 0 { cst[2] = 1; return; }
+            if is_arrayish(types, syms[s].ty) { cst[2] = 1; return; }
+            let v = check_expr(src, toks, nodes, types, syms, sigs, ptys, ntys, cst, nodes[n].b);
+            if cst[2] != 0 { return; }
+            if !same_ty(types, syms[s].ty, v) { cst[2] = 1; }
+            if nodes[n].ival >= 0 && !is_numeric(types, syms[s].ty) { cst[2] = 1; }
+            return;
+        }
+        if tk == 68 {
+            if nodes[nodes[tgt].a].kind != 65 { cst[2] = 1; return; }
+            let s = sym_find(src, toks, syms, cst, nodes[nodes[tgt].a].a);
+            if s < 0 { cst[2] = 1; return; }
+            let bt = syms[s].ty;
+            if !is_arrayish(types, bt) { cst[2] = 1; return; }
+            // writing needs an owned `let mut` array or a `&mut [T]`
+            if types[bt].kind == 5 && syms[s].mutable == 0 { cst[2] = 1; return; }
+            if types[bt].kind == 6 && types[bt].mutable == 0 { cst[2] = 1; return; }
+            let it = check_expr(src, toks, nodes, types, syms, sigs, ptys, ntys, cst, nodes[tgt].b);
+            if cst[2] == 0 && it != 0 { cst[2] = 1; return; }
+            let v = check_expr(src, toks, nodes, types, syms, sigs, ptys, ntys, cst, nodes[n].b);
+            if cst[2] != 0 { return; }
+            if !same_ty(types, types[bt].elem, v) { cst[2] = 1; }
+            return;
+        }
+        cst[2] = 1;
+        return;
+    }
+    if k == 92 {
+        let a = check_expr(src, toks, nodes, types, syms, sigs, ptys, ntys, cst, nodes[n].b);
+        let b = check_expr(src, toks, nodes, types, syms, sigs, ptys, ntys, cst, nodes[n].c);
+        if cst[2] != 0 { return; }
+        if a != 0 || b != 0 { cst[2] = 1; return; }
+        let saved = cst[1];
+        declare(syms, cst, nodes[n].a, 0, 0);
+        cst[5] = cst[5] + 1;
+        let t = check_block(src, toks, nodes, types, syms, sigs, ptys, ntys, cst, nodes[n].d);
+        cst[5] = cst[5] - 1;
+        cst[1] = saved;
+        if cst[2] == 0 && t != 4 { cst[2] = 1; }
+        return;
+    }
+    if k == 93 {
+        let c = check_expr(src, toks, nodes, types, syms, sigs, ptys, ntys, cst, nodes[n].a);
+        if cst[2] == 0 && c != 2 { cst[2] = 1; return; }
+        if nodes[n].b >= 0 {
+            let m = check_expr(src, toks, nodes, types, syms, sigs, ptys, ntys, cst, nodes[n].b);
+            if cst[2] == 0 && m != 0 { cst[2] = 1; return; }
+        }
+        cst[5] = cst[5] + 1;
+        let t = check_block(src, toks, nodes, types, syms, sigs, ptys, ntys, cst, nodes[n].c);
+        cst[5] = cst[5] - 1;
+        if cst[2] == 0 && t != 4 { cst[2] = 1; }
+        return;
+    }
+    if k == 94 {
+        if cst[5] == 0 { cst[2] = 1; }
+        return;
+    }
+    if k == 95 {
+        let t = check_expr(src, toks, nodes, types, syms, sigs, ptys, ntys, cst, nodes[n].a);
+        if cst[2] == 0 && is_arrayish(types, t) { cst[2] = 1; }
+        return;
+    }
+    if k == 96 {
+        if nodes[n].a < 0 {
+            if cst[6] != 4 { cst[2] = 1; }
+            return;
+        }
+        let t = check_expr(src, toks, nodes, types, syms, sigs, ptys, ntys, cst, nodes[n].a);
+        if cst[2] == 0 && !same_ty(types, t, cst[6]) { cst[2] = 1; }
+        return;
+    }
+    cst[2] = 1;
+}
+
+// ---- functions ----
+
+// every signature first, so a call may name a function declared later
+fn collect_sigs(src: &[u8], toks: &[Token], nodes: &[Node], types: &mut [Ty], sigs: &mut [Sig],
+                ptys: &mut [i64], cst: &mut [i64], first: i64) {
+    let mut f = first;
+    while cst[2] == 0 && f >= 0 {
+        let si = cst[3];
+        sigs[si].name = nodes[f].a;
+        sigs[si].params = cst[4];
+        let mut np = 0;
+        let mut p = nodes[f].b;
+        while cst[2] == 0 && p >= 0 {
+            let t = resolve_ty(src, toks, nodes, types, cst, nodes[p].b);
+            ptys[cst[4]] = t;
+            cst[4] = cst[4] + 1;
+            np += 1;
+            p = nodes[p].next;
+        }
+        sigs[si].n_params = np;
+        sigs[si].ret = resolve_ty(src, toks, nodes, types, cst, nodes[f].c);
+        cst[3] = si + 1;
+        f = nodes[f].next;
+    }
+}
+
+fn check_func(src: &[u8], toks: &[Token], nodes: &[Node], types: &mut [Ty], syms: &mut [Sym],
+              sigs: &[Sig], ptys: &[i64], ntys: &mut [i64], cst: &mut [i64], f: i64, si: i64) {
+    if cst[2] != 0 { return; }
+    let saved = cst[1];
+    let mut p = nodes[f].b;
+    let mut k = 0;
+    while p >= 0 {
+        declare(syms, cst, nodes[p].a, ptys[sigs[si].params + k], 0);
+        k += 1;
+        p = nodes[p].next;
+    }
+    cst[6] = sigs[si].ret;
+    let body = nodes[f].d;
+    let t = check_block(src, toks, nodes, types, syms, sigs, ptys, ntys, cst, body);
+    if cst[2] == 0 {
+        if nodes[body].b >= 0 {
+            // the body's value is its tail: it must be what the signature says
+            if !same_ty(types, t, sigs[si].ret) { cst[2] = 1; }
+        } else if sigs[si].ret != 4 && !ends_in_return(nodes, body) {
+            cst[2] = 1;
+        }
+    }
+    cst[1] = saved;
+}
+
+// the last statement of a block is a `return`
+fn ends_in_return(nodes: &[Node], body: i64) -> bool {
+    let mut s = nodes[body].a;
+    let mut last = -1;
+    while s >= 0 {
+        last = s;
+        s = nodes[s].next;
+    }
+    last >= 0 && nodes[last].kind == 96
+}
+
+// returns 0 when the program checks, 1 when it does not
+fn check_program(src: &[u8], toks: &[Token], nodes: &[Node], types: &mut [Ty], syms: &mut [Sym],
+                 sigs: &mut [Sig], ptys: &mut [i64], ntys: &mut [i64], cst: &mut [i64], first: i64) -> i64 {
+    intern_scalars(types, cst);
+    collect_sigs(src, toks, nodes, types, sigs, ptys, cst, first);
+    let mut f = first;
+    let mut si = 0;
+    while cst[2] == 0 && f >= 0 {
+        check_func(src, toks, nodes, types, syms, sigs, ptys, ntys, cst, f, si);
+        si += 1;
+        f = nodes[f].next;
+    }
+    cst[2]
+}

@@ -287,7 +287,18 @@ depth-first node-kind sequence to `bootstrap/src/parse.rs` (`neant parsedump`,
 both. Two things it found: `parse.rs` checks "block tail" before "`if` needs no `;`" and the order
 matters; and the C emitter put user functions and its own runtime helpers in one namespace, so a
 neant function named `alloc` collided with `nt_alloc` — user functions are now `ntu_`-prefixed.
-Not designed yet: the checker, IR, emitter, or the fixpoint itself.
+**Third milestone done: `compiler/check.nt`**, designed in
+[self-hosting-checker-design.md](self-hosting-checker-design.md) — the first slice of `types.rs`
+(964 lines): name resolution and type checking, no size variables, no chain desugaring, no
+moves/layout, each left out because it feeds a stage that does not exist self-hosted yet. A scope
+is the symbol table's saved length; names compare by the source bytes their tokens span, since
+`lex.nt` kept spans instead of copying identifiers. Exit test passed in two halves: verdict parity
+with `neant check` on every in-slice golden — including the six negative ones, each firing a
+different rule — plus twenty hand-written probes, each a broken form and its fix, whose verdicts
+must flip (they include the `&mut [T]`/`&[T]` argument direction both ways); and `fib.nt`'s
+per-expression type codes pinned after hand-checking each one against the source. Building it
+produced the start of a typed IR ahead of schedule: the exit test needed each node's type, so the
+checker records one. Not designed yet: the IR proper, the emitter, or the fixpoint itself.
 
 ## M7 — the constant factor
 
