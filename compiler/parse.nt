@@ -19,6 +19,9 @@
 //   110 Func  111 Param  112 StructDef  113 FieldDef  114 FieldInit  70 StructLit
 //   116 ExternFn (a signature and no body; its `uses` clause is dropped)
 //   115 a struct-name marker, laid down before parsing and never part of the tree
+//   79 Lambda (`|x| e`; `a` the first Param, chained, `b` the body)
+//   80 Comprehension (`[e for x in xs if c]`; `a` elem, `b` the variable, `c` source, `d` cond)
+//   81 MethodCall (`a` receiver, `b` the name token, `c` the first argument, chained)
 //   117 CostAttr — `#[cost(…)]`, hung off the item it precedes through that item's `ival`;
 //       `a` the `work_at_most` string token, `b` `moves_at_most`, `c` `sizes`, each −1 when absent
 // Out of this slice, by design §6: MethodCall/chains other than `.len()`,
@@ -304,8 +307,21 @@ fn postfix_level(src: &[u8], toks: &[Token], n_toks: i64, st: &mut [i64], nodes:
                     nodes[n].a = e;
                     e = n;
                 } else {
-                    st[2] = 1;
-                    going = false;
+                    // a chain stage or terminal: `.map(|x| e)`, `.sum()`, `.fold(i, |a, x| e)`.
+                    // `.len()` keeps its own node because it is a size and not a chain.
+                    bump(st);
+                    let n = alloc(nodes, st, 81);
+                    nodes[n].a = e;
+                    nodes[n].b = name;
+                    let mut last = 0 - 1;
+                    while st[2] == 0 && toks[st[0]].kind != 24 {
+                        let a = expr(src, toks, n_toks, st, nodes);
+                        if last < 0 { nodes[n].c = a; } else { nodes[last].next = a; };
+                        last = a;
+                        if !eat(toks, st, 29) { break; }
+                    }
+                    expect(toks, st, 24);
+                    e = n;
                 }
             } else {
                 let n = alloc(nodes, st, 69);
@@ -352,11 +368,46 @@ fn primary(src: &[u8], toks: &[Token], n_toks: i64, st: &mut [i64], nodes: &mut 
         nodes[n].a = t;
         return n;
     }
+    if k == 53 {
+        // `|x| e` and `|a, x| e` — a closure is syntax here and not a value: it appears only as a
+        // chain stage's argument, which is what makes fusion the construct's only form
+        bump(st);
+        let n = alloc(nodes, st, 79);
+        let mut last = 0 - 1;
+        while st[2] == 0 && toks[st[0]].kind != 53 {
+            let pn = expect(toks, st, 0);
+            let p = alloc(nodes, st, 111);
+            nodes[p].a = pn;
+            if last < 0 { nodes[n].a = p; } else { nodes[last].next = p; };
+            last = p;
+            if !eat(toks, st, 29) { break; }
+        }
+        expect(toks, st, 53);
+        nodes[n].b = expr(src, toks, n_toks, st, nodes);
+        return n;
+    }
     if k == 25 {
         // `[e; n]` and `[a, b, c]`, told apart by what follows the first element. The language
         // already restricts either to a `let` initialiser, which is checked there.
         bump(st);
         let first = expr(src, toks, n_toks, st, nodes);
+        // `[e for x in xs if c]` — the same loop a chain is, with the condition a filter and the
+        // element a map, which is why it needs no machinery of its own beyond this shape
+        if st[2] == 0 && toks[st[0]].kind == 11 {
+            bump(st);
+            let v = expect(toks, st, 0);
+            expect(toks, st, 12);
+            let n = alloc(nodes, st, 80);
+            nodes[n].a = first;
+            nodes[n].b = v;
+            nodes[n].c = expr(src, toks, n_toks, st, nodes);
+            if toks[st[0]].kind == 9 {
+                bump(st);
+                nodes[n].d = expr(src, toks, n_toks, st, nodes);
+            };
+            expect(toks, st, 26);
+            return n;
+        }
         if eat(toks, st, 30) {
             let n = alloc(nodes, st, 78);
             nodes[n].a = first;

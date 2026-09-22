@@ -1570,3 +1570,16 @@ which is the argument for it.
    two-parameter closures — which is `chains.nt`.
 4. **`.par()` and span**, last, because a `.par()` chain is a chain first and the span rule is a
    separate calculus on top of it.
+
+### Step 1 done: the parser reads chains
+
+`.name(args)` as a general method call (kind 81), closures (79) and comprehensions (80) parse.
+`while`, `chains`, `decl`, `owned` and `par` all get through the parser now and are stopped by the
+checker instead, which is exactly where step 2 begins. Nothing already in the slice moved: all four
+columns and every suite are unchanged.
+
+Two things the grammar settled on the way. `.len()` keeps its own node rather than becoming a method
+call, because it is a *size* and the checker reads it as one — a chain is a loop and `.len()` is
+not. And a closure is **syntax, not a value**: it is parsed only where a stage's argument is
+expected, which is what makes fusion the construct's only form rather than an optimisation applied
+to something more general.
