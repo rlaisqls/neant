@@ -233,3 +233,52 @@ instructions 0.0 per call (gcc inlines its own `labs`), refills 0.0–2.6 bytes 
 noise over the repeats — against a tolerance of one line. Confirmed; the lockfile line reads
 `declared  measured over n = 1000..16000: confirmed`, and `total`, which calls it, `rests on labs
 (declared, extern)`. A small thing measured; the shape of the chain is the point.
+
+## IOLB — the bounds from the tool, against the hand entry
+
+**Question.** With IOLB (Olivry et al. 2020) hooked up through `neant emit --scop` and
+`neant cost --iolb`, what does it say about the kernels, and was the hand entry right?
+
+**Setup.** IOLB built from `gitlab.inria.fr/CORSE/iolb` inside its docker image, run under
+amd64 emulation on the arm64 host (`tonistiigi/binfmt --install amd64`; the image is x86 only).
+`tests/kernels/iolb.sh` copies the export into the checkout and runs `iolb-affine` with a
+wall-clock limit. Bounds in words with `S` the cache in words, converted with `S = M/8` and ×8.
+
+| function | IOLB, words | in bytes over `M` | hand entry | function's own moves (leading) | gap |
+|---|---|---|---|---|---|
+| `matmul` naive | `2·n³/√S` | `45.25·n³/√M` | `8·n³/√M` | `8·n³` (column fits), `B·n³` (not) | 256×, 2304× |
+| `matmul` tiled, `t = 64` | `3·n²` | `24·n²` | `8·n³/√M` | `n³/8 + …` | hand entry leads |
+| `dot` | `2·n` | `16·n` | — | `16·n` | 1× |
+| `saxpy` | `2·n` | `16·n` | — | `16·n` | 1× |
+| `sum` | `n` | `8·n` | — | `8·n` | 1× |
+| `transpose` | `n²` | `8·n²` | — | `16·n²` (fits), `72·n²` (not) | 2×, 9× |
+| `pairs` (triangular reduction) | `n²/(2S)` | `32·n²/M` | — | `8·n` | weak: below the input size |
+| `tiles` (`for ii in 0..n/4`) | none in 240 s | | | | timed out |
+
+**Findings.**
+
+- **The hand entry's constant was `4·√2 ≈ 5.66×` too small.** `bounds.rs` carried
+  Irony–Toledo–Tiskin's `N/(2√2·√S)` words; IOLB derives Smith–van de Geijn's `2·N/√S`. Both are
+  valid lower bounds and the second is the one to quote. The report now leads with IOLB's where
+  it answers, and every matmul gap in the README is `5.66×` smaller than printed before: the
+  tiled product at `M = 2 MiB` sits `4×` above the bound, not `23×`.
+- **On the streaming kernels the bound meets the model.** `dot`, `saxpy` and `sum` move exactly
+  their inputs once, and IOLB says nothing less is possible. That is the first external
+  confirmation that the moves rules are tight on the easy cases, not only that they agree with
+  the counters.
+- **IOLB does not see through the tiled nest.** A six-deep nest with a literal tile side returns
+  only the size of the data. That is the case the hand entry was written for, so it stays: both
+  bounds are reported and the asymptotically stronger one leads.
+- **Where the input is smaller than the iteration space, IOLB's bound can fall below the
+  input size** (`pairs`: `n²/(2S)` against `n` words that must be read). Reading the input is a
+  bound too, and the model's own footprint already gives it; whether to print it as a bound is
+  left open until a kernel needs it.
+- **Floors in loop bounds blow the search up.** `for ii in 0..n/4` did not finish in four
+  minutes; the same nest without the division returns at once. The export could rewrite
+  `0..n/4` with `ii·4 < n` in the inner bound, which is affine; not done, the case is rare.
+- **Two things the export had to get right for PET to accept the file**, found by feeding it:
+  the flat index `a[i*n+k]` crashes GiNaC with a pole error (hence delinearisation), and a
+  statement with no effect — the function's tail expression printed as `(void)(s);` — made IOLB
+  run for more than ten minutes on a two-line reduction; dropping it, the same file answers in a
+  second.
+

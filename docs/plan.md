@@ -43,7 +43,9 @@ tiling removed 53× of measured traffic against 39× predicted and beat the hand
 1.75×. **M3** — `while` with inferred or declared measures, `break`, `u8`, solved self-recursion,
 `io` inferred, `#[cost]` by asymptotic dominance, `neant measure`, and a four-program corpus.
 Then the exactness pass: verified measures, reaching definitions, loop sums by Faulhaber, exact
-recurrence constants, and piecewise costs with `if` as max and fit tests that fork.
+recurrence constants, and piecewise costs with `if` as max and fit tests that fork. After the
+literature review (decisions §5): lower bounds from IOLB through `emit --scop` and `cost --iolb`,
+the hand catalogue reduced to a fallback.
 
 What M0–M3 established is an analyser. Everything in it could have been built over a Rust subset
 or as an MLIR dialect. The coverage it reached on ordinary code is the number that governs what
@@ -185,7 +187,9 @@ bootstrap/              everything that builds the compiler from nothing
       size.rs           symbolic sizes and costs: rational polynomials over atoms, B and M
       piece.rs          piecewise costs: conditions, max, feasibility
       analyze.rs        the calculus, one walk (docs/cost-model.md is its spec)
-      bounds.rs         the lower-bound catalogue
+      bounds.rs         the one hand lower bound, the fallback
+      scop.rs           export of an affine function as a SCoP for IOLB, indices delinearised
+      iolb.rs           runs IOLB, parses its bound into bytes over M
       rewrite.rs        tile and transpose
       assert.rs         #[cost] parsing and dominance
       measure.rs        the measured tier
@@ -194,7 +198,7 @@ bootstrap/              everything that builds the compiler from nothing
 compiler/               the compiler in neant. Empty until self-hosting.
 tests/
   golden/               .nt programs with expected output (.out, .exit), rejection (.err), cost report (.cost)
-  kernels/              the M1/M2 experiments: kernel templates and sweep.py, the perf harness
+  kernels/              the M1/M2 experiments: kernel templates and sweep.py, the perf harness; iolb.sh runs IOLB in docker
 docs/
   plan.md               this file
   cost-model.md         the calculus, as implemented

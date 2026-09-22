@@ -174,6 +174,9 @@ site, which is not composition but whole-program analysis, and is said so.
 | cache-oblivious algorithms | the theory, complete | any language; they are library code |
 | Tofte–Talpin / MLKit | region inference | a cost model to serve |
 | Koka / Lean 4 | Perceus in-place reuse | reporting whether it happened |
+| IOLB (Olivry et al., 2020) | automatic, parametric, non-asymptotic **lower bounds** on data movement for any affine program; proofs that a kernel cannot be tiled | the upper side: what *this* program moves |
+| Elango et al. (POPL 2015) | lower bounds of a program composed from the bounds of its sub-computations | costs composed from function signatures |
+| Bao et al. (POPL 2018) | exact, closed-form cache-miss counts for affine programs in set-associative caches, parametric in the cache | anything outside affine control: calls, `while`, recursion, data-dependent access; a language around it |
 
 The parts are twenty to forty years old. Nobody has assembled them, and the thing that would hold
 them together — a cost that is inferred, reported and lockable, always, for every function — has
@@ -196,9 +199,14 @@ was measured against pairs read streams and does not see write streams, so it wa
 model's unit. The linear kernels' slopes are near-trivial; the information is in the naive/tiled
 separation and in the two rules the data forced.
 
-**The gap report exists for a dozen computations.** A lower bound is known for the matrix product
-and other contractions, FFT, sorting, permutation, some stencils — the catalogue will hold maybe a
-dozen entries. For anything else the compiler says what yours costs and cannot say what it should.
+**The lower bounds are not this project's.** The hand-written catalogue has one entry, the
+matrix product, and it is not going to grow by hand: IOLB derives parametric lower bounds for any
+affine program automatically, matches Hong–Kung on the product, improves on every other published
+hand bound in PolyBench, and proves two kernels untileable. What this compiler owns is the other
+side of the gap — what the program as written moves — and `neant cost --iolb` feeds the affine
+functions of a program to IOLB for the bound rather than writing bounds down (its first answer:
+the hand entry's constant for the product was `5.7×` too small). For code that is not affine no
+bound exists, and the compiler says what yours costs and cannot say what it should.
 
 **The exact tier covers less than the demo suggests.** On the four ordinary programs of the M3
 corpus — string processing, a stack machine, breadth-first search, a recursive-descent parser —

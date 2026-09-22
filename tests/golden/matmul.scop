@@ -1,0 +1,17 @@
+matmul
+// exported by neant for IOLB: matmul
+void nt_matmul(long n, long a_rows, long b_rows, long c_rows, double a[a_rows][n], double b[b_rows][n], double c[c_rows][n])
+{
+  double acc_6;
+#pragma scop
+  for (long i_4 = 0; i_4 < n; i_4++) {
+    for (long j_5 = 0; j_5 < n; j_5++) {
+      acc_6 = 0.0;
+      for (long k_7 = 0; k_7 < n; k_7++) {
+        acc_6 += (a[i_4][k_7] * b[k_7][j_5]);
+      }
+      c[i_4][j_5] = acc_6;
+    }
+  }
+#pragma endscop
+}

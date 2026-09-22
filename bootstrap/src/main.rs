@@ -44,6 +44,8 @@ fn main() {
     let mut m_repeat: i64 = 1;
     let mut m_cpu: Option<u32> = None;
     let mut m_lock = false;
+    let mut scop_fn: Option<String> = None;
+    let mut use_iolb = false;
     let mut i = 1;
     while i < args.len() {
         match args[i].as_str() {
@@ -60,6 +62,8 @@ fn main() {
             "--repeat" => { i += 1; m_repeat = args.get(i).and_then(|s| s.parse().ok()).unwrap_or(1); }
             "--cpu" => { i += 1; m_cpu = args.get(i).and_then(|s| s.parse().ok()); }
             "--lock" => m_lock = true,
+            "--scop" => { i += 1; scop_fn = args.get(i).cloned(); }
+            "--iolb" => use_iolb = true,
             "--" => { passthrough = args[i + 1..].to_vec(); break; }
             a if a.starts_with('-') => { eprintln!("unknown flag {a}"); process::exit(2); }
             a => file = Some(PathBuf::from(a)),
@@ -95,7 +99,8 @@ fn main() {
     match cmd {
         "check" => {}
         "cost" => {
-            let costs = cost::analyze(&module, &machine);
+            let mut costs = cost::analyze(&module, &machine);
+            if use_iolb { iolb_bounds(&module, &mut costs); }
             for c in &costs {
                 print!("{}", cost::lock::report(c, &machine));
                 if let (Some(ev), cost::CostResult::Exact { work, moves }) = (&eval, &c.result) {
@@ -126,7 +131,16 @@ fn main() {
                 process::exit(1);
             }
         }
-        "emit" => print!("{}", emit_c::emit(&module, &opts)),
+        "emit" => match &scop_fn {
+            Some(name) => {
+                let Some(f) = module.funcs.iter().find(|f| f.name == *name) else { eprintln!("no function `{name}`"); process::exit(2); };
+                match cost::scop::export(&module, f) {
+                    Ok(c) => print!("{c}"),
+                    Err(e) => { eprintln!("{}: `{name}` is not a SCoP: {e}", file.display()); process::exit(1); }
+                }
+            }
+            None => print!("{}", emit_c::emit(&module, &opts)),
+        },
         "build" => {
             let out = out.unwrap_or_else(|| file.with_extension(""));
             let c = emit_c::emit(&module, &opts);
@@ -276,6 +290,36 @@ fn parse_bytes(s: Option<&String>) -> i128 {
 
 /// `--eval n=1000,a.len()=1000`: every size variable of the function must be given. Conditions
 /// are decided at the machine's `B` and `M`, and the applicable pieces' maximum is taken.
+/// `--iolb`: hand every function IOLB can take to it and let its bound replace the catalogue's.
+/// A function the export refuses keeps whatever the catalogue said and gets a note saying why.
+fn iolb_bounds(module: &ir::Module, costs: &mut [cost::FuncCost]) {
+    if cost::iolb::command().is_none() {
+        eprintln!("--iolb: set NEANT_IOLB to a command with `{{file}}` in it, e.g. `tests/kernels/iolb.sh {{file}}`");
+        process::exit(2);
+    }
+    let dir = std::env::temp_dir().join(format!("neant-iolb-{}", process::id()));
+    let _ = std::fs::create_dir_all(&dir);
+    for (f, c) in module.funcs.iter().zip(costs.iter_mut()) {
+        let src = match cost::scop::export(module, f) {
+            Ok(s) => s,
+            Err(e) => { if !c.bounds.is_empty() { c.notes.push(format!("IOLB not asked: {e}")); } continue; }
+        };
+        match cost::iolb::bound(&src, &c.names, &dir) {
+            Ok(p) => {
+                // both are valid lower bounds; the report leads with the asymptotically stronger
+                // one (the gap of a rewrite is measured against the first). IOLB does not always
+                // see through a tiled nest, where the catalogue's contraction bound stands.
+                let line = c.bounds.first().map_or(f.line, |b| b.line);
+                let b = cost::bounds::Bound { kind: "whole function", citation: "IOLB, Olivry et al. 2020".into(), moves: p, line, operands: [0, 0], nest: vec![] };
+                let hand_stronger = c.bounds.first().is_some_and(|h| cost::assert::dominated(&b.moves, &h.moves) && !cost::assert::dominated(&h.moves, &b.moves));
+                if hand_stronger { c.bounds.push(b); } else { c.bounds.insert(0, b); }
+            }
+            Err(e) => c.notes.push(format!("IOLB gave no bound: {e}")),
+        }
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 fn evaluate(c: &cost::FuncCost, work: &cost::Cost, moves: &cost::Cost, ev: &str, m: &cost::Machine) -> Option<(f64, f64)> {
     use cost::size::Atom;
     let mut vals: Vec<(String, f64)> = Vec::new();

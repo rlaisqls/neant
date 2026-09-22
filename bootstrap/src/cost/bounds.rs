@@ -1,4 +1,6 @@
-//! The lower-bound catalogue. Entry one: the matrix product.
+//! The lower-bound catalogue: one hand entry, the matrix product. With `NEANT_IOLB` set the
+//! bounds come from IOLB instead (`iolb.rs`) and this entry stands in only when the export or the
+//! tool fails.
 //!
 //! A statement `acc += A[ia] * B[ib]` inside a loop nest, where the two indices are affine in
 //! the loop variables, share at least one of them (the reduction) and each has one the other
@@ -17,7 +19,7 @@ use super::size::{Atom, Poly, Rat};
 #[derive(Debug, Clone)]
 pub struct Bound {
     pub kind: &'static str,
-    pub citation: &'static str,
+    pub citation: String,
     /// The bound on moves, in bytes, over the function's atoms.
     pub moves: Poly,
     pub line: u32,

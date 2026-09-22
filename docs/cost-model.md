@@ -161,6 +161,26 @@ Other moves:
 | `[e; n]`, `[a, b, c]` | a sequential write of the array: `n × elem_bytes` |
 | call | the callee's moves with its atoms substituted, less what is already resident of its footprint (rule two) |
 
+## Where these rules stand
+
+For affine loop nests there is an exact answer to the question these rules approximate: Bao,
+Krishnamoorthy, Pouchet and Sadayappan (POPL 2018) count cache misses in closed form for
+polyhedral programs by computing, for every access, the set of distinct lines touched since the
+last touch of the same line — the reuse distance — as a count of integer points in a polyhedron,
+parametric in the problem sizes and the cache size, for set-associative caches. The slide rule, the
+contiguity flag and the fit test here are a rule-based approximation of that computation, exact in
+the cases M1 measured and coarser elsewhere (a slide over a region that is not contiguous, two
+accesses whose lines overlap by accident). Where a nest is affine, the honest replacement for these
+rules is that computation, and the plan holds a place for it. What the rules cover that the
+polyhedral count does not is everything around the nest: calls with footprints and residues,
+`while` with a measure, recursion, data-dependent access under the region rule, and a whole
+function's cost as one object a caller composes.
+
+On the other side of the gap, lower bounds: IOLB (Olivry, Langou, Pouchet, Sadayappan, Rastello,
+2020) derives them automatically for any affine program, and `neant cost --iolb` obtains them
+from it (§ Lower bounds). The one hand entry in `bounds.rs` is the fallback when the tool is
+absent, and the stronger statement where the tool does not see through a tiled nest.
+
 ## What the model does not see
 
 Each of these rounds up, so the reported cost stays an upper bound; each is a place where the
@@ -302,26 +322,60 @@ the calculus for that one function.
 
 ## Lower bounds
 
-For some computations the catalogue knows what *any* program must move, and the report says how
-far the function is from it.
+The report can say how far a function is from what *any* program computing the same thing must
+move. The bounds come from **IOLB** (Olivry, Langou, Pouchet, Sadayappan, Rastello, PLDI 2020),
+an external tool that derives parametric data-movement lower bounds for affine programs, and from
+one hand entry that stands in when the tool is absent or cannot see through a nest.
 
-**Entry one: the matrix product.** A statement `acc += A[ia] * B[ib]` — or `C[ic] += …` —
-inside a loop nest, whose two indices are affine in the loop variables, share at least one of
-them (the reduction) and each have one the other lacks, is a contraction. Whatever the loop
-order or tiling around it, the number of multiply-adds `N` is the product of the enclosing trip
-counts, and a cache of `M` bytes must move at least
+**Export.** `neant emit --scop f` writes `f` as the C that IOLB's front end (PET) reads: a loop
+nest with affine bounds and indices between `#pragma scop` and `#pragma endscop`. A flat row-major
+index `i·n + k` with a parametric row length is not affine in the polyhedral sense — a parameter
+times an iterator is not linear — so an array every one of whose indices has the form
+`v·row + w`, with `v` a loop variable and `row` free of loop variables, is **delinearised** into a
+two-dimensional parameter `double a[a_rows][row]` and the access into `a[v][w]`. Immutable scalars
+bound to a literal before any loop (`let t = 64`, a tile side) are written as the literal so the
+bounds stay affine. A call, a `while`, `break`, an array born inside the function, a
+data-dependent index or a mixed one- and two-dimensional use of one array refuses the export with
+the reason; the report carries the reason as a note.
+
+**Running it.** `neant cost --iolb` exports every function it can and runs the command in
+`NEANT_IOLB`, with `{file}` standing for the exported C; `tests/kernels/iolb.sh {file}` runs the
+tool inside its docker image from a checkout in `IOLB_DIR`, with a wall-clock limit `IOLB_TIMEOUT`
+(default 120 s — IOLB's search is exponential in the worst case, and a nest it cannot finish
+yields no bound rather than a hang). The second-to-last line of IOLB's output is the asymptotic
+bound, a GiNaC expression in the parameters and `S`, the cache size in words: `2*n^3*S^(-1/2)`
+for the product. It is parsed into the function's atoms and converted: with 8-byte words
+`S = M/8`, so `S^e = 8^(-e)·M^e`, and the count is ×8 into bytes. `8^(1/2)` is irrational; the
+coefficient is kept to four decimals.
+
+```
+2·n³/√S words  =  16·√8·n³/√M  ≈  45.2548·n³/√M bytes
+```
+
+**The hand entry.** A statement `acc += A[ia] * B[ib]` — or `C[ic] += …` — inside a loop nest,
+whose two indices are affine in the loop variables, share at least one of them (the reduction)
+and each have one the other lacks, is a contraction. Whatever the loop order or tiling around it,
+the number of multiply-adds `N` is the product of the enclosing trip counts, and a cache of `M`
+bytes must move at least
 
 ```
 8·N / √M   bytes          (Hong–Kung 1981, constant per Irony–Toledo–Tiskin, 8-byte elements)
 ```
 
-The report prints the bound under the function's line, and the **gap** — the ratio of the
-function's leading moves term to the bound's, at the machine's `B` and `M` — when the size
-variables cancel, or the plain ratio when both are numbers. A specialised call hands its bounds
-up to the caller, scaled by how often it is called, so a concrete `main` gets a gap too.
+IOLB's constant for the same product is `4·√2 ≈ 5.66×` larger (it is Smith–van de Geijn's
+`2·N/√S` words rather than Irony–Toledo–Tiskin's `N/(2√2·√S)`), so where IOLB answers, its bound
+is the tighter one. Where it does not — the tiled product, where IOLB returns only the size of
+the data, `3·n²` words — the contraction bound is the stronger statement. Both are valid lower
+bounds, so both are kept; the report leads with the one that dominates asymptotically, and the
+gap of a rewrite is measured against that one.
 
-Under the bound, the report says what each operand does in the innermost loop when it moves by
-a whole line or more per iteration: that access is the one paying for the gap.
+**The gap** is the ratio of the function's leading moves term to the bound's, at the machine's
+`B` and `M`, when the size variables cancel, or the plain ratio when both are numbers, per
+regime. A specialised call hands its bounds up to the caller, scaled by how often it is called,
+so a concrete `main` gets a gap too.
+
+Under the hand bound, the report says what each operand does in the innermost loop when it moves
+by a whole line or more per iteration: that access is the one paying for the gap.
 
 ## Rewrites
 

@@ -1,4 +1,4 @@
-//! Every `tests/golden/*.nt` with a `.cost` file must also reproduce it under `neant cost`. It either runs — stdout must equal `.out`, exit code must equal `.exit`
+//! Every `tests/golden/*.nt` with a `.cost` file must also reproduce it under `neant cost`, and one with a `.scop` file its SCoP export. It either runs — stdout must equal `.out`, exit code must equal `.exit`
 //! (default 0) — or, when a `.err` file exists, must be rejected with an error containing it.
 
 use std::path::{Path, PathBuf};
@@ -45,6 +45,17 @@ fn golden() {
             let got = String::from_utf8_lossy(&out.stdout).to_string();
             if got != want {
                 failures.push(format!("{name}: cost report differs\n--- got ---\n{got}--- want ---\n{want}"));
+            }
+        }
+        // `.scop`: the first line names the function, the rest is what `emit --scop` must print
+        let scop_file = stem.with_extension("scop");
+        if scop_file.exists() {
+            let want = std::fs::read_to_string(&scop_file).unwrap();
+            let (func, want) = want.split_once('\n').unwrap();
+            let out = Command::new(neant()).arg("emit").arg("--scop").arg(func.trim()).arg(nt).output().unwrap();
+            let got = String::from_utf8_lossy(&out.stdout).to_string();
+            if got != want {
+                failures.push(format!("{name}: SCoP export differs\n--- got ---\n{got}--- want ---\n{want}"));
             }
         }
         let want_out = std::fs::read_to_string(stem.with_extension("out")).unwrap_or_default();

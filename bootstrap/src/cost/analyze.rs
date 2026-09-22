@@ -968,7 +968,7 @@ impl<'a, 'b, 'c> Fa<'a, 'b, 'c> {
         let n = self.times_here();
         let nest: Vec<LocalId> = self.loops.iter().filter_map(|l| l.var).collect();
         self.bounds.push(Bound {
-            kind: "matrix product", citation: "Hong–Kung 1981",
+            kind: "matrix product", citation: "Hong–Kung 1981".into(),
             moves: bounds::matmul_bound(&n, es), line: mac.line, operands: [mac.a, mac.b], nest,
         });
         // what each operand does in the innermost loop

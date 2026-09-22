@@ -4,6 +4,41 @@ Design decisions with the reasoning that produced them, so the reasoning is not 
 code is. Newest first. A decision is recorded when it was argued over, when it rejected
 alternatives worth remembering, or when a future reader would otherwise ask "why on earth".
 
+## 5 — Against the literature: the bound side is IOLB's, the upper side and the composition are not in it
+
+**Decided 2026-09-22, after reading Olivry et al. (IOLB, 2020) and Elango et al. (POPL 2015) in
+full, and Bao et al. (POPL 2018) from its abstract and the author's description; the Bao paper
+itself was not obtainable without library access.**
+
+- **The lower-bound catalogue is folded.** IOLB derives parametric, non-asymptotic data-movement
+  lower bounds for arbitrary affine programs, reproduces Hong–Kung on the product (the catalogue's
+  one entry), improves on every other published hand bound across PolyBench, and proves two
+  kernels untileable — a result the catalogue could never give. Extending a hand catalogue against
+  that is a lost race. `bounds.rs` keeps its one entry as the fallback when IOLB is not installed.
+  Done the same day: `neant emit --scop` exports an affine function to IOLB's input (C with
+  `#pragma scop`, PET's front end; flat parametric indexing delinearised, since `i·n + k` is not
+  affine in the polyhedral sense) and `neant cost --iolb` parses the bound back into the gap
+  report. What the tool then said (docs/experiments.md): on the product its bound is `4·√2 ≈ 5.7×`
+  tighter than the hand entry's constant, so the hand entry had been understating the bound all
+  along; on `dot`, `saxpy` and `sum` the bound equals the function's own moves to the leading
+  term (gap 1×); on the tiled product it returns only the data size, so the hand entry stays as
+  the stronger statement there and both are reported.
+- **The upper side is what this compiler owns.** IOLB computes what any schedule must move, not
+  what this program moves. The gap needs both. Bao 2018 computes the upper side exactly for affine
+  nests in set-associative caches; the moves rules here are an approximation of that count where
+  the nest is affine, and cover what it does not — calls, `while`, recursion, data-dependent
+  access, and a whole function as one composable object. The plan holds a place for replacing the
+  rules by the exact polyhedral count inside affine nests.
+- **Composition is not in the literature.** Elango's "composition" assembles a program's lower
+  bound from its sub-computations' bounds; nobody composes a function's cost from a signature
+  with a footprint and a residue, checks callers against declarations alone, or audits the
+  boundary. Stages A, B and C stand.
+- **Hardware validation is a differentiator and moves to the front.** IOLB validates achieved
+  operational intensity with the Dinero cache simulator; this project counted `l2d_cache_refill`
+  on the core, which is how it found that read streams register at half and write streams not
+  at all. A simulator would never have shown either. The earlier judgement that the M1 sweep was
+  over-described is reversed for this part.
+
 ## 4 — What four reviews changed: composition is an effect, the language's reason is scope, and the boundary is the measure of it
 
 **Decided 2026-09-22, after four written reviews of the tree at M3.**
