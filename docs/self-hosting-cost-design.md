@@ -363,3 +363,52 @@ each parameter advanced along its own shift.
   `15·log(hi − lo) − lo` where the answer is `15·log(hi − lo) + 15`. The fix is an offset, so a
   nested print writes above the caller's region. The first genuinely re-entrant thing in the
   self-hosted compiler, and it aliased on the first try.
+
+## 13. Regimes: a cost that forks once
+
+The eight golden functions with a piecewise `moves` are the language's distinctive feature made
+concrete — decisions §2, "an undecidable fit test forks into regimes" — and five of them have the
+same shape:
+
+```
+arena.nt  sum_list      moves 16·nodes.len()   if 16·nodes.len() < M
+                        moves B·nodes.len()    if 16·nodes.len() ≥ M
+words.nt  is_palindrome moves s.len()          if s.len() < M
+                        moves 2·B·s.len() − 2·B if s.len() ≥ M
+```
+
+A **scattered walk over one array**: an index the compiler cannot follow, or a loop with no
+variable at all. This slice already recognises that case and already rounds it up to "a whole line
+per touch" (§11). The fork is the other half of the same rule, and it is the half that carries the
+information:
+
+> If the array fits in `M`, every distinct element crosses **once** — the footprint. If it does
+> not, every touch crosses a line.
+
+`settle_moves` reaches this through a working set computed per loop level, innermost out, and that
+generality is what produces `matmul`'s two pieces with two *different* conditions. Here the slice
+is narrower and says so.
+
+### The slice: one condition
+
+A cost may **fork at most once**. It is either a single polynomial, or a pair of polynomials under
+one condition `ws < M` / `ws ≥ M`. Two costs combine when they are both single, or both forked on
+the same `ws`, or one of each; **two independent conditions make it unknown**.
+
+That covers the five single-condition functions above and excludes `matmul`, `stencil` and
+`tri.nt`'s `pairs`, which are nested-loop and already outside §11's one-loop boundary. The
+narrowing is stated rather than discovered: a fuller piecewise algebra is `piece.rs`'s 304 lines,
+with feasibility, pruning by dominance and a cross product on every `add`, and none of that earns
+its place until a second condition does.
+
+### The footprint
+
+`ws` for a scattered walk is the array's own size: `elem_bytes · length`, in bytes — which is what
+the report prints (`16·nodes.len() < M`), while `analyze.rs` carries it in lines and multiplies by
+`B` to display it. This slice carries bytes and compares against `M` directly, because it never
+needs the line count for anything else.
+
+### Exit test
+
+The same `moves` column, string for string, now including the pieces and their conditions. The
+count in the test goes up by five; a function whose cost forks twice must say unknown.
