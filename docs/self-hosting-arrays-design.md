@@ -63,9 +63,9 @@ then the emitter's `let s = b"static ";` idiom. The slice takes exactly that pos
   from it (`[b'\0'; 262144]`, `[Token { … }; 262144]`, `[0; 4096]`, `[-1; 262144]`), and a driver
   is what makes the stages a program. A fixed-size C array, filled by a loop.
 
-A brace list (`[1, 2, 3]`) is **out**: nothing in the compiler or its drivers writes one, so it
-would be untested code, which is the same reason the emitter design §4 kept arrays out entirely
-until now.
+A brace list (`[1, 2, 3]`) was called **out** here on the grounds that "nothing in the compiler or
+its drivers writes one". That was checked against `compiler/*.nt` and not against the drivers, and
+every driver's parser state is `let mut st = [0, 0, 0, 0, 0];`. It is in.
 
 `n` in `[e; n]` is any `i64`, and the array is **heap-allocated** — `nt_alloc(n, sizeof T)`, the
 same helper and the same shape the Rust emitter uses — not a C automatic array. Fixing `n` to a
@@ -145,3 +145,17 @@ between here and a real fixpoint, and it is now a `-c` in a test rather than a p
 - **An array variable is two names everywhere, including when it is just passed on.** `keyword(src,
   start, len)` inside the lexer passes its own `&[u8]` parameter through, and the first version
   emitted the bare name. Caught by `cc`, not by a test, because no golden re-passes a view.
+- **`ys = xs` must copy.** The Rust compiler assigns the pointer when it can prove nothing else is
+  looking at `xs` — and that proof is M5's move and uniqueness checking, which is not in this
+  slice. The first version aliased, and `reassign_copy.nt` printed `9` where `neant run` prints
+  `1`: a live view saw a write it should not have. Copying is the language's meaning and aliasing
+  is the optimisation, so an emitter that cannot tell must not take it. The same goes for
+  `let ys = xs`; `let v = &xs` still aliases, because a view *is* an alias.
+- **The emitter needed a way to refuse.** It had none: anything outside its slice produced C that
+  looked plausible until `cc` read it (`int64_t v_n = ; …`). `est[2]` is now a refusal flag and
+  `emit_program` returns `-3`, which is the difference between "this is not supported" and "here
+  is a broken file".
+- **`extern fn` closed the last gap.** The stages are not a program without a driver and every
+  driver opens with `extern fn read_file(…)`. It is a signature with no body, called by the C name
+  it declares rather than the `ntu_` one; its `uses` clause is read and dropped, because effects
+  are the cost model's and the cost model is not self-hosted.

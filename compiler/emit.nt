@@ -123,10 +123,13 @@ fn is_arr(types: &[Ty], t: i64) -> bool {
     t >= 0 && (types[t].kind == 5 || types[t].kind == 6)
 }
 
+// `est` is the emitter's state: est[0] the bytes written, est[1] the next temporary's number,
+// est[2] the refusal flag — set where the emitter meets something the slice does not cover.
+//
 // ---- expressions ----
 
 fn emit_expr(out: &mut [u8], est: &mut [i64], src: &[u8], toks: &[Token], nodes: &[Node],
-             types: &[Ty], strs: &[Str], ntys: &[i64], n: i64) {
+             types: &[Ty], strs: &[Str], sigs: &[Sig], ntys: &[i64], n: i64) {
     if n < 0 { return; }
     let k = nodes[n].kind;
     if k == 60 {
@@ -160,7 +163,7 @@ fn emit_expr(out: &mut [u8], est: &mut [i64], src: &[u8], toks: &[Token], nodes:
         emit_arr_name(out, est, src, toks, base, b'p');
         let o = b"[nt_idx(";
         emit_bytes(out, est, &o);
-        emit_expr(out, est, src, toks, nodes, types, strs, ntys, nodes[n].b);
+        emit_expr(out, est, src, toks, nodes, types, strs, sigs, ntys, nodes[n].b);
         let c = b", ";
         emit_bytes(out, est, &c);
         emit_arr_name(out, est, src, toks, base, b'n');
@@ -181,26 +184,26 @@ fn emit_expr(out: &mut [u8], est: &mut [i64], src: &[u8], toks: &[Token], nodes:
         let narrow = ntys[n] >= 0 && types[ntys[n]].kind == 3 && nodes[n].ival <= 4;
         if narrow { let s = b"((uint8_t)"; emit_bytes(out, est, &s); };
         emit_b(out, est, b'(');
-        emit_expr(out, est, src, toks, nodes, types, strs, ntys, nodes[n].a);
+        emit_expr(out, est, src, toks, nodes, types, strs, sigs, ntys, nodes[n].a);
         emit_op(out, est, nodes[n].ival);
-        emit_expr(out, est, src, toks, nodes, types, strs, ntys, nodes[n].b);
+        emit_expr(out, est, src, toks, nodes, types, strs, sigs, ntys, nodes[n].b);
         emit_b(out, est, b')');
         if narrow { emit_b(out, est, b')'); };
     } else if k == 67 {
         emit_b(out, est, b'(');
         if nodes[n].ival == 0 { emit_b(out, est, b'-'); } else { emit_b(out, est, b'!'); };
-        emit_expr(out, est, src, toks, nodes, types, strs, ntys, nodes[n].a);
+        emit_expr(out, est, src, toks, nodes, types, strs, sigs, ntys, nodes[n].a);
         emit_b(out, est, b')');
     } else if k == 74 {
         let s = b"((";
         emit_bytes(out, est, &s);
         emit_type(out, est, src, toks, types, strs, ntys[n]);
         emit_b(out, est, b')');
-        emit_expr(out, est, src, toks, nodes, types, strs, ntys, nodes[n].a);
+        emit_expr(out, est, src, toks, nodes, types, strs, sigs, ntys, nodes[n].a);
         emit_b(out, est, b')');
     } else if k == 69 {
         emit_b(out, est, b'(');
-        emit_expr(out, est, src, toks, nodes, types, strs, ntys, nodes[n].a);
+        emit_expr(out, est, src, toks, nodes, types, strs, sigs, ntys, nodes[n].a);
         let s = b").";
         emit_bytes(out, est, &s);
         emit_span(out, est, src, toks, nodes[n].b);
@@ -218,23 +221,35 @@ fn emit_expr(out: &mut [u8], est: &mut [i64], src: &[u8], toks: &[Token], nodes:
             emit_span(out, est, src, toks, nodes[fi].a);
             let eq = b" = ";
             emit_bytes(out, est, &eq);
-            emit_expr(out, est, src, toks, nodes, types, strs, ntys, nodes[fi].b);
+            emit_expr(out, est, src, toks, nodes, types, strs, sigs, ntys, nodes[fi].b);
             fi = nodes[fi].next;
             if fi >= 0 { let c = b", "; emit_bytes(out, est, &c); };
         }
         let c = b"})";
         emit_bytes(out, est, &c);
     } else if k == 71 {
-        emit_call(out, est, src, toks, nodes, types, strs, ntys, n);
+        emit_call(out, est, src, toks, nodes, types, strs, sigs, ntys, n);
     } else if k == 75 || k == 76 {
-        emit_value_block(out, est, src, toks, nodes, types, strs, ntys, n);
+        emit_value_block(out, est, src, toks, nodes, types, strs, sigs, ntys, n);
     }
+}
+
+// whether this name is an `extern fn`. The signature table is in declaration order and its names
+// are tokens, so this is the same byte comparison every other name lookup is.
+fn is_extern(src: &[u8], toks: &[Token], sigs: &[Sig], name: i64) -> bool {
+    let mut i = 0;
+    let mut found = false;
+    while i < sigs.len() && sigs[i].name >= 0 {
+        if sigs[i].ext == 1 && name_eq(src, toks, sigs[i].name, name) { found = true; }
+        i += 1;
+    }
+    found
 }
 
 // `println` by the argument's type, `min`/`max` without evaluating an argument twice, and
 // everything else as a call of `ntu_<name>`
 fn emit_call(out: &mut [u8], est: &mut [i64], src: &[u8], toks: &[Token], nodes: &[Node],
-             types: &[Ty], strs: &[Str], ntys: &[i64], n: i64) {
+             types: &[Ty], strs: &[Str], sigs: &[Sig], ntys: &[i64], n: i64) {
     let name = nodes[n].a;
     let arg = nodes[n].b;
     if name_is_println(src, toks, name) {
@@ -244,7 +259,7 @@ fn emit_call(out: &mut [u8], est: &mut [i64], src: &[u8], toks: &[Token], nodes:
         else if kk == 2 { let s = b"nt_println_bool("; emit_bytes(out, est, &s); }
         else if kk == 3 { let s = b"nt_println_u8("; emit_bytes(out, est, &s); }
         else { let s = b"nt_println_i64("; emit_bytes(out, est, &s); };
-        emit_expr(out, est, src, toks, nodes, types, strs, ntys, arg);
+        emit_expr(out, est, src, toks, nodes, types, strs, sigs, ntys, arg);
         emit_b(out, est, b')');
         return;
     }
@@ -260,14 +275,14 @@ fn emit_call(out: &mut [u8], est: &mut [i64], src: &[u8], toks: &[Token], nodes:
         emit_tmp_name(out, est, a);
         let eq = b" = ";
         emit_bytes(out, est, &eq);
-        emit_expr(out, est, src, toks, nodes, types, strs, ntys, arg);
+        emit_expr(out, est, src, toks, nodes, types, strs, sigs, ntys, arg);
         let semi = b"; ";
         emit_bytes(out, est, &semi);
         emit_type(out, est, src, toks, types, strs, ntys[second]);
         emit_b(out, est, b' ');
         emit_tmp_name(out, est, b);
         emit_bytes(out, est, &eq);
-        emit_expr(out, est, src, toks, nodes, types, strs, ntys, second);
+        emit_expr(out, est, src, toks, nodes, types, strs, sigs, ntys, second);
         emit_bytes(out, est, &semi);
         emit_tmp_name(out, est, a);
         if name_is_min(src, toks, name) { let s = b" < "; emit_bytes(out, est, &s); }
@@ -283,13 +298,13 @@ fn emit_call(out: &mut [u8], est: &mut [i64], src: &[u8], toks: &[Token], nodes:
         emit_bytes(out, est, &close);
         return;
     }
-    let pre = b"ntu_";
-    emit_bytes(out, est, &pre);
+    // an `extern fn` is called by the C name it declares; everything else by its `ntu_` one
+    if !is_extern(src, toks, sigs, name) { let pre = b"ntu_"; emit_bytes(out, est, &pre); };
     emit_span(out, est, src, toks, name);
     emit_b(out, est, b'(');
     let mut a = arg;
     while a >= 0 {
-        emit_expr(out, est, src, toks, nodes, types, strs, ntys, a);
+        emit_expr(out, est, src, toks, nodes, types, strs, sigs, ntys, a);
         a = nodes[a].next;
         if a >= 0 { let s = b", "; emit_bytes(out, est, &s); };
     }
@@ -299,7 +314,7 @@ fn emit_call(out: &mut [u8], est: &mut [i64], src: &[u8], toks: &[Token], nodes:
 // an `if` or a block *as a value*: a statement expression holding a temporary, which is how the
 // Rust emitter does it too (and why the output only ever targets gcc and clang)
 fn emit_value_block(out: &mut [u8], est: &mut [i64], src: &[u8], toks: &[Token], nodes: &[Node],
-                    types: &[Ty], strs: &[Str], ntys: &[i64], n: i64) {
+                    types: &[Ty], strs: &[Str], sigs: &[Sig], ntys: &[i64], n: i64) {
     let t = ntys[n];
     let unit = t < 0 || types[t].kind == 4;
     let tmp = est[1];
@@ -315,9 +330,9 @@ fn emit_value_block(out: &mut [u8], est: &mut [i64], src: &[u8], toks: &[Token],
     };
     let target = if unit { -1 } else { tmp };
     if nodes[n].kind == 75 {
-        emit_if(out, est, src, toks, nodes, types, strs, ntys, n, target);
+        emit_if(out, est, src, toks, nodes, types, strs, sigs, ntys, n, target);
     } else {
-        emit_block(out, est, src, toks, nodes, types, strs, ntys, n, target);
+        emit_block(out, est, src, toks, nodes, types, strs, sigs, ntys, n, target);
     };
     if !unit {
         emit_b(out, est, b' ');
@@ -330,25 +345,64 @@ fn emit_value_block(out: &mut [u8], est: &mut [i64], src: &[u8], toks: &[Token],
 
 // `if (c) { … } else { … }`, each arm's value assigned to `target` when there is one
 fn emit_if(out: &mut [u8], est: &mut [i64], src: &[u8], toks: &[Token], nodes: &[Node],
-           types: &[Ty], strs: &[Str], ntys: &[i64], n: i64, target: i64) {
+           types: &[Ty], strs: &[Str], sigs: &[Sig], ntys: &[i64], n: i64, target: i64) {
     let s = b"if (";
     emit_bytes(out, est, &s);
-    emit_expr(out, est, src, toks, nodes, types, strs, ntys, nodes[n].a);
+    emit_expr(out, est, src, toks, nodes, types, strs, sigs, ntys, nodes[n].a);
     let c = b") ";
     emit_bytes(out, est, &c);
-    emit_block(out, est, src, toks, nodes, types, strs, ntys, nodes[n].b, target);
+    emit_block(out, est, src, toks, nodes, types, strs, sigs, ntys, nodes[n].b, target);
     if nodes[n].c >= 0 {
         let e = b" else ";
         emit_bytes(out, est, &e);
-        emit_block(out, est, src, toks, nodes, types, strs, ntys, nodes[n].c, target);
+        emit_block(out, est, src, toks, nodes, types, strs, sigs, ntys, nodes[n].c, target);
     };
+}
+
+// `let ys = xs`: a fresh allocation and a copy of the elements
+fn emit_let_array_copy(out: &mut [u8], est: &mut [i64], src: &[u8], toks: &[Token], nodes: &[Node],
+                       types: &[Ty], strs: &[Str], sigs: &[Sig], ntys: &[i64], name: i64,
+                       from: i64, t: i64) {
+    let n1 = b"int64_t ";
+    emit_bytes(out, est, &n1);
+    emit_arr_name(out, est, src, toks, name, b'n');
+    let eq = b" = ";
+    emit_bytes(out, est, &eq);
+    emit_arr_name(out, est, src, toks, from, b'n');
+    let semi = b"; ";
+    emit_bytes(out, est, &semi);
+    emit_type(out, est, src, toks, types, strs, t);
+    let star = b" *";
+    emit_bytes(out, est, &star);
+    emit_arr_name(out, est, src, toks, name, b'p');
+    let al = b" = nt_alloc(";
+    emit_bytes(out, est, &al);
+    emit_arr_name(out, est, src, toks, name, b'n');
+    let sz = b", sizeof(";
+    emit_bytes(out, est, &sz);
+    emit_type(out, est, src, toks, types, strs, t);
+    let cl = b")); memcpy(";
+    emit_bytes(out, est, &cl);
+    emit_arr_name(out, est, src, toks, name, b'p');
+    let c = b", ";
+    emit_bytes(out, est, &c);
+    emit_arr_name(out, est, src, toks, from, b'p');
+    emit_bytes(out, est, &c);
+    let st = b"(size_t)";
+    emit_bytes(out, est, &st);
+    emit_arr_name(out, est, src, toks, name, b'n');
+    let so = b" * sizeof(";
+    emit_bytes(out, est, &so);
+    emit_type(out, est, src, toks, types, strs, t);
+    let end = b"));";
+    emit_bytes(out, est, &end);
 }
 
 // `let xs = <array>`: the two names, from the two forms the slice takes (arrays design §3). A
 // byte string becomes a C string literal, which is both shorter than a brace list and the thing C
 // is good at; `[e; n]` becomes `nt_alloc` and a fill loop, as it does in the Rust emitter.
 fn emit_let_array(out: &mut [u8], est: &mut [i64], src: &[u8], toks: &[Token], nodes: &[Node],
-                  types: &[Ty], strs: &[Str], ntys: &[i64], n: i64) {
+                  types: &[Ty], strs: &[Str], sigs: &[Sig], ntys: &[i64], n: i64) {
     let name = nodes[n].a;
     let init = nodes[n].c;
     let t = ntys[init];
@@ -385,12 +439,82 @@ fn emit_let_array(out: &mut [u8], est: &mut [i64], src: &[u8], toks: &[Token], n
         emit_bytes(out, est, &s6);
         return;
     }
+    // `let v = &xs` binds a view, and a view *is* an alias: the two names are copied and no
+    // element is. `let ys = xs` is the other case and copies the elements, for the reason the
+    // whole-array assignment above copies them.
+    let is_ref = nodes[init].kind == 73 && nodes[nodes[init].a].kind == 65;
+    if nodes[init].kind == 65 {
+        emit_let_array_copy(out, est, src, toks, nodes, types, strs, sigs, ntys, name, nodes[init].a, t);
+        return;
+    }
+    if is_ref {
+        let from = nodes[nodes[init].a].a;
+        if types[t].mutable == 0 { let c = b"const "; emit_bytes(out, est, &c); };
+        emit_type(out, est, src, toks, types, strs, t);
+        let star = b" *";
+        emit_bytes(out, est, &star);
+        emit_arr_name(out, est, src, toks, name, b'p');
+        let eq = b" = ";
+        emit_bytes(out, est, &eq);
+        emit_arr_name(out, est, src, toks, from, b'p');
+        let n1 = b"; int64_t ";
+        emit_bytes(out, est, &n1);
+        emit_arr_name(out, est, src, toks, name, b'n');
+        emit_bytes(out, est, &eq);
+        emit_arr_name(out, est, src, toks, from, b'n');
+        emit_b(out, est, b';');
+        return;
+    }
+    if nodes[init].kind != 77 && nodes[init].kind != 78 && nodes[init].kind != 64 {
+        // anything else — a call returning an array, a chain — is outside the slice. Saying so
+        // costs one flag and is the difference between a refusal and a C file that looks fine
+        // until `cc` reads it.
+        est[2] = 1;
+        return;
+    }
+    if nodes[init].kind == 77 {
+        // a brace list becomes a C brace list; `sizeof` divides out the length, so the count is
+        // never written twice and never disagrees with what is there
+        emit_type(out, est, src, toks, types, strs, t);
+        emit_b(out, est, b' ');
+        emit_arr_name(out, est, src, toks, name, b'b');
+        let ob = b"[] = {";
+        emit_bytes(out, est, &ob);
+        let mut e = nodes[init].a;
+        while e >= 0 {
+            emit_expr(out, est, src, toks, nodes, types, strs, sigs, ntys, e);
+            e = nodes[e].next;
+            if e >= 0 { let c = b", "; emit_bytes(out, est, &c); };
+        }
+        let cb = b"}; ";
+        emit_bytes(out, est, &cb);
+        emit_type(out, est, src, toks, types, strs, t);
+        let star = b" *";
+        emit_bytes(out, est, &star);
+        emit_arr_name(out, est, src, toks, name, b'p');
+        let eq = b" = ";
+        emit_bytes(out, est, &eq);
+        emit_arr_name(out, est, src, toks, name, b'b');
+        let n1 = b"; int64_t ";
+        emit_bytes(out, est, &n1);
+        emit_arr_name(out, est, src, toks, name, b'n');
+        emit_bytes(out, est, &eq);
+        let sz = b"(int64_t)(sizeof(";
+        emit_bytes(out, est, &sz);
+        emit_arr_name(out, est, src, toks, name, b'b');
+        let d = b") / sizeof(";
+        emit_bytes(out, est, &d);
+        emit_type(out, est, src, toks, types, strs, t);
+        let end = b"));";
+        emit_bytes(out, est, &end);
+        return;
+    }
     let nm = b"int64_t ";
     emit_bytes(out, est, &nm);
     emit_arr_name(out, est, src, toks, name, b'n');
     let eq = b" = ";
     emit_bytes(out, est, &eq);
-    emit_expr(out, est, src, toks, nodes, types, strs, ntys, nodes[init].b);
+    emit_expr(out, est, src, toks, nodes, types, strs, sigs, ntys, nodes[init].b);
     let semi = b"; ";
     emit_bytes(out, est, &semi);
     emit_type(out, est, src, toks, types, strs, t);
@@ -414,7 +538,7 @@ fn emit_let_array(out: &mut [u8], est: &mut [i64], src: &[u8], toks: &[Token], n
     emit_b(out, est, b' ');
     emit_tmp_name(out, est, k);
     emit_bytes(out, est, &eq);
-    emit_expr(out, est, src, toks, nodes, types, strs, ntys, nodes[init].a);
+    emit_expr(out, est, src, toks, nodes, types, strs, sigs, ntys, nodes[init].a);
     emit_bytes(out, est, &semi);
     let f1 = b"for (int64_t nt_i";
     emit_bytes(out, est, &f1);
@@ -445,12 +569,12 @@ fn emit_let_array(out: &mut [u8], est: &mut [i64], src: &[u8], toks: &[Token], n
 
 // `{ … }`: the statements, then the tail, assigned to `target` when the block has a value
 fn emit_block(out: &mut [u8], est: &mut [i64], src: &[u8], toks: &[Token], nodes: &[Node],
-              types: &[Ty], strs: &[Str], ntys: &[i64], n: i64, target: i64) {
+              types: &[Ty], strs: &[Str], sigs: &[Sig], ntys: &[i64], n: i64, target: i64) {
     let o = b"{ ";
     emit_bytes(out, est, &o);
     let mut s = nodes[n].a;
     while s >= 0 {
-        emit_stmt(out, est, src, toks, nodes, types, strs, ntys, s);
+        emit_stmt(out, est, src, toks, nodes, types, strs, sigs, ntys, s);
         emit_b(out, est, b' ');
         s = nodes[s].next;
     }
@@ -460,7 +584,7 @@ fn emit_block(out: &mut [u8], est: &mut [i64], src: &[u8], toks: &[Token], nodes
             let eq = b" = ";
             emit_bytes(out, est, &eq);
         };
-        emit_expr(out, est, src, toks, nodes, types, strs, ntys, nodes[n].b);
+        emit_expr(out, est, src, toks, nodes, types, strs, sigs, ntys, nodes[n].b);
         let semi = b"; ";
         emit_bytes(out, est, &semi);
     }
@@ -468,12 +592,12 @@ fn emit_block(out: &mut [u8], est: &mut [i64], src: &[u8], toks: &[Token], nodes
 }
 
 fn emit_stmt(out: &mut [u8], est: &mut [i64], src: &[u8], toks: &[Token], nodes: &[Node],
-             types: &[Ty], strs: &[Str], ntys: &[i64], n: i64) {
+             types: &[Ty], strs: &[Str], sigs: &[Sig], ntys: &[i64], n: i64) {
     let k = nodes[n].kind;
     if k == 90 {
         let t = ntys[nodes[n].c];
         if is_arr(types, t) {
-            emit_let_array(out, est, src, toks, nodes, types, strs, ntys, n);
+            emit_let_array(out, est, src, toks, nodes, types, strs, sigs, ntys, n);
             return;
         }
         emit_type(out, est, src, toks, types, strs, t);
@@ -481,31 +605,45 @@ fn emit_stmt(out: &mut [u8], est: &mut [i64], src: &[u8], toks: &[Token], nodes:
         emit_span(out, est, src, toks, nodes[n].a);
         let eq = b" = ";
         emit_bytes(out, est, &eq);
-        emit_expr(out, est, src, toks, nodes, types, strs, ntys, nodes[n].c);
+        emit_expr(out, est, src, toks, nodes, types, strs, sigs, ntys, nodes[n].c);
         emit_b(out, est, b';');
     } else if k == 91 {
-        // `ys = xs` on whole arrays moves both names; the checker has already agreed the sizes do
+        // `ys = xs` on whole arrays **copies**. Assigning the pointer instead is what the Rust
+        // compiler does when it can prove nothing else is looking at `xs` — that proof is M5's
+        // move and uniqueness checking, which is not in this slice. Copying is the language's
+        // meaning; aliasing is the optimisation, and an emitter that cannot tell must not take it.
+        // `reassign_copy.nt` is the golden that tells the two apart.
         if nodes[nodes[n].a].kind == 65 && nodes[nodes[n].b].kind == 65 && is_arr(types, ntys[nodes[n].a]) {
             let l = nodes[nodes[n].a].a;
             let r = nodes[nodes[n].b].a;
+            let mc = b"memcpy(";
+            emit_bytes(out, est, &mc);
             emit_arr_name(out, est, src, toks, l, b'p');
-            let eq = b" = ";
-            emit_bytes(out, est, &eq);
+            let c = b", ";
+            emit_bytes(out, est, &c);
             emit_arr_name(out, est, src, toks, r, b'p');
-            let semi = b"; ";
-            emit_bytes(out, est, &semi);
+            emit_bytes(out, est, &c);
+            let sz = b"(size_t)";
+            emit_bytes(out, est, &sz);
+            emit_arr_name(out, est, src, toks, r, b'n');
+            let so = b" * sizeof(";
+            emit_bytes(out, est, &so);
+            emit_type(out, est, src, toks, types, strs, ntys[nodes[n].a]);
+            let cl = b")); ";
+            emit_bytes(out, est, &cl);
             emit_arr_name(out, est, src, toks, l, b'n');
+            let eq = b" = ";
             emit_bytes(out, est, &eq);
             emit_arr_name(out, est, src, toks, r, b'n');
             emit_b(out, est, b';');
             return;
         }
-        emit_expr(out, est, src, toks, nodes, types, strs, ntys, nodes[n].a);
+        emit_expr(out, est, src, toks, nodes, types, strs, sigs, ntys, nodes[n].a);
         emit_b(out, est, b' ');
         if nodes[n].ival >= 0 { emit_op(out, est, nodes[n].ival); };
         let eq = b"= ";
         emit_bytes(out, est, &eq);
-        emit_expr(out, est, src, toks, nodes, types, strs, ntys, nodes[n].b);
+        emit_expr(out, est, src, toks, nodes, types, strs, sigs, ntys, nodes[n].b);
         emit_b(out, est, b';');
     } else if k == 92 {
         // the end of the range is evaluated once, as the language says it is
@@ -514,14 +652,14 @@ fn emit_stmt(out: &mut [u8], est: &mut [i64], src: &[u8], toks: &[Token], nodes:
         emit_span(out, est, src, toks, nodes[n].a);
         let eq = b" = ";
         emit_bytes(out, est, &eq);
-        emit_expr(out, est, src, toks, nodes, types, strs, ntys, nodes[n].b);
+        emit_expr(out, est, src, toks, nodes, types, strs, sigs, ntys, nodes[n].b);
         let e2 = b", nt_e";
         emit_bytes(out, est, &e2);
         let lim = est[1];
         est[1] = lim + 1;
         emit_int(out, est, lim);
         emit_bytes(out, est, &eq);
-        emit_expr(out, est, src, toks, nodes, types, strs, ntys, nodes[n].c);
+        emit_expr(out, est, src, toks, nodes, types, strs, sigs, ntys, nodes[n].c);
         let sep = b"; ";
         emit_bytes(out, est, &sep);
         emit_span(out, est, src, toks, nodes[n].a);
@@ -532,14 +670,14 @@ fn emit_stmt(out: &mut [u8], est: &mut [i64], src: &[u8], toks: &[Token], nodes:
         emit_span(out, est, src, toks, nodes[n].a);
         let inc = b"++) ";
         emit_bytes(out, est, &inc);
-        emit_block(out, est, src, toks, nodes, types, strs, ntys, nodes[n].d, -1);
+        emit_block(out, est, src, toks, nodes, types, strs, sigs, ntys, nodes[n].d, -1);
     } else if k == 93 {
         let w = b"while (";
         emit_bytes(out, est, &w);
-        emit_expr(out, est, src, toks, nodes, types, strs, ntys, nodes[n].a);
+        emit_expr(out, est, src, toks, nodes, types, strs, sigs, ntys, nodes[n].a);
         let c = b") ";
         emit_bytes(out, est, &c);
-        emit_block(out, est, src, toks, nodes, types, strs, ntys, nodes[n].c, -1);
+        emit_block(out, est, src, toks, nodes, types, strs, sigs, ntys, nodes[n].c, -1);
     } else if k == 94 {
         let b2 = b"break;";
         emit_bytes(out, est, &b2);
@@ -548,11 +686,11 @@ fn emit_stmt(out: &mut [u8], est: &mut [i64], src: &[u8], toks: &[Token], nodes:
         let ek = nodes[e].kind;
         // an `if` or a block in statement position is a statement, not a statement expression
         if ek == 75 {
-            emit_if(out, est, src, toks, nodes, types, strs, ntys, e, -1);
+            emit_if(out, est, src, toks, nodes, types, strs, sigs, ntys, e, -1);
         } else if ek == 76 {
-            emit_block(out, est, src, toks, nodes, types, strs, ntys, e, -1);
+            emit_block(out, est, src, toks, nodes, types, strs, sigs, ntys, e, -1);
         } else {
-            emit_expr(out, est, src, toks, nodes, types, strs, ntys, e);
+            emit_expr(out, est, src, toks, nodes, types, strs, sigs, ntys, e);
             emit_b(out, est, b';');
         }
     } else if k == 96 {
@@ -560,7 +698,7 @@ fn emit_stmt(out: &mut [u8], est: &mut [i64], src: &[u8], toks: &[Token], nodes:
         emit_bytes(out, est, &r);
         if nodes[n].a >= 0 {
             emit_b(out, est, b' ');
-            emit_expr(out, est, src, toks, nodes, types, strs, ntys, nodes[n].a);
+            emit_expr(out, est, src, toks, nodes, types, strs, sigs, ntys, nodes[n].a);
         };
         emit_b(out, est, b';');
     }
@@ -570,11 +708,13 @@ fn emit_stmt(out: &mut [u8], est: &mut [i64], src: &[u8], toks: &[Token], nodes:
 
 fn emit_signature(out: &mut [u8], est: &mut [i64], src: &[u8], toks: &[Token], nodes: &[Node],
                   types: &[Ty], strs: &[Str], sigs: &[Sig], ptys: &[i64], si: i64, f: i64) {
-    let st = b"static ";
-    emit_bytes(out, est, &st);
+    // an `extern fn` names a C symbol that already exists (`bootstrap/rt.c`), so it is neither
+    // `static` nor `ntu_`-prefixed — the prefix exists to keep *our* names off the runtime's
+    let ext = nodes[f].kind == 116;
+    if !ext { let st = b"static "; emit_bytes(out, est, &st); };
     emit_type(out, est, src, toks, types, strs, sigs[si].ret);
-    let pre = b" ntu_";
-    emit_bytes(out, est, &pre);
+    emit_b(out, est, b' ');
+    if !ext { let pre = b"ntu_"; emit_bytes(out, est, &pre); };
     emit_span(out, est, src, toks, nodes[f].a);
     emit_b(out, est, b'(');
     let mut p = nodes[f].b;
@@ -605,7 +745,7 @@ fn emit_signature(out: &mut [u8], est: &mut [i64], src: &[u8], toks: &[Token], n
 }
 
 fn emit_func(out: &mut [u8], est: &mut [i64], src: &[u8], toks: &[Token], nodes: &[Node],
-             types: &[Ty], strs: &[Str], ntys: &[i64], sigs: &[Sig], ptys: &[i64], si: i64, f: i64) {
+             types: &[Ty], strs: &[Str], sigs: &[Sig], ntys: &[i64], ptys: &[i64], si: i64, f: i64) {
     emit_signature(out, est, src, toks, nodes, types, strs, sigs, ptys, si, f);
     let s = b" {\n";
     emit_bytes(out, est, &s);
@@ -614,7 +754,7 @@ fn emit_func(out: &mut [u8], est: &mut [i64], src: &[u8], toks: &[Token], nodes:
     while st >= 0 {
         let sp = b"    ";
         emit_bytes(out, est, &sp);
-        emit_stmt(out, est, src, toks, nodes, types, strs, ntys, st);
+        emit_stmt(out, est, src, toks, nodes, types, strs, sigs, ntys, st);
         emit_b(out, est, b'\n');
         st = nodes[st].next;
     }
@@ -623,7 +763,7 @@ fn emit_func(out: &mut [u8], est: &mut [i64], src: &[u8], toks: &[Token], nodes:
         emit_bytes(out, est, &sp);
         // a body's value is its return, unless the function returns nothing
         if sigs[si].ret != 4 { let r = b"return "; emit_bytes(out, est, &r); };
-        emit_expr(out, est, src, toks, nodes, types, strs, ntys, nodes[body].b);
+        emit_expr(out, est, src, toks, nodes, types, strs, sigs, ntys, nodes[body].b);
         let e = b";\n";
         emit_bytes(out, est, &e);
     }
@@ -681,7 +821,7 @@ fn emit_program(out: &mut [u8], est: &mut [i64], src: &[u8], toks: &[Token], nod
     let mut si = 0;
     while f >= 0 {
         // the item list interleaves structs, which have no signature and no body
-        if nodes[f].kind == 110 {
+        if nodes[f].kind == 110 || nodes[f].kind == 116 {
             emit_signature(out, est, src, toks, nodes, types, strs, sigs, ptys, si, f);
             let s = b";\n";
             emit_bytes(out, est, &s);
@@ -694,12 +834,17 @@ fn emit_program(out: &mut [u8], est: &mut [i64], src: &[u8], toks: &[Token], nod
     si = 0;
     while f >= 0 {
         if nodes[f].kind == 110 {
-            emit_func(out, est, src, toks, nodes, types, strs, ntys, sigs, ptys, si, f);
+            emit_func(out, est, src, toks, nodes, types, strs, sigs, ntys, ptys, si, f);
+            si += 1;
+        } else if nodes[f].kind == 116 {
             si += 1;
         }
         f = nodes[f].next;
     }
     let m = b"int main(void) { ntu_main(); return 0; }\n";
     emit_bytes(out, est, &m);
+    // a negative length is a refusal, not a short file: est[2] is set where the emitter met
+    // something outside its slice, and the caller must not write what is in the buffer
+    if est[2] != 0 { return -3; }
     est[0]
 }

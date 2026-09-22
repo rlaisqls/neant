@@ -17,8 +17,9 @@
 //   90 Let  91 Assign  92 For  93 While  94 Break  95 ExprStmt  96 Return
 //   100 TyNamed  101 TyUnit  102 TyArray  103 TySlice  104 TyOwned
 //   110 Func  111 Param  112 StructDef  113 FieldDef  114 FieldInit  70 StructLit
+//   116 ExternFn (a signature and no body; its `uses` clause is dropped)
 //   115 a struct-name marker, laid down before parsing and never part of the tree
-// Out of this slice, by design §6: MethodCall/chains other than `.len()`, ArrayLit(77),
+// Out of this slice, by design §6: MethodCall/chains other than `.len()`,
 // Lambda(79), Comprehension(80), `extern` and attributes. Structs were added afterwards, the
 // first widening of the slice (docs/self-hosting-structs.md).
 //
@@ -350,13 +351,25 @@ fn primary(src: &[u8], toks: &[Token], n_toks: i64, st: &mut [i64], nodes: &mut 
         return n;
     }
     if k == 25 {
-        // `[e; n]` only, and only the repeat form: a brace list is out (arrays design §3). The
-        // language already restricts either to a `let` initialiser, which is checked there.
+        // `[e; n]` and `[a, b, c]`, told apart by what follows the first element. The language
+        // already restricts either to a `let` initialiser, which is checked there.
         bump(st);
-        let n = alloc(nodes, st, 78);
-        nodes[n].a = expr(src, toks, n_toks, st, nodes);
-        expect(toks, st, 30);
-        nodes[n].b = expr(src, toks, n_toks, st, nodes);
+        let first = expr(src, toks, n_toks, st, nodes);
+        if eat(toks, st, 30) {
+            let n = alloc(nodes, st, 78);
+            nodes[n].a = first;
+            nodes[n].b = expr(src, toks, n_toks, st, nodes);
+            expect(toks, st, 26);
+            return n;
+        }
+        let n = alloc(nodes, st, 77);
+        nodes[n].a = first;
+        let mut last = first;
+        while st[2] == 0 && eat(toks, st, 29) && toks[st[0]].kind != 26 {
+            let e = expr(src, toks, n_toks, st, nodes);
+            nodes[last].next = e;
+            last = e;
+        }
         expect(toks, st, 26);
         return n;
     }
@@ -569,6 +582,36 @@ fn item(src: &[u8], toks: &[Token], n_toks: i64, st: &mut [i64], nodes: &mut [No
 
 // `fn name(p: T, …) -> T { … }` — `a` is the name token, `b` the first Param (chained by `next`),
 // `c` the return type (−1 when `()` was written or omitted), `d` the body block
+// `extern fn name(params) -> ret uses <effects>;` — a signature and no body. The effect list is
+// read and dropped: effects are the cost model's, and the cost model is not self-hosted, so
+// keeping them would be a field nothing reads. What this buys is the driver: `read_file` and
+// `write_file` are the only reason the stages are not already a program.
+fn extern_fn(src: &[u8], toks: &[Token], n_toks: i64, st: &mut [i64], nodes: &mut [Node]) -> i64 {
+    if st[2] != 0 { return -1; }
+    expect(toks, st, 20);
+    expect(toks, st, 6);
+    let name = expect(toks, st, 0);
+    let n = alloc(nodes, st, 116);
+    nodes[n].a = name;
+    expect(toks, st, 23);
+    let mut last = -1;
+    while st[2] == 0 && toks[st[0]].kind != 24 {
+        let pname = expect(toks, st, 0);
+        expect(toks, st, 31);
+        let p = alloc(nodes, st, 111);
+        nodes[p].a = pname;
+        nodes[p].b = type_expr(src, toks, n_toks, st, nodes);
+        if last < 0 { nodes[n].b = p; } else { nodes[last].next = p; }
+        last = p;
+        if !eat(toks, st, 29) { break; }
+    }
+    expect(toks, st, 24);
+    if eat(toks, st, 32) { nodes[n].c = type_expr(src, toks, n_toks, st, nodes); };
+    while st[2] == 0 && toks[st[0]].kind != 30 && toks[st[0]].kind != 57 { bump(st); }
+    expect(toks, st, 30);
+    n
+}
+
 fn func(src: &[u8], toks: &[Token], n_toks: i64, st: &mut [i64], nodes: &mut [Node]) -> i64 {
     if st[2] != 0 { return -1; }
     expect(toks, st, 6);
@@ -636,6 +679,8 @@ fn parse_program(src: &[u8], toks: &[Token], n_toks: i64, st: &mut [i64], nodes:
     while st[2] == 0 && toks[st[0]].kind != 57 {
         let f = if toks[st[0]].kind == 22 {
             struct_def(src, toks, n_toks, st, nodes)
+        } else if toks[st[0]].kind == 20 {
+            extern_fn(src, toks, n_toks, st, nodes)
         } else {
             func(src, toks, n_toks, st, nodes)
         };

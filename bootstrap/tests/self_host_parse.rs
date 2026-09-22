@@ -47,12 +47,17 @@ fn dump_node(nodes: &[Node], n: i64) {
         dump_node(nodes, nodes[n].d);
     } else if k == 71 {
         dump_list(nodes, nodes[n].b);
+    } else if k == 116 {
+        dump_list(nodes, nodes[n].b);
+        dump_node(nodes, nodes[n].c);
     } else if k == 110 {
         dump_list(nodes, nodes[n].b);
         dump_node(nodes, nodes[n].c);
         dump_node(nodes, nodes[n].d);
     } else if k == 111 {
         dump_node(nodes, nodes[n].b);
+    } else if k == 77 {
+        dump_list(nodes, nodes[n].a);
     } else if k == 112 || k == 70 {
         dump_list(nodes, nodes[n].b);
     } else if k == 113 || k == 114 {

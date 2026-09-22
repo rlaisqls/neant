@@ -35,7 +35,7 @@ fn main() {{
     }} else {{
         let mut types = [Ty {{ kind: 0, elem: 0, mutable: 0, size: 0 }}; 4096];
         let mut syms = [Sym {{ name: 0, ty: 0, mutable: 0 }}; 4096];
-        let mut sigs = [Sig {{ name: 0, params: 0, n_params: 0, ret: 0 }}; 1024];
+        let mut sigs = [Sig {{ name: -1, params: 0, n_params: 0, ret: 0, ext: 0 }}; 1024];
         let mut strs = [Str {{ name: 0, fields: 0, n_fields: 0 }}; 1024];
         let mut flds = [Fld {{ name: 0, ty: 0 }}; 4096];
         let mut ptys = [0; 4096];
@@ -46,9 +46,14 @@ fn main() {{
             println(-1);
         }} else {{
             let mut out = [b'\0'; 262144];
-            let mut est = [0, 0];
+            let mut est = [0, 0, 0];
             let len = emit_program(&mut out, &mut est, &buf, &toks, &nodes, &types, &strs, &flds, &ntys, &sigs, &ptys, first);
-            println(write_file(&outpath, &out, len));
+            if len < 0 {{
+                // the emitter refused: something in this program is outside its slice
+                println(len);
+            }} else {{
+                println(write_file(&outpath, &out, len));
+            }}
         }}
     }}
 }}
@@ -92,7 +97,9 @@ fn self_hosted_emit_runs_the_same() {
         }
         let wrote: i64 = String::from_utf8_lossy(&run.stdout).trim().parse().unwrap_or(-9);
         if wrote <= 0 {
-            failures.push(format!("{name}: the self-hosted compiler emitted nothing (code {wrote})"));
+            // -2 the parser, -1 the checker, -3 the emitter refusing, anything else write_file
+            failures.push(format!("{name}: the self-hosted compiler emitted nothing (code {wrote}; \
+                -2 parser, -1 checker, -3 emitter)"));
             continue;
         }
 

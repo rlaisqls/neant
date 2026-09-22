@@ -320,8 +320,13 @@ mod parsedump {
         Ok(())
     }
     fn func(f: &Func, o: &mut Vec<i32>) -> Result<(), String> {
-        if f.body.is_none() { return Err("an `extern fn`".into()); }
         if !f.asserts.is_empty() { return Err("a `#[cost(...)]` attribute".into()); }
+        if f.body.is_none() {
+            o.push(116);
+            for p in &f.params { o.push(111); ty(&p.ty, o)?; }
+            if !matches!(f.ret, TypeExpr::Unit) { ty(&f.ret, o)?; }
+            return Ok(());
+        }
         o.push(110);
         for p in &f.params { o.push(111); ty(&p.ty, o)?; }
         if !matches!(f.ret, TypeExpr::Unit) { ty(&f.ret, o)?; }
@@ -397,7 +402,11 @@ mod parsedump {
                 expr(recv, o)
             }
             ExprKind::MethodCall(..) => Err("a method call or chain".into()),
-            ExprKind::ArrayLit(_) => Err("an array literal".into()),
+            ExprKind::ArrayLit(es) => {
+                o.push(77);
+                for e in es { expr(e, o)?; }
+                Ok(())
+            }
             ExprKind::ArrayRepeat(e, n) => {
                 o.push(78);
                 expr(e, o)?;
