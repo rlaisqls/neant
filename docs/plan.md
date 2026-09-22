@@ -350,12 +350,13 @@ summed by Faulhaber, `if` by dominance, `while` by the two ways `analyze.rs` fin
 count — the programmer's `decreasing` measure, whose promise is checked rather than taken, or an
 induction variable the body steps by a constant exactly once — and self-recursion with one call per
 invocation, by finding a measure that shrinks and then unrolling it or, when it halves, taking a
-logarithm. **71 golden functions' `work` columns come out string for
-string identical to `neant cost`'s**; exactly one it declines — `msum`, the only recursion with two
-calls per invocation, which wants the master theorem — and 4 differ *on purpose*, because `ys = xs` costs 1 when
+logarithm. **72 golden functions' `work` columns come out string for
+string identical to `neant cost`'s, and it declines none of them** — the last was `msum`, whose two
+calls halve the measure, which is the master theorem rather than `fib`'s exponential; 4 differ
+*on purpose*, because `ys = xs` costs 1 when
 in place and the array's length when copied — the self-hosted emitter has no uniqueness proof and
 always copies, so its cost says so. Charging 1 for parity would have been a cost report for code
-this compiler does not emit. **`moves`'s first slice landed too**: 54 columns exact for functions that call nothing, by the rule
+this compiler does not emit. **`moves`'s first slice landed too**: 55 columns exact for functions that call nothing, by the rule
 `t·s + B` for a contiguous site and `t·B` for a strided one, with 7 differing because the
 self-hosted emitter always lays an array of structs out as AoS while the Rust compiler chooses —
 the same principle as the `ys = xs` divergences, arrived at independently, and predicted in the

@@ -603,3 +603,24 @@ access in them**, and `msum`.
 
 What remains is one mechanism, honestly: the per-level working set, which is what `settle_moves` is
 for and what `matmul`, `stencil` and `tri` need. Everything cheaper than it is done.
+
+## 15. Two calls per invocation, and the `work` column closes
+
+`msum` was the last `work` decline: `T(m) = 2·T(m/2) + f`, a divide-and-conquer whose two calls
+each halve the measure. §12 had put every two-call recursion out on the grounds that it is either
+`fib` or the master theorem. It is both, and the two are told apart by *how* the measure shrinks:
+
+- **falls by a constant, two calls** — `fib`. Exponential. Still out, and `neant cost` declines it
+  too, so the exit test requires this pass to decline it as well.
+- **halves, `a` calls with `a = b`** — each level pays `f` per node, the ratio is `a` and the depth
+  is `log_a m`, so the levels sum to `(a·m − 1)/(a − 1)`. `msum` is `a = b = 2` and comes to
+  `f·(2m − 1)`: `20·hi − 20·lo − 10` for `work` and `2·B·hi − 2·B·lo − B` for `moves`, both exact.
+
+`a ≠ b` lifts the measure to a fractional power and is out; so is any `f` that varies with the
+measure. And **every call must shrink the measure the same way** — `msum` recurses on both halves,
+and both are checked, where before only the first was looked at.
+
+**72 `work` columns exact, four differing by design, and no declines at all.** Every in-slice
+golden function's `work` is either reproduced string for string or differs for one of the two
+recorded reasons. `moves` is at 55, and its eight declines are all one thing: a site inside two
+loops.
