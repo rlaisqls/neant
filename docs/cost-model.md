@@ -44,7 +44,7 @@ predicts 6 per element and measures 4.5: gcc fused the multiply-add).
 | `x[i] = e` | 1 + index + e — a store; `x[i] op= e` | 3 — load, op, store |
 | `for i in a..b { body }` | bounds once; then `Σ_{i=a}^{b−1} (2 + body)` — increment, compare-and-branch; exact for triangular bounds |
 | `while c { body }` | `trip × (1 + c + body)` |
-| `if c { t } else { e }` | 1 + c + t + e — **both branches are charged**; an upper bound, tight when one is empty |
+| `if c { t } else { e }` | 1 + c + max(t, e) — the branches are alternatives |
 | call | 2 + arguments + the callee's work — call and return |
 | `println` | 1, and the function is `io`; the library call behind it is not modelled |
 | `[e; n]`, `[e for x in xs]` | one store per element, plus the loop |
@@ -102,20 +102,41 @@ the working set of *every* access site inside that loop, added together, is a kn
 bytes strictly less than `M`. The sum is what the M1 experiment forced: a tiled matrix product
 whose `a`-panel alone fits was measured re-reading it, because the `b` tiles streaming through
 the same loop level brought the total to exactly `M`. Strictly less, because a cache is never
-empty of everything else. A working set that still contains a size variable is, today, assumed
-not to fit — which makes a function's own line the most pessimistic regime. That rule is being
-replaced by conditional costs, decided in [decisions.md](decisions.md) §2: an undecidable fit
-test forks the cost into `… if n·B < M` and `… otherwise`, with a lid of four regimes per
-function folded toward the pessimistic side. This is why `matmul(n, ...)` analysed on its own reports
-`B·n³ + 8n³ + 8n²` — a conservative bound in which nothing is reused — while the same function
-called from a `main` where `n = 1792` reports `8n³ + …`, because there the column of `b` is
-`1792` lines, that is a number, it is under `M`, and the walk down consecutive columns is seen to
-share lines.
+empty of everything else.
+
+When the working set still contains a size variable the test **cannot be decided, and the cost
+forks**: the level is computed both ways, and each result carries its condition — `ws·B < M` on
+one side, `ws·B ≥ M` on the other. The function's cost is then **piecewise**: a set of pieces,
+each a polynomial under a set of conditions, whose value at an input is the maximum over the
+pieces whose conditions hold there. Pieces whose conditions contradict each other are dropped —
+symbolically when one working set dominates another term by term (sizes are at least one, so
+`B·n²` covers `B·n`), and at the machine's `B` and `M` when every condition of a piece is in one
+size variable: each is then an interval of that variable, and an empty intersection is an
+impossible regime. The conditions themselves stay symbolic; only their feasibility is decided
+for the machine, so another cache size may keep more or fewer regimes. Nothing is folded
+([decisions.md](decisions.md) §2, §3). The naive product analysed on its own comes out in three
+regimes:
+
+```
+matmul   moves  24·n² + …    if  8·n² < M                              everything fits
+                8·n³ + …     if  B·n + 8·n < M  and  8·n² ≥ M          the column of b fits, the matrix does not
+                B·n³ + …     if  B·n + 8·n ≥ M                          nothing fits
+```
+
+with the gap to the Hong–Kung bound per regime: 1448× where the column fits, 13033× where it
+does not. A concrete `main` decides every test with numbers and has one piece.
+
+`if` is the other source of pieces: its two branches are alternatives, and the cost of the
+statement is the **larger** of the two, not their sum — a binary search is one recursive call per
+level, a stack machine's dispatch costs its most expensive opcode. Access sites on the two sides
+of an `if` are alternatives too, and their lines combine by max in the final total. (Inside a
+loop, the working-set sum still counts the sites of both branches: a branch-dependent working
+set is bounded by the sum.)
 
 That is the second rule: **a call whose argument sizes are all known at the call site is analysed
 again for that call site**, with the parameters bound to the caller's polynomials, so every fit
 and stride decision inside is made with the caller's numbers. The function's own line in the
-report and in `costs.lock` is still its symbolic, conservative one.
+report and in `costs.lock` is its symbolic, piecewise one.
 
 And the third: when such a call sits inside the caller's loops and **none of its arguments moves
 with those loops** — `for r in 0..20 { sum(&xs) }` — the callee is analysed *inside* them. The
@@ -150,7 +171,6 @@ measured number can come in under the prediction.
   measured count on strided access above the model's.
 - **Element alignment.** An element is assumed not to straddle two lines.
 - **Recursion.** A recursive function is *unknown* until recurrences are solved (M3).
-- **Branches** are summed, not maxed.
 
 ## Loops without a range
 
@@ -290,6 +310,8 @@ matmul           work 10·n³ + 5·n² + 2·n           moves B·n³ + 8·n³ + 
 fib              unknown: calls `fib`, whose cost is unknown (recursive; recurrences are not solved yet) (line 3)
 ```
 
-`exact` means both polynomials were derived by the rules above with no unknown. It does not mean
-the machine will agree to the byte; it means the shape is proven and the constant is the rules'.
-`--eval n=1792,B=64` substitutes and prints numbers.
+`exact` means both costs were derived by the rules above with no unknown. It does not mean the
+machine will agree to the byte; it means the shape is proven and the constant is the rules'. A
+piecewise cost prints its regimes on the lines under the function; `costs.lock` keeps every piece
+exactly on the function's one line. `--eval n=1792,B=64` decides the conditions at the machine's
+`B` and `M` and prints the applicable piece's numbers. `#[cost]` must hold in every piece.
