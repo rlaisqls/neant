@@ -1763,3 +1763,50 @@ the loop a reader would write by hand. It is not overhead the rewrite adds; it i
 
 What is left of `chains.nt` is one thing: `[e for x in xs]` used as a **value**, which allocates an
 array rather than reducing to a scalar. Every stage and terminal it uses is now built.
+
+## 26. The array-valued comprehension, designed
+
+`chains.nt` needs one thing more: `[e for x in xs]` used as a **value**. It is the only chain form
+that allocates rather than reducing, and it is a different shape of rewrite from everything above.
+
+### What it costs, and what that says
+
+```
+let ys = [2.0 * x for x in xs];      work 5·xs.len() + 1   moves 16·xs.len() + 2·B
+```
+
+A hand-written equivalent costs `6·xs.len() + 1` and `24·xs.len() + 3·B`: one array's traffic more,
+and one instruction per element more. The difference is the zero-fill. `[0.0; xs.len()]` builds
+*and fills*, and the comprehension then writes every element again; `analyze.rs` allocates and fills
+once. So the rewrite needs **an allocation with no fill**, which no expression in the language
+denotes — `[e; n]` always fills.
+
+A **filtered** comprehension as a value is rejected outright: *"the length of a filtered
+comprehension depends on the data; reduce it (`.sum()`, `.count()`, …) or drop the `if`"*. So only
+the unconditional form allocates, and its length is exactly the source's — which is what makes the
+size atom straightforward, and what `err_filtered_let.nt` is the golden for.
+
+### Why it cannot be an expression rewrite
+
+Every chain so far became a *block expression* written over the chain's own node, and the emitter
+never had to know. This one cannot: `emit`'s array-`let` path accepts three initialiser shapes —
+a brace list (77), a repeat (78) and a byte string (64) — and **refuses everything else outright**,
+by design, "the difference between a refusal and a C file that looks fine until `cc` reads it".
+A block is not one of the three.
+
+So it has to be a **statement-level** rewrite: `let ys = <comprehension>;` becomes a `let` of an
+allocation followed by a fill loop, two statements where there was one. That is the first rewrite
+that changes a statement list rather than an expression, and the first that the emitter has to be
+taught about rather than kept ignorant of.
+
+### The pieces, in order
+
+1. **An allocation with no fill.** `[e; n]` already emits `nt_alloc(n, sizeof(T))` and then a fill
+   loop; this is that path with the loop left out. It needs a node kind of its own so the emitter
+   can tell them apart, and it costs no work and no moves — a build is charged for its fill.
+2. **The statement rewrite**, in `check_stmt_inner`'s `let` case rather than in `check_expr`.
+3. **Owned array returns**, which `owned.nt` needs and `chains.nt` does not: `fn doubled(xs: &[f64])
+   -> [f64]` is rejected by this checker today, comprehension or no comprehension. Measured
+   separately so it is not mistaken for part of this.
+
+`chains.nt` lands on (1) and (2). `owned.nt` needs (3) as well.
