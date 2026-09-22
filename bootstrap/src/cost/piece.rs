@@ -169,6 +169,55 @@ impl Cost {
         }
         Cost::from_pieces(out)
     }
+    /// Feasibility at the machine's `B` and `M`: when every condition of a piece mentions one
+    /// size variable, each is an interval of it — `ws(n)·B < M` is `n < n₀` for the threshold
+    /// `n₀`, found by bisection since a working set has nonnegative coefficients — and a piece
+    /// whose intervals do not meet on `n ≥ 1` cannot hold. The pieces' conditions stay symbolic;
+    /// only their feasibility is decided here, so another machine may keep more or fewer regimes.
+    /// Conditions a piece's other conditions imply are dropped the same way.
+    pub fn prune_at(&mut self, m: &Machine) {
+        let at = |a: Atom| match a { Atom::B => Some(m.b_bytes as f64), Atom::M => Some(m.m_bytes as f64), _ => None };
+        let threshold = |c: &Cond, v: usize| -> Option<f64> {
+            // smallest n ≥ 1 with ws(n)·B ≥ M; None if ws is not monotone in n or never reaches M
+            if !c.ws.terms.values().all(|k| k.n >= 0) { return None; }
+            let f = |n: f64| c.ws.eval(&|a| if a == Atom::Var(v) { Some(n) } else { at(a) }).map(|w| w * m.b_bytes as f64);
+            let target = m.m_bytes as f64;
+            if f(1.0)? >= target { return Some(1.0); }
+            let (mut lo, mut hi) = (1.0f64, 2.0f64);
+            while f(hi)? < target { hi *= 2.0; if hi > 1e30 { return Some(f64::INFINITY); } }
+            for _ in 0..200 { let mid = (lo + hi) / 2.0; if f(mid)? >= target { hi = mid; } else { lo = mid; } }
+            Some(hi.ceil())
+        };
+        let mut kept: Vec<Piece> = Vec::new();
+        for p in std::mem::take(&mut self.pieces) {
+            let vars: Vec<usize> = p.conds.iter().flat_map(|c| c.ws.vars()).collect();
+            let single = vars.first().copied().filter(|v| vars.iter().all(|x| x == v));
+            let Some(v) = single else { kept.push(p); continue };
+            // intervals: fits → n < n₀ (n ≤ n₀−1); ¬fits → n ≥ n₀
+            let mut lo = 1.0f64; let mut hi = f64::INFINITY;
+            let mut bounds: Vec<(usize, f64, bool)> = Vec::new(); // (cond index, threshold, fits)
+            for (i, c) in p.conds.iter().enumerate() {
+                let Some(t) = threshold(c, v) else { bounds.clear(); break };
+                if c.fits { hi = hi.min(t - 1.0); } else { lo = lo.max(t); }
+                bounds.push((i, t, c.fits));
+            }
+            if bounds.len() == p.conds.len() && lo > hi { continue; } // infeasible on n ≥ 1
+            // drop conditions implied by tighter ones of the same kind
+            if bounds.len() == p.conds.len() && !bounds.is_empty() {
+                let tight_hi = bounds.iter().filter(|b| b.2).map(|b| b.1).fold(f64::INFINITY, f64::min);
+                let tight_lo = bounds.iter().filter(|b| !b.2).map(|b| b.1).fold(0.0, f64::max);
+                let conds: Vec<Cond> = p.conds.iter().enumerate().filter(|(i, _)| {
+                    let b = bounds.iter().find(|b| b.0 == *i).unwrap();
+                    if b.2 { b.1 <= tight_hi } else { b.1 >= tight_lo }
+                }).map(|(_, c)| c.clone()).collect();
+                kept.push(Piece { conds, poly: p.poly });
+            } else {
+                kept.push(p);
+            }
+        }
+        self.pieces = kept;
+        self.prune();
+    }
     pub fn has_vars(&self) -> bool { self.pieces.iter().any(|p| p.poly.has_vars()) }
     pub fn mentions(&self, atom: usize) -> bool { self.pieces.iter().any(|p| p.poly.mentions(atom) || p.conds.iter().any(|c| c.ws.mentions(atom))) }
     pub fn max_var(&self) -> Option<usize> { self.pieces.iter().filter_map(|p| p.poly.max_var()).max() }

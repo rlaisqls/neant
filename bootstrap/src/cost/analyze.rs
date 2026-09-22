@@ -305,6 +305,9 @@ impl<'a, 'b, 'c> Fa<'a, 'b, 'c> {
         let result = match walked {
             Ok(()) => {
                 self.settle_moves();
+                let m = self.machine();
+                self.work.prune_at(&m);
+                self.moves.prune_at(&m);
                 if self.rec_calls.is_empty() {
                     CostResult::Exact { work: self.work.clone(), moves: self.moves.clone() }
                 } else {
