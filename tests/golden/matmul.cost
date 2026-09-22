@@ -1,2 +1,2 @@
-matmul           work 10·n³ + 6·n² + n             moves B·n³ + 8·n³ + 8·n²           exact
+matmul           work 10·n³ + 6·n² + n             moves B·n³ + 8·n³ + B·n²           exact
 main             work 473                          moves 648                          exact

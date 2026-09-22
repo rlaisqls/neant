@@ -20,8 +20,10 @@ SWEEP = {
     "dot":          ([50_000, 200_000, 800_000, 3_200_000, 12_800_000], 20),
     "saxpy":        ([50_000, 200_000, 800_000, 3_200_000, 12_800_000], 20),
     "transpose":    ([500, 1000, 2000, 3000, 4000], 5),
-    "matmul_naive": ([448, 896, 1344, 1792], 1),
-    "matmul_tiled": ([448, 896, 1344, 1792], 1),
+    # multiples of 64 for the tiles, with an odd cofactor: a row stride with a large power of
+    # two in it maps a column onto a handful of cache sets, which the ideal-cache model cannot see
+    "matmul_naive": ([448, 832, 1216, 1600, 1984], 1),
+    "matmul_tiled": ([448, 832, 1216, 1600, 1984], 1),
 }
 
 def run(cmd, **kw):
@@ -42,12 +44,17 @@ def measure(binary, cpu, runs):
                            capture_output=True, text=True)
         if p.returncode != 0:
             sys.exit(p.stderr)
+        # two PMUs on a big.LITTLE machine: the event shows up once per cluster as
+        # armv8_pmuv3_N/event/u, and only the pinned cluster's copy is counted
         counts = {}
         for line in p.stderr.splitlines():
             parts = line.split(",")
             if len(parts) > 3 and parts[2]:
-                try: counts[parts[2]] = int(parts[0])
-                except ValueError: pass
+                try: v = int(parts[0])
+                except ValueError: continue
+                for ev in (EVENT, "l1d_cache_refill", "ll_cache_miss_rd", "instructions"):
+                    if ev in parts[2]:
+                        counts[ev] = counts.get(ev, 0) + v
         if EVENT not in counts:
             sys.exit("perf gave no %s:\n%s" % (EVENT, p.stderr))
         if best is None or counts[EVENT] < best[EVENT]:

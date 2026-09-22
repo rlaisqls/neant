@@ -60,19 +60,24 @@ Then, from the innermost loop outward, with `t` the loop's trip count and `s` th
 bytes the access moves per iteration of that loop (its coefficient times the element size):
 
 ```
-lines = 1
-for each loop level, innermost first:
-    if lines·B is not a known number ≤ M:      lines ×= t            -- inner working set does not fit
+for every access site:  lines = 1
+for each loop, innermost first, for every site inside it:
+    ws = Σ over the sites inside this loop of their lines      -- they share the cache
+    if ws·B is not a known number < M:          lines ×= t            -- the working set does not fit
     else if s = 0:                              lines ×= 1            -- same lines every iteration
     else if s ≥ B (or s is symbolic):           lines ×= t            -- a fresh line every iteration
     else:                                       lines ×= t·s/B        -- consecutive iterations share lines
                                                 (but never below 1)
-moves += lines · B
+moves += Σ lines · B
 ```
 
 The **fit test** is the whole model: a level reuses the lines its inner levels touched only when
-that working set is a known number of bytes at most `M`. A working set that still contains a size
-variable is assumed not to fit. This is why `matmul(n, ...)` analysed on its own reports
+the working set of *every* access site inside that loop, added together, is a known number of
+bytes strictly less than `M`. The sum is what the M1 experiment forced: a tiled matrix product
+whose `a`-panel alone fits was measured re-reading it, because the `b` tiles streaming through
+the same loop level brought the total to exactly `M`. Strictly less, because a cache is never
+empty of everything else. A working set that still contains a size variable is assumed not to
+fit. This is why `matmul(n, ...)` analysed on its own reports
 `B·n³ + 8n³ + 8n²` — a conservative bound in which nothing is reused — while the same function
 called from a `main` where `n = 1792` reports `8n³ + …`, because there the column of `b` is
 `1792` lines, that is a number, it is under `M`, and the walk down consecutive columns is seen to
@@ -83,21 +88,29 @@ again for that call site**, with the parameters bound to the caller's polynomial
 and stride decision inside is made with the caller's numbers. The function's own line in the
 report and in `costs.lock` is still its symbolic, conservative one.
 
+And the third: when such a call sits inside the caller's loops and **none of its arguments moves
+with those loops** — `for r in 0..20 { sum(&xs) }` — the callee is analysed *inside* them. The
+caller's loops appear to the callee as levels with no variable, so every access in the callee
+sees them as stride-0 levels and reuses across them when its working set fits. A twenty-fold
+repeat over an array that fits `M` is then charged one pass, not twenty. When an argument does
+depend on a caller loop, nothing is inherited and the call is charged in full per iteration.
+
 Other moves:
 
 | construct | moves |
 |---|---|
 | `[e; n]`, `[a, b, c]` | a sequential write of the array: `n × elem_bytes` |
-| call | the callee's moves, times the enclosing trip counts — **no reuse across calls** |
-| a repeated call in a loop | charged in full every iteration, even when the data would still be in cache |
+| call, arguments loop-invariant | the callee's moves analysed inside the caller's loops (rule three) |
+| call, an argument moves with a loop | the callee's moves, times the enclosing trip counts — no reuse across calls |
 
 ## What the model does not see
 
 Each of these rounds up, so the reported cost stays an upper bound; each is a place where the
 measured number can come in under the prediction.
 
-- **Accesses do not compete.** The fit test looks at one access site's working set as if it had
-  the cache to itself. Three arrays each fitting `M` do not necessarily fit together.
+- **The fit test is a step.** Below `M` everything is reused, at `M` nothing is; a real cache
+  with LRU and prefetch traffic degrades gradually from well under `M`. The tiled product at
+  `n = 1600` (working set 85% of `M`) measures between the two.
 - **Associativity.** The cache is ideal — fully associative, optimal replacement. A stride that
   is a multiple of a large power of two maps many lines to the same set, and the real cache
   evicts what the model keeps. The experiment avoids power-of-two sizes for this reason, and

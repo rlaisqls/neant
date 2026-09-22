@@ -65,7 +65,7 @@ impl<'a> Analyzer<'a> {
                 });
             } else {
                 self.active[fid] = true;
-                let fc = Fa::new(self, f, None).run();
+                let fc = Fa::new(self, f, None, vec![]).run();
                 self.active[fid] = false;
                 self.done[fid] = Some(fc);
             }
@@ -114,7 +114,10 @@ impl Affine {
 enum Bound { Upper, Lower }
 
 struct Loop {
-    var: LocalId,
+    id: usize,
+    /// `None` for a loop inherited from the caller at a specialised call: no index in this
+    /// function can depend on it, so it only ever contributes reuse (stride 0) or repetition.
+    var: Option<LocalId>,
     trip: Poly,
     start: Poly,
     end: Poly,
@@ -128,10 +131,27 @@ enum Fail {
     Unknown(String, u32),
 }
 
+/// One `x[i]` in the source, with the loops it sits in (outermost first). Moves are settled
+/// for all sites together once the body has been walked, because whether a level reuses its
+/// lines depends on every site sharing that loop.
+struct Site {
+    aff: Option<Affine>,
+    es: i128,
+    path: Vec<usize>,
+}
+
+/// What is remembered of a loop after it is popped.
+struct LoopRec {
+    var: Option<LocalId>,
+    trip: Poly,
+}
+
 struct Fa<'a, 'b> {
     an: &'b mut Analyzer<'a>,
     f: &'a Func,
     names: Vec<String>,
+    sites: Vec<Site>,
+    loop_recs: Vec<LoopRec>,
     /// size in elements of every array/slice local
     local_size: HashMap<LocalId, Poly>,
     /// value of every immutable i64 local that is an affine expression
@@ -146,11 +166,17 @@ impl<'a, 'b> Fa<'a, 'b> {
     /// the caller's polynomial rather than the parameter's own atom, so every fit and stride
     /// decision inside is made with the caller's numbers. The result is then already in the
     /// caller's atom space.
-    fn new(an: &'b mut Analyzer<'a>, f: &'a Func, bindings: Option<&[Poly]>) -> Self {
+    fn new(an: &'b mut Analyzer<'a>, f: &'a Func, bindings: Option<&[Poly]>, inherited: Vec<Loop>) -> Self {
+        let mut loop_recs = Vec::new();
+        let mut loops = Vec::new();
+        for l in inherited {
+            loop_recs.push(LoopRec { var: None, trip: l.trip.clone() });
+            loops.push(Loop { id: loop_recs.len() - 1, ..l });
+        }
         let mut fa = Fa {
-            an, f, names: param_names(f),
+            an, f, names: param_names(f), sites: vec![], loop_recs,
             local_size: HashMap::new(), local_affine: HashMap::new(),
-            loops: vec![], work: Poly::zero(), moves: Poly::zero(),
+            loops, work: Poly::zero(), moves: Poly::zero(),
         };
         for (i, &p) in f.params.iter().enumerate() {
             let l = &f.locals[p];
@@ -166,7 +192,10 @@ impl<'a, 'b> Fa<'a, 'b> {
 
     fn run(mut self) -> FuncCost {
         let result = match self.block(&self.f.body) {
-            Ok(()) => CostResult::Exact { work: self.work.clone(), moves: self.moves.clone() },
+            Ok(()) => {
+                self.settle_moves();
+                CostResult::Exact { work: self.work.clone(), moves: self.moves.clone() }
+            }
             Err(Fail::Unknown(reason, line)) => CostResult::Unknown { reason, line },
         };
         FuncCost { name: self.f.name.clone(), names: self.names, result }
@@ -207,7 +236,7 @@ impl<'a, 'b> Fa<'a, 'b> {
         match &e.kind {
             ExprKind::Int(v) => Some(Poly::constant(*v as i128)),
             ExprKind::Local(l) => {
-                if let Some(lp) = self.loops.iter().find(|lp| lp.var == *l) {
+                if let Some(lp) = self.loops.iter().find(|lp| lp.var == Some(*l)) {
                     return Some(if bound == Bound::Upper { lp.end.clone() } else { lp.start.clone() });
                 }
                 let a = self.local_affine.get(l)?;
@@ -239,7 +268,7 @@ impl<'a, 'b> Fa<'a, 'b> {
         match &e.kind {
             ExprKind::Int(v) => Some(Affine::constant(Poly::constant(*v as i128))),
             ExprKind::Local(l) => {
-                if let Some(lp) = self.loops.iter().find(|lp| lp.var == *l) {
+                if let Some(lp) = self.loops.iter().find(|lp| lp.var == Some(*l)) {
                     return lp.offset.as_ref().map(|off| Affine::var(*l).add(off));
                 }
                 self.local_affine.get(l).cloned()
@@ -278,46 +307,79 @@ impl<'a, 'b> Fa<'a, 'b> {
 
     // ---- the moves rule ----
 
-    /// Lines touched by one access site over the whole enclosing loop nest, times B, added to
-    /// moves. Level by level from the innermost loop out:
+    /// Record an access site; its moves are settled with everyone else's at the end.
+    fn access(&mut self, arr: LocalId, idx: &Expr) {
+        let es = self.elem_bytes(arr);
+        let aff = self.affine(idx);
+        let path = self.loops.iter().map(|l| l.id).collect();
+        self.sites.push(Site { aff, es, path });
+    }
+
+    /// Lines touched by every access site over its loop nest, times B, added to moves. Level by
+    /// level from the innermost loop out, for all sites at once:
     ///
     ///   lines(inner of innermost) = 1
-    ///   lines(level) = lines(inner) × t                      if the inner working set does not fit M
+    ///   lines(level) = lines(inner) × t                      if the working set at this level does not fit M
     ///                = lines(inner) × 1                      if the access does not move with this loop
     ///                = lines(inner) × t                      if it moves by a whole line or more
     ///                = lines(inner) × t·s/B                  if it moves by s < B bytes per iteration
     ///
-    /// The working set is lines(inner)·B; it fits when that is a known number ≤ M. A symbolic
-    /// working set is assumed not to fit, and a non-affine index is assumed to move by a whole
-    /// line or more. Every assumption rounds up.
-    fn access(&mut self, arr: LocalId, idx: &Expr) {
-        let es = self.elem_bytes(arr);
-        let aff = self.affine(idx);
+    /// The working set at a level is the sum, over every site inside that loop, of the lines
+    /// that site touches per iteration of it — the sites compete for the same cache. It fits
+    /// when that is a known number ≤ M. A symbolic working set is assumed not to fit, and a
+    /// non-affine index is assumed to move by a whole line or more. Every assumption rounds up.
+    fn settle_moves(&mut self) {
         let m = self.machine();
-        let mut lines = Poly::constant(1);
-        for lp in self.loops.iter().rev() {
-            let fits = self.numeric(&lines).is_some_and(|l| l * m.b_bytes as f64 <= m.m_bytes as f64);
-            if !fits {
-                lines = lines.mul(&lp.trip);
-                continue;
+        let nsites = self.sites.len();
+        // lines[(site, loop)] = lines the site touches over one full run of that loop
+        let mut lines: HashMap<(usize, usize), Poly> = HashMap::new();
+        let inner = |lines: &HashMap<(usize, usize), Poly>, s: usize, path: &[usize], pos: usize| -> Poly {
+            if pos + 1 < path.len() { lines[&(s, path[pos + 1])].clone() } else { Poly::constant(1) }
+        };
+        // loops in post-order: a loop's id is smaller than every loop nested in it, so
+        // descending id processes inner loops first
+        let mut ids: Vec<usize> = (0..self.loop_recs.len()).collect();
+        ids.sort_unstable_by(|a, b| b.cmp(a));
+        for lid in ids {
+            let members: Vec<(usize, usize)> = (0..nsites)
+                .filter_map(|s| self.sites[s].path.iter().position(|&l| l == lid).map(|pos| (s, pos)))
+                .collect();
+            if members.is_empty() { continue; }
+            let mut ws = Poly::zero();
+            for &(s, pos) in &members {
+                ws = ws.add(&inner(&lines, s, &self.sites[s].path, pos));
             }
-            let stride = aff.as_ref().map(|a| a.coeffs.get(&lp.var).cloned().unwrap_or_else(Poly::zero).scale(Rat::int(es)));
-            let factor = match stride {
-                None => lp.trip.clone(),
-                Some(s) if s.is_zero() => Poly::constant(1),
-                Some(s) => match self.numeric(&s) {
-                    Some(sb) if sb.abs() >= m.b_bytes as f64 => lp.trip.clone(),
-                    Some(sb) => {
-                        // t·|s|/B, but never below one line
-                        let f = lp.trip.scale(Rat::new(sb.abs() as i128, 1)).mul_atom_pow(Atom::B, Rat::int(-1));
-                        match self.numeric(&f) { Some(v) if v < 1.0 => Poly::constant(1), _ => f }
+            let fits = self.numeric(&ws).is_some_and(|l| (l * m.b_bytes as f64) < (m.m_bytes as f64));
+            let rec = &self.loop_recs[lid];
+            for &(s, pos) in &members {
+                let site = &self.sites[s];
+                let in_lines = inner(&lines, s, &site.path, pos);
+                let factor = if !fits {
+                    rec.trip.clone()
+                } else {
+                    let stride = site.aff.as_ref().map(|a| rec.var.and_then(|v| a.coeffs.get(&v).cloned()).unwrap_or_else(Poly::zero).scale(Rat::int(site.es)));
+                    match stride {
+                        None => rec.trip.clone(),
+                        Some(st) if st.is_zero() => Poly::constant(1),
+                        Some(st) => match self.numeric(&st) {
+                            Some(sb) if sb.abs() >= m.b_bytes as f64 => rec.trip.clone(),
+                            Some(sb) => {
+                                let f = rec.trip.scale(Rat::new(sb.abs() as i128, 1)).mul_atom_pow(Atom::B, Rat::int(-1));
+                                match self.numeric(&f) { Some(v) if v < 1.0 => Poly::constant(1), _ => f }
+                            }
+                            None => rec.trip.clone(),
+                        },
                     }
-                    None => lp.trip.clone(),
-                },
-            };
-            lines = lines.mul(&factor);
+                };
+                lines.insert((s, lid), in_lines.mul(&factor));
+            }
         }
-        self.moves = self.moves.add(&lines.mul_atom_pow(Atom::B, Rat::int(1)));
+        let mut total = Poly::zero();
+        for (s, site) in self.sites.iter().enumerate() {
+            let l = match site.path.first() { Some(&l0) => lines[&(s, l0)].clone(), None => Poly::constant(1) };
+            total = total.add(&l);
+        }
+        self.moves = self.moves.add(&total.mul_atom_pow(Atom::B, Rat::int(1)));
     }
 
     /// A sequential pass over `n` elements of `es` bytes, once per enclosing iteration.
@@ -400,7 +462,8 @@ impl<'a, 'b> Fa<'a, 'b> {
                     _ => hi.sub(&lo),
                 };
                 if let Some(c) = trip.as_const() { if c.n < 0 { trip = Poly::zero(); } }
-                self.loops.push(Loop { var: *var, trip, start: lo, end: hi, offset: a_lo });
+                self.loop_recs.push(LoopRec { var: Some(*var), trip: trip.clone() });
+                self.loops.push(Loop { id: self.loop_recs.len() - 1, var: Some(*var), trip, start: lo, end: hi, offset: a_lo });
                 self.add_work_n(1); // increment and compare, per iteration
                 let r = self.block(body);
                 self.loops.pop();
@@ -452,8 +515,15 @@ impl<'a, 'b> Fa<'a, 'b> {
                     if self.an.active[*fid] {
                         return Err(Fail::Unknown(format!("calls `{}`, whose cost is unknown (recursive; recurrences are not solved yet)", cf.name), e.line));
                     }
+                    // the caller's loops go with the call when no argument depends on them,
+                    // as loops without a variable: every access inside reuses across them if it fits
+                    let invariant = args.iter().all(|a| self.affine(a).is_none_or(|af| af.is_const()) || matches!(a.kind, ExprKind::Ref(..) | ExprKind::Local(_)));
+                    let inherited: Vec<Loop> = if invariant {
+                        self.loops.iter().map(|l| Loop { id: 0, var: None, trip: l.trip.clone(), start: l.start.clone(), end: l.end.clone(), offset: None }).collect()
+                    } else { vec![] };
+                    let inherits = !inherited.is_empty();
                     self.an.active[*fid] = true;
-                    let fc = Fa::new(self.an, cf, Some(&b)).run();
+                    let fc = Fa::new(self.an, cf, Some(&b), inherited).run();
                     self.an.active[*fid] = false;
                     let (w, mv) = match fc.result {
                         CostResult::Exact { work, moves } => (work, moves),
@@ -463,7 +533,8 @@ impl<'a, 'b> Fa<'a, 'b> {
                             return Err(Fail::Unknown(reason, e.line));
                         }
                     };
-                    let o = self.outer();
+                    // an inherited context already multiplied the callee's cost by the trips
+                    let o = if inherits { Poly::constant(1) } else { self.outer() };
                     self.work = self.work.add(&w.mul(&o));
                     self.moves = self.moves.add(&mv.mul(&o));
                     return Ok(());

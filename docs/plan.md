@@ -89,6 +89,12 @@ the ratio wanders by an order of magnitude across sizes, the moves model as spec
 predict the machine. Stop, and do not build M2 on top of it. Either the rule set is fixed until the
 experiment passes, or the project's central claim is withdrawn.
 
+**Status: passed, 2026-09-22, on the second rule set.** Slopes within 0.1 on the five fixed-pattern
+kernels; naive/tiled separated 30× measured against 28× predicted; ratios stable per kernel. The
+first rule set failed on the tiled product and was changed twice — access sites now compete for
+the cache, and fitting is strictly less than `M`. The record, with the numbers and the three
+things the model does not see, is [experiments.md](experiments.md).
+
 ### M2 — Guaranteed fusion, one lower bound, one gap report
 
 Two things the README promises that M1 does not yet deliver.
@@ -265,7 +271,8 @@ tests/
   bootstrap.sh          the two-seed fixpoint
 docs/
   plan.md               this file
-  cost-model.md         the calculus, written as M1 builds it
+  cost-model.md         the calculus, as implemented
+  experiments.md        what was measured against what prediction, and what it changed
 ```
 
 ## Validation harness notes
