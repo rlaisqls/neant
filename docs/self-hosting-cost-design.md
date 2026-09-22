@@ -1379,3 +1379,79 @@ neither can follow — but the Rust has recorded the site on `pos` by the time i
 walk has not, because it stops at the loop it cannot bound rather than walking the body for sites it
 will not charge for. Widening it is a change to the walk, not to the footprint, so it is recorded in
 `FOOTPRINT_NARROWER` rather than absorbed into the count.
+
+## 24. `#[cost]`, measured before designing
+
+With work, moves, the footprint bound and the footprint all reproduced, what is left in the report
+is coupled, and the front end's own slice is now the binding constraint. **37 of the 45 positive
+goldens parse**; the eight that do not fail for three reasons only:
+
+| blocker | files |
+|---|---|
+| a method call or chain | `while`, `chains`, `par`, `par_span` |
+| a `#[cost(...)]` attribute | `assert`, `decl`, `decl_extern` |
+| a comprehension | `owned` |
+
+`while.nt` is out for a single line of its `main` — `o.iter().filter(|c| c == b'L').count()` — and
+nothing else in the file. That is worth knowing before anyone reads "four files need chains" as
+four files' worth of work.
+
+### The `gap` annotation is not the cheap win it looks like
+
+It reads as pure arithmetic: the cost over the bound at the machine's `B` and `M`, and both are
+already reproduced. It is not, because the *clauses* depend on which bounds exist. `assert`'s
+`pairs` prints
+
+```
+lower bound  moves 8·a.len()              (footprint, …)   gap 2× if ≈ 8·a.len() < M
+lower bound  moves 16·a.len()²/M − M      (HBL, σ = 2)     gap 1048576× if ≈ 8·a.len() ≥ M
+```
+
+— one regime each, because `strongest_first` gives each regime to whichever bound leads there. A
+footprint bound alone would print both regimes on one line and match neither. **The gap needs the
+HBL bound first**, which is the rational LP over the loop nest, for the single corpus line that has
+one. Recorded so it is not picked up as a quick job later.
+
+### What `#[cost]` is, measured
+
+Three behaviours, and the rule that selects them is the one thing that had to be measured rather
+than read:
+
+**A `#[cost]` is a declaration only when it gives *both* `work_at_most` and `moves_at_most`.**
+
+```
+#[cost(work_at_most = "10 xs.len()", moves_at_most = "8 xs.len() + 2 B")]
+  both        work ≤ 10·xs.len()   moves ≤ 8·xs.len() + 2·B   declared
+              inferred   work 4·xs.len()   moves 8·xs.len() + B   within the declaration
+
+#[cost(work_at_most = "10 xs.len()")]                     ← one only
+  only_work   work 4·xs.len()      moves 8·xs.len() + B       exact
+#[cost(moves_at_most = "8 xs.len() + 2 B")]               ← one only
+  only_moves  work 4·xs.len()      moves 8·xs.len() + B       exact
+```
+
+With both, the declaration **replaces** the reported line, the inference moves to an `inferred`
+line, and the lower-bound and footprint lines disappear — a caller sees the declaration and nothing
+else, which is Stage B's "delete the body" test. With one, it is an **assertion**: the line stays
+the inference and a breach prints `✗ … is asserted moves at most X but its moves is Y when <cond>`,
+per regime. A bare number with `sizes` is a **budget**, checked numerically at the declared size:
+`✗ … has a moves budget of 1024 at the declared sizes but needs 2112`.
+
+`sizes = "xs.len() <= 256"` also appears on the declared line as `sizes xs.len() ≤ 256`.
+
+### What building it needs
+
+1. **The attribute, in the parser.** A prefix on `fn` and on `extern fn` — `decl_extern.nt` declares
+   libc's `labs`, which has no body at all, and is the case that shows a declaration is not a
+   summary of an inference but a claim in its own right.
+2. **A reader for the cost expression**, which is its own small language: `"8 xs.len() + 2 B"`,
+   juxtaposition for multiplication, `^` for powers, `.len()`, and `B` and `M` as themselves. It
+   produces a polynomial, so everything downstream already exists.
+3. **The comparison**, which is `pol_dominates` — already built, and already used for exactly this
+   kind of question.
+4. **The call path**: a caller must take the declaration where there is one, not the inference.
+   This is the only part that is not additive, and it is what `rests on` then records.
+
+Of these only (2) and (4) are new; (1) is small and (3) is done. Order: the attribute and the
+reader first, since `assert.nt` and `decl_extern.nt` need no chains and would come into the slice
+on those alone.
