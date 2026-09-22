@@ -1,0 +1,600 @@
+// The cost calculus, first slice: `work` as a polynomial, over the parse tree
+// (docs/self-hosting-cost-design.md). A fragment; the concatenation order is lex, parse, check,
+// emit, poly, this, main — it uses `emit.nt`'s byte-writing helpers rather than growing its own,
+// and `poly.nt`'s arenas for the arithmetic.
+//
+// **The work table is copied from `bootstrap/src/cost/analyze.rs`, entry for entry**, because the
+// exit test is string equality with what that file computes. 1 for a binary operator, 1 for a
+// unary or a cast, 2 for `min`/`max` (compare, select), 1 for `println`, 2 for a call (call and
+// return; arguments are register moves), 1 for an index, 2 per `for` iteration (increment,
+// compare-and-branch), the element count for an array literal. An assignment costs 1 through an
+// index and 0 into a register, unless it is compound.
+//
+// Out of this slice (design §2): moves, regimes, recurrences (`while`, self-recursion), span,
+// bounds, layout. Each reports **unknown** rather than a number, which is the one thing a cost
+// calculus must do when it does not know.
+//
+// Atoms are the current function's parameters, by position — an array parameter's atom is its
+// length, which is why it prints as `xs.len()`. A loop variable gets an atom above 100, which
+// `pol_sum_over` eliminates before anything is printed.
+//
+// `wst` is this pass's state:
+//   wst[0] environment length   wst[1] unknown flag   wst[2] next loop atom
+//   wst[3] the current function's parameter count
+
+struct Env { name: i64, val: i64, len: i64 }
+
+// ---- the environment: what a local's value, or an array local's length, is known to be ----
+
+fn env_find(src: &[u8], toks: &[Token], env: &[Env], wst: &[i64], name: i64) -> i64 {
+    let mut i = wst[0] - 1;
+    let mut found = -1;
+    while i >= 0 {
+        if found < 0 && name_eq(src, toks, env[i].name, name) { found = i; }
+        i -= 1;
+    }
+    found
+}
+
+fn env_add(env: &mut [Env], wst: &mut [i64], name: i64, val: i64, len: i64) {
+    let i = wst[0];
+    env[i].name = name;
+    env[i].val = val;
+    env[i].len = len;
+    wst[0] = i + 1;
+}
+
+// The polynomial an expression evaluates to, or −1 when it is not a size expression. Only the
+// shapes a loop bound or an array length is written in: a literal, a known local, a `.len()`, and
+// the three operators that keep a polynomial a polynomial.
+fn val_of(src: &[u8], toks: &[Token], nodes: &[Node], facs: &mut [Fac], terms: &mut [Term],
+          pols: &mut [Pol], pst: &mut [i64], env: &[Env], wst: &[i64], n: i64) -> i64 {
+    if n < 0 { return -1; }
+    let k = nodes[n].kind;
+    if k == 60 { return pol_const(facs, terms, pols, pst, int_value(src, toks, nodes[n].a)); }
+    if k == 65 {
+        let e = env_find(src, toks, env, wst, nodes[n].a);
+        if e < 0 { return -1; }
+        return env[e].val;
+    }
+    if k == 72 {
+        if nodes[nodes[n].a].kind != 65 { return -1; }
+        let e = env_find(src, toks, env, wst, nodes[nodes[n].a].a);
+        if e < 0 { return -1; }
+        return env[e].len;
+    }
+    if k == 67 {
+        // unary minus, which a loop bound reaches through `0 - n` more often than `-n`
+        if nodes[n].ival != 0 { return -1; }
+        let a = val_of(src, toks, nodes, facs, terms, pols, pst, env, wst, nodes[n].a);
+        if a < 0 { return -1; }
+        return pol_scale(facs, terms, pols, pst, a, 0 - 1, 1);
+    }
+    if k == 66 {
+        let op = nodes[n].ival;
+        if op > 3 { return -1; }
+        let a = val_of(src, toks, nodes, facs, terms, pols, pst, env, wst, nodes[n].a);
+        if a < 0 { return -1; }
+        let b = val_of(src, toks, nodes, facs, terms, pols, pst, env, wst, nodes[n].b);
+        if b < 0 { return -1; }
+        if op == 0 { return pol_add(facs, terms, pols, pst, a, b); }
+        if op == 1 { return pol_sub(facs, terms, pols, pst, a, b); }
+        if op == 2 { return pol_mul(facs, terms, pols, pst, a, b); }
+        // `n / 4` is a size expression when the divisor is a constant — `0..n/4` is how a tiled
+        // loop is written, and it is where a rational coefficient enters from the source rather
+        // than from Faulhaber. A non-constant divisor is not a polynomial and is refused.
+        let d = pol_as_int(facs, terms, pols, pst, b);
+        if pst[4] == 0 || d == 0 { return -1; }
+        return pol_scale(facs, terms, pols, pst, a, 1, d);
+    }
+    -1
+}
+
+// ---- `if` is the larger branch, which needs a comparison ----
+
+// Does `q` dominate `p` — is `q` at least `p` for every assignment of sizes ≥ 1? The exact half of
+// `piece::dominates`: if every coefficient of `q − p` is non-negative, yes. The Rust one goes on
+// to a budget argument that lets `3·n²` cover `n² + n`; this slice stops here and reports unknown,
+// which the exit test measures rather than hides.
+fn pol_dominates(facs: &[Fac], terms: &mut [Term], pols: &mut [Pol], pst: &mut [i64],
+                 q: i64, p: i64) -> bool {
+    let d = pol_sub(facs, terms, pols, pst, q, p);
+    let mut i = 0;
+    let mut ok = true;
+    while i < pols[d].n_term {
+        if terms[pols[d].term + i].cn < 0 { ok = false; }
+        i += 1;
+    }
+    ok
+}
+
+// the larger of two costs; sets the unknown flag when neither dominates, which is where the Rust
+// pass would fork into regimes
+fn pol_max(facs: &[Fac], terms: &mut [Term], pols: &mut [Pol], pst: &mut [i64], wst: &mut [i64],
+           a: i64, b: i64) -> i64 {
+    if pol_dominates(facs, terms, pols, pst, a, b) { return a; }
+    if pol_dominates(facs, terms, pols, pst, b, a) { return b; }
+    wst[1] = 1;
+    a
+}
+
+// ---- the walk ----
+
+fn w_expr(src: &[u8], toks: &[Token], nodes: &[Node], types: &[Ty], ntys: &[i64], sigs: &[Sig],
+          fw: &[i64], facs: &mut [Fac], terms: &mut [Term], pols: &mut [Pol], pst: &mut [i64],
+          env: &mut [Env], wst: &mut [i64], scratch: &mut [i64], n: i64) -> i64 {
+    if n < 0 || wst[1] != 0 { return pol_zero(facs, terms, pols, pst); }
+    let k = nodes[n].kind;
+    // a literal, a variable, a view and a length are all already in a register
+    if k == 60 || k == 61 || k == 62 || k == 63 || k == 64 || k == 65 || k == 72 || k == 73 {
+        return pol_zero(facs, terms, pols, pst);
+    }
+    if k == 66 {
+        let a = w_expr(src, toks, nodes, types, ntys, sigs, fw, facs, terms, pols, pst, env, wst, scratch, nodes[n].a);
+        let b = w_expr(src, toks, nodes, types, ntys, sigs, fw, facs, terms, pols, pst, env, wst, scratch, nodes[n].b);
+        let s = pol_add(facs, terms, pols, pst, a, b);
+        let one = pol_const(facs, terms, pols, pst, 1);
+        return pol_add(facs, terms, pols, pst, s, one);
+    }
+    if k == 67 || k == 74 {
+        let a = w_expr(src, toks, nodes, types, ntys, sigs, fw, facs, terms, pols, pst, env, wst, scratch, nodes[n].a);
+        let one = pol_const(facs, terms, pols, pst, 1);
+        return pol_add(facs, terms, pols, pst, a, one);
+    }
+    if k == 68 {
+        // only the index is evaluated: the array is a register pair
+        let i = w_expr(src, toks, nodes, types, ntys, sigs, fw, facs, terms, pols, pst, env, wst, scratch, nodes[n].b);
+        let one = pol_const(facs, terms, pols, pst, 1);
+        return pol_add(facs, terms, pols, pst, i, one);
+    }
+    if k == 69 {
+        // `xs[i].f` is one load; a field of a value already in registers is free
+        let base = nodes[n].a;
+        if nodes[base].kind == 68 {
+            let i = w_expr(src, toks, nodes, types, ntys, sigs, fw, facs, terms, pols, pst, env, wst, scratch, nodes[base].b);
+            let one = pol_const(facs, terms, pols, pst, 1);
+            return pol_add(facs, terms, pols, pst, i, one);
+        }
+        return w_expr(src, toks, nodes, types, ntys, sigs, fw, facs, terms, pols, pst, env, wst, scratch, base);
+    }
+    if k == 70 {
+        let mut acc = pol_zero(facs, terms, pols, pst);
+        let mut fi = nodes[n].b;
+        while fi >= 0 {
+            let v = w_expr(src, toks, nodes, types, ntys, sigs, fw, facs, terms, pols, pst, env, wst, scratch, nodes[fi].b);
+            acc = pol_add(facs, terms, pols, pst, acc, v);
+            fi = nodes[fi].next;
+        }
+        return acc;
+    }
+    if k == 71 { return w_call(src, toks, nodes, types, ntys, sigs, fw, facs, terms, pols, pst, env, wst, scratch, n); }
+    if k == 75 {
+        let c = w_expr(src, toks, nodes, types, ntys, sigs, fw, facs, terms, pols, pst, env, wst, scratch, nodes[n].a);
+        let one = pol_const(facs, terms, pols, pst, 1);
+        let base = pol_add(facs, terms, pols, pst, c, one);
+        let t = w_block(src, toks, nodes, types, ntys, sigs, fw, facs, terms, pols, pst, env, wst, scratch, nodes[n].b);
+        let e = w_block(src, toks, nodes, types, ntys, sigs, fw, facs, terms, pols, pst, env, wst, scratch, nodes[n].c);
+        let m = pol_max(facs, terms, pols, pst, wst, t, e);
+        return pol_add(facs, terms, pols, pst, base, m);
+    }
+    if k == 76 { return w_block(src, toks, nodes, types, ntys, sigs, fw, facs, terms, pols, pst, env, wst, scratch, n); }
+    if k == 77 || k == 78 {
+        // an array literal is only ever a `let` initialiser, and `w_stmt` costs it there: the
+        // element count is work the expression alone does not explain
+        wst[1] = 1;
+        return pol_zero(facs, terms, pols, pst);
+    }
+    wst[1] = 1;
+    pol_zero(facs, terms, pols, pst)
+}
+
+// `println` costs one, `min`/`max` two, and everything else two plus the callee's own work with
+// this call's argument sizes substituted for the callee's atoms.
+fn w_call(src: &[u8], toks: &[Token], nodes: &[Node], types: &[Ty], ntys: &[i64], sigs: &[Sig],
+          fw: &[i64], facs: &mut [Fac], terms: &mut [Term], pols: &mut [Pol], pst: &mut [i64],
+          env: &mut [Env], wst: &mut [i64], scratch: &mut [i64], n: i64) -> i64 {
+    let name = nodes[n].a;
+    let arg = nodes[n].b;
+    let mut acc = pol_zero(facs, terms, pols, pst);
+    let mut a = arg;
+    let mut n_args = 0;
+    while a >= 0 {
+        let w = w_expr(src, toks, nodes, types, ntys, sigs, fw, facs, terms, pols, pst, env, wst, scratch, a);
+        acc = pol_add(facs, terms, pols, pst, acc, w);
+        n_args += 1;
+        a = nodes[a].next;
+    }
+    if name_is_println(src, toks, name) {
+        let one = pol_const(facs, terms, pols, pst, 1);
+        return pol_add(facs, terms, pols, pst, acc, one);
+    }
+    if name_is_min(src, toks, name) || name_is_max(src, toks, name) {
+        let two = pol_const(facs, terms, pols, pst, 2);
+        return pol_add(facs, terms, pols, pst, acc, two);
+    }
+    let two = pol_const(facs, terms, pols, pst, 2);
+    acc = pol_add(facs, terms, pols, pst, acc, two);
+    // the callee, by name, in the signature table
+    let mut si = -1;
+    let mut i = 0;
+    while sigs[i].name >= 0 {
+        if si < 0 && name_eq(src, toks, sigs[i].name, name) { si = i; }
+        i += 1;
+    }
+    if si < 0 || fw[si] < 0 {
+        wst[1] = 1;
+        return acc;
+    }
+    // substitute each argument's size for the callee's atom. A parameter whose size this call
+    // site does not know makes the whole call unknown rather than a guess.
+    let mut body = fw[si];
+    let mut p = 0;
+    a = arg;
+    while p < sigs[si].n_params && a >= 0 {
+        let inner = if nodes[a].kind == 73 { nodes[a].a } else { a };
+        let v = val_of(src, toks, nodes, facs, terms, pols, pst, env, wst, inner);
+        let sz = if v >= 0 { v } else { arg_len(src, toks, nodes, env, wst, inner) };
+        if sz < 0 {
+            // the callee's work may simply not mention this parameter, in which case nothing is
+            // lost; asking is cheaper than proving
+            let e = mono_mentions(facs, terms, pols, body, p);
+            if e { wst[1] = 1; }
+        } else {
+            body = pol_subst(facs, terms, pols, pst, body, p, sz);
+        }
+        p += 1;
+        a = nodes[a].next;
+    }
+    if p < sigs[si].n_params { wst[1] = 1; }
+    pol_add(facs, terms, pols, pst, acc, body)
+}
+
+// a byte-string literal's element count: the span, with each escape counting once
+fn bytes_len(src: &[u8], toks: &[Token], t: i64) -> i64 {
+    let mut i = 0;
+    let mut n = 0;
+    while i < toks[t].len {
+        if src[toks[t].start + i] == b'\\' { i += 1; };
+        n += 1;
+        i += 1;
+    }
+    n
+}
+
+// the length of an array argument, when the caller knows it
+fn arg_len(src: &[u8], toks: &[Token], nodes: &[Node], env: &[Env], wst: &[i64], n: i64) -> i64 {
+    if n < 0 || nodes[n].kind != 65 { return -1; }
+    let e = env_find(src, toks, env, wst, nodes[n].a);
+    if e < 0 { return -1; }
+    env[e].len
+}
+
+// does this polynomial mention the atom at all
+fn mono_mentions(facs: &[Fac], terms: &[Term], pols: &[Pol], p: i64, atom: i64) -> bool {
+    let mut i = 0;
+    let mut yes = false;
+    while i < pols[p].n_term {
+        let t = pols[p].term + i;
+        if mono_exp(facs, terms[t].fac, terms[t].n_fac, atom) != 0 { yes = true; }
+        i += 1;
+    }
+    yes
+}
+
+fn w_block(src: &[u8], toks: &[Token], nodes: &[Node], types: &[Ty], ntys: &[i64], sigs: &[Sig],
+           fw: &[i64], facs: &mut [Fac], terms: &mut [Term], pols: &mut [Pol], pst: &mut [i64],
+           env: &mut [Env], wst: &mut [i64], scratch: &mut [i64], n: i64) -> i64 {
+    if n < 0 { return pol_zero(facs, terms, pols, pst); }
+    let saved = wst[0];
+    let mut acc = pol_zero(facs, terms, pols, pst);
+    let mut s = nodes[n].a;
+    while s >= 0 && wst[1] == 0 {
+        let w = w_stmt(src, toks, nodes, types, ntys, sigs, fw, facs, terms, pols, pst, env, wst, scratch, s);
+        acc = pol_add(facs, terms, pols, pst, acc, w);
+        s = nodes[s].next;
+    }
+    if nodes[n].b >= 0 && wst[1] == 0 {
+        let t = w_expr(src, toks, nodes, types, ntys, sigs, fw, facs, terms, pols, pst, env, wst, scratch, nodes[n].b);
+        acc = pol_add(facs, terms, pols, pst, acc, t);
+    }
+    wst[0] = saved;
+    acc
+}
+
+fn w_stmt(src: &[u8], toks: &[Token], nodes: &[Node], types: &[Ty], ntys: &[i64], sigs: &[Sig],
+          fw: &[i64], facs: &mut [Fac], terms: &mut [Term], pols: &mut [Pol], pst: &mut [i64],
+          env: &mut [Env], wst: &mut [i64], scratch: &mut [i64], n: i64) -> i64 {
+    let k = nodes[n].kind;
+    if k == 90 {
+        let init = nodes[n].c;
+        let ik = nodes[init].kind;
+        if ik == 78 {
+            // `[e; n]`: the element and the length are evaluated, then the fill costs one per
+            // element — which is where a `let` first puts a size variable into the work
+            let a = w_expr(src, toks, nodes, types, ntys, sigs, fw, facs, terms, pols, pst, env, wst, scratch, nodes[init].a);
+            let b = w_expr(src, toks, nodes, types, ntys, sigs, fw, facs, terms, pols, pst, env, wst, scratch, nodes[init].b);
+            let sz = val_of(src, toks, nodes, facs, terms, pols, pst, env, wst, nodes[init].b);
+            if sz < 0 {
+                wst[1] = 1;
+                return pol_zero(facs, terms, pols, pst);
+            }
+            env_add(env, wst, nodes[n].a, -1, sz);
+            let s = pol_add(facs, terms, pols, pst, a, b);
+            return pol_add(facs, terms, pols, pst, s, sz);
+        }
+        if ik == 77 {
+            let mut acc = pol_zero(facs, terms, pols, pst);
+            let mut e = nodes[init].a;
+            let mut count = 0;
+            while e >= 0 {
+                let w = w_expr(src, toks, nodes, types, ntys, sigs, fw, facs, terms, pols, pst, env, wst, scratch, e);
+                acc = pol_add(facs, terms, pols, pst, acc, w);
+                count += 1;
+                e = nodes[e].next;
+            }
+            let c = pol_const(facs, terms, pols, pst, count);
+            env_add(env, wst, nodes[n].a, -1, c);
+            return pol_add(facs, terms, pols, pst, acc, c);
+        }
+        if ik == 64 {
+            // `let s = b"…"` is an array literal like any other: one unit per element, and the
+            // element count is the *decoded* byte count, not the span's — `\n` is two bytes of
+            // source and one of array
+            let c = pol_const(facs, terms, pols, pst, bytes_len(src, toks, nodes[init].a));
+            env_add(env, wst, nodes[n].a, -1, c);
+            return c;
+        }
+        let w = w_expr(src, toks, nodes, types, ntys, sigs, fw, facs, terms, pols, pst, env, wst, scratch, init);
+        // an array bound to another array or a view of one keeps its length; a scalar keeps its
+        // value when it has one
+        let t = ntys[init];
+        if t >= 0 && (types[t].kind == 5 || types[t].kind == 6) {
+            let inner = if nodes[init].kind == 73 { nodes[init].a } else { init };
+            env_add(env, wst, nodes[n].a, -1, arg_len(src, toks, nodes, env, wst, inner));
+        } else {
+            env_add(env, wst, nodes[n].a, val_of(src, toks, nodes, facs, terms, pols, pst, env, wst, init), -1);
+        }
+        return w;
+    }
+    if k == 91 {
+        let w = w_expr(src, toks, nodes, types, ntys, sigs, fw, facs, terms, pols, pst, env, wst, scratch, nodes[n].b);
+        let tgt = nodes[n].a;
+        let tk = nodes[tgt].kind;
+        let compound = nodes[n].ival >= 0;
+        let mut extra = 0;
+        if tk == 65 {
+            let t = ntys[tgt];
+            if t >= 0 && (types[t].kind == 5 || types[t].kind == 6) {
+                // `ys = xs` on whole arrays. **The self-hosted emitter always copies** (arrays
+                // design §7), because deciding in-place needs M5's uniqueness proof and this
+                // compiler has none — so the cost is the copy's. The Rust compiler charges 1 for
+                // the reassignments it can prove are in place, and there the two reports differ
+                // on purpose: a cost is a claim about the code the compiler emits, and these two
+                // compilers emit different code.
+                let srcn = if nodes[n].b >= 0 && nodes[nodes[n].b].kind == 65 { nodes[nodes[n].b].a } else { -1 };
+                let e = if srcn >= 0 { env_find(src, toks, env, wst, srcn) } else { -1 };
+                let sz = if e >= 0 { env[e].len } else { -1 };
+                if sz < 0 {
+                    wst[1] = 1;
+                    return pol_zero(facs, terms, pols, pst);
+                }
+                let tgte = env_find(src, toks, env, wst, nodes[tgt].a);
+                if tgte >= 0 { env[tgte].len = sz; };
+                return pol_add(facs, terms, pols, pst, w, sz);
+            }
+            // a register: only the operation of `op=` costs, and the value is no longer known
+            if compound { extra = 1; }
+            let e = env_find(src, toks, env, wst, nodes[tgt].a);
+            if e >= 0 { env[e].val = -1; }
+        } else if tk == 68 {
+            let i = w_expr(src, toks, nodes, types, ntys, sigs, fw, facs, terms, pols, pst, env, wst, scratch, nodes[tgt].b);
+            let c = pol_const(facs, terms, pols, pst, if compound { 3 } else { 1 });
+            let s = pol_add(facs, terms, pols, pst, w, i);
+            return pol_add(facs, terms, pols, pst, s, c);
+        } else if tk == 69 {
+            let base = nodes[tgt].a;
+            if nodes[base].kind == 68 {
+                let i = w_expr(src, toks, nodes, types, ntys, sigs, fw, facs, terms, pols, pst, env, wst, scratch, nodes[base].b);
+                let c = pol_const(facs, terms, pols, pst, if compound { 3 } else { 1 });
+                let s = pol_add(facs, terms, pols, pst, w, i);
+                return pol_add(facs, terms, pols, pst, s, c);
+            }
+            if compound { extra = 1; }
+        }
+        let c = pol_const(facs, terms, pols, pst, extra);
+        return pol_add(facs, terms, pols, pst, w, c);
+    }
+    if k == 92 {
+        let lo = val_of(src, toks, nodes, facs, terms, pols, pst, env, wst, nodes[n].b);
+        let hi = val_of(src, toks, nodes, facs, terms, pols, pst, env, wst, nodes[n].c);
+        let wlo = w_expr(src, toks, nodes, types, ntys, sigs, fw, facs, terms, pols, pst, env, wst, scratch, nodes[n].b);
+        let whi = w_expr(src, toks, nodes, types, ntys, sigs, fw, facs, terms, pols, pst, env, wst, scratch, nodes[n].c);
+        let outside = pol_add(facs, terms, pols, pst, wlo, whi);
+        if lo < 0 || hi < 0 {
+            wst[1] = 1;
+            return pol_zero(facs, terms, pols, pst);
+        }
+        let trip = pol_sub(facs, terms, pols, pst, hi, lo);
+        let atom = wst[2];
+        wst[2] = atom + 1;
+        let saved = wst[0];
+        let av = pol_atom(facs, terms, pols, pst, atom);
+        env_add(env, wst, nodes[n].a, av, -1);
+        let two = pol_const(facs, terms, pols, pst, 2);
+        let body = w_block(src, toks, nodes, types, ntys, sigs, fw, facs, terms, pols, pst, env, wst, scratch, nodes[n].d);
+        wst[0] = saved;
+        let per = pol_add(facs, terms, pols, pst, two, body);
+        let summed = pol_sum_over(facs, terms, pols, pst, per, atom, lo, 1, trip, scratch);
+        return pol_add(facs, terms, pols, pst, outside, summed);
+    }
+    if k == 93 {
+        // a `while` is a recurrence, and recurrences are out of this slice (design §2)
+        wst[1] = 1;
+        return pol_zero(facs, terms, pols, pst);
+    }
+    if k == 94 { return pol_zero(facs, terms, pols, pst); }
+    if k == 95 || k == 96 {
+        return w_expr(src, toks, nodes, types, ntys, sigs, fw, facs, terms, pols, pst, env, wst, scratch, nodes[n].a);
+    }
+    wst[1] = 1;
+    pol_zero(facs, terms, pols, pst)
+}
+
+// One function's work, or −1 when this slice cannot say. The parameters become atoms 0..n−1,
+// which is what makes the printed polynomial read in the caller's own names.
+fn w_func(src: &[u8], toks: &[Token], nodes: &[Node], types: &[Ty], ntys: &[i64], sigs: &[Sig],
+          ptys: &[i64], fw: &[i64], facs: &mut [Fac], terms: &mut [Term], pols: &mut [Pol],
+          pst: &mut [i64], env: &mut [Env], wst: &mut [i64], scratch: &mut [i64],
+          f: i64, si: i64) -> i64 {
+    wst[0] = 0;
+    wst[1] = 0;
+    wst[2] = 100;
+    let mut p = nodes[f].b;
+    let mut i = 0;
+    while p >= 0 {
+        let t = ptys[sigs[si].params + i];
+        let a = pol_atom(facs, terms, pols, pst, i);
+        if t >= 0 && (types[t].kind == 5 || types[t].kind == 6) {
+            env_add(env, wst, nodes[p].a, -1, a);
+        } else {
+            env_add(env, wst, nodes[p].a, a, -1);
+        }
+        i += 1;
+        p = nodes[p].next;
+    }
+    let w = w_block(src, toks, nodes, types, ntys, sigs, fw, facs, terms, pols, pst, env, wst, scratch, nodes[f].d);
+    if wst[1] != 0 { return -1; }
+    w
+}
+
+// ---- printing ----
+//
+// The exit test is string equality with `neant cost`'s `work` column, so this mirrors
+// `PolyDisplay` in `bootstrap/src/cost/size.rs` exactly: terms by descending degree, positive
+// before negative at equal degree, then by monomial descending; a coefficient of 1 is elided
+// unless the term has no atoms; the denominator goes after the atoms, so `21/4·n` prints as
+// `21·n/4`. The decimal form the Rust one falls back to for a big denominator is **not** written
+// — it needs float formatting, and a cost calculus that cannot print its answer should say so.
+
+// A byte-string literal holds **ASCII only** (`bootstrap/src/lex.rs`: "byte literals hold ASCII
+// only"), and every character this printer needs that the Rust one writes as a `char` — `·`, `−`,
+// and the superscript digits — is multi-byte UTF-8. So they go in by number. Listed here rather
+// than spelled, because a reader cannot check `0xC2 0xB7` by eye against a `·` that is not there.
+fn emit_u(out: &mut [u8], est: &mut [i64], b: i64) {
+    emit_b(out, est, b as u8);
+}
+
+// `·` U+00B7
+fn emit_dot(out: &mut [u8], est: &mut [i64]) {
+    emit_u(out, est, 194);
+    emit_u(out, est, 183);
+}
+
+// `−` U+2212, the minus sign, not the hyphen
+fn emit_minus(out: &mut [u8], est: &mut [i64]) {
+    emit_u(out, est, 226);
+    emit_u(out, est, 136);
+    emit_u(out, est, 146);
+}
+
+// `²` and `³` are Latin-1 supplement (two bytes); `⁰` and `⁴`..`⁹` are superscripts (three)
+fn emit_superscript(out: &mut [u8], est: &mut [i64], e: i64) {
+    if e == 2 { emit_u(out, est, 194); emit_u(out, est, 178); return; }
+    if e == 3 { emit_u(out, est, 194); emit_u(out, est, 179); return; }
+    if e == 1 { emit_u(out, est, 194); emit_u(out, est, 185); return; }
+    if e == 0 { emit_u(out, est, 226); emit_u(out, est, 129); emit_u(out, est, 176); return; }
+    if e >= 4 && e <= 9 {
+        emit_u(out, est, 226);
+        emit_u(out, est, 129);
+        emit_u(out, est, 176 + e);
+        return;
+    }
+    est[2] = 1;
+}
+
+// an atom's name: the parameter's own spelling, with `.len()` when it is an array — which is what
+// makes a cost read `12·s.len()` and not `12·s`
+fn emit_atom_name(out: &mut [u8], est: &mut [i64], src: &[u8], toks: &[Token], pnames: &[i64],
+                  parr: &[i64], atom: i64) {
+    if atom >= 100 {
+        // a loop atom that `pol_sum_over` should have eliminated; printing one is a bug, not a
+        // narrowing, so it is loud
+        est[2] = 1;
+        return;
+    }
+    emit_span(out, est, src, toks, pnames[atom]);
+    if parr[atom] == 1 { let s = b".len()"; emit_bytes(out, est, &s); };
+}
+
+fn pol_print(out: &mut [u8], est: &mut [i64], src: &[u8], toks: &[Token], facs: &[Fac],
+             terms: &[Term], pols: &[Pol], pnames: &[i64], parr: &[i64], p: i64,
+             order: &mut [i64]) {
+    if pols[p].n_term == 0 { let z = b"0"; emit_bytes(out, est, &z); return; }
+    // the display order, as a permutation: highest degree first, positive before negative at equal
+    // degree, then by monomial descending
+    let mut i = 0;
+    while i < pols[p].n_term {
+        order[i] = pols[p].term + i;
+        i += 1;
+    }
+    let mut k = 1;
+    while k < pols[p].n_term {
+        let mut j = k;
+        while j > 0 && display_before(facs, terms, order[j], order[j - 1]) {
+            let t = order[j - 1];
+            order[j - 1] = order[j];
+            order[j] = t;
+            j -= 1;
+        }
+        k += 1;
+    }
+    let mut x = 0;
+    while x < pols[p].n_term {
+        let t = order[x];
+        let neg = terms[t].cn < 0;
+        let cn = if neg { 0 - terms[t].cn } else { terms[t].cn };
+        let cd = terms[t].cd;
+        if x > 0 {
+            if neg {
+                emit_b(out, est, b' ');
+                emit_minus(out, est);
+                emit_b(out, est, b' ');
+            } else {
+                let s = b" + ";
+                emit_bytes(out, est, &s);
+            };
+        } else if neg {
+            emit_minus(out, est);
+        };
+        // the decimal fallback is out of this slice
+        if cd > 64 || (cd > 1 && cn > 1000000) { est[2] = 1; return; };
+        let n_fac = terms[t].n_fac;
+        if cn != 1 || n_fac == 0 {
+            emit_int(out, est, cn);
+            if n_fac > 0 { emit_dot(out, est); };
+        }
+        let mut f = 0;
+        while f < n_fac {
+            if f > 0 { emit_dot(out, est); };
+            emit_atom_name(out, est, src, toks, pnames, parr, facs[terms[t].fac + f].atom);
+            let e = facs[terms[t].fac + f].exp;
+            if e != 1 { emit_superscript(out, est, e); };
+            f += 1;
+        }
+        if cd != 1 {
+            emit_b(out, est, b'/');
+            emit_int(out, est, cd);
+        };
+        x += 1;
+    }
+}
+
+fn display_before(facs: &[Fac], terms: &[Term], a: i64, b: i64) -> bool {
+    let da = mono_degree(facs, terms[a].fac, terms[a].n_fac);
+    let db = mono_degree(facs, terms[b].fac, terms[b].n_fac);
+    if da != db { return da > db; }
+    let pa = terms[a].cn > 0;
+    let pb = terms[b].cn > 0;
+    if pa != pb { return pa; }
+    mono_cmp(facs, terms[b].fac, terms[b].n_fac, terms[a].fac, terms[a].n_fac) < 0
+}

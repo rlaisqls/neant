@@ -141,5 +141,45 @@ that declines.
 String equality is deliberately strict. It catches `n²/2 − n/2` printed as `0.5·n² − 0.5·n`, and a
 term order that happens to agree on the corpus and not in general.
 
-The count — 63 of 98 — goes in the test, so widening the slice means changing a number that
-someone has to look at.
+The count goes in the test, so widening the slice means changing a number that someone has to
+look at.
+
+## 9. What building it changed
+
+**Passed**, with a number the estimate did not predict: **53 work columns exact**, 19 declined, and
+4 that differ *on purpose*. Every one of the 19 is in a function with a `while` or a self-recursive
+call — the recurrences §2 put out of the slice — or calls one, so the boundary the design drew is
+exactly the boundary the corpus found.
+
+- **Four functions disagree because the two compilers emit different code.** `ys = xs` on whole
+  arrays costs 1 when the compiler can prove the assignment is in place and the array's length
+  when it cannot. The proof is M5's uniqueness analysis; the self-hosted compiler has none, so its
+  emitter always copies, and its cost says so — `2400006` where the Rust compiler says `1600007`.
+  It would have been easy to charge 1 and call it parity. That would have been a cost report for
+  code this compiler does not emit, which is the one thing a cost calculus may not do. The four are
+  listed by name in the test, and deleting a line from that list is what growing move checking
+  would look like.
+- **`n / 4` is a size expression, and the corpus said so twice.** The first walk refused division,
+  on the reasoning that a quotient is not a polynomial. It is, when the divisor is a constant —
+  `for ii in 0..n / 4` is how a tiled loop is written, and `let m = xs.len() / 10` how a derived
+  length is. That is also where a rational coefficient enters from the *source* rather than from
+  Faulhaber, which is a second reason `Rat` is not optional.
+- **A byte-string literal is an array literal.** `let s = b"hello"` costs five, like `[0; 5]`, and
+  carries a length that `s.len()` reads back. Missing it cost exactly 5 in `arrayview.nt` and was
+  invisible until the total was 6 out — 5 for the literal and 1 for the reassignment above.
+- **Byte-string literals hold ASCII only.** `bootstrap/src/lex.rs` refuses a non-ASCII byte
+  literal, and every character this printer needs that the Rust one writes as a `char` — `·`, the
+  minus sign `−`, the superscript digits — is multi-byte UTF-8. They go in by number, with the
+  code points named in a comment, because a reader cannot check `0xC2 0xB7` by eye against a `·`
+  that is not there. This is the first place the self-hosted compiler has had to write text it
+  cannot spell.
+- **The `if` comment in `analyze.rs` is wrong.** Three lines above `wt.max(&we)` it says "both
+  branches are charged". They are not; the cost is the larger. Reading the comment and not the code
+  would have produced a walker that agreed with nothing.
+
+**Not integrated into the compiler binary.** `compiler/main.nt` is a filter — source in, C out —
+and there is no argv to select a mode with, so `poly.nt` and `cost.nt` are not in the concatenation
+`compiler/build.sh` builds and are not in `bootstrap/neant.c`. They are tested, and the native
+self-hosted compiler compiles them and computes identical polynomials, so nothing about them is
+outside the slice. What is missing is a way to *ask* for a cost report, and that is a question
+about the command line, not about the calculus.
