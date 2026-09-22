@@ -1,0 +1,37 @@
+// an arena: a linked list whose links are indices into the array that holds it
+struct Node { val: i64, next: i64 }
+
+fn sum_list(nodes: &[Node], head: i64) -> i64 {
+    let mut i = head;
+    let mut s = 0;
+    let mut steps = 0;
+    while i >= 0 decreasing nodes.len() - steps {
+        s += nodes[i].val;
+        i = nodes[i].next;
+        steps += 1;
+    }
+    s
+}
+
+// a tree in the same arena: two links per node, walked by index
+fn depth(nodes: &[Node], root: i64) -> i64 {
+    let mut d = 0;
+    let mut i = root;
+    let mut steps = 0;
+    while i >= 0 decreasing nodes.len() - steps {
+        d += 1;
+        i = nodes[i].next;
+        steps += 1;
+    }
+    d
+}
+
+fn main() {
+    let mut ns = [Node { val: 0, next: -1 }; 8];
+    for k in 0..8 {
+        ns[k].val = k + 1;
+        ns[k].next = if k < 7 { k + 1 } else { -1 };
+    }
+    println(sum_list(&ns, 0));
+    println(depth(&ns, 0));
+}

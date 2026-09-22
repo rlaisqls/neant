@@ -292,6 +292,31 @@ impl Poly {
         out
     }
 
+    /// The same polynomial with `B` and `M` at their machine values: the form in which two
+    /// costs can be compared as functions of the sizes alone. A fractional power of `M` leaves
+    /// an irrational coefficient, kept to four decimals.
+    pub fn at_machine(&self, b: i128, m: i128) -> Poly {
+        let mut out = Poly::zero();
+        for (mono, c) in &self.terms {
+            let mut coef = *c;
+            let mut rest = Mono::one();
+            for (a, e) in &mono.factors {
+                match a {
+                    Atom::B | Atom::M => {
+                        let base = if *a == Atom::B { b as f64 } else { m as f64 };
+                        let v = base.powf(e.to_f64());
+                        coef = coef.mul(Rat::new((v * 10000.0).round() as i128, 10000));
+                    }
+                    other => { rest.factors.insert(other.clone(), *e); }
+                }
+            }
+            let mut t = Poly::zero();
+            t.terms.insert(rest, coef);
+            out = out.add(&t);
+        }
+        out
+    }
+
     /// The one term of a single-term polynomial.
     pub fn as_mono(&self) -> Option<(&Mono, Rat)> {
         if self.terms.len() != 1 { return None; }

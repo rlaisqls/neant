@@ -427,6 +427,9 @@ struct Site {
     stride: i128,
     /// which field, when the site is one field of a struct element
     field: Option<usize>,
+    /// a canonical form of the index expression, for sites whose index is not affine: two
+    /// non-affine reads of the same element are still one element
+    key: Option<String>,
     /// where this site's addresses start inside the array. Zero under AoS; under SoA the field
     /// arrays are modelled as laid end to end, so a field's base is the size of the fields before
     /// it. The ranges of two fields are then disjoint, and every rule about ranges — footprint,
@@ -1079,12 +1082,15 @@ impl<'a, 'b, 'c> Fa<'a, 'b, 'c> {
         let stride = self.stride_bytes(arr, field);
         let base = self.soa_base(arr, field);
         let soa = self.soa_fields(arr).is_some();
+        let key = idx_key(idx);
         let aff = self.affine(idx);
         let path: Vec<usize> = self.loops.iter().map(|l| l.id).collect();
         let root = self.local_root.get(&arr).copied().unwrap_or(arr);
         if let Some(prev) = self.sites.iter_mut().find(|s| {
             s.arr == arr && s.stride == stride && s.path == path && s.branch == self.branch
-                && s.aff.is_some() && s.aff == aff
+                // the same address: an affine index equal term by term, or, where the index is
+                // not affine — a walk over an arena — the same expression
+                && ((s.aff.is_some() && s.aff == aff) || (s.aff.is_none() && aff.is_none() && key.is_some() && s.key == key))
                 // under SoA two fields are two arrays and never one site
                 && (!soa || s.field == field)
         }) {
@@ -1093,7 +1099,7 @@ impl<'a, 'b, 'c> Fa<'a, 'b, 'c> {
             if prev.field != field { prev.es = stride; }
             return;
         }
-        self.sites.push(Site { arr, aff, es, stride, field, base, path, branch: self.branch.clone() });
+        self.sites.push(Site { arr, aff, es, stride, field, base, key, path, branch: self.branch.clone() });
     }
 
     /// Lines touched by every access site over its loop nest, times B, added to moves. Level by
@@ -1165,10 +1171,51 @@ impl<'a, 'b, 'c> Fa<'a, 'b, 'c> {
                         },
                     };
                     for (conds, fits) in outcomes {
+                        // an arena's lines are the arena's, however many sites walk it
+                        let mut arenas_taken: Vec<LocalId> = Vec::new();
                         for (i, &(s, _)) in members.iter().enumerate() {
                             let site = &self.sites[s];
                             let lp = picks[i];
                             let summed = rec.sum(&lp.lines);
+                            // **The region rule.** A site whose index is not an affine function of
+                            // the loops — a walk over an arena, `nodes[i]` with `i` loaded from
+                            // memory — costs a fresh line per iteration, unless the array it walks
+                            // is small enough to stay in cache: once every line of it has been
+                            // touched, nothing more is fetched, whatever the order. So the site
+                            // costs at most the array, under the condition that the array fits.
+                            if site.aff.is_none() && fits {
+                                let root = self.local_root.get(&site.arr).copied().unwrap_or(site.arr);
+                                let bytes = self.local_size.get(&root).cloned().unwrap_or_else(Poly::zero).scale(Rat::int(self.elem_bytes(root)));
+                                if !bytes.is_zero() {
+                                    let arena = bytes.mul_atom_pow(Atom::B, Rat::int(-1));
+                                    // the walk is worth bounding only when it is longer than the
+                                    // arena, which is a comparison between a trip count and a
+                                    // number of lines: it needs this machine's `B`
+                                    let mm = self.machine();
+                                    let longer = super::piece::dominates(&summed.at_machine(mm.b_bytes, mm.m_bytes), &arena.at_machine(mm.b_bytes, mm.m_bytes));
+                                    if longer {
+                                        let first = !arenas_taken.contains(&root);
+                                        arenas_taken.push(root);
+                                        let arena = if first { arena } else { Poly::zero() };
+                                        let mut cf = conds.clone();
+                                        let cond = Cond { ws: arena.clone(), fits: true };
+                                        if !cf.contains(&cond) { cf.push(cond); }
+                                        if super::piece::feasible(&cf) {
+                                            let np = LP { conds: cf, lines: arena, contig: false };
+                                            if !out[i].iter().any(|x| x.conds == np.conds && x.lines == np.lines) { out[i].push(np); }
+                                        }
+                                        // and the piece where it does not fit keeps the walk's cost
+                                        let mut cn = conds.clone();
+                                        let cond = Cond { ws: bytes.mul_atom_pow(Atom::B, Rat::int(-1)), fits: false };
+                                        if !cn.contains(&cond) { cn.push(cond); }
+                                        if super::piece::feasible(&cn) {
+                                            let np = LP { conds: cn, lines: summed.clone(), contig: false };
+                                            if !out[i].iter().any(|x| x.conds == np.conds && x.lines == np.lines) { out[i].push(np); }
+                                        }
+                                        continue;
+                                    }
+                                }
+                            }
                             let same_set = || if rec.atom.is_some_and(|a| lp.lines.mentions(a)) { summed.clone() } else { lp.lines.clone() };
                             let (total, contig) = if !fits {
                                 (summed.clone(), false)
@@ -1978,6 +2025,24 @@ fn collect_refs<'e>(e: &'e Expr, out: &mut Vec<(LocalId, &'e Expr, Option<usize>
 
 /// `q ≥ p` for all sizes ≥ 1, by the piecewise machinery's dominance.
 fn bounds_dominates(q: &Poly, p: &Poly) -> bool { super::piece::dominates(q, p) }
+
+/// A canonical form of an index expression, free of line numbers, so that two occurrences of the
+/// same index in one loop are recognised as one address. `None` for anything this does not model,
+/// which is never merged with anything.
+fn idx_key(e: &Expr) -> Option<String> {
+    Some(match &e.kind {
+        ExprKind::Int(v) => format!("{v}"),
+        ExprKind::Local(l) => format!("v{l}"),
+        ExprKind::Len(l) => format!("len{l}"),
+        ExprKind::Binary(op, a, b) => format!("({} {} {})", idx_key(a)?, op.c_str(), idx_key(b)?),
+        ExprKind::Unary(op, a) => format!("({op:?} {})", idx_key(a)?),
+        ExprKind::Cast(a, t) => format!("({} as {t})", idx_key(a)?),
+        ExprKind::MinMax(m, a, b) => format!("({} {m} {})", idx_key(a)?, idx_key(b)?),
+        ExprKind::Index(arr, i) => format!("a{arr}[{}]", idx_key(i)?),
+        ExprKind::Field(b, f) => format!("{}.{f}", idx_key(b)?),
+        _ => return None,
+    })
+}
 
 /// Every scalar local read in an expression tree, loop variables included (they have no alias).
 fn collect_scalars(e: &Expr, out: &mut Vec<LocalId>) {

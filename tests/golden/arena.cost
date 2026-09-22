@@ -1,0 +1,10 @@
+struct Node      layout AoS  decided by sum_list (16·nodes.len() if 16·nodes.len() < M | B·nodes.len() if 16·nodes.len() ≥ M, SoA 16·nodes.len() if 16·nodes.len() < M | 2·B·nodes.len() if 16·nodes.len() ≥ M), main (B + 512, SoA 2·B + 512)
+sum_list         work 5·nodes.len() + 2            moves                              exact  (2 regimes)
+                                               moves 16·nodes.len()               if 16·nodes.len() < M
+                                               moves B·nodes.len()                if 16·nodes.len() ≥ M
+                 footprint        nodes: [0, 16·nodes.len()) (whole array)   no residue claimed
+depth            work 4·nodes.len() + 2            moves                              exact  (2 regimes)
+                                               moves 16·nodes.len()               if 16·nodes.len() < M
+                                               moves B·nodes.len()                if 16·nodes.len() ≥ M
+                 footprint        nodes: [0, 16·nodes.len()) (whole array)   no residue claimed
+main             work 155                          moves B + 512                      exact, io

@@ -5,6 +5,8 @@ count_words      work 16·s.len()                   moves s.len() + B           
 upcase           work 12·s.len()                   moves 2·s.len() + 2·B              exact
                  lower bound      moves s.len()                      (footprint, every distinct element crosses once)   gap 2× at M = 2 MiB, B = 64
                  footprint        s: [0, s.len())   resident after if s.len() < M
-is_palindrome    work 7·s.len() − 4                moves 2·B·s.len() − 2·B            exact
+is_palindrome    work 7·s.len() − 4                moves                              exact  (2 regimes)
+                                               moves s.len()                      if s.len() < M
+                                               moves 2·B·s.len() − 2·B            if s.len() ≥ M
                  footprint        s: [0, s.len()) (whole array)   no residue claimed
-main             work 1024                         moves 30·B + 108                   exact, io
+main             work 1024                         moves 4·B + 123                    exact, io
