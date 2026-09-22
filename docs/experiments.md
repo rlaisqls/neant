@@ -332,10 +332,12 @@ Predicted bytes are the model's; the ratio is predicted over measured.
   two regimes' predictions. This is the octave M1 saw the fit transition spread over, seen from
   the other side, and it is Sleator–Tarjan's factor: an LRU cache of `M` is as good as the ideal
   cache of `M/2`.
-- **The rule changed twice from this table.** The boundary is now taken at `M/2`, and among
-  candidates the model cannot tell apart the smaller side wins. The choice is `T < √M/8` at `M/2`,
-  178 once the edge lines are counted (181 without them), and the `2×` gain over the old square
-  of 256 that the model claimed for 510 is a measured `1.25×` at 181.
+- **The rule changed three times from this table.** A regime that depends on a *partial* fit is
+  no longer a candidate at all; the boundary is taken at `M/2`; ties go to the smaller side. The
+  choice for the product became `T < 0.1443·√M`, 206 once the edge lines are counted, which a
+  further run measured at 6.06e8 and 2.46e9 — `1.02` and `0.78` of its prediction, `19%` fewer
+  bytes than the square of 256 the old rule picked, and `6%` more than 181, the best of the seven.
+  The `2×` gain the model had claimed for 510 was worth `-30×` on the machine.
 - **The model's partial-fit regimes are optimistic for the machine**, and this is now written in
   cost-model § What the model does not see. Nothing in the calculus corrects for it yet except
   the tile choice.

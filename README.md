@@ -48,8 +48,8 @@ matmul           work 10·n³ + 5·n² + 2·n           moves                   
                  lower bound      moves 8·n³/√M − M                  (HBL, σ = 3/2, CDKSY 2013)   gap 13033× if ≈ B·n + 8·n ≥ M; 1448× if ≈ B·n + 8·n  …
                  lower bound      moves 24·n²                        (footprint, every distinct element crosses once)   gap 1× if ≈ 8·n² < M at M = 2  …
                  `b` moves by 8·n bytes per iteration of the innermost loop: a new line every time (line 7)
-                 tile T < √M/8 (at M/2, leading term) work ≈ 88·n³/√M + 320·n³/M + 2560·n³/M^(3/2) + 10·n³ moves ≈ 128·n³/√M + 64·B·n³/M if ≈ 8·n ≥ M  …
-                 tile by 178      work ≈ 10.0733·n³                 moves ≈ 3.1562e-5·B·n³ + 0.0899·n³ if ≈ 8·n ≥ M | ≈ 0.0169·B·n² + 40·n² if ≈ 8·n²  …
+                 tile T < 0.1443·√M (at M/2, leading term) work ≈ 76.2301·n³/√M + 240.1250·n³/M + 1664.0678·n³/M^(3/2) + 10·n³ moves ≈ 110.8801·n³/√M  …
+                 tile by 206      work ≈ 10.0633·n³                 moves ≈ 2.3565e-5·B·n³ + 0.0777·n³ if ≈ 8·n ≥ M | ≈ 0.0097·B·n² + 32·n² if ≈ 8·n²  …
                  transpose the column operand work ≈ 10·n³                      moves ≈ 16·n³ if ≈ 16·n ≥ M | 48·n² + 4·B·n if ≈ 8·n² < M (+2 regimes)  …
 ```
 
@@ -62,9 +62,10 @@ the column fits, 13033× where nothing does. A `main` that calls it with `n = 19
 test with numbers and gets one piece. The tile side was not looked up either: the tiled program
 was analysed with its side `T` symbolic and the side read off its own cost — then measured. The
 model's first choice, the side at which one tile just fits, moved thirty times what it predicted;
-the side at which every tile fits in half the cache, 178 here, moved the least of seven tried and
-`1.25×` less than the square of 256 a rule of thumb picks, so that is the rule now
-(docs/experiments.md). The suggestions are the rewrite applied to the IR and the calculus run
+the side at which every tile fits in half the cache moved the least of the seven tried, so a
+partial fit is no longer a candidate and the boundary is taken at half the cache. The side it now
+recommends, 206 here, measures within `2%` of its own prediction and `19%` under the square of
+256 a rule of thumb picks (docs/experiments.md). The suggestions are the rewrite applied to the IR and the calculus run
 again on the result, which is why the transpose is offered with its real cost and not with a
 slogan.
 

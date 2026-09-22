@@ -512,25 +512,34 @@ the conditions allow, so each such condition is solved for `T` at its boundary a
 the piece's other conditions, substituted too, must stay feasible and must hold at the reference
 point (this machine, every size a million: tiling is for large sizes). Among the candidates the
 smallest moves at the reference point wins, and among candidates within five percent of each
-other the **smaller side**. The boundary is taken at **half the cache**, `M/2`, not at `M`. Both
-rules came from the machine, not from the model (docs/experiments.md, the tile-side sweep): the
-model's first answer for the product was `T < √(M/8)`, 510, the regime in which one tile fits
-and the other two stream, which in the ideal cache ties the regime in which everything fits
-(`90.5·n³/√M` either way); the machine moved twenty times the prediction at 510, matched the
-prediction at every side with all tiles inside `M`, and moved the least at 181, the side at
-which everything fits in **half** of `M`. A fit the ideal cache decides at `M` is not one an LRU
-cache of `M` honours; one decided at `M/2` is (Sleator–Tarjan), and the octave-wide transition
-M1 measured is the same fact. The expression is printed from the working set's leading term in
-`T` when there are edge terms, and says so; the integer recommended is the largest for which the
-working set, edge lines included, is strictly below `M/2`. The report then shows the tiled cost at
+other the **smaller side**. Three rules narrow this, and all three came from the machine rather
+than from the model (docs/experiments.md, the tile-side sweep):
+
+1. **A partial fit is not a candidate.** A regime that depends on something *not* fitting — one
+   tile resident while the other two operands stream — is one the ideal cache computes and an
+   LRU machine does not deliver. Two working sets of the same degree in `T` belong to the same
+   loop level, so if one of them does not fit, the side is a partial fit and is refused.
+2. **The boundary is half the cache.** A fit the ideal cache decides at `M` is not one an LRU
+   cache of `M` honours; one decided at `M/2` is (Sleator–Tarjan), and the octave-wide transition
+   M1 measured is the same fact.
+3. **Ties go to the smaller side.**
+
+The model's first answer for the product was `T < √(M/8)`, 510, the one-tile regime, which in the
+ideal cache ties the regime where everything fits (`90.5·n³/√M` either way); the machine moved
+thirty times the prediction at 510, matched the prediction at every side with all tiles inside
+`M`, and moved the least at 181, the side at which everything fits in half of `M`. The expression
+is printed from the working set's leading term in `T` when there are edge terms, and says so; the
+integer recommended is the largest for which the working set, edge lines included, is strictly
+below `M/2`. The report then shows the tiled cost at
 that side, symbolically, and the concrete `tile by T` line re-analysed at the integer, with the
 gap of each against the strongest bound. This is the upper side of the I/O question — what the
 best tiling of this loop order moves — from the model's own exact cost rather than a separate
 cost formula, in closed form where IOUB solves numerically, and corrected by the counters.
 
-For the product at `M = 2 MiB` the answer is `T < √M/8` at `M/2` — `√(M/64)`, 178 once the edge
-lines are counted — with moves `128·n³/√M`: `16×` above the HBL bound, `2.8×` above IOLB's,
-`1.25×` fewer measured bytes than the square of 256 the old rule picked.
+For the product at `M = 2 MiB` the answer is the side at which all three tiles fit half the
+cache, `T < 0.1443·√M`, which is 206 once the edge lines are counted. It moves `110.9·n³/√M`:
+`14×` above the HBL bound, `2.5×` above IOLB's, and on the machine `19%` fewer bytes than the
+square of 256 a rule of thumb picks and `6%` more than the best of the seven sides measured.
 
 A tiled nest's `N` is counted on its rectangular hull — `(n+T−1)/T` tiles of `T` — so the bound
 printed for a rewritten function is over by `(1+T/n)³`. The suggestion lines take the gap against
