@@ -1,3 +1,3 @@
-fill             work 5·out.len()                  moves 8·out.len()                  exact
-total            work 4·xs.len()                   moves 8·xs.len()                   exact
-main             work 14116                        moves B + 32824                    exact, io
+fill             work 5·out.len()                  moves 8·out.len() + B              exact
+total            work 4·xs.len()                   moves 8·xs.len() + B               exact
+main             work 14116                        moves 4·B + 32824                  exact, io

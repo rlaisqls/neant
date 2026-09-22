@@ -209,6 +209,53 @@ impl Poly {
         self.terms.keys().map(|m| m.factors.iter().filter(|(a, _)| matches!(a, Atom::Var(i) if vars.contains(i))).fold(Rat::zero(), |acc, (_, e)| acc.add(*e))).max().unwrap_or(Rat::zero())
     }
 
+    /// `Σ_{k=0}^{n−1} k^j` as a polynomial in `n`: Faulhaber's formula, by the identity
+    /// `n^{j+1} = Σ_{i≤j} C(j+1, i)·S_i(n)`, which gives `S_j` from the `S_i` below it. Exact
+    /// rationals throughout.
+    pub fn faulhaber(j: usize, n: &Poly) -> Poly {
+        fn binom(n: i128, k: i128) -> i128 {
+            let mut r: i128 = 1;
+            for i in 0..k { r = r * (n - i) / (i + 1); }
+            r
+        }
+        let mut s: Vec<Poly> = Vec::with_capacity(j + 1);
+        for jj in 0..=j {
+            // S_jj(n) = (n^{jj+1} − Σ_{i<jj} C(jj+1, i)·S_i(n)) / (jj+1)
+            let mut acc = n.pow(jj as i128 + 1);
+            for i in 0..jj {
+                acc = acc.sub(&s[i].scale(Rat::int(binom(jj as i128 + 1, i as i128))));
+            }
+            s.push(acc.scale(Rat::new(1, jj as i128 + 1)));
+        }
+        s.pop().unwrap()
+    }
+
+    /// `Σ` of this polynomial over `atom = lo, lo+step, …` for `trip` values: substitute
+    /// `atom := lo + step·k`, then sum each `k^j` with Faulhaber. Exact when every power of the
+    /// atom is a nonnegative integer, which is all the calculus produces. A polynomial that does
+    /// not mention the atom sums to itself times `trip`.
+    pub fn sum_over(&self, atom: usize, lo: &Poly, step: i128, trip: &Poly) -> Poly {
+        const K: usize = usize::MAX / 2;
+        if !self.mentions(atom) { return self.mul(trip); }
+        let shifted = self.subst(atom, &lo.add(&Poly::var(K).scale(Rat::int(step))));
+        let mut out = Poly::zero();
+        for (m, c) in &shifted.terms {
+            let mut rest = m.clone();
+            let j = rest.factors.remove(&Atom::Var(K)).map_or(0, |e| e.n as usize);
+            let mut t = Poly::zero();
+            t.terms.insert(rest, *c);
+            out = out.add(&t.mul(&Poly::faulhaber(j, trip)));
+        }
+        out
+    }
+    pub fn mentions(&self, atom: usize) -> bool {
+        self.terms.keys().any(|m| m.factors.keys().any(|a| match a { Atom::Var(i) => *i == atom, Atom::Log(inner) => inner.mentions(atom), _ => false }))
+    }
+    /// Largest variable index used, for allocating fresh atoms above it.
+    pub fn max_var(&self) -> Option<usize> {
+        self.terms.keys().flat_map(|m| m.factors.keys()).filter_map(|a| if let Atom::Var(i) = a { Some(*i) } else { None }).max()
+    }
+
     /// Replace one size variable by a polynomial. The variable's exponents must be
     /// nonnegative integers; a fractional exponent on a variable never arises in the calculus.
     pub fn subst(&self, var: usize, by: &Poly) -> Poly {

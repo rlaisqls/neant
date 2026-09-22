@@ -1,5 +1,5 @@
 is_space         work 5                            moves 0                            exact
-count_words      work 16·s.len()                   moves s.len()                      exact
-upcase           work 12·s.len()                   moves 4·s.len()                    exact
+count_words      work 16·s.len()                   moves s.len() + B                  exact
+upcase           work 12·s.len()                   moves 4·s.len() + 4·B              exact
 is_palindrome    work 7·s.len() − 4                moves 2·B·s.len() − 2·B            exact
-main             work 1024                         moves 32·B + 46                    exact, io
+main             work 1024                         moves 37·B + 46                    exact, io

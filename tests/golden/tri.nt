@@ -1,0 +1,19 @@
+fn pairs(a: &[i64]) -> i64 {
+    let mut s = 0;
+    for i in 0..a.len() {
+        for j in i..a.len() {
+            s += a[i] * a[j];
+        }
+    }
+    s
+}
+fn tiles(n: i64, a: &[f64]) -> f64 {
+    let mut s = 0.0;
+    for ii in 0..n / 4 {
+        for i in ii * 4..ii * 4 + 4 {
+            s += a[i];
+        }
+    }
+    s
+}
+fn main() { let a = [1, 2, 3]; println(pairs(&a)); let b = [1.0; 8]; println(tiles(8, &b)); }

@@ -176,9 +176,13 @@ struct Loop {
     /// `None` for a loop inherited from the caller at a specialised call: no index in this
     /// function can depend on it, so it only ever contributes reuse (stride 0) or repetition.
     var: Option<LocalId>,
+    /// The loop variable as a size atom, so a cost accumulated in the body may mention it and
+    /// be summed over it exactly when the loop is left. `None` for inherited and `decreasing` loops.
+    atom: Option<usize>,
     trip: Poly,
-    start: Poly,
-    end: Poly,
+    /// first value of the variable, and how much it moves per iteration
+    lo: Poly,
+    step: i128,
     /// The loop's start as an affine function of the loops outside it, so that an index written
     /// in terms of this variable is seen to move with the outer loops too. `None` when the start
     /// is not affine, in which case any index using this variable is treated as non-affine.
@@ -201,7 +205,18 @@ struct Site {
 /// What is remembered of a loop after it is popped.
 struct LoopRec {
     var: Option<LocalId>,
+    atom: Option<usize>,
     trip: Poly,
+    lo: Poly,
+    step: i128,
+}
+
+impl LoopRec {
+    /// `Σ` of `p` over this loop's iterations: exact over the atom, `× trip` when `p` does not
+    /// mention it.
+    fn sum(&self, p: &Poly) -> Poly {
+        match self.atom { Some(a) => p.sum_over(a, &self.lo, self.step, &self.trip), None => p.mul(&self.trip) }
+    }
 }
 
 struct Fa<'a, 'b, 'c> {
@@ -230,8 +245,11 @@ struct Fa<'a, 'b, 'c> {
     /// while set, `size_of` reads a mutable local as that entry value: for a `decreasing` measure
     at_entry: bool,
     loops: Vec<Loop>,
+    /// cost accumulated in the innermost open loop body (or the function body); when a loop is
+    /// left, its frame is summed over the loop atom into the frame below
     work: Poly,
     moves: Poly,
+    saved: Vec<(Poly, Poly)>,
 }
 
 impl<'a, 'b, 'c> Fa<'a, 'b, 'c> {
@@ -240,17 +258,21 @@ impl<'a, 'b, 'c> Fa<'a, 'b, 'c> {
     /// decision inside is made with the caller's numbers. The result is then already in the
     /// caller's atom space.
     fn new(an: &'b mut Analyzer<'a>, f: &'c Func, bindings: Option<&[Poly]>, inherited: Vec<Loop>, self_fid: Option<FuncId>) -> Self {
-        let mut loop_recs = Vec::new();
-        let mut loops = Vec::new();
-        for l in inherited {
-            loop_recs.push(LoopRec { var: None, trip: l.trip.clone() });
-            loops.push(Loop { id: loop_recs.len() - 1, ..l });
-        }
+        // in a specialised analysis the polynomials live in the caller's atom space: fresh loop
+        // atoms must be allocated above anything the bindings or inherited trips mention
+        let mut names = param_names(f);
+        let mut top = names.len();
+        if let Some(b) = bindings { for p in b { if let Some(m) = p.max_var() { top = top.max(m + 1); } } }
+        for l in &inherited { if let Some(m) = l.trip.max_var() { top = top.max(m + 1); } }
+        while names.len() < top { names.push("?".into()); }
         let mut fa = Fa {
-            an, f, names: param_names(f), sites: vec![], loop_recs, bounds: vec![], notes: vec![], io: false, self_fid, rec_calls: vec![],
+            an, f, names, sites: vec![], loop_recs: vec![], bounds: vec![], notes: vec![], io: false, self_fid, rec_calls: vec![],
             local_size: HashMap::new(), local_affine: HashMap::new(), initial: HashMap::new(), at_entry: false,
-            loops, work: Poly::zero(), moves: Poly::zero(),
+            loops: vec![], work: Poly::zero(), moves: Poly::zero(), saved: vec![],
         };
+        // the caller's loops are entered like this function's own, so the body's cost is summed
+        // over them when they are left at the end of `run`
+        for l in inherited { fa.enter_loop(l); }
         for (i, &p) in f.params.iter().enumerate() {
             let l = &f.locals[p];
             let size = bindings.map_or_else(|| Poly::var(i), |b| b[i].clone());
@@ -265,7 +287,10 @@ impl<'a, 'b, 'c> Fa<'a, 'b, 'c> {
 
     fn run(mut self) -> FuncCost {
         let mut tier = "exact";
-        let result = match self.block(&self.f.body) {
+        let walked = self.block(&self.f.body);
+        // leave the inherited loops: their frames sum the body over the caller's iterations
+        while !self.loops.is_empty() { self.leave_loop(); }
+        let result = match walked {
             Ok(()) => {
                 self.settle_moves();
                 if self.rec_calls.is_empty() {
@@ -404,13 +429,47 @@ impl<'a, 'b, 'c> Fa<'a, 'b, 'c> {
 
     fn machine(&self) -> Machine { self.an.machine }
 
-    /// Product of the trip counts of the enclosing loops: how many times the current point runs.
-    fn outer(&self) -> Poly {
-        self.loops.iter().fold(Poly::constant(1), |acc, l| acc.mul(&l.trip))
+    /// How many times the current point runs per invocation: `Σ` of 1 over the enclosing loops,
+    /// innermost first — the product of the trips when they are independent, the exact count
+    /// when an inner bound mentions an outer variable.
+    fn times_here(&self) -> Poly {
+        let mut o = Poly::constant(1);
+        for l in self.loops.iter().rev() {
+            o = match l.atom { Some(a) => o.sum_over(a, &l.lo, l.step, &l.trip), None => o.mul(&l.trip) };
+        }
+        o
     }
+    /// Cost of the current point, charged once; the enclosing loops sum it when they are left.
     fn add_work(&mut self, p: Poly) {
-        let o = self.outer();
-        self.work = self.work.add(&p.mul(&o));
+        self.work = self.work.add(&p);
+    }
+    /// A fresh size atom for a loop variable.
+    fn new_atom(&mut self, name: &str) -> usize {
+        self.names.push(name.to_string());
+        self.names.len() - 1
+    }
+    /// Open a loop: push it and start a fresh accumulator frame for its body.
+    fn enter_loop(&mut self, lp: Loop) {
+        self.loop_recs.push(LoopRec { var: lp.var, atom: lp.atom, trip: lp.trip.clone(), lo: lp.lo.clone(), step: lp.step });
+        let lp = Loop { id: self.loop_recs.len() - 1, ..lp };
+        self.loops.push(lp);
+        self.saved.push((std::mem::take(&mut self.work), std::mem::take(&mut self.moves)));
+    }
+    /// Leave a loop: sum its body frame over its variable into the frame below.
+    fn leave_loop(&mut self) {
+        let lp = self.loops.pop().unwrap();
+        let rec = &self.loop_recs[lp.id];
+        let (w, m) = (rec.sum(&self.work), rec.sum(&self.moves));
+        let (pw, pm) = self.saved.pop().unwrap();
+        self.work = pw.add(&w);
+        self.moves = pm.add(&m);
+    }
+    /// Add a cost that was already summed over every enclosing loop (an inherited-context call).
+    fn add_at_root(&mut self, w: &Poly, m: &Poly) {
+        match self.saved.first_mut() {
+            Some((rw, rm)) => { *rw = rw.add(w); *rm = rm.add(m); }
+            None => { self.work = self.work.add(w); self.moves = self.moves.add(m); }
+        }
     }
     fn add_work_n(&mut self, n: i128) { self.add_work(Poly::constant(n)); }
 
@@ -429,16 +488,16 @@ impl<'a, 'b, 'c> Fa<'a, 'b, 'c> {
     // ---- size expressions ----
 
     /// An `i64` expression as a size polynomial: literals, size parameters, `.len()`, immutable
-    /// lets bound to such, and `+ - *` of them. A loop variable is replaced by the bound of its
-    /// range that maximises the result (`Upper`) or minimises it (`Lower`), so a triangular
-    /// loop is bounded by its rectangular hull.
+    /// lets bound to such, `+ - *` of them, and loop variables as their atoms — so a triangular
+    /// bound `i..n` is the exact `n − i`, summed when the outer loop is left. `Dir` only decides
+    /// which side of a `min`/`max` to take.
     fn size_of(&self, e: &Expr, bound: Dir) -> Option<Poly> {
         let flip = |b: Dir| if b == Dir::Upper { Dir::Lower } else { Dir::Upper };
         match &e.kind {
             ExprKind::Int(v) => Some(Poly::constant(*v as i128)),
             ExprKind::Local(l) => {
                 if let Some(lp) = self.loops.iter().find(|lp| lp.var == Some(*l)) {
-                    return Some(if bound == Dir::Upper { lp.end.clone() } else { lp.start.clone() });
+                    return lp.atom.map(Poly::var);
                 }
                 if self.at_entry && self.f.locals[*l].mutable { return self.entry_value(*l); }
                 let a = self.local_affine.get(l)?;
@@ -537,6 +596,8 @@ impl<'a, 'b, 'c> Fa<'a, 'b, 'c> {
         let nsites = self.sites.len();
         // lines[(site, loop)] = lines the site touches over one full run of that loop
         let mut lines: HashMap<(usize, usize), Poly> = HashMap::new();
+        // whether the lines a site touches over a loop form one contiguous region
+        let mut contig: HashMap<(usize, usize), bool> = HashMap::new();
         let inner = |lines: &HashMap<(usize, usize), Poly>, s: usize, path: &[usize], pos: usize| -> Poly {
             if pos + 1 < path.len() { lines[&(s, path[pos + 1])].clone() } else { Poly::constant(1) }
         };
@@ -549,33 +610,57 @@ impl<'a, 'b, 'c> Fa<'a, 'b, 'c> {
                 .filter_map(|s| self.sites[s].path.iter().position(|&l| l == lid).map(|pos| (s, pos)))
                 .collect();
             if members.is_empty() { continue; }
+            let rec = &self.loop_recs[lid];
             let mut ws = Poly::zero();
             for &(s, pos) in &members {
                 ws = ws.add(&inner(&lines, s, &self.sites[s].path, pos));
             }
-            let fits = self.numeric(&ws).is_some_and(|l| (l * m.b_bytes as f64) < (m.m_bytes as f64));
-            let rec = &self.loop_recs[lid];
+            // the working set may vary with this loop's own variable (a triangular inner loop):
+            // it fits when its largest value does, taken at the two ends of the range
+            let ws_max: Option<f64> = match rec.atom {
+                Some(a) if ws.mentions(a) => {
+                    let last = rec.lo.add(&rec.trip.sub(&Poly::constant(1)).scale(Rat::int(rec.step)));
+                    match (self.numeric(&ws.subst(a, &rec.lo)), self.numeric(&ws.subst(a, &last))) {
+                        (Some(x), Some(y)) => Some(x.max(y)),
+                        _ => None,
+                    }
+                }
+                _ => self.numeric(&ws),
+            };
+            let fits = ws_max.is_some_and(|l| (l * m.b_bytes as f64) < (m.m_bytes as f64));
             for &(s, pos) in &members {
                 let site = &self.sites[s];
                 let in_lines = inner(&lines, s, &site.path, pos);
-                let factor = if !fits {
-                    rec.trip.clone()
+                let was_contig = if pos + 1 < site.path.len() { contig[&(s, site.path[pos + 1])] } else { true };
+                // Σ over this loop of the inner lines, always eliminating this loop's atom
+                let summed = rec.sum(&in_lines);
+                let same_set = || if rec.atom.is_some_and(|a| in_lines.mentions(a)) { summed.clone() } else { in_lines.clone() };
+                let (total, now_contig) = if !fits {
+                    (summed.clone(), false)
                 } else {
                     let stride = site.aff.as_ref().map(|a| rec.var.and_then(|v| a.coeffs.get(&v).cloned()).unwrap_or_else(Poly::zero).scale(Rat::int(site.es)));
                     match stride {
-                        None => rec.trip.clone(),
-                        Some(st) if st.is_zero() => Poly::constant(1),
+                        None => (summed.clone(), false),
+                        // the same lines every iteration
+                        Some(st) if st.is_zero() => (same_set(), was_contig),
                         Some(st) => match self.numeric(&st) {
-                            Some(sb) if sb.abs() >= m.b_bytes as f64 => rec.trip.clone(),
+                            // a whole line or more: fresh lines every iteration
+                            Some(sb) if sb.abs() >= m.b_bytes as f64 => (summed.clone(), false),
                             Some(sb) => {
-                                let f = rec.trip.scale(Rat::new(sb.abs() as i128, 1)).mul_atom_pow(Atom::B, Rat::int(-1));
-                                match self.numeric(&f) { Some(v) if v < 1.0 => Poly::constant(1), _ => f }
+                                // the inner set slides by |s| bytes per iteration. A contiguous set
+                                // (sequential inner loops) grows by the slide: in + Σ|s|/B. Separate
+                                // lines (a strided inner loop) each slide: in × Σ|s|/B. Never less
+                                // than one new line for the whole level.
+                                let slide = rec.sum(&Poly::constant(1)).scale(Rat::new(sb.abs() as i128, 1)).mul_atom_pow(Atom::B, Rat::int(-1));
+                                let slide = match self.numeric(&slide) { Some(v) if v < 1.0 => Poly::constant(1), _ => slide };
+                                if was_contig { (same_set().add(&slide), true) } else { (same_set().mul(&slide), false) }
                             }
-                            None => rec.trip.clone(),
+                            None => (summed.clone(), false),
                         },
                     }
                 };
-                lines.insert((s, lid), in_lines.mul(&factor));
+                lines.insert((s, lid), total);
+                contig.insert((s, lid), now_contig);
             }
         }
         let mut total = Poly::zero();
@@ -595,7 +680,7 @@ impl<'a, 'b, 'c> Fa<'a, 'b, 'c> {
         let vb: Vec<LocalId> = ab.coeffs.keys().copied().collect();
         if !bounds::is_contraction(&va, &vb) { return; }
         let es = self.elem_bytes(mac.a);
-        let n = self.outer();
+        let n = self.times_here();
         let nest: Vec<LocalId> = self.loops.iter().filter_map(|l| l.var).collect();
         self.bounds.push(Bound {
             kind: "matrix product", citation: "Hong–Kung 1981",
@@ -618,9 +703,7 @@ impl<'a, 'b, 'c> Fa<'a, 'b, 'c> {
 
     /// A sequential pass over `n` elements of `es` bytes, once per enclosing iteration.
     fn stream(&mut self, n: &Poly, es: i128) {
-        let bytes = n.scale(Rat::int(es));
-        let o = self.outer();
-        self.moves = self.moves.add(&bytes.mul(&o));
+        self.moves = self.moves.add(&n.scale(Rat::int(es)));
     }
 
     // ---- the walk ----
@@ -657,11 +740,11 @@ impl<'a, 'b, 'c> Fa<'a, 'b, 'c> {
                 let es = self.elem_bytes(*id);
                 self.stream(&size, es);
                 self.local_size.insert(*id, size.clone());
-                self.loop_recs.push(LoopRec { var: Some(*var), trip: size.clone() });
-                self.loops.push(Loop { id: self.loop_recs.len() - 1, var: Some(*var), trip: size.clone(), start: Poly::zero(), end: size, offset: Some(Affine::constant(Poly::zero())) });
+                let atom = self.new_atom(&self.f.locals[*var].name.clone());
+                self.enter_loop(Loop { id: 0, var: Some(*var), atom: Some(atom), trip: size, lo: Poly::zero(), step: 1, offset: Some(Affine::constant(Poly::zero())) });
                 self.add_work_n(3); // store, increment, compare-and-branch
                 let r = self.block(body);
-                self.loops.pop();
+                self.leave_loop();
                 r
             }
             Stmt::LetRepeat(id, e, n) => {
@@ -725,11 +808,12 @@ impl<'a, 'b, 'c> Fa<'a, 'b, 'c> {
                     _ => hi.sub(&lo),
                 };
                 if let Some(c) = trip.as_const() { if c.n < 0 { trip = Poly::zero(); } }
-                self.loop_recs.push(LoopRec { var: Some(*var), trip: trip.clone() });
-                self.loops.push(Loop { id: self.loop_recs.len() - 1, var: Some(*var), trip, start: lo, end: hi, offset: a_lo });
+                let _ = hi;
+                let atom = self.new_atom(&self.f.locals[*var].name.clone());
+                self.enter_loop(Loop { id: 0, var: Some(*var), atom: Some(atom), trip, lo, step: 1, offset: a_lo });
                 self.add_work_n(2); // increment, compare-and-branch, per iteration
                 let r = self.block(body);
-                self.loops.pop();
+                self.leave_loop();
                 r
             }
             Stmt::Break => Ok(()),
@@ -767,15 +851,17 @@ impl<'a, 'b, 'c> Fa<'a, 'b, 'c> {
                 let Some((trip, ind)) = found else {
                     return Err(Fail::Unknown("`while` has no measure the compiler can find; write `while cond decreasing <expr>` with an `i64` that goes down by at least one every iteration".into(), *line));
                 };
-                let (var, offset) = match ind {
-                    Some((v, i0)) => (Some(v), Some(Affine::constant(i0))),
-                    None => (None, None),
+                let (var, atom, lo, step, offset) = match ind {
+                    Some((v, i0, st)) => {
+                        let a = self.new_atom(&self.f.locals[v].name.clone());
+                        (Some(v), Some(a), i0.clone(), st, Some(Affine::constant(i0)))
+                    }
+                    None => (None, None, Poly::zero(), 1, None),
                 };
-                self.loop_recs.push(LoopRec { var, trip: trip.clone() });
-                self.loops.push(Loop { id: self.loop_recs.len() - 1, var, trip: trip.clone(), start: Poly::zero(), end: trip, offset });
+                self.enter_loop(Loop { id: 0, var, atom, trip, lo, step, offset });
                 self.add_work_n(1);
                 let r = self.block(body);
-                self.loops.pop();
+                self.leave_loop();
                 r
             }
             Stmt::Expr(e) => self.expr(e),
@@ -878,7 +964,7 @@ impl<'a, 'b, 'c> Fa<'a, 'b, 'c> {
     /// stepped by the constant `c` exactly once in the body and nowhere else, `e` is a size
     /// expression, and `i₀` — the last assignment to `i` before the loop — is one too.
     /// `i > e` with `i -= c` is the mirror. Anything else is not an induction variable.
-    fn induction_trip(&self, cond: &Expr, body: &Block) -> Result<(Poly, Option<(LocalId, Poly)>), String> {
+    fn induction_trip(&self, cond: &Expr, body: &Block) -> Result<(Poly, Option<(LocalId, Poly, i128)>), String> {
         let ask = "`while` has no measure the compiler can find; write `while cond decreasing <expr>` with an `i64` that goes down by at least one every iteration".to_string();
         let ExprKind::Binary(op, l, r) = &cond.kind else { return Err(ask) };
         // normalise to (var, bound, ascending)
@@ -903,7 +989,7 @@ impl<'a, 'b, 'c> Fa<'a, 'b, 'c> {
         let span = if asc { e.sub(&i0) } else { i0.sub(&e) };
         // the variable steps by |step| per iteration: indices in it move by step·elem bytes,
         // which the stride rule sees through the loop variable's coefficient
-        Ok((span.scale(Rat::new(1, step.abs() as i128)), Some((var, i0))))
+        Ok((span.scale(Rat::new(1, step.abs() as i128)), Some((var, i0, step as i128))))
     }
 
     fn expr(&mut self, e: &Expr) -> Result<(), Fail> {
@@ -958,7 +1044,7 @@ impl<'a, 'b, 'c> Fa<'a, 'b, 'c> {
                             match &a.kind { ExprKind::Ref(s, _) | ExprKind::Local(s) => self.local_size.get(s).cloned(), _ => None }
                         } else { self.size_of(a, Dir::Upper) }
                     }).collect();
-                    let o = self.outer();
+                    let o = self.times_here();
                     self.rec_calls.push((sizes, o, e.line));
                     return Ok(());
                 }
@@ -980,16 +1066,19 @@ impl<'a, 'b, 'c> Fa<'a, 'b, 'c> {
                     }
                     // the caller's loops go with the call when no argument depends on them,
                     // as loops without a variable: every access inside reuses across them if it fits
-                    let invariant = args.iter().all(|a| self.affine(a).is_none_or(|af| af.is_const()) || matches!(a.kind, ExprKind::Ref(..) | ExprKind::Local(_)));
+                    let invariant = args.iter().all(|a| matches!(a.kind, ExprKind::Ref(..)) || self.affine(a).is_some_and(|af| af.is_const()));
+                    // an inherited loop's trip may mention this function's loop atoms; the callee
+                    // is analysed in the same atom space, and its result is summed here as usual
                     let inherited: Vec<Loop> = if invariant {
-                        self.loops.iter().map(|l| Loop { id: 0, var: None, trip: l.trip.clone(), start: l.start.clone(), end: l.end.clone(), offset: None }).collect()
+                        self.loops.iter().map(|l| Loop { id: 0, var: None, atom: None, trip: l.trip.clone(), lo: Poly::zero(), step: 1, offset: None }).collect()
                     } else { vec![] };
                     let inherits = !inherited.is_empty();
                     self.an.active[*fid] = true;
                     let fc = Fa::new(self.an, cf, Some(&b), inherited, Some(*fid)).run();
                     self.an.active[*fid] = false;
                     if fc.effects.contains(&"io") { self.io = true; }
-                    let o = if inherits { Poly::constant(1) } else { self.outer() };
+                    // a bound found in the callee counts once per time this call runs
+                    let o = if inherits { Poly::constant(1) } else { self.times_here() };
                     for bd in fc.bounds {
                         self.bounds.push(Bound { moves: bd.moves.mul(&o), ..bd });
                     }
@@ -1004,9 +1093,8 @@ impl<'a, 'b, 'c> Fa<'a, 'b, 'c> {
                             return Err(Fail::Unknown(reason, e.line));
                         }
                     };
-                    // an inherited context already multiplied the callee's cost by the trips
-                    self.work = self.work.add(&w.mul(&o));
-                    self.moves = self.moves.add(&mv.mul(&o));
+                    // an inherited context already summed the callee's cost over these loops
+                    if inherits { self.add_at_root(&w, &mv); } else { self.work = self.work.add(&w); self.moves = self.moves.add(&mv); }
                     return Ok(());
                 }
                 // otherwise: the callee's symbolic cost, with the atoms it uses substituted
@@ -1040,9 +1128,8 @@ impl<'a, 'b, 'c> Fa<'a, 'b, 'c> {
                     w = w.subst(i, &by);
                     mv = mv.subst(i, &by);
                 }
-                let o = self.outer();
-                self.work = self.work.add(&w.mul(&o));
-                self.moves = self.moves.add(&mv.mul(&o));
+                self.work = self.work.add(&w);
+                self.moves = self.moves.add(&mv);
                 Ok(())
             }
         }

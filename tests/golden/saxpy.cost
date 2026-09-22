@@ -1,2 +1,2 @@
-saxpy            work 7·x.len()                    moves 16·x.len()                   exact
-main             work 87                           moves 6·B + 64                     exact, io
+saxpy            work 7·x.len()                    moves 16·x.len() + 2·B             exact
+main             work 87                           moves 11·B + 64                    exact, io

@@ -19,11 +19,10 @@ A function's atoms are its parameters, in order: a slice parameter `a: &[T]` con
 the body must reduce to these and constants, or the function's cost is unknown.
 
 An `i64` expression is a **size expression** when it is built from integer literals, size
-atoms, `.len()` of a local whose size is known, immutable `let`s bound to size expressions, and
-`+ − *`, or `/` by a literal. Inside a loop, a loop variable standing in a bound is replaced by
-its own bound — the end for an upper bound, the start for a lower — so a triangular loop
-`for j in i..n` is charged as its rectangular hull `n`. When the loop variables cancel between
-the two bounds (`ii*T .. ii*T + T`) the trip count is exact (`T`).
+atoms, `.len()` of a local whose size is known, immutable `let`s bound to size expressions, loop
+variables of the loops that are open, and `+ − *`, or `/` by a literal. A loop variable is its
+own atom while its loop is open; a bound `i..n` gives the exact trip `n − i`, and the cost of the
+body, a polynomial in `i`, is summed over `i` when the outer loop is left.
 
 Machine parameters default to `M = 2 MiB`, `B = 64` and are set with `-M` and `-B`. They are
 kept symbolic in the reported polynomial and made numeric only for the two decisions below.
@@ -43,15 +42,16 @@ predicts 6 per element and measures 4.5: gcc fused the multiply-add).
 | `x[i]` (read) | 1 + index — a load; the index arithmetic is counted as written |
 | `x = e` | 0 + e; `x op= e` | 1 + e |
 | `x[i] = e` | 1 + index + e — a store; `x[i] op= e` | 3 — load, op, store |
-| `for i in a..b { body }` | bounds once; then `trip × (2 + body)` — increment, compare-and-branch |
+| `for i in a..b { body }` | bounds once; then `Σ_{i=a}^{b−1} (2 + body)` — increment, compare-and-branch; exact for triangular bounds |
 | `while c { body }` | `trip × (1 + c + body)` |
 | `if c { t } else { e }` | 1 + c + t + e — **both branches are charged**; an upper bound, tight when one is empty |
 | call | 2 + arguments + the callee's work — call and return |
 | `println` | 1, and the function is `io`; the library call behind it is not modelled |
 | `[e; n]`, `[e for x in xs]` | one store per element, plus the loop |
 
-Everything inside a loop is multiplied by the product of the enclosing trip counts. A chain
-desugars to the same loop a hand-written one would be, so it costs the same.
+Everything inside a loop is summed over the enclosing loop variables — the product of the trip
+counts when the bounds are independent, the exact polynomial when an inner bound mentions an outer
+variable. A chain desugars to the same loop a hand-written one would be, so it costs the same.
 
 ## Moves
 
@@ -66,19 +66,36 @@ two loop variables, a mutable accumulator, a value loaded from memory — is tre
 whole line every iteration of every loop.
 
 Then, from the innermost loop outward, with `t` the loop's trip count and `s` the number of
-bytes the access moves per iteration of that loop (its coefficient times the element size):
+bytes the access moves per iteration of that loop (its coefficient times the element size),
+each site's lines are computed by **summing over the loop variable** rather than multiplying
+by `t`: the loop variable is a size atom while the loop is open, a cost accumulated in the body
+may mention it, and leaving the loop applies `Σ_{v=lo}^{hi−1}` exactly (Faulhaber's formula).
+For a rectangular loop the sum is the product; for `for j in i..n` it is `Σᵢ (n−i) = n(n+1)/2`,
+not the hull `n²`.
 
 ```
-for every access site:  lines = 1
+for every access site:  lines = 1, contiguous = true
 for each loop, innermost first, for every site inside it:
     ws = Σ over the sites inside this loop of their lines      -- they share the cache
-    if ws·B is not a known number < M:          lines ×= t            -- the working set does not fit
-    else if s = 0:                              lines ×= 1            -- same lines every iteration
-    else if s ≥ B (or s is symbolic):           lines ×= t            -- a fresh line every iteration
-    else:                                       lines ×= t·s/B        -- consecutive iterations share lines
-                                                (but never below 1)
+    if ws·B is not a known number < M:          lines = Σ_v lines         -- the working set does not fit
+    else if s = 0:                              lines = lines             -- same lines every iteration
+    else if s ≥ B (or s is symbolic):           lines = Σ_v lines         -- a fresh line every iteration; not contiguous
+    else if contiguous:                         lines = lines + Σ_v s/B   -- a contiguous set slides by s per iteration
+    else:                                       lines = lines × Σ_v s/B   -- each separate line slides
+                                                (a slide of under one line counts as one)
 moves += Σ lines · B
 ```
+
+A working set that varies with the loop's own variable is tested at both ends of the range and
+must fit at the larger. A set that changes with the variable is not credited for overlap when the
+stride is zero: it is summed, an upper bound.
+
+The two slide rules are the model's geometry. After sequential inner loops a site's lines form one
+contiguous region; an outer loop that moves it by less than a line grows the region by the slide,
+so a row of `n` doubles read `t` times at an offset of 8 bytes costs `n·8/B + t·8/B` lines, once
+plus the slide. After a strided inner loop the lines are separate — a column — and each slides on
+its own: `n × t·8/B`. The second is the case M1 measured on the naive product; the first is what a
+tiled row does.
 
 The **fit test** is the whole model: a level reuses the lines its inner levels touched only when
 the working set of *every* access site inside that loop, added together, is a known number of
