@@ -1,201 +1,189 @@
 # neant
 
-A language where what the machine code does is a property the compiler checks, not a hope.
+A language where what a program costs is a property the compiler infers, reports, and can be asked
+to hold — the way a type is.
 
-In every other language, "this function must be constant-time", "this function must not allocate",
-"this function must stay compiled" are comments and code review, and a profile long afterwards. Here
-they are questions with answers, asked of the compiler from inside the language, about the machine
-code it actually emitted.
+Correctness has types: `f: A → B` and `g: B → C` compose to `A → C`, and you know that without
+running anything. Performance has nothing. Two fast functions composed can be slow, and the only way
+to find out is to run it, profile it, guess, and try again. Performance today is where correctness
+was before types existed.
 
-```
-jitct  {[a;b] (a band b) bor a bxor b}   // ""   no data-dependent branch in the emitted code
-jitct  {[a;b] (a bxor b) + 1}            // the check is back, and named
-jitwhy {[x] w: (); w,: x; w}             // "does not compile: op 0 (list) is not in the subset"
-jitwhy {[a;b] (a bxor b) + 1}            // "compiles, but can fall back ... 2 x an int-null check"
-```
-
-`jitct` compiles a function in exactly the environment the JIT compiles it in, then **decodes the
-machine code it emitted** and answers `""` only when there is no data-dependent control flow in it.
-It is a check on the bytes, not an argument about the source, so it cannot be talked around.
-
-## Why this is possible here and not elsewhere
-
-Every other tool that makes a machine-level claim has to trust the compiler underneath it.
-Cryptol and SAW check a specification, HACL\* checks F\* source and then hands the result to a C
-compiler that is free to reintroduce a branch, Jasmin checks its own IR. The gap between what was
-verified and what ships is where the property gets lost, and "the optimiser turned my mask back
-into a branch" is a real and recurring way to lose it.
-
-neant closes that gap by being small enough to look at the other end. The backend is
-`src/neant/jit/arm64.nt`, written in neant; the checker reads what it emitted. A large compiler
-cannot credibly make this claim. That is the whole of the advantage, and it is structural: matching
-it means writing a small compiler, not adding a pass.
-
-```
-runtime      4,515 lines of Rust, zero dependencies
-front end      516 lines of neant, self-hosting
-backend      2,746 lines of neant
+```rust
+fn score(events: &[Event]) -> f64 {          // work n·c(weight)   moves n/B   exact ✓
+    events.iter().map(|e| e.weight()).sum()
+}
 ```
 
-## The evidence it works
+The grey text is the compiler's. It is not written by hand, it appears in the editor next to the
+signature, it is recorded in a lockfile that shows up in code review, and it changes when the code
+does. Nobody computed it.
 
-**A TLS 1.3 client, in neant, that reaches the public web.** DER, X.509, RSA over SHA-256 and
-SHA-384, ECDSA on P-256 and P-384, a trust store, chain validation and hostname matching — Google,
-Cloudflare, GitHub, Wikipedia and Amazon all complete a verified handshake. Every hot kernel is a
-scalar loop the whole-function JIT compiles: SHA-256 **1.0ms** per 64KB, ChaCha20 **1.7ms**,
-Poly1305 **0.34ms**, X25519 **3.0ms**. ([docs/crypto.md](docs/crypto.md))
+## Two facts the theory knows and no language reflects
 
-**Four secret-dependent branches found and removed, with the cost of each measured.** Not argued —
-measured, on scalars chosen to make the branch fire or not:
+**Cost is data movement, not operations.** An add is one cycle; a cache miss is a hundred to three
+hundred. Every language's implicit cost model — and LLVM's explicit one — counts instructions. That
+was right in 1980. The theory that counts bytes moved across cache boundaries has existed for forty
+years: the red-blue pebble game (Hong–Kung 1981), the I/O model (Aggarwal–Vitter 1988),
+cache-oblivious algorithms (Frigo–Leiserson–Prokop–Ramachandran 1999), communication-avoiding
+algorithms (Demmel). It has never been a language's cost model.
 
-```
-                    1 bit set    255 bits set
-ecShamir               218 ms         455 ms     <- the side channel, in one number
-ecCtMul                592 ms         589 ms
+**Performance is empirical; correctness is compositional.** A cost that lives in a signature
+composes. A cost that lives in a profile does not. Making the first one true is the whole of this
+project.
 
-bnModExpL              171 ms         306 ms
-bnModExpCtL            406 ms         405 ms
-```
+## What the compiler does with a cost
 
-Plus a tag comparison that returned early and an x25519 swap that branched on two adjacent key bits.
-Each is asserted constant-time in `tests/ct.nt`, so a helper rewritten with an `if` fails the suite
-rather than quietly costing the property. ([docs/constant-time.md](docs/constant-time.md))
+Three things, in order of how often they happen:
 
-**The property survives contact with real code.** `src/neant/stdlib/ct.nt` is the set of primitives
-built on it — `ctMask`, `ctSel`, `ctEqBit`, `ctLtBit`, `ctAcc` — each written to a discipline the
-compiler can see rather than a mode a caller has to remember.
-
-## The plan: ask the compiler
-
-The first draft of this section proposed declarations — `where compiled`, `where ct` — that a
-function carries and the build enforces. That was wrong twice over, and the reasons are worth
-keeping.
-
-A declaration only protects what someone thought to declare. docs/compiler.md's SHA-512 lost ninety
-times its speed to a single `w,:`, and nobody would have annotated it, because nobody knew there was
-anything to annotate. And for a *performance* property, failing the build is the wrong severity: the
-annotation is the first thing deleted when it gets in the way. Worse, for constant time the contract
-already exists and needs no syntax at all — `tests/ct.nt`'s `ctIs` asserts `jitct f` is `""` for
-each primitive, and a `where` clause would add locality and nothing else.
-
-What is actually distinctive here is smaller and already half-built:
-
-> **How a function compiled is a value the program can ask for.**
-
-`jitct f` and `jitwhy f` are ordinary functions returning ordinary values. Every other JIT keeps this
-behind an out-of-band log flag — `-XX:+PrintCompilation`, `--trace-deopt` — that a human reads after
-the fact. None of them lets the running program ask. Once it is a value, the policy is written by
-whoever is using it rather than fixed by the language: a crypto file signals on a bad answer, a hot
-loop only prints one, and neither needs a keyword.
-
-### 1. `jitwhy`, structured — done as prose, wanted as data
-
-`jitwhy f` answers "" when `f` compiles and holds no path back to the interpreter, and otherwise why
-not. Today that answer is a sentence, which only a person can act on. The same facts as a dict —
-whether it compiled, how many ways out and of which kind — let neant code act on them, with the
-sentence kept as a formatter over the top.
-
-### 2. Enumerating what to ask about
-
-The names bound in the global namespace are not reachable from neant today (`vm.rs`'s `slot_names`
-holds them). One primitive exposes them, and it is the only part of this that needs Rust.
-
-### 3. The sweep, in neant
-
-With those two, walking every bound function and reporting the ones that cannot compile — or that
-compile and can still leave — is a dozen lines of neant, and so is every policy built on it:
+**Infer.** Every function gets a cost — work, bytes moved, span — derived from its body. Where a
+known lower bound exists for what the function computes (matrix multiply, sort, stencil, scan,
+join, a fused pipeline), the compiler compares the two and reports the gap and the schedule
+transformation that closes it:
 
 ```
-if[0<count jitscan[]; signal "a kernel fell out of the compilable subset"]   // strict
-show jitscan[]                                                              // advisory
+matmul                          work n³     moves n³          lower bound n³/√M
+  gap √M ≈ 180× on this machine's L2
+  b[k, j] is read down a column inside the k loop           (line 7)
+  tile (i, j, k) by √(M/3)      → moves n³/√M               [apply]
+  transpose b before the loop   → moves n³/B                [apply]
 ```
 
-This is what would have caught SHA-512 without anyone anticipating it, and it is the same tool that
-answers the open question on the constant-time side: not "does this function pass `jitct`" — `ctIs`
-already asks that — but **which functions handle a secret and were never asked at all**.
+**Report.** The cost is not in the source. It lives in four places: an inlay hint after the
+signature; `costs.lock`, one line per function, committed, diffed in every pull request the way
+`Cargo.lock` is; an error when a function falls out of the exact tier, naming the line and why;
+and an attribute when you want to lock one:
 
-### 4. The property itself is still incomplete
-
-No syntax closes this one. `jitct` checks branches and **not memory addresses**, and a
-secret-dependent load is the other half of constant time — the half that broke AES T-tables.
-`src/neant/stdlib/ct.nt` avoids it by never indexing, and avoidance is a discipline rather than a
-check. Tainting secret values through registers and looking at the address operand of every load and
-store is the real work here, and it also lifts the opposite limitation: with addresses checked, a
-bounds test on a *public* index no longer has to be refused.
-
-### 5. The language debts underneath all of it
-
-Three decisions tax every one of these, and each shows up as a line in `ct.nt`'s list of things its
-code may not do:
-
-- **The int null is a bit pattern** (`0x8000000000000000`), so `+`, `-` and `*` emit a check against
-  it, which is a branch. That is why `badd` exists as a second `+`, why SHA-512's kernel contains no
-  arithmetic operator, and why `bnMontFinL` cannot be checked at all. A `u64` width — a type with no
-  null — deletes the check, the workaround and the gap together. **Highest ratio of anything here.**
-- **A vector slot is `Ints` and nothing else**, so a byte or char buffer stops a function compiling.
-  That is certificate parsing, base64 and the formatter, all of them unreachable by any of this.
-- **A compiled function calling another goes through a trampoline whose bail-out check is a branch**,
-  so `ct.nt` is written out rather than composed. Proving a callee cannot deopt — which `jitwhy`
-  now answers for a single function — makes the call direct and makes the property compose.
-
-One silent failure is already fixed: a bare `-1` after a verb lexes as monadic minus and falls out of
-the compilable subset, so a missing pair of parentheses used to drop the guarantee without a word.
-`jitwhy` says so now.
-
-## Run
-
-```
-cargo run --release                     # REPL
-cargo run --release -- file.nt          # run a file
-cargo test --release
+```rust
+#[cost(moves_at_most = "n log n")]
+fn sort(xs: &mut [T]) { ... }         // build fails if an edit makes this n²
 ```
 
-After editing `src/neant/{core,stdlib,crypto}/*.nt`: `cargo run --release -- --build-boot`, then
-rebuild — `cargo test` fails until the embedded `src/neant/image.nb` matches the sources again. A
-change to the *compiler* needs the cycle twice: the first pass compiles the new compiler with the
-old one, the second is the fixpoint the test checks for.
+**Never stay silent.** Inference is undecidable in general, so the compiler will not always have an
+exact answer. It always has *an* answer, and says which kind:
 
-The image is the only front end, so it is also the only seed. A `src/neant/image.nb` that cannot
-compile its own sources can only be rebuilt by a binary that still carries a working one — the last
-good build, or the copy in git. Removing that dependency, so the tree builds from source alone, is
-on the list above's other side: it costs nothing a user sees and buys everything a stranger needs to
-trust the build.
+| the code looks like | work | moves |
+|---|---|---|
+| bounded loops over arrays, comprehensions, iterator chains | exact | exact |
+| higher-order: `map f`, callbacks, combinators | parametric in `cost(f)` | parametric |
+| pointer structures inside an inferred region | exact | region-granular bound |
+| structural recursion, or `while` with an inferable measure | recurrence | measured |
+| input-dependent loops, external calls | effect `unbounded` | measured |
 
-## The language, briefly
+"Measured" means the compiler ran it on the sizes it could, fit a curve, and reports that curve
+marked as measured, not proven. A function that falls from exact to measured is a diff in
+`costs.lock`, and the error says what to change to bring it back.
 
-A vector language in the kdb/q family — that is where the notation came from, not where it is going.
-The array tier earns its place as the form a specification is written in: short enough to read once
-and check, which is how `bnMulV` serves as the oracle that `bnMulL` is tested against. Production
-code is scalar loops the compiler can take.
+## What it looks like
 
+Nothing about cost is in the grammar. The grammar is deliberately unremarkable — expression-oriented,
+Rust-shaped — because everything that made earlier drafts of this design ugly turned out to be
+analysis information that belongs in the type checker and the editor, not in the source.
+
+```rust
+fn matmul(a: Matrix<f64>, b: Matrix<f64>) -> Matrix<f64> {   // n³ · n³/√M   exact, at bound ✓
+    let mut c = Matrix::zeros(a.rows, b.cols);
+    for (i, j, k) in tiles(a.rows, b.cols, a.cols) {
+        c[i, j] += a[i, k] * b[k, j];
+    }
+    c
+}
+
+fn positives(xs: &[f64]) -> f64 {                             // n · n/B   exact, fused ✓
+    [x * x for x in xs if x > 0.0].sum()
+}
+
+fn build_index(path: Path) -> Index uses io, unbounded {      // ~n^1.02  measured, 1k–10M
+    ...
+}
 ```
-x: 1 2 3 4          // vector literal, assignment
-2*x+1               // 4 6 8 10      no precedence, strict right-to-left
-+/x                 // 10
-{x*y}[3;4]          // 12            lambdas, implicit args x y z
-f: +/               // a verb is a value; f 1 2 3 -> 6
-```
 
-Full reference: [docs/language.md](docs/language.md).
+`for i in 0..n` is ordinary syntax; that its bound must be a size expression is a type check, not
+a grammar rule, and the checker tells you when a loop is not one. `while` is ordinary syntax; the
+termination measure is inferred when it can be (`i < n` with `i += 1` is most of them) and asked
+for when it cannot, with the same frequency and the same mild annoyance as a lifetime in Rust.
+Effects go where `throws` goes in Swift and `suspend` in Kotlin.
 
-## Documentation
+### The decisions underneath, and what each one buys
 
-| | |
-|---|---|
-| [docs/language.md](docs/language.md) | syntax, types, standard library, builtins, errors, gotchas |
-| [docs/library.md](docs/library.md) | tables, JSON, regexes, formatter and LSP, HTTP, TLS server, concurrency |
-| [docs/compiler.md](docs/compiler.md) | how it is built, what the JIT compiles, how that is tested |
-| [docs/constant-time.md](docs/constant-time.md) | `jitct`, and the four branches removed with it |
-| [docs/crypto.md](docs/crypto.md) | what is implemented on the bytes, against which vectors |
-| [docs/performance.md](docs/performance.md) | what was measured and what it bought |
+Each of these is what it is because a cost has to flow through it.
+
+- **A reference is a view, not an address.** `&xs[i]` exists and reads as you expect; it denotes
+  (collection, index), not a location. Nothing in the language can pin a byte to a place. This is
+  what lets the compiler own layout — pack hot fields, split cold ones, choose SoA for one loop and
+  AoS for another — and owning layout is what makes bytes moved a thing it can bound. It is also
+  what makes every value position-independent, so writing a structure to disk or a socket and
+  reading it back is a copy of bytes and not a serialization step.
+- **Regions are inferred.** Pointer structures — lists, trees, graphs — live inside a region the
+  compiler finds by escape analysis (Tofte–Talpin). Inside a region the pointers are free; the
+  region's size is known; and if it fits a cache level, a traversal costs one load of the region
+  regardless of access order. You write `Arena::with_capacity(..)` only when you want to pin that
+  size yourself.
+- **Mutation is written one way and the compiler says what it did.** `ys = xs; ys[3] = 9` is the
+  same text whether it copies or updates in place. If `xs` is uniquely referenced it is in place and
+  the cost says `1`; if it is not, the cost says `n` and names the line that keeps `xs` alive. This
+  is Perceus/FBIP exposed as a report instead of a syntax.
+- **Operators can be overloaded, and the overload's cost is part of its type.** `Matrix + Matrix`
+  is `n²`, and the compiler knows it at every use. The rule is not "no overloading"; it is "no
+  operation without a cost."
+- **Dynamic dispatch is `dyn`, costed at the maximum over implementations.** Exceptions are
+  `Result`; unwinding has no bound. Null is `Option`. Sizes are named by the compiler and appear in
+  reports as `xs.len()`, not as a bare `n` you had to declare.
+
+The array-language lineage of the previous project survives in one place: the semantics of the
+collection tier. Every operation there has a known cost, programs are compositions, and fusion is
+guaranteed — a pipeline that would allocate an intermediate is a type error, not a missed
+optimization. `.sum()` means what `+/` meant. The notation is words now.
+
+## Why this is a language and not a library on Rust or Zig
+
+Neither has a cost semantics. Performance in both is emergent — the reason a program is fast or
+slow lives in LLVM, not in the language, and changes with the compiler version. A cost in a
+signature needs the compiler to know layout, aliasing and effects for the whole program, and one
+`&mut p.x` destroys the first, one raw pointer the second. `repr(Rust)` is unspecified; `Vec`,
+`String` and `Box` hold absolute addresses; making a struct position-independent means leaving the
+native type system for a parallel one (`rkyv`). None of this is a pass that can be added. It is the
+part of the language that decides what a value is.
+
+## Where the pieces already exist
+
+| | has | lacks |
+|---|---|---|
+| NESL (Blelloch, 1990s) | provable work–span cost semantics | an I/O model; it is gone |
+| RAML (Hoffmann) | automatic polynomial resource bounds for an OCaml subset | movement, practicality |
+| calf (Harper et al., 2022–) | cost in types, as a logical framework | a language outside a proof assistant |
+| Futhark | guaranteed fusion, parallel cost | costs in signatures; CPU as a target |
+| cache-oblivious algorithms | the theory, complete | any language; they are library code |
+| Tofte–Talpin / MLKit | region inference | a cost model to serve |
+| Koka / Lean 4 | Perceus in-place reuse | reporting whether it happened |
+
+The parts are twenty to forty years old. Nobody has assembled them, and the thing that would hold
+them together — a cost that is inferred, reported and lockable, always, for every function — has
+not been built.
 
 ## What this is not
 
-`jitct` proves one property and not constant time in general: `MUL` is constant-time on the cores
-this targets without being architecturally required to be, and nothing here says anything about what
-a caller does before or after. The other three contracts are not built. The measured numbers come
-from one machine and should be read as ratios.
+`O(·)` does not capture constants. A function can meet its movement bound and still lose 2× to
+a prefetcher, NUMA, or out-of-order effects the model does not see; the model turns "why is this
+slow" from a profiling question into a compositional one and leaves the last factor of two to
+measurement, where it has always been. The ideal-cache assumption (full associativity, optimal
+replacement) is a proven constant-factor approximation of real hardware, and that constant is
+sometimes uncomfortable. Inference will refuse things you know are fine, and ask for measures and
+sizes you find obvious — the same bargain Rust struck with the borrow checker, made for time
+instead of memory. And costing works best where the lower bounds are known; for an algorithm the
+compiler has never seen, it can tell you what yours costs but not what it should.
 
-What is claimed is narrower and, it is hoped, more useful: that a compiler small enough to be read
-can be made to answer for its own output, and that this is worth more than a larger compiler's
-silence.
+## Status
+
+Nothing is built. This document is the design, and it exists to be argued with before anything is.
+
+The first thing to build is the smallest possible demonstration of the thesis: a subset with arrays,
+bounded loops and iterator chains; inference of work and moves for that subset; a `costs.lock`;
+and one lower bound (matrix multiply) with its gap report. If that is not convincing on its own,
+nothing downstream of it will be.
+
+This repository previously held a different language of the same name — a k-family array language
+with a self-hosted arm64 JIT and a checker that read the emitted machine code to decide whether a
+function was constant-time. It reached a verified TLS 1.3 handshake against the public web. It was
+retired at commit `4cc1410`, where its README, its five documents and its 28,000 lines remain, and
+where the idea that became this project — that how a program compiled should be a value the
+compiler answers for, not a log a person reads afterwards — was first tried on something narrower.
