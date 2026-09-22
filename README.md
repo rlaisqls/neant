@@ -41,10 +41,10 @@ join, a fused pipeline), the compiler compares the two and reports the gap and t
 transformation that closes it:
 
 ```
-matmul           work 10·n³ + 6·n² + n             moves B·n³ + 8·n³ + B·n²           exact
+matmul           work 10·n³ + 5·n² + 2·n           moves B·n³ + 8·n³ + B·n²           exact
                  lower bound      moves 8·n³/√M    (matrix product, Hong–Kung 1981)   gap 13033× at M = 2 MiB, B = 64
                  `b` moves by 8·n bytes per iteration of the innermost loop: a new line every time (line 7)
-                 tile by 256      work ≈ 10.05·n³  moves ≈ n³/8     [--apply matmul:tile]        gap 23×
+                 tile by 256      work ≈ 10.0509·n³  moves ≈ n³/8     [--apply matmul:tile]        gap 23×
                  transpose the column operand      moves 16·n³ + …  [--apply matmul:transpose]   gap 2896×
 ```
 

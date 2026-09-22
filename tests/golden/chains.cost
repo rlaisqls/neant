@@ -1,4 +1,4 @@
-positives        work 11·xs.len() + 2              moves 8·xs.len()                   exact
-dot              work 11·a.len() + 4               moves 16·a.len()                   exact
-weighted         work 11·xs.len() + 2              moves 8·xs.len()                   exact
-main             work 668                          moves 17·B + 160                   exact, io
+positives        work 7·xs.len()                   moves 8·xs.len()                   exact
+dot              work 6·a.len() + 2                moves 16·a.len()                   exact
+weighted         work 6·xs.len()                   moves 8·xs.len()                   exact
+main             work 451                          moves 17·B + 160                   exact, io

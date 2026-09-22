@@ -177,7 +177,7 @@ one of them better than a person did by hand.
 and refills could be read against the prediction.
 
 ```
-count_lt         work 8·xs.len() + 4               moves 8·xs.len()                   exact
+count_lt         work 6·xs.len() + 1               moves 8·xs.len()                   exact
            n     instructions         L2 bytes   predicted work / moves
        20000           482625           211200   6.400e5 / 6.400e5
       320000          5882661          2512320   1.024e7 / 1.024e7
@@ -185,8 +185,9 @@ count_lt         work 8·xs.len() + 4               moves 8·xs.len()           
 count_lt         work ~n^0.99                     moves ~n^1.26                     measured over n = 20000..5120000
 ```
 
-Work: the slope is 1, and 4.5 instructions per element against the model's 8 operations — the
-unit differs, the shape agrees. Moves: half the predicted bytes at the top (the read-stream
+Work: the slope is 1, and 4.5 instructions per element against the model's 6 — work was
+redefined after this run to approximate instructions (it said 8 "operations" at the time), and
+the remaining gap is gcc fusing the compare into the branch and the increment into the address. Moves: half the predicted bytes at the top (the read-stream
 pairing from M1, finding 3), and a slope above 1 because the two smallest sizes fit in L2 and
 were repeated four times.
 

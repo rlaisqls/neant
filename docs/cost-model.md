@@ -30,19 +30,28 @@ kept symbolic in the reported polynomial and made numeric only for the two decis
 
 ## Work
 
+Work approximates the **instructions the C compiler will emit**. It is not exact — the compiler
+fuses, strength-reduces and unrolls — but it is in the same unit as `perf stat -e instructions`,
+so `neant measure` can print the two side by side and the ratio means something (a hand `dot`
+predicts 6 per element and measures 4.5: gcc fused the multiply-add).
+
 | construct | work |
 |---|---|
-| literal, variable read, `&x` | 0 |
-| `a op b`, `-a`, `!a`, `x as T`, `.len()`, `println` | 1 + operands |
-| `x[i]` (read) | 1 + index |
-| `let`, `x = e` | 1 + value; `op=` counts 2 |
-| `x[i] = e` | 2 + index + value |
-| `for i in a..b { body }` | bounds, once; then `trip × (1 + body)` |
+| literal, variable read, `&x`, `.len()`, `let x = e` | 0 + e — a register |
+| `a op b`, `-a`, `!a`, `x as T` | 1 + operands |
+| `min(a, b)` | 2 + operands — compare, select |
+| `x[i]` (read) | 1 + index — a load; the index arithmetic is counted as written |
+| `x = e` | 0 + e; `x op= e` | 1 + e |
+| `x[i] = e` | 1 + index + e — a store; `x[i] op= e` | 3 — load, op, store |
+| `for i in a..b { body }` | bounds once; then `trip × (2 + body)` — increment, compare-and-branch |
+| `while c { body }` | `trip × (1 + c + body)` |
 | `if c { t } else { e }` | 1 + c + t + e — **both branches are charged**; an upper bound, tight when one is empty |
-| call | 1 + arguments + the callee's work |
-| `[e; n]` | n; `[a, b, c]` | 3 |
+| call | 2 + arguments + the callee's work — call and return |
+| `println` | 1, and the function is `io`; the library call behind it is not modelled |
+| `[e; n]`, `[e for x in xs]` | one store per element, plus the loop |
 
-Everything inside a loop is multiplied by the product of the enclosing trip counts.
+Everything inside a loop is multiplied by the product of the enclosing trip counts. A chain
+desugars to the same loop a hand-written one would be, so it costs the same.
 
 ## Moves
 
@@ -251,10 +260,10 @@ says so, because it is computed, not looked up. Tiling wins in both regimes.
 ## Reading a line
 
 ```
-matmul           work 10·n³ + 6·n² + n             moves B·n³ + 8·n³ + B·n²           exact
+matmul           work 10·n³ + 5·n² + 2·n           moves B·n³ + 8·n³ + B·n²           exact
                  lower bound      moves 8·n³/√M    (matrix product, Hong–Kung 1981)   gap 11585× at M = 2 MiB, B = 64
                  `b` moves by 8·n bytes per iteration of the innermost loop: a new line every time (line 7)
-                 tile by 256      work ≈ 10.05·n³  moves ≈ n³/8                        [--apply matmul:tile]
+                 tile by 256      work ≈ 10.0509·n³  moves ≈ n³/8                        [--apply matmul:tile]
 fib              unknown: calls `fib`, whose cost is unknown (recursive; recurrences are not solved yet) (line 3)
 ```
 

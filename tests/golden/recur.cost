@@ -1,6 +1,6 @@
-fact             work 5·n + 5                      moves 0                            recurrence
+fact             work 6·n + 6                      moves 0                            recurrence
 sum_from         work −7·i + 7·xs.len() + 7        moves −B·i + B·xs.len() + B        recurrence
-msum             work 24·hi − 24·lo                moves 2·B·hi − 2·B·lo              recurrence
-bsearch          work 16·log(hi − lo)              moves 2·B·log(hi − lo)             recurrence
+msum             work 26·hi − 26·lo                moves 2·B·hi − 2·B·lo              recurrence
+bsearch          work 17·log(hi − lo)              moves 2·B·log(hi − lo)             recurrence
 fib              unknown: 2 recursive calls each shrinking `n` by a constant: exponential (line 28)
 main             unknown: calls `fib`, whose cost is unknown (2 recursive calls each shrinking `n` by a constant: exponential) (line 40), io

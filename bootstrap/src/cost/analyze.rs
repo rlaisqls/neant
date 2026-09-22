@@ -2,7 +2,8 @@
 //! The rules are specified in docs/cost-model.md; this file is their implementation and the
 //! comments here say which rule each piece is.
 //!
-//! Work counts primitive operations. Moves counts bytes crossing the cache boundary in the
+//! Work approximates the instructions the C compiler will emit: what lives in a register is
+//! free, every arithmetic, load, store and branch is one. Moves counts bytes crossing the cache boundary in the
 //! I/O model: for each array access inside a loop nest, the number of distinct cache lines it
 //! touches is computed level by level from the innermost loop outward, and a level reuses
 //! lines only when the working set of the levels inside it is known to fit in `M`.
@@ -631,7 +632,6 @@ impl<'a, 'b, 'c> Fa<'a, 'b, 'c> {
         match s {
             Stmt::Let(id, e) => {
                 self.expr(e)?;
-                self.add_work_n(1);
                 let l = &self.f.locals[*id];
                 if l.ty.is_arrayish() {
                     let src = match &e.kind { ExprKind::Ref(s, _) | ExprKind::Local(s) => Some(*s), _ => None };
@@ -655,7 +655,7 @@ impl<'a, 'b, 'c> Fa<'a, 'b, 'c> {
                 self.local_size.insert(*id, size.clone());
                 self.loop_recs.push(LoopRec { var: Some(*var), trip: size.clone() });
                 self.loops.push(Loop { id: self.loop_recs.len() - 1, var: Some(*var), trip: size.clone(), start: Poly::zero(), end: size, offset: Some(Affine::constant(Poly::zero())) });
-                self.add_work_n(2);
+                self.add_work_n(3); // store, increment, compare-and-branch
                 let r = self.block(body);
                 self.loops.pop();
                 r
@@ -689,11 +689,15 @@ impl<'a, 'b, 'c> Fa<'a, 'b, 'c> {
                         match self.size_of(e, Dir::Upper) { Some(p) if self.loops.is_empty() => { self.initial.insert(*v, p); } _ => { self.initial.remove(v); } }
                     }
                 } else if let LValue::Var(v) = lv { self.initial.remove(v); }
-                self.add_work_n(if op.is_some() { 2 } else { 1 });
-                if let LValue::Index(arr, idx, _) = lv {
-                    self.expr(idx)?;
-                    self.add_work_n(1);
-                    self.access(*arr, idx);
+                match lv {
+                    // a register: only the operation of `op=` costs
+                    LValue::Var(_) => self.add_work_n(if op.is_some() { 1 } else { 0 }),
+                    // a store, and for `op=` a load and the operation as well
+                    LValue::Index(arr, idx, _) => {
+                        self.expr(idx)?;
+                        self.add_work_n(if op.is_some() { 3 } else { 1 });
+                        self.access(*arr, idx);
+                    }
                 }
                 Ok(())
             }
@@ -717,7 +721,7 @@ impl<'a, 'b, 'c> Fa<'a, 'b, 'c> {
                 if let Some(c) = trip.as_const() { if c.n < 0 { trip = Poly::zero(); } }
                 self.loop_recs.push(LoopRec { var: Some(*var), trip: trip.clone() });
                 self.loops.push(Loop { id: self.loop_recs.len() - 1, var: Some(*var), trip, start: lo, end: hi, offset: a_lo });
-                self.add_work_n(1); // increment and compare, per iteration
+                self.add_work_n(2); // increment, compare-and-branch, per iteration
                 let r = self.block(body);
                 self.loops.pop();
                 r
@@ -791,8 +795,9 @@ impl<'a, 'b, 'c> Fa<'a, 'b, 'c> {
     fn expr(&mut self, e: &Expr) -> Result<(), Fail> {
         match &e.kind {
             ExprKind::Int(_) | ExprKind::Float(_) | ExprKind::Bool(_) | ExprKind::Byte(_) | ExprKind::Local(_) | ExprKind::Ref(..) => Ok(()),
-            ExprKind::Len(_) => { self.add_work_n(1); Ok(()) }
-            ExprKind::Binary(_, a, b) | ExprKind::MinMax(_, a, b) => { self.expr(a)?; self.expr(b)?; self.add_work_n(1); Ok(()) }
+            ExprKind::Len(_) => Ok(()), // the length is already in a register
+            ExprKind::Binary(_, a, b) => { self.expr(a)?; self.expr(b)?; self.add_work_n(1); Ok(()) }
+            ExprKind::MinMax(_, a, b) => { self.expr(a)?; self.expr(b)?; self.add_work_n(2); Ok(()) } // compare, select
             ExprKind::Unary(_, a) | ExprKind::Cast(a, _) => { self.expr(a)?; self.add_work_n(1); Ok(()) }
             ExprKind::Println(a) => { self.expr(a)?; self.add_work_n(1); self.io = true; Ok(()) }
             ExprKind::Index(arr, idx) => {
@@ -821,7 +826,7 @@ impl<'a, 'b, 'c> Fa<'a, 'b, 'c> {
             ExprKind::Block(b) => self.block(b),
             ExprKind::Call(fid, args) => {
                 for a in args { self.expr(a)?; }
-                self.add_work_n(1);
+                self.add_work_n(2); // call and return; arguments are register moves
                 if Some(*fid) == self.self_fid {
                     let cf = &self.an.m.funcs[*fid];
                     let sizes: Vec<Option<Poly>> = args.iter().zip(&cf.params).map(|(a, &p)| {
