@@ -54,9 +54,12 @@ const EXACT: usize = 72;
 ///
 /// Nested loops settle here too, since `settle_moves` (design §18): `matmul`, `stencil` and `tri`'s
 /// `pairs` and the `main`s that call them, whose regimes are compared piece by piece including the
-/// order the report lists them in. The three still declined are the `main`s whose callee leaves a
-/// per-field footprint resident under SoA where this slice tracks one per array.
-const EXACT_MOVES: usize = 70;
+/// order the report lists them in.
+///
+/// **Nothing is declined.** Every `moves` column either matches or is one of the four in
+/// `COPIES_INSTEAD` — a footprint is a range now, so a callee that reads two fields of a four-field
+/// particle leaves half the array resident and the next call over the other half pays in full.
+const EXACT_MOVES: usize = 72;
 
 
 

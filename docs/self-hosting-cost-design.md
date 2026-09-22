@@ -1029,3 +1029,69 @@ it never read. A test that skips what it cannot parse fails open.
 The three SoA per-field residency `main`s — `arrayview`, `particles`, `structs` — where a callee
 leaves a footprint per *field* resident and this slice tracks one per array. Unrelated to nested
 loops, and the next thing.
+
+## 20. A footprint is a range, and `moves` has no declines left
+
+**`moves` is 72 columns exact and declines nothing.** The four that still differ are the
+`COPIES_INSTEAD` group, where the emitter copies a whole-array assignment the Rust proves is in
+place — a divergence of the *code*, not of the calculus, and the only one recorded since the start.
+Every column in the corpus is now either reproduced exactly or differs for that one stated reason.
+
+What closed the last three — the `main`s of `arrayview`, `particles` and `structs` — was one line
+being deleted:
+
+```rust
+if ffoot[si * 16 + p] != 0 && is_soa(types, slay, t) { wst[1] = 1; };
+```
+
+The cost pass declined outright whenever a callee touched a struct array the module had laid out as
+SoA. It had to, because a footprint here was **the whole array or nothing**: a byte count, matched
+to a resident set by array name. Under SoA that is wrong in the expensive direction. `kinetic` reads
+`vx` and `vy` of a four-field particle and touches half the array; crediting a later call over the
+other half against it would report traffic that does not happen.
+
+### The model that replaces it
+
+The one `analyze.rs` already had, and the one the layout design already described without building:
+**the field arrays are laid end to end**, so a field's base is the size of the fields before it, two
+fields' ranges are disjoint by construction, and footprint, residue and overlap are all ranges with
+no special case for SoA anywhere. A parameter's footprint becomes `[lo, hi)` in bytes per element,
+scaled by the argument's length at the call:
+
+```
+kinetic     ps: [16·ps.len(), 32·ps.len())    vx and vy
+centroid_x  ps: [0, 8·ps.len())               x
+sum_all     ps: [0, 24·ps.len())              all three fields of a Point
+tagged      cs: [0, 9·cs.len())               an i64 and a u8, 9 bytes per element and no padding
+```
+
+and a credit is the **smaller of two ranges, and only when one contains the other**. Two ranges that
+merely overlap say nothing this slice can use. That is what makes `centroid_x` pay in full after
+`kinetic`: `[0, 8·n)` and `[16·n, 32·n)` are disjoint, so nothing carries over.
+
+### The rule that is order-dependent, and is meant to be
+
+Merging several sites' ranges into one parameter's accepts two cases — the same range twice, or two
+ranges where one lies entirely after the other, which becomes the span. Anything else falls back to
+the whole array and is **not exact**, and an inexact footprint forfeits the residue for the whole
+call.
+
+`particles`' `step` is the case that makes this visible. It touches all four fields, so its range is
+the whole array either way — but it meets them in source order as `vx, x, vy, y`, that is fields
+2, 0, 3, 1. By the time field 1 arrives the span is already `[0, 32·n)`, which is neither equal to
+`[8·n, 16·n)` nor disjoint from it, so the merge fails and `step` claims no residue. `analyze.rs`
+prints exactly that: `ps: [0, 32·ps.len()) (whole array)   no residue claimed`.
+
+It would have been easy to "fix" this by testing containment as well, and the answer would then have
+stopped matching. The rule is conservative in the safe direction — it can only *refuse* to credit —
+and reproducing it mattered more than improving it.
+
+### What is approximated, stated plainly
+
+A site's range here is its **field's whole array**, where `analyze.rs` computes the range the index
+actually reaches from the affine form and the loop bounds. On this corpus every walk is
+`for i in 0..xs.len()` and the two agree, and the pre-existing AoS path made the same assumption
+before this change. A function that walked half an array would have its footprint overstated and its
+caller over-credited. That is the next thing this would need if the corpus grew a partial walk, and
+it is `site_range` in `analyze.rs` — which is now within reach, since the settle pass already records
+each site's coefficient against every enclosing loop and each loop's first and last value.

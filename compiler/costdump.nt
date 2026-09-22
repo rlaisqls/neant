@@ -37,14 +37,14 @@ fn main() {
     let mut lpes = [Lpe { cnd: 0, n_cnd: 0, lines: 0, contig: 0 }; 65536];
     let mut sc = [0; 40960];
     let mut wst = [0; 4096];
-    let mut sites = [Site { arr: 0, idx: 0, inloop: 0, coef: 0, stride: 0, bad: 0, trip: 0, branch: 0, novar: 0, field: -1, p0: -1, p1: -1, p2: -1, c0: 0, c1: 0, c2: 0, b0: 0, b1: 0, b2: 0, alen: -1, es: 0 }; 4096];
+    let mut sites = [Site { arr: 0, idx: 0, inloop: 0, coef: 0, stride: 0, bad: 0, trip: 0, branch: 0, novar: 0, field: -1, p0: -1, p1: -1, p2: -1, c0: 0, c1: 0, c2: 0, b0: 0, b1: 0, b2: 0, alen: -1, es: 0, base: 0 }; 4096];
     let mut fm = [-1; 4096];
     let mut cks = [Ck { pce: 0, n_pce: 0 }; 262144];
     let mut cnds = [Cnd { ws: 0, fits: 0 }; 262144];
     let mut pcs = [Pce { cnd: 0, n_cnd: 0, poly: 0 }; 262144];
     let mut subst = [-1; 64];
-    let mut ffoot = [0; 65536];
-    let mut resid = [Res { root: 0, foot: 0 }; 128];
+    let mut ffoot = [0; 262144];
+    let mut resid = [Res { root: 0, lo: 0, hi: 0 }; 128];
     let mut slay = [0; 1024];
     let mut cof = [Cof { name: 0, c: 0 }; 256];
     let mut rargs = [-1; 64];

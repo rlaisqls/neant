@@ -592,7 +592,7 @@ fn walks_anything(ffoot: &[i64], sigs: &[Sig], si: i64) -> bool {
     let mut p = 0;
     let mut any = false;
     while p < sigs[si].n_params {
-        if ffoot[si * 16 + p] != 0 { any = true; }
+        if ffoot[(si * 16 + p) * 4] != 0 { any = true; }
         p += 1;
     }
     any
@@ -1286,11 +1286,18 @@ fn display_before(facs: &[Fac], terms: &[Term], a: i64, b: i64) -> bool {
 //   3. It is **conditional**: the callee leaves its footprint resident only if that fits in `M`,
 //      so every credit carries that condition and is decided, here, at this machine's `M`.
 //
-// A footprint is the whole array or nothing, and the flags say which array parameters a callee
-// walks: `ffoot[si · 16 + p]`. A flat array rather than a bit mask because the language has no
-// bitwise operators — `|` is only ever `||` here.
+// A footprint is a **range** in an array parameter, `[lo, hi)` in bytes, recorded per element so
+// that the caller can scale it by the argument's own length: `ffoot[(si · 16 + p) · 4]` is the walk
+// flag, `+ 1` and `+ 2` the range's ends per element, and `+ 3` whether the range is exact. Four
+// flat slots rather than a packed word because the language has no bitwise operators — `|` is only
+// ever `||` here.
+//
+// Under AoS a walked parameter's range is the whole element, `[0, es)`, and the range says nothing
+// the flag did not. Under SoA it is the fields the callee actually touches: `kinetic` reads `vx` and
+// `vy` of a four-field particle and its footprint is `[16·ps.len(), 32·ps.len())`, half the array,
+// which is what makes a later call over the other half pay in full.
 
-struct Res { root: i64, foot: i64 }
+struct Res { root: i64, lo: i64, hi: i64 }
 
 fn foot_flags(src: &[u8], toks: &[Token], nodes: &[Node], sites: &[Site], ffoot: &mut [i64],
               wst: &[i64], f: i64, si: i64) {
@@ -1302,6 +1309,11 @@ fn foot_flags(src: &[u8], toks: &[Token], nodes: &[Node], sites: &[Site], ffoot:
         // call leaves **nothing** resident. `ring.nt`'s `push_all` writes `buf[head]` and is
         // exactly this case.
         let mut walks = 0;
+        let mut lo = 0;
+        let mut hi = 0;
+        let mut whole = 0;
+        let mut have = false;
+        let mut exact = 1;
         let mut k = 0;
         while k < wst[10] {
             if name_eq(src, toks, sites[k].arr, nodes[p].a) {
@@ -1311,12 +1323,41 @@ fn foot_flags(src: &[u8], toks: &[Token], nodes: &[Node], sites: &[Site], ffoot:
                 // exact. `analyze.rs` reaches the same verdict for `stencil`'s `src` and says so:
                 // "no residue claimed".
                 if sites[k].bad != 0 || sites[k].b0 != 0 || sites[k].b1 != 0 || sites[k].b2 != 0
-                    || sites[k].coef == 0 && sites[k].novar != 0 { walks = 2; }
-                else if walks == 0 { walks = 1; }
+                    || sites[k].coef == 0 && sites[k].novar != 0 {
+                    walks = 2;
+                    exact = 0;
+                } else if walks == 0 { walks = 1; };
+                if sites[k].es > whole { whole = sites[k].es; };
+                // **The site's range, merged into the parameter's.** Two ranges on one parameter
+                // are one when they are the same, and the span from the first to the last when they
+                // are disjoint; anything else falls back to the whole array and is not exact. The
+                // rule is order-dependent, and deliberately so — `particles`' `step` touches all
+                // four fields but meets them as 2, 0, 3, 1, so by the time field 1 arrives the span
+                // already covers it without being disjoint from it, and `step` claims no residue.
+                let slo = sites[k].base;
+                let shi = sites[k].base + sites[k].stride;
+                if !have {
+                    lo = slo;
+                    hi = shi;
+                    have = true;
+                } else if exact == 1 && slo == lo && shi == hi {
+                } else if exact == 1 && (slo >= hi || lo >= shi) {
+                    if slo < lo { lo = slo; };
+                    if shi > hi { hi = shi; };
+                } else {
+                    exact = 0;
+                };
             }
             k += 1;
         }
-        ffoot[si * 16 + i] = walks;
+        if exact == 0 || !have {
+            lo = 0;
+            hi = whole;
+        };
+        ffoot[(si * 16 + i) * 4] = walks;
+        ffoot[(si * 16 + i) * 4 + 1] = lo;
+        ffoot[(si * 16 + i) * 4 + 2] = hi;
+        ffoot[(si * 16 + i) * 4 + 3] = exact;
         i += 1;
         p = nodes[p].next;
     }
@@ -1791,7 +1832,7 @@ fn ck_max(facs: &[Fac], terms: &mut [Term], pols: &mut [Pol], pst: &mut [i64], b
 // the region rule needs the footprint of an array whose binding is out of scope by settle time.
 struct Site { arr: i64, idx: i64, inloop: i64, coef: i64, stride: i64, bad: i64, trip: i64, branch: i64,
              novar: i64, field: i64, p0: i64, p1: i64, p2: i64,
-             c0: i64, c1: i64, c2: i64, b0: i64, b1: i64, b2: i64, alen: i64, es: i64 }
+             c0: i64, c1: i64, c2: i64, b0: i64, b1: i64, b2: i64, alen: i64, es: i64, base: i64 }
 
 // the id of the loop this site sits in at depth `d`, or −1
 fn site_lp(sites: &[Site], s: i64, d: i64) -> i64 {
@@ -1993,6 +2034,25 @@ fn is_soa(types: &[Ty], slay: &[i64], t: i64) -> bool {
     slay[types[e].elem] == 1
 }
 
+// **Where a field's own array starts, per element.** Under SoA the field arrays are modelled as
+// laid end to end, so a field's base is the size of the fields before it — which makes two fields'
+// ranges disjoint and lets footprint, residue and overlap be stated as ranges with no special case.
+// `Site.base` in `analyze.rs`. Zero under AoS, where a site's range is the element's.
+fn field_base(src: &[u8], toks: &[Token], types: &[Ty], strs: &[Str], flds: &[Fld], t: i64,
+              fld: i64) -> i64 {
+    let e = types[t].elem;
+    if e < 0 || types[e].kind != 7 { return 0; }
+    let si = types[e].elem;
+    let mut i = 0;
+    let mut off = 0;
+    while i < strs[si].n_fields {
+        if name_eq(src, toks, flds[strs[si].fields + i].name, fld) { return off; }
+        off += scalar_bytes(types, strs, flds, flds[strs[si].fields + i].ty);
+        i += 1;
+    }
+    0
+}
+
 // the bytes one field of this array's struct element occupies, or −1
 fn field_bytes(src: &[u8], toks: &[Token], types: &[Ty], strs: &[Str], flds: &[Fld], t: i64,
                fld: i64) -> i64 {
@@ -2117,6 +2177,7 @@ fn site_add(src: &[u8], toks: &[Token], nodes: &[Node], types: &[Ty], strs: &[St
     sites[s].p1 = if wst[11] > 1 { wst[43] } else { -1 };
     sites[s].p2 = if wst[11] > 2 { wst[44] } else { -1 };
     sites[s].es = es;
+    sites[s].base = if soa && sfld >= 0 { field_base(src, toks, types, strs, flds, t, sfld) } else { 0 };
     sites[s].alen = arg_len(src, toks, nodes, env, wst, arr);
     // The coefficient against every enclosing loop, taken here because `idx_coef` asks whether a
     // variable is assigned in the body it stands in. A loop *inside* `d` chains into `d`'s stride
@@ -2740,33 +2801,53 @@ fn call_moves(src: &[u8], toks: &[Token], nodes: &[Node], types: &[Ty], strs: &[
         let len = if v >= 0 { v } else { arg_len(src, toks, nodes, env, wst, inner) };
         subst[p] = len;
         let t = ptys[sigs[si].params + p];
-        if ffoot[si * 16 + p] != 0 && is_soa(types, slay, t) { wst[1] = 1; };
-        if ffoot[si * 16 + p] == 2 { wst[27] = 1; };
-        if ffoot[si * 16 + p] == 1 && t >= 0 && inner >= 0 && nodes[inner].kind == 65 {
-            let es = elem_bytes(types, strs, flds, t);
+        // a walked parameter whose range is not exact forfeits the residue for the whole call, as
+        // `signature_footprint`'s `all_exact` does
+        if ffoot[(si * 16 + p) * 4] != 0 && ffoot[(si * 16 + p) * 4 + 3] == 0 { wst[27] = 1; };
+        if ffoot[(si * 16 + p) * 4] == 1 && ffoot[(si * 16 + p) * 4 + 3] == 1
+            && t >= 0 && inner >= 0 && nodes[inner].kind == 65 {
             let al = arg_len(src, toks, nodes, env, wst, inner);
-            if es < 0 || al < 0 {
+            if al < 0 {
                 wst[1] = 1;
             } else {
                 resid[64 + newn].root = env_root(src, toks, env, wst, nodes[inner].a);
-                resid[64 + newn].foot = pol_scale(facs, terms, pols, pst, al, es, 1);
+                resid[64 + newn].lo = pol_scale(facs, terms, pols, pst, al,
+                                                ffoot[(si * 16 + p) * 4 + 1], 1);
+                resid[64 + newn].hi = pol_scale(facs, terms, pols, pst, al,
+                                                ffoot[(si * 16 + p) * 4 + 2], 1);
                 newn += 1;
             }
         }
         if a >= 0 { a = nodes[a].next; };
         p += 1;
     }
-    // every footprint against every resident range
+    // every footprint against every resident range: what is credited is **the smaller of the two**,
+    // and only when one contains the other. Two ranges that merely overlap say nothing this slice
+    // can use, which is `analyze.rs`'s rule exactly — and it is what makes `particles`' `centroid_x`
+    // pay in full after `kinetic`, since `[0, 8·n)` and `[16·n, 32·n)` are disjoint.
     let mut i = 0;
     while i < newn {
         let mut r = 0;
         while r < wst[26] {
             if name_eq(src, toks, resid[r].root, resid[64 + i].root) {
-                let bytes = pol_as_int(facs, terms, pols, pst, resid[r].foot);
-                if pst[4] == 0 {
-                    wst[1] = 1;
-                } else if bytes < 2097152 {
-                    credit = pol_add(facs, terms, pols, pst, credit, resid[r].foot);
+                let f_in_r = pol_dominates(facs, terms, pols, pst, budget, resid[64 + i].lo, resid[r].lo)
+                    && pol_dominates(facs, terms, pols, pst, budget, resid[r].hi, resid[64 + i].hi);
+                let r_in_f = pol_dominates(facs, terms, pols, pst, budget, resid[r].lo, resid[64 + i].lo)
+                    && pol_dominates(facs, terms, pols, pst, budget, resid[64 + i].hi, resid[r].hi);
+                let mut over = 0 - 1;
+                if f_in_r {
+                    over = pol_sub(facs, terms, pols, pst, resid[64 + i].hi, resid[64 + i].lo);
+                } else if r_in_f {
+                    over = pol_sub(facs, terms, pols, pst, resid[r].hi, resid[r].lo);
+                };
+                if over >= 0 {
+                    let span = pol_sub(facs, terms, pols, pst, resid[r].hi, resid[r].lo);
+                    let bytes = pol_as_int(facs, terms, pols, pst, span);
+                    if pst[4] == 0 {
+                        wst[1] = 1;
+                    } else if bytes < 2097152 {
+                        credit = pol_add(facs, terms, pols, pst, credit, over);
+                    }
                 }
             }
             r += 1;
@@ -2777,7 +2858,8 @@ fn call_moves(src: &[u8], toks: &[Token], nodes: &[Node], types: &[Ty], strs: &[
     let mut k = 0;
     while k < newn {
         resid[k].root = resid[64 + k].root;
-        resid[k].foot = resid[64 + k].foot;
+        resid[k].lo = resid[64 + k].lo;
+        resid[k].hi = resid[64 + k].hi;
         k += 1;
     }
     wst[26] = newn;
@@ -3118,16 +3200,16 @@ fn choose_layouts(src: &[u8], toks: &[Token], nodes: &[Node], types: &[Ty], strs
     let mut pst = [0, 0, 0, 0, 0, 0, 0, 0];
     let mut env = [Env { name: 0, val: 0, len: 0, root: 0 }; 4096];
     let mut cof = [Cof { name: 0, c: 0 }; 256];
-    let mut sites = [Site { arr: 0, idx: 0, inloop: 0, coef: 0, stride: 0, bad: 0, trip: 0, branch: 0, novar: 0, field: -1, p0: -1, p1: -1, p2: -1, c0: 0, c1: 0, c2: 0, b0: 0, b1: 0, b2: 0, alen: -1, es: 0 }; 4096];
+    let mut sites = [Site { arr: 0, idx: 0, inloop: 0, coef: 0, stride: 0, bad: 0, trip: 0, branch: 0, novar: 0, field: -1, p0: -1, p1: -1, p2: -1, c0: 0, c1: 0, c2: 0, b0: 0, b1: 0, b2: 0, alen: -1, es: 0, base: 0 }; 4096];
     let mut cks = [Ck { pce: 0, n_pce: 0 }; 262144];
     let mut cnds = [Cnd { ws: 0, fits: 0 }; 262144];
     let mut pcs = [Pce { cnd: 0, n_cnd: 0, poly: 0 }; 262144];
     let mut subst = [-1; 64];
     let mut budget = [0.0; 4096];
-    let mut resid = [Res { root: 0, foot: 0 }; 128];
+    let mut resid = [Res { root: 0, lo: 0, hi: 0 }; 128];
     let mut rargs = [-1; 64];
     let mut scratch = [0; 64];
-    let mut ffoot = [0; 65536];
+    let mut ffoot = [0; 262144];
     let mut fm = [-1; 4096];
     let mut lpes = [Lpe { cnd: 0, n_cnd: 0, lines: 0, contig: 0 }; 65536];
     let mut sc = [0; 40960];
