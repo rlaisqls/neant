@@ -12,6 +12,8 @@ use std::collections::{BTreeMap, HashMap};
 use crate::ast::BinOp;
 use crate::ir::*;
 
+use super::bounds::{self, Bound};
+use super::rewrite;
 use super::size::{Atom, Poly, Rat};
 
 #[derive(Debug, Clone, Copy)]
@@ -35,6 +37,20 @@ pub struct FuncCost {
     /// in order, so a caller can substitute by position.
     pub names: Vec<String>,
     pub result: CostResult,
+    /// Lower bounds the catalogue recognised in this function's body.
+    pub bounds: Vec<Bound>,
+    /// What the bound's operands do in the innermost loop, when it is worth saying.
+    pub notes: Vec<String>,
+    /// Rewrites that were tried on this function, with what they cost.
+    pub suggestions: Vec<Suggestion>,
+}
+
+#[derive(Debug, Clone)]
+pub struct Suggestion {
+    pub label: String,
+    /// The `--apply` spec that performs it.
+    pub flag: String,
+    pub result: CostResult,
 }
 
 pub fn analyze(m: &Module, machine: &Machine) -> Vec<FuncCost> {
@@ -42,7 +58,41 @@ pub fn analyze(m: &Module, machine: &Machine) -> Vec<FuncCost> {
     for i in 0..m.funcs.len() {
         an.func(i);
     }
+    // a function with a recognised bound gets each rewrite tried on it and costed
+    for i in 0..m.funcs.len() {
+        if an.done[i].as_ref().is_some_and(|c| c.bounds.is_empty()) { continue; }
+        let f = &m.funcs[i];
+        let t = rewrite::tile_side(machine.m_bytes, 8);
+        let mut sugg = Vec::new();
+        if let Some(g) = rewrite::tile(f, t) {
+            let r = Fa::new(&mut an, &g, None, vec![]).run().result;
+            sugg.push(Suggestion { label: format!("tile by {t}"), flag: format!("{}:tile", f.name), result: r });
+        }
+        if let Some(g) = rewrite::transpose(f) {
+            let r = Fa::new(&mut an, &g, None, vec![]).run().result;
+            sugg.push(Suggestion { label: "transpose the column operand".into(), flag: format!("{}:transpose", f.name), result: r });
+        }
+        an.done[i].as_mut().unwrap().suggestions = sugg;
+    }
     an.done.into_iter().map(|c| c.unwrap()).collect()
+}
+
+/// Apply `--apply` specs (`name:tile`, `name:transpose`) to a module before anything else sees it.
+pub fn apply_rewrites(m: &mut Module, specs: &[String], machine: &Machine) -> Result<(), String> {
+    for spec in specs {
+        let Some((name, what)) = spec.split_once(':') else { return Err(format!("--apply takes `function:tile` or `function:transpose`, not `{spec}`")) };
+        let Some(i) = m.funcs.iter().position(|f| f.name == name) else { return Err(format!("--apply: no function `{name}`")) };
+        let g = match what {
+            "tile" => rewrite::tile(&m.funcs[i], rewrite::tile_side(machine.m_bytes, 8)),
+            "transpose" => rewrite::transpose(&m.funcs[i]),
+            other => return Err(format!("--apply: unknown rewrite `{other}`")),
+        };
+        match g {
+            Some(g) => m.funcs[i] = g,
+            None => return Err(format!("--apply: `{name}` does not have the shape `{what}` applies to (a product with `let mut acc = 0` over the inner loop)")),
+        }
+    }
+    Ok(())
 }
 
 struct Analyzer<'a> {
@@ -62,6 +112,7 @@ impl<'a> Analyzer<'a> {
                     name: f.name.clone(),
                     names: param_names(f),
                     result: CostResult::Unknown { reason: "recursive; recurrences are not solved yet".into(), line: f.line },
+                    bounds: vec![], notes: vec![], suggestions: vec![],
                 });
             } else {
                 self.active[fid] = true;
@@ -111,7 +162,7 @@ impl Affine {
 }
 
 #[derive(Clone, Copy, PartialEq)]
-enum Bound { Upper, Lower }
+enum Dir { Upper, Lower }
 
 struct Loop {
     id: usize,
@@ -146,12 +197,14 @@ struct LoopRec {
     trip: Poly,
 }
 
-struct Fa<'a, 'b> {
+struct Fa<'a, 'b, 'c> {
     an: &'b mut Analyzer<'a>,
-    f: &'a Func,
+    f: &'c Func,
     names: Vec<String>,
     sites: Vec<Site>,
     loop_recs: Vec<LoopRec>,
+    bounds: Vec<Bound>,
+    notes: Vec<String>,
     /// size in elements of every array/slice local
     local_size: HashMap<LocalId, Poly>,
     /// value of every immutable i64 local that is an affine expression
@@ -161,12 +214,12 @@ struct Fa<'a, 'b> {
     moves: Poly,
 }
 
-impl<'a, 'b> Fa<'a, 'b> {
+impl<'a, 'b, 'c> Fa<'a, 'b, 'c> {
     /// With `bindings`, the function is analysed for one call site: each parameter's size is
     /// the caller's polynomial rather than the parameter's own atom, so every fit and stride
     /// decision inside is made with the caller's numbers. The result is then already in the
     /// caller's atom space.
-    fn new(an: &'b mut Analyzer<'a>, f: &'a Func, bindings: Option<&[Poly]>, inherited: Vec<Loop>) -> Self {
+    fn new(an: &'b mut Analyzer<'a>, f: &'c Func, bindings: Option<&[Poly]>, inherited: Vec<Loop>) -> Self {
         let mut loop_recs = Vec::new();
         let mut loops = Vec::new();
         for l in inherited {
@@ -174,7 +227,7 @@ impl<'a, 'b> Fa<'a, 'b> {
             loops.push(Loop { id: loop_recs.len() - 1, ..l });
         }
         let mut fa = Fa {
-            an, f, names: param_names(f), sites: vec![], loop_recs,
+            an, f, names: param_names(f), sites: vec![], loop_recs, bounds: vec![], notes: vec![],
             local_size: HashMap::new(), local_affine: HashMap::new(),
             loops, work: Poly::zero(), moves: Poly::zero(),
         };
@@ -198,7 +251,7 @@ impl<'a, 'b> Fa<'a, 'b> {
             }
             Err(Fail::Unknown(reason, line)) => CostResult::Unknown { reason, line },
         };
-        FuncCost { name: self.f.name.clone(), names: self.names, result }
+        FuncCost { name: self.f.name.clone(), names: self.names, result, bounds: self.bounds, notes: self.notes, suggestions: vec![] }
     }
 
     fn machine(&self) -> Machine { self.an.machine }
@@ -231,13 +284,13 @@ impl<'a, 'b> Fa<'a, 'b> {
     /// lets bound to such, and `+ - *` of them. A loop variable is replaced by the bound of its
     /// range that maximises the result (`Upper`) or minimises it (`Lower`), so a triangular
     /// loop is bounded by its rectangular hull.
-    fn size_of(&self, e: &Expr, bound: Bound) -> Option<Poly> {
-        let flip = |b: Bound| if b == Bound::Upper { Bound::Lower } else { Bound::Upper };
+    fn size_of(&self, e: &Expr, bound: Dir) -> Option<Poly> {
+        let flip = |b: Dir| if b == Dir::Upper { Dir::Lower } else { Dir::Upper };
         match &e.kind {
             ExprKind::Int(v) => Some(Poly::constant(*v as i128)),
             ExprKind::Local(l) => {
                 if let Some(lp) = self.loops.iter().find(|lp| lp.var == Some(*l)) {
-                    return Some(if bound == Bound::Upper { lp.end.clone() } else { lp.start.clone() });
+                    return Some(if bound == Dir::Upper { lp.end.clone() } else { lp.start.clone() });
                 }
                 let a = self.local_affine.get(l)?;
                 if !a.is_const() { return None; }
@@ -246,8 +299,8 @@ impl<'a, 'b> Fa<'a, 'b> {
             ExprKind::Len(l) => self.local_size.get(l).cloned(),
             ExprKind::Cast(inner, Ty::I64) => self.size_of(inner, bound),
             // min is bounded above by either argument, max below by either: the first that is a size
-            ExprKind::MinMax(true, a, b) if bound == Bound::Upper => self.size_of(a, bound).or_else(|| self.size_of(b, bound)),
-            ExprKind::MinMax(false, a, b) if bound == Bound::Lower => self.size_of(a, bound).or_else(|| self.size_of(b, bound)),
+            ExprKind::MinMax(true, a, b) if bound == Dir::Upper => self.size_of(a, bound).or_else(|| self.size_of(b, bound)),
+            ExprKind::MinMax(false, a, b) if bound == Dir::Lower => self.size_of(a, bound).or_else(|| self.size_of(b, bound)),
             ExprKind::Binary(BinOp::Add, a, b) => Some(self.size_of(a, bound)?.add(&self.size_of(b, bound)?)),
             ExprKind::Binary(BinOp::Sub, a, b) => Some(self.size_of(a, bound)?.sub(&self.size_of(b, flip(bound))?)),
             ExprKind::Binary(BinOp::Mul, a, b) => {
@@ -387,6 +440,36 @@ impl<'a, 'b> Fa<'a, 'b> {
         self.moves = self.moves.add(&total.mul_atom_pow(Atom::B, Rat::int(1)));
     }
 
+    /// The catalogue, entry one: is this statement a multiply-accumulate whose two indices form
+    /// a contraction over the enclosing loops? Then the Hong–Kung bound applies to the whole nest.
+    fn recognise(&mut self, s: &Stmt) {
+        let Some(mac) = bounds::as_mac(s) else { return };
+        let (Some(aa), Some(ab)) = (self.affine(mac.ia), self.affine(mac.ib)) else { return };
+        let va: Vec<LocalId> = aa.coeffs.keys().copied().collect();
+        let vb: Vec<LocalId> = ab.coeffs.keys().copied().collect();
+        if !bounds::is_contraction(&va, &vb) { return; }
+        let es = self.elem_bytes(mac.a);
+        let n = self.outer();
+        let nest: Vec<LocalId> = self.loops.iter().filter_map(|l| l.var).collect();
+        self.bounds.push(Bound {
+            kind: "matrix product", citation: "Hong–Kung 1981",
+            moves: bounds::matmul_bound(&n, es), line: mac.line, operands: [mac.a, mac.b], nest,
+        });
+        // what each operand does in the innermost loop
+        if let Some(inner) = self.loops.last().and_then(|l| l.var) {
+            let m = self.machine();
+            for (arr, aff) in [(mac.a, &aa), (mac.b, &ab)] {
+                let stride = aff.coeffs.get(&inner).cloned().unwrap_or_else(Poly::zero).scale(Rat::int(es));
+                let big = match self.numeric(&stride) { Some(v) => v.abs() >= m.b_bytes as f64, None => !stride.is_zero() };
+                if big {
+                    let nm = self.f.locals[arr].name.clone();
+                    let sd = stride.display(&self.names).to_string();
+                    self.notes.push(format!("`{nm}` moves by {sd} bytes per iteration of the innermost loop: a new line every time (line {})", mac.line));
+                }
+            }
+        }
+    }
+
     /// A sequential pass over `n` elements of `es` bytes, once per enclosing iteration.
     fn stream(&mut self, n: &Poly, es: i128) {
         let bytes = n.scale(Rat::int(es));
@@ -420,7 +503,7 @@ impl<'a, 'b> Fa<'a, 'b> {
             }
             Stmt::LetBuild { id, len, var, body } => {
                 self.expr(len)?;
-                let Some(size) = self.size_of(len, Bound::Upper) else {
+                let Some(size) = self.size_of(len, Dir::Upper) else {
                     return Err(Fail::Unknown(format!("the length of `{}` is not a size expression", self.f.locals[*id].name), len.line));
                 };
                 let es = self.elem_bytes(*id);
@@ -436,7 +519,7 @@ impl<'a, 'b> Fa<'a, 'b> {
             Stmt::LetRepeat(id, e, n) => {
                 self.expr(e)?;
                 self.expr(n)?;
-                let Some(size) = self.size_of(n, Bound::Upper) else {
+                let Some(size) = self.size_of(n, Dir::Upper) else {
                     return Err(Fail::Unknown(format!("the length of `{}` is not a size expression", self.f.locals[*id].name), n.line));
                 };
                 self.add_work(size.clone());
@@ -455,6 +538,7 @@ impl<'a, 'b> Fa<'a, 'b> {
                 Ok(())
             }
             Stmt::Assign(lv, op, e) => {
+                self.recognise(s);
                 self.expr(e)?;
                 self.add_work_n(if op.is_some() { 2 } else { 1 });
                 if let LValue::Index(arr, idx, _) = lv {
@@ -467,7 +551,7 @@ impl<'a, 'b> Fa<'a, 'b> {
             Stmt::For { var, start, end, body } => {
                 self.expr(start)?;
                 self.expr(end)?;
-                let (Some(lo), Some(hi)) = (self.size_of(start, Bound::Lower), self.size_of(end, Bound::Upper)) else {
+                let (Some(lo), Some(hi)) = (self.size_of(start, Dir::Lower), self.size_of(end, Dir::Upper)) else {
                     return Err(Fail::Unknown("loop bound is not a size expression".into(), start.line.max(end.line)));
                 };
                 // the trip count is exact when the outer loop variables cancel between the two
@@ -526,7 +610,7 @@ impl<'a, 'b> Fa<'a, 'b> {
                     if cf.locals[p].ty.is_arrayish() {
                         match &a.kind { ExprKind::Ref(s, _) | ExprKind::Local(s) => self.local_size.get(s).cloned(), _ => None }
                     } else if cf.locals[p].ty == Ty::I64 {
-                        self.size_of(a, Bound::Upper)
+                        self.size_of(a, Dir::Upper)
                     } else {
                         Some(Poly::zero()) // not a size; never read
                     }
@@ -545,6 +629,13 @@ impl<'a, 'b> Fa<'a, 'b> {
                     self.an.active[*fid] = true;
                     let fc = Fa::new(self.an, cf, Some(&b), inherited).run();
                     self.an.active[*fid] = false;
+                    let o = if inherits { Poly::constant(1) } else { self.outer() };
+                    for bd in fc.bounds {
+                        self.bounds.push(Bound { moves: bd.moves.mul(&o), ..bd });
+                    }
+                    for n in fc.notes {
+                        if !self.notes.contains(&n) { self.notes.push(format!("in `{}`: {n}", cf.name)); }
+                    }
                     let (w, mv) = match fc.result {
                         CostResult::Exact { work, moves } => (work, moves),
                         CostResult::Unknown { reason, .. } => {
@@ -554,7 +645,6 @@ impl<'a, 'b> Fa<'a, 'b> {
                         }
                     };
                     // an inherited context already multiplied the callee's cost by the trips
-                    let o = if inherits { Poly::constant(1) } else { self.outer() };
                     self.work = self.work.add(&w.mul(&o));
                     self.moves = self.moves.add(&mv.mul(&o));
                     return Ok(());
@@ -578,7 +668,7 @@ impl<'a, 'b> Fa<'a, 'b> {
                     let by = if cf.locals[p].ty.is_arrayish() {
                         match &a.kind { ExprKind::Ref(s, _) | ExprKind::Local(s) => self.local_size.get(s).cloned(), _ => None }
                     } else {
-                        self.size_of(a, Bound::Upper)
+                        self.size_of(a, Dir::Upper)
                     };
                     let Some(by) = by else {
                         return Err(Fail::Unknown(

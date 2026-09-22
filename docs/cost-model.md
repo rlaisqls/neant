@@ -123,11 +123,58 @@ measured number can come in under the prediction.
 - **Recursion.** A recursive function is *unknown* until recurrences are solved (M3).
 - **Branches** are summed, not maxed.
 
+## Lower bounds
+
+For some computations the catalogue knows what *any* program must move, and the report says how
+far the function is from it.
+
+**Entry one: the matrix product.** A statement `acc += A[ia] * B[ib]` — or `C[ic] += …` —
+inside a loop nest, whose two indices are affine in the loop variables, share at least one of
+them (the reduction) and each have one the other lacks, is a contraction. Whatever the loop
+order or tiling around it, the number of multiply-adds `N` is the product of the enclosing trip
+counts, and a cache of `M` bytes must move at least
+
+```
+8·N / √M   bytes          (Hong–Kung 1981, constant per Irony–Toledo–Tiskin, 8-byte elements)
+```
+
+The report prints the bound under the function's line, and the **gap** — the ratio of the
+function's leading moves term to the bound's, at the machine's `B` and `M` — when the size
+variables cancel, or the plain ratio when both are numbers. A specialised call hands its bounds
+up to the caller, scaled by how often it is called, so a concrete `main` gets a gap too.
+
+Under the bound, the report says what each operand does in the innermost loop when it moves by
+a whole line or more per iteration: that access is the one paying for the gap.
+
+## Rewrites
+
+A function with a recognised bound has two rewrites tried on it; each is costed by running the
+calculus on the rewritten IR, and the result is printed as a suggestion with the `--apply` flag
+that performs it. Nothing is applied silently. Both work on the naive shape the catalogue
+recognises — `for i { for j { let mut acc = 0; for k { acc += A·B } C = acc } }` — and are
+refused, with a sentence, on anything else.
+
+- **`name:tile`** — the three loops are split into tiles of side `T`, the largest power of two
+  with three `T×T` tiles of 8-byte elements strictly inside `M` (256 at 2 MiB). The tile loops
+  accumulate into `C` across the `kk` tiles, so `C` is cleared first; the result is the same
+  product. Tile edges use `min(ii·T + T, n)`, which the calculus reads as `T`.
+- **`name:transpose`** — the operand walked down a column (the one whose index carries the
+  innermost variable times a row length) is copied transposed before the nest, and the inner
+  loop reads the copy along a row. The copy costs a transpose and `8·nk·nj` bytes of memory.
+
+What the two buy is a matter of the regime. In the symbolic report, where nothing is assumed to
+fit, transposing turns `B·n³` into `8·n³` — a factor of `B/8`. In a concrete program where the
+column of `b` is a known number of lines that fits `M`, the naive walk already shares each line
+across eight consecutive `j` and the transpose buys nothing while costing a copy; the report
+says so, because it is computed, not looked up. Tiling wins in both regimes.
+
 ## Reading a line
 
 ```
-matmul           work 10·n³ + 6·n² + n             moves B·n³ + 8·n³ + 8·n²           exact
-main             work 5.760e+10                    moves 4.622e+10                    exact
+matmul           work 10·n³ + 6·n² + n             moves B·n³ + 8·n³ + B·n²           exact
+                 lower bound      moves 8·n³/√M    (matrix product, Hong–Kung 1981)   gap 11585× at M = 2 MiB, B = 64
+                 `b` moves by 8·n bytes per iteration of the innermost loop: a new line every time (line 7)
+                 tile by 256      work ≈ 10.05·n³  moves ≈ n³/8                        [--apply matmul:tile]
 fib              unknown: calls `fib`, whose cost is unknown (recursive; recurrences are not solved yet) (line 3)
 ```
 

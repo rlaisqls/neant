@@ -7,6 +7,7 @@
 //!   neant cost  f.nt [-M bytes] [-B bytes] [--eval n=..,..]
 //!                                             infer work and moves for every function
 //!   neant lock  f.nt [--check]                write costs.lock next to the source, or diff it
+//!   any command: --apply fn:tile[,fn:transpose]  rewrite a function first
 
 mod ast;
 mod cost;
@@ -34,6 +35,7 @@ fn main() {
     let mut machine = cost::Machine { m_bytes: 2 << 20, b_bytes: 64 };
     let mut eval: Option<String> = None;
     let mut lock_check = false;
+    let mut applies: Vec<String> = Vec::new();
     let mut i = 1;
     while i < args.len() {
         match args[i].as_str() {
@@ -43,6 +45,7 @@ fn main() {
             "-M" => { i += 1; machine.m_bytes = parse_bytes(args.get(i)); }
             "-B" => { i += 1; machine.b_bytes = parse_bytes(args.get(i)); }
             "--eval" => { i += 1; eval = args.get(i).cloned(); }
+            "--apply" => { i += 1; applies.extend(args.get(i).map(|s| s.split(',').map(String::from).collect::<Vec<_>>()).unwrap_or_default()); }
             "--" => { passthrough = args[i + 1..].to_vec(); break; }
             a if a.starts_with('-') => { eprintln!("unknown flag {a}"); process::exit(2); }
             a => file = Some(PathBuf::from(a)),
@@ -57,17 +60,21 @@ fn main() {
         Ok(s) => s,
         Err(e) => { eprintln!("{}: {e}", file.display()); process::exit(2); }
     };
-    let module = match compile(&src) {
+    let mut module = match compile(&src) {
         Ok(m) => m,
         Err(e) => { eprintln!("{}:{e}", file.display()); process::exit(1); }
     };
+    if let Err(e) = cost::analyze::apply_rewrites(&mut module, &applies, &machine) {
+        eprintln!("{e}");
+        process::exit(1);
+    }
     let opts = emit_c::Options { checked };
     match cmd {
         "check" => {}
         "cost" => {
             let costs = cost::analyze(&module, &machine);
             for c in &costs {
-                println!("{}", cost::lock::line(c));
+                print!("{}", cost::lock::report(c, &machine));
                 if let (Some(ev), cost::CostResult::Exact { work, moves }) = (&eval, &c.result) {
                     if let Some((w, m)) = evaluate(c, work, moves, ev, &machine) {
                         println!("{:<16}   at {ev}: work {w:.0}  moves {m:.0} bytes", "");

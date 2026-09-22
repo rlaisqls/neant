@@ -15,6 +15,7 @@ LINE = 64
 EVENT = "l2d_cache_refill"
 
 # sizes avoid powers of two: set-associativity conflicts are not in the model
+# name: (sizes, repeats) — or (sizes, repeats, template, extra compiler flags)
 SWEEP = {
     "sum":          ([50_000, 200_000, 800_000, 3_200_000, 12_800_000], 20),
     "dot":          ([50_000, 200_000, 800_000, 3_200_000, 12_800_000], 20),
@@ -24,17 +25,24 @@ SWEEP = {
     # two in it maps a column onto a handful of cache sets, which the ideal-cache model cannot see
     "matmul_naive": ([448, 832, 1216, 1600, 1984], 1),
     "matmul_tiled": ([448, 832, 1216, 1600, 1984], 1),
+    # the naive kernel with the compiler's own rewrites applied: the M2 exit test
+    "matmul_apply_tile":      ([448, 832, 1216, 1600, 1984], 1, "matmul_naive", ["--apply", "matmul:tile"]),
+    "matmul_apply_transpose": ([448, 832, 1216, 1600, 1984], 1, "matmul_naive", ["--apply", "matmul:transpose"]),
 }
 
 def run(cmd, **kw):
     return subprocess.run(cmd, check=True, capture_output=True, text=True, **kw)
 
-def predict(nt):
-    out = run([str(NEANT), "cost", str(nt), "--eval", "B=%d" % LINE]).stdout
-    m = re.search(r"^main\s+.*\n\s+at .*?: work (\S+)\s+moves (\S+) bytes", out, re.M)
-    if not m:
-        sys.exit("could not read prediction from:\n" + out)
-    return float(m.group(1)), float(m.group(2))
+def predict(nt, flags):
+    out = run([str(NEANT), "cost", str(nt), "--eval", "B=%d" % LINE] + flags).stdout
+    lines = out.splitlines()
+    start = next((i for i, l in enumerate(lines) if l.startswith("main")), None)
+    if start is not None:
+        for l in lines[start + 1:]:
+            m = re.search(r"at .*?: work (\S+)\s+moves (\S+) bytes", l)
+            if m: return float(m.group(1)), float(m.group(2))
+            if l and not l.startswith(" "): break
+    sys.exit("could not read prediction from:\n" + out)
 
 def measure(binary, cpu, runs):
     best = None
@@ -80,20 +88,23 @@ def main():
     kernels = a.kernels or list(SWEEP)
     work = tempfile.mkdtemp(prefix="neant-sweep-")
     for k in kernels:
-        sizes, reps = SWEEP[k]
-        src = (HERE / f"{k}.nt.in").read_text()
+        entry = SWEEP[k]
+        sizes, reps = entry[0], entry[1]
+        template = entry[2] if len(entry) > 2 else k
+        flags = entry[3] if len(entry) > 3 else []
+        src = (HERE / f"{template}.nt.in").read_text()
         print(f"\n{k}   (repeats {reps}, event {EVENT} × {LINE}B, cpu {a.cpu})")
         print(f"  {'n':>10} {'pred work':>14} {'pred bytes':>14} {'meas bytes':>14} {'ratio':>7}  {'l1 refills':>12} {'ll misses':>12}")
         ns, preds, meas = [], [], []
         for n in sizes:
             nt = pathlib.Path(work) / f"{k}_{n}.nt"
             nt.write_text(src.replace("@N@", str(n)).replace("@R@", str(reps)))
-            pw, pb = predict(nt)
+            pw, pb = predict(nt, flags)
             row = f"  {n:>10} {pw:>14.3e} {pb:>14.3e}"
             if a.dry:
                 print(row); continue
             binary = nt.with_suffix("")
-            run([str(NEANT), "build", str(nt), "--unchecked", "-o", str(binary)])
+            run([str(NEANT), "build", str(nt), "--unchecked", "-o", str(binary)] + flags)
             c = measure(binary, a.cpu, a.runs)
             mb = c[EVENT] * LINE
             ns.append(n); preds.append(pb); meas.append(mb)

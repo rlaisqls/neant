@@ -41,12 +41,19 @@ join, a fused pipeline), the compiler compares the two and reports the gap and t
 transformation that closes it:
 
 ```
-matmul                          work n³     moves n³          lower bound n³/√M
-  gap √M ≈ 180× on this machine's L2
-  b[k, j] is read down a column inside the k loop           (line 7)
-  tile (i, j, k) by √(M/3)      → moves n³/√M               [apply]
-  transpose b before the loop   → moves n³/B                [apply]
+matmul           work 10·n³ + 6·n² + n             moves B·n³ + 8·n³ + B·n²           exact
+                 lower bound      moves 8·n³/√M    (matrix product, Hong–Kung 1981)   gap 13033× at M = 2 MiB, B = 64
+                 `b` moves by 8·n bytes per iteration of the innermost loop: a new line every time (line 7)
+                 tile by 256      work ≈ 10.05·n³  moves ≈ n³/8     [--apply matmul:tile]        gap 23×
+                 transpose the column operand      moves 16·n³ + …  [--apply matmul:transpose]   gap 2896×
 ```
+
+That is `neant cost` on the naive triple loop, as it prints today. The function's own line is the
+conservative one — nothing is assumed to fit the cache when the sizes are symbols — and a `main`
+that calls it with `n = 1984` gets the same report with numbers: 6.27e10 bytes against a bound
+of 4.31e7, a gap of 1453×, and 1.59e9 after `--apply matmul:tile`. The two suggestions were not
+looked up: each is the rewrite applied to the IR and the calculus run again on the result, which
+is why the transpose is offered with its real cost and not with a slogan.
 
 **Report.** The cost is not in the source. It lives in four places: an inlay hint after the
 signature; `costs.lock`, one line per function, committed, diffed in every pull request the way

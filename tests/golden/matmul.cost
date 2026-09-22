@@ -1,2 +1,7 @@
 matmul           work 10·n³ + 6·n² + n             moves B·n³ + 8·n³ + B·n²           exact
+                 lower bound      moves 8·n³/√M                      (matrix product, Hong–Kung 1981)   gap 13033× at M = 2 MiB, B = 64
+                 `b` moves by 8·n bytes per iteration of the innermost loop: a new line every time (line 7)
+                 tile by 256      work ≈ 10.0509·n³                 moves ≈ n³/8                       [--apply matmul:tile]   gap 23×
+                 transpose the column operand work ≈ 10·n³                      moves 16·n³ + 2·B·n² + 16·n²       [--apply matmul:transpose]   gap 2896×
 main             work 473                          moves 648                          exact
+                 lower bound      moves 216/√M                       (matrix product, Hong–Kung 1981)   gap 4344× at M = 2 MiB, B = 64

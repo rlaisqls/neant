@@ -130,6 +130,27 @@ impl Poly {
         r
     }
 
+    /// The terms of highest total degree in the size variables: what the cost is asymptotically.
+    pub fn leading(&self) -> Poly {
+        let Some(top) = self.terms.keys().map(|m| m.degree()).max() else { return Poly::zero() };
+        Poly { terms: self.terms.iter().filter(|(m, _)| m.degree() == top).map(|(m, c)| (m.clone(), *c)).collect() }
+    }
+    /// `self / other` when both are single terms; the exponents subtract.
+    pub fn div_mono(&self, other: &Poly) -> Option<Poly> {
+        if self.terms.len() != 1 || other.terms.len() != 1 { return None; }
+        let (m1, c1) = self.terms.iter().next().unwrap();
+        let (m2, c2) = other.terms.iter().next().unwrap();
+        if c2.is_zero() { return None; }
+        let mut f = m1.factors.clone();
+        for (a, e) in &m2.factors {
+            let ne = f.get(a).map_or(e.neg(), |x| x.add(e.neg()));
+            if ne.is_zero() { f.remove(a); } else { f.insert(*a, ne); }
+        }
+        let mut p = Poly::zero();
+        p.terms.insert(Mono { factors: f }, Rat::new(c1.n * c2.d, c1.d * c2.n));
+        Some(p)
+    }
+
     /// The value as a rational, when there are no atoms at all.
     pub fn as_const(&self) -> Option<Rat> {
         match self.terms.len() {
@@ -222,14 +243,21 @@ impl<'a> fmt::Display for PolyDisplay<'a> {
             ordered.sort_by_key(|(a, _)| match a { Atom::B => 0, Atom::M => 1, Atom::Var(i) => 2 + *i });
             let num: Vec<String> = ordered.iter().filter(|(_, e)| e.n > 0).map(|(a, e)| atom_str(a, **e)).collect();
             let den: Vec<String> = ordered.iter().filter(|(_, e)| e.n < 0).map(|(a, e)| atom_str(a, e.neg())).collect();
+            // a rational with a big denominator (a tile count, a division by a constant) reads as
+            // a decimal; small ones stay exact
+            let decimal = c.d > 64 || (c.d > 1 && c.n.abs() > 1_000_000);
             let mut s = String::new();
-            if c.n != 1 || num.is_empty() { s.push_str(&c.n.to_string()); }
-            if !num.is_empty() {
-                if c.n != 1 { s.push('·'); }
-                s.push_str(&num.join("·"));
+            if decimal {
+                let v = c.to_f64();
+                s.push_str(&if v.abs() >= 1e6 || v.abs() < 1e-3 { format!("{v:.4e}") } else { format!("{v:.4}") });
+                if !num.is_empty() { s.push('·'); }
+            } else if c.n != 1 || num.is_empty() {
+                s.push_str(&c.n.to_string());
+                if !num.is_empty() { s.push('·'); }
             }
+            if !num.is_empty() { s.push_str(&num.join("·")); }
             let mut d: Vec<String> = Vec::new();
-            if c.d != 1 { d.push(c.d.to_string()); }
+            if c.d != 1 && !decimal { d.push(c.d.to_string()); }
             d.extend(den);
             if !d.is_empty() {
                 s.push('/');
