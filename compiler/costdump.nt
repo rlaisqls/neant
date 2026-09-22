@@ -38,7 +38,10 @@ fn main() {
     let mut imgs = [Img { arr: 0, fld: 0, poly: 0 }; 1024];
     let mut fb = [-1; 4096];
     let mut fdecl = [0; 4096];
+    let mut iw = [-1; 4096];
+    let mut im = [-1; 4096];
     let mut ds = [0, 0, 0];
+    let mut viol = [0];
     let mut sc = [0; 40960];
     let mut wst = [0; 4096];
     let mut sites = [Site { arr: 0, idx: 0, inloop: 0, coef: 0, stride: 0, bad: 0, trip: 0, branch: 0, novar: 0, field: -1, p0: -1, p1: -1, p2: -1, c0: 0, c1: 0, c2: 0, b0: 0, b1: 0, b2: 0, alen: -1, es: 0, base: 0, touch: 0, fldname: -1, tail: 0, pc0: -1, pc1: -1, pc2: -1, rlo: -1, rhi: -1 }; 4096];
@@ -84,6 +87,10 @@ fn main() {
                 // **A declaration replaces the inference**, and only when it gives both columns
                 // (design §24). Replacing `fw`/`fm` is all it takes for a caller to see the
                 // declaration rather than the body: the call path reads them and asks nothing else.
+                // the inference is kept, because a declaration replaces what is *reported* and an
+                // assertion is still checked against what was *inferred*
+                iw[si] = fw[si];
+                im[si] = fm[si];
                 fdecl[si] = take_decl(&buf, &toks, &nodes, &mut facs, &mut terms, &mut pols,
                                       &mut pst, &mut budget, &mut cnds, &mut pcs, &mut cks,
                                       &mut wst, &mut ds, &mut fw, &mut fm, f, si);
@@ -99,6 +106,21 @@ fn main() {
             f = nodes[f].next;
         }
         pass += 1;
+    }
+
+    // **a breached `#[cost]` bound is a check error**, which is what `neant check` reports, so the
+    // verdict this prints has to account for it and not only for the checker's own rules
+    let mut vf = first;
+    let mut vsi = 0;
+    while vf >= 0 {
+        if nodes[vf].kind == 110 {
+            if !asserts_hold(&buf, &toks, &nodes, &mut facs, &mut terms, &mut pols, &mut pst,
+                             &pcs, &cks, &mut ds, iw[vsi], im[vsi], vf) { viol[0] = 1; };
+            vsi += 1;
+        } else if nodes[vf].kind == 116 {
+            vsi += 1;
+        }
+        vf = nodes[vf].next;
     }
 
     let mut f = first;
@@ -256,7 +278,7 @@ fn main() {
         }
         f = nodes[f].next;
     }
-    println(bad);
+    println(if bad != 0 || viol[0] != 0 { 1 } else { 0 });
     println(st[2]);
     write_stdout(&out, est[0]);
 }

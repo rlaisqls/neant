@@ -427,6 +427,9 @@ static int64_t ntu_c_atom(const uint8_t *src_p, int64_t src_n, const struct nt_T
 static int64_t ntu_c_factor(const uint8_t *src_p, int64_t src_n, const struct nt_Token *toks_p, int64_t toks_n, const struct nt_Node *nodes_p, int64_t nodes_n, int64_t *facs_atom_p, int64_t *facs_exp_p, int64_t facs_n, struct nt_Term *terms_p, int64_t terms_n, struct nt_Pol *pols_p, int64_t pols_n, int64_t *pst_p, int64_t pst_n, int64_t *ds_p, int64_t ds_n, int64_t f);
 static int64_t ntu_c_term(const uint8_t *src_p, int64_t src_n, const struct nt_Token *toks_p, int64_t toks_n, const struct nt_Node *nodes_p, int64_t nodes_n, int64_t *facs_atom_p, int64_t *facs_exp_p, int64_t facs_n, struct nt_Term *terms_p, int64_t terms_n, struct nt_Pol *pols_p, int64_t pols_n, int64_t *pst_p, int64_t pst_n, int64_t *ds_p, int64_t ds_n, int64_t f);
 static int64_t ntu_c_read(const uint8_t *src_p, int64_t src_n, const struct nt_Token *toks_p, int64_t toks_n, const struct nt_Node *nodes_p, int64_t nodes_n, int64_t *facs_atom_p, int64_t *facs_exp_p, int64_t facs_n, struct nt_Term *terms_p, int64_t terms_n, struct nt_Pol *pols_p, int64_t pols_n, int64_t *pst_p, int64_t pst_n, int64_t *ds_p, int64_t ds_n, int64_t f, int64_t t);
+static bool ntu_mono_asym_ge(const int64_t *facs_atom_p, const int64_t *facs_exp_p, int64_t facs_n, int64_t u, int64_t nu, int64_t t, int64_t nt);
+static bool ntu_asym_dominated(const int64_t *facs_atom_p, const int64_t *facs_exp_p, int64_t facs_n, const struct nt_Term *terms_p, int64_t terms_n, const struct nt_Pol *pols_p, int64_t pols_n, int64_t inferred, int64_t asserted);
+static bool ntu_asserts_hold(const uint8_t *src_p, int64_t src_n, const struct nt_Token *toks_p, int64_t toks_n, const struct nt_Node *nodes_p, int64_t nodes_n, int64_t *facs_atom_p, int64_t *facs_exp_p, int64_t facs_n, struct nt_Term *terms_p, int64_t terms_n, struct nt_Pol *pols_p, int64_t pols_n, int64_t *pst_p, int64_t pst_n, const struct nt_Pce *pcs_p, int64_t pcs_n, const struct nt_Ck *cks_p, int64_t cks_n, int64_t *ds_p, int64_t ds_n, int64_t iw, int64_t im, int64_t f);
 static void ntu_emit_le(uint8_t *out_p, int64_t out_n, int64_t *est_p, int64_t est_n);
 static int64_t ntu_take_decl(const uint8_t *src_p, int64_t src_n, const struct nt_Token *toks_p, int64_t toks_n, const struct nt_Node *nodes_p, int64_t nodes_n, int64_t *facs_atom_p, int64_t *facs_exp_p, int64_t facs_n, struct nt_Term *terms_p, int64_t terms_n, struct nt_Pol *pols_p, int64_t pols_n, int64_t *pst_p, int64_t pst_n, double *budget_p, int64_t budget_n, struct nt_Cnd *cnds_p, int64_t cnds_n, struct nt_Pce *pcs_p, int64_t pcs_n, struct nt_Ck *cks_p, int64_t cks_n, int64_t *wst_p, int64_t wst_n, int64_t *ds_p, int64_t ds_n, int64_t *fw_p, int64_t fw_n, int64_t *fm_p, int64_t fm_n, int64_t f, int64_t si);
 static int64_t ntu_m_func(const uint8_t *src_p, int64_t src_n, const struct nt_Token *toks_p, int64_t toks_n, const struct nt_Node *nodes_p, int64_t nodes_n, const struct nt_Ty *types_p, int64_t types_n, const struct nt_Str *strs_p, int64_t strs_n, const struct nt_Fld *flds_p, int64_t flds_n, const int64_t *ntys_p, int64_t ntys_n, const struct nt_Sig *sigs_p, int64_t sigs_n, const int64_t *ptys_p, int64_t ptys_n, const int64_t *fm_p, int64_t fm_n, const int64_t *ffoot_p, int64_t ffoot_n, int64_t *facs_atom_p, int64_t *facs_exp_p, int64_t facs_n, struct nt_Term *terms_p, int64_t terms_n, struct nt_Pol *pols_p, int64_t pols_n, int64_t *pst_p, int64_t pst_n, struct nt_Env *env_p, int64_t env_n, struct nt_Cof *cof_p, int64_t cof_n, struct nt_Site *sites_p, int64_t sites_n, struct nt_Ck *cks_p, int64_t cks_n, struct nt_Cnd *cnds_p, int64_t cnds_n, struct nt_Pce *pcs_p, int64_t pcs_n, double *budget_p, int64_t budget_n, struct nt_Res *resid_p, int64_t resid_n, int64_t *rargs_p, int64_t rargs_n, int64_t *logs_p, int64_t logs_n, int64_t *scratch_p, int64_t scratch_n, int64_t *subst_p, int64_t subst_n, const int64_t *slay_p, int64_t slay_n, struct nt_Lpe *lpes_p, int64_t lpes_n, struct nt_Img *imgs_p, int64_t imgs_n, int64_t *sc_p, int64_t sc_n, int64_t *wst_p, int64_t wst_n, int64_t f, int64_t si);
@@ -2677,6 +2680,32 @@ static int64_t ntu_c_read(const uint8_t *src_p, int64_t src_n, const struct nt_T
     return acc;
 }
 
+static bool ntu_mono_asym_ge(const int64_t *facs_atom_p, const int64_t *facs_exp_p, int64_t facs_n, int64_t u, int64_t nu, int64_t t, int64_t nt) {
+    bool ok = true;
+    int64_t i = 0;
+    while ((i<nu)) { int64_t a = facs_atom_p[nt_idx((u+i), facs_n, 7441)]; if ((((a>=3)&&(a<2000))&&(facs_exp_p[nt_idx((u+i), facs_n, 7442)]<ntu_mono_exp(facs_atom_p, facs_exp_p, facs_n, t, nt, a)))) { ok = false; } i += 1; }
+    int64_t j = 0;
+    while ((j<nt)) { int64_t a = facs_atom_p[nt_idx((t+j), facs_n, 7447)]; if ((((a>=3)&&(a<2000))&&(ntu_mono_exp(facs_atom_p, facs_exp_p, facs_n, u, nu, a)<facs_exp_p[nt_idx((t+j), facs_n, 7448)]))) { ok = false; } j += 1; }
+    return ok;
+}
+
+static bool ntu_asym_dominated(const int64_t *facs_atom_p, const int64_t *facs_exp_p, int64_t facs_n, const struct nt_Term *terms_p, int64_t terms_n, const struct nt_Pol *pols_p, int64_t pols_n, int64_t inferred, int64_t asserted) {
+    int64_t i = 0;
+    bool all = true;
+    while ((i<(pols_p[nt_idx(inferred, pols_n, 7457)]).n_term)) { int64_t t = ((pols_p[nt_idx(inferred, pols_n, 7458)]).term+i); bool any = false; int64_t j = 0; while ((j<(pols_p[nt_idx(asserted, pols_n, 7461)]).n_term)) { int64_t u = ((pols_p[nt_idx(asserted, pols_n, 7462)]).term+j); if (ntu_mono_asym_ge(facs_atom_p, facs_exp_p, facs_n, (terms_p[nt_idx(u, terms_n, 7463)]).fac, (terms_p[nt_idx(u, terms_n, 7463)]).n_fac, (terms_p[nt_idx(t, terms_n, 7463)]).fac, (terms_p[nt_idx(t, terms_n, 7463)]).n_fac)) { any = true; } j += 1; } if ((!any)) { all = false; } i += 1; }
+    return all;
+}
+
+static bool ntu_asserts_hold(const uint8_t *src_p, int64_t src_n, const struct nt_Token *toks_p, int64_t toks_n, const struct nt_Node *nodes_p, int64_t nodes_n, int64_t *facs_atom_p, int64_t *facs_exp_p, int64_t facs_n, struct nt_Term *terms_p, int64_t terms_n, struct nt_Pol *pols_p, int64_t pols_n, int64_t *pst_p, int64_t pst_n, const struct nt_Pce *pcs_p, int64_t pcs_n, const struct nt_Ck *cks_p, int64_t cks_n, int64_t *ds_p, int64_t ds_n, int64_t iw, int64_t im, int64_t f) {
+    int64_t at = (nodes_p[nt_idx(f, nodes_n, 7481)]).ival;
+    if ((at<0)) { return true; }
+    if (((nodes_p[nt_idx(at, nodes_n, 7485)]).c>=0)) { return true; }
+    bool ok = true;
+    if ((((nodes_p[nt_idx(at, nodes_n, 7487)]).a>=0)&&(iw>=0))) { int64_t aw = ntu_c_read(src_p, src_n, toks_p, toks_n, nodes_p, nodes_n, facs_atom_p, facs_exp_p, facs_n, terms_p, terms_n, pols_p, pols_n, pst_p, pst_n, ds_p, ds_n, f, (nodes_p[nt_idx(at, nodes_n, 7488)]).a); if (((aw<0)||(!ntu_asym_dominated(facs_atom_p, facs_exp_p, facs_n, terms_p, terms_n, pols_p, pols_n, iw, aw)))) { ok = false; } }
+    if ((((nodes_p[nt_idx(at, nodes_n, 7491)]).b>=0)&&(im>=0))) { int64_t am = ntu_c_read(src_p, src_n, toks_p, toks_n, nodes_p, nodes_n, facs_atom_p, facs_exp_p, facs_n, terms_p, terms_n, pols_p, pols_n, pst_p, pst_n, ds_p, ds_n, f, (nodes_p[nt_idx(at, nodes_n, 7492)]).b); if ((am<0)) { ok = false; } else { int64_t pi = 0; while ((pi<(cks_p[nt_idx(im, cks_n, 7497)]).n_pce)) { if ((!ntu_asym_dominated(facs_atom_p, facs_exp_p, facs_n, terms_p, terms_n, pols_p, pols_n, (pcs_p[nt_idx(((cks_p[nt_idx(im, cks_n, 7498)]).pce+pi), pcs_n, 7498)]).poly, am))) { ok = false; } pi += 1; } } }
+    return ok;
+}
+
 static void ntu_emit_le(uint8_t *out_p, int64_t out_n, int64_t *est_p, int64_t est_n) {
     ntu_emit_u(out_p, out_n, est_p, est_n, 226);
     ntu_emit_u(out_p, out_n, est_p, est_n, 137);
@@ -2685,43 +2714,43 @@ static void ntu_emit_le(uint8_t *out_p, int64_t out_n, int64_t *est_p, int64_t e
 }
 
 static int64_t ntu_take_decl(const uint8_t *src_p, int64_t src_n, const struct nt_Token *toks_p, int64_t toks_n, const struct nt_Node *nodes_p, int64_t nodes_n, int64_t *facs_atom_p, int64_t *facs_exp_p, int64_t facs_n, struct nt_Term *terms_p, int64_t terms_n, struct nt_Pol *pols_p, int64_t pols_n, int64_t *pst_p, int64_t pst_n, double *budget_p, int64_t budget_n, struct nt_Cnd *cnds_p, int64_t cnds_n, struct nt_Pce *pcs_p, int64_t pcs_n, struct nt_Ck *cks_p, int64_t cks_n, int64_t *wst_p, int64_t wst_n, int64_t *ds_p, int64_t ds_n, int64_t *fw_p, int64_t fw_n, int64_t *fm_p, int64_t fm_n, int64_t f, int64_t si) {
-    int64_t at = (nodes_p[nt_idx(f, nodes_n, 7444)]).ival;
-    if ((((at<0)||((nodes_p[nt_idx(at, nodes_n, 7445)]).a<0))||((nodes_p[nt_idx(at, nodes_n, 7445)]).b<0))) { return 0; }
-    int64_t dw = ntu_c_read(src_p, src_n, toks_p, toks_n, nodes_p, nodes_n, facs_atom_p, facs_exp_p, facs_n, terms_p, terms_n, pols_p, pols_n, pst_p, pst_n, ds_p, ds_n, f, (nodes_p[nt_idx(at, nodes_n, 7446)]).a);
+    int64_t at = (nodes_p[nt_idx(f, nodes_n, 7522)]).ival;
+    if ((((at<0)||((nodes_p[nt_idx(at, nodes_n, 7523)]).a<0))||((nodes_p[nt_idx(at, nodes_n, 7523)]).b<0))) { return 0; }
+    int64_t dw = ntu_c_read(src_p, src_n, toks_p, toks_n, nodes_p, nodes_n, facs_atom_p, facs_exp_p, facs_n, terms_p, terms_n, pols_p, pols_n, pst_p, pst_n, ds_p, ds_n, f, (nodes_p[nt_idx(at, nodes_n, 7524)]).a);
     if ((dw<0)) { return 0; }
-    int64_t dm = ntu_c_read(src_p, src_n, toks_p, toks_n, nodes_p, nodes_n, facs_atom_p, facs_exp_p, facs_n, terms_p, terms_n, pols_p, pols_n, pst_p, pst_n, ds_p, ds_n, f, (nodes_p[nt_idx(at, nodes_n, 7448)]).b);
+    int64_t dm = ntu_c_read(src_p, src_n, toks_p, toks_n, nodes_p, nodes_n, facs_atom_p, facs_exp_p, facs_n, terms_p, terms_n, pols_p, pols_n, pst_p, pst_n, ds_p, ds_n, f, (nodes_p[nt_idx(at, nodes_n, 7526)]).b);
     if ((dm<0)) { return 0; }
-    fw_p[nt_idx(si, fw_n, 7450)] = dw;
-    fm_p[nt_idx(si, fm_n, 7451)] = ntu_ck_one(facs_atom_p, facs_exp_p, facs_n, terms_p, terms_n, pols_p, pols_n, pst_p, pst_n, budget_p, budget_n, cnds_p, cnds_n, pcs_p, pcs_n, cks_p, cks_n, wst_p, wst_n, dm);
+    fw_p[nt_idx(si, fw_n, 7528)] = dw;
+    fm_p[nt_idx(si, fm_n, 7529)] = ntu_ck_one(facs_atom_p, facs_exp_p, facs_n, terms_p, terms_n, pols_p, pols_n, pst_p, pst_n, budget_p, budget_n, cnds_p, cnds_n, pcs_p, pcs_n, cks_p, cks_n, wst_p, wst_n, dm);
     return 1;
 }
 
 static int64_t ntu_m_func(const uint8_t *src_p, int64_t src_n, const struct nt_Token *toks_p, int64_t toks_n, const struct nt_Node *nodes_p, int64_t nodes_n, const struct nt_Ty *types_p, int64_t types_n, const struct nt_Str *strs_p, int64_t strs_n, const struct nt_Fld *flds_p, int64_t flds_n, const int64_t *ntys_p, int64_t ntys_n, const struct nt_Sig *sigs_p, int64_t sigs_n, const int64_t *ptys_p, int64_t ptys_n, const int64_t *fm_p, int64_t fm_n, const int64_t *ffoot_p, int64_t ffoot_n, int64_t *facs_atom_p, int64_t *facs_exp_p, int64_t facs_n, struct nt_Term *terms_p, int64_t terms_n, struct nt_Pol *pols_p, int64_t pols_n, int64_t *pst_p, int64_t pst_n, struct nt_Env *env_p, int64_t env_n, struct nt_Cof *cof_p, int64_t cof_n, struct nt_Site *sites_p, int64_t sites_n, struct nt_Ck *cks_p, int64_t cks_n, struct nt_Cnd *cnds_p, int64_t cnds_n, struct nt_Pce *pcs_p, int64_t pcs_n, double *budget_p, int64_t budget_n, struct nt_Res *resid_p, int64_t resid_n, int64_t *rargs_p, int64_t rargs_n, int64_t *logs_p, int64_t logs_n, int64_t *scratch_p, int64_t scratch_n, int64_t *subst_p, int64_t subst_n, const int64_t *slay_p, int64_t slay_n, struct nt_Lpe *lpes_p, int64_t lpes_n, struct nt_Img *imgs_p, int64_t imgs_n, int64_t *sc_p, int64_t sc_n, int64_t *wst_p, int64_t wst_n, int64_t f, int64_t si) {
-    wst_p[nt_idx(0, wst_n, 7466)] = 0;
-    wst_p[nt_idx(1, wst_n, 7467)] = 0;
-    wst_p[nt_idx(10, wst_n, 7468)] = 0;
-    wst_p[nt_idx(11, wst_n, 7469)] = 0;
-    wst_p[nt_idx(41, wst_n, 7470)] = 0;
-    wst_p[nt_idx(12, wst_n, 7471)] = (-1);
-    wst_p[nt_idx(13, wst_n, 7472)] = (-1);
-    wst_p[nt_idx(24, wst_n, 7473)] = si;
-    wst_p[nt_idx(26, wst_n, 7474)] = 0;
-    wst_p[nt_idx(2, wst_n, 7475)] = 1003;
-    wst_p[nt_idx(20, wst_n, 7476)] = 0;
-    wst_p[nt_idx(21, wst_n, 7477)] = 0;
-    wst_p[nt_idx(22, wst_n, 7478)] = (-1);
-    int64_t p = (nodes_p[nt_idx(f, nodes_n, 7479)]).b;
+    wst_p[nt_idx(0, wst_n, 7544)] = 0;
+    wst_p[nt_idx(1, wst_n, 7545)] = 0;
+    wst_p[nt_idx(10, wst_n, 7546)] = 0;
+    wst_p[nt_idx(11, wst_n, 7547)] = 0;
+    wst_p[nt_idx(41, wst_n, 7548)] = 0;
+    wst_p[nt_idx(12, wst_n, 7549)] = (-1);
+    wst_p[nt_idx(13, wst_n, 7550)] = (-1);
+    wst_p[nt_idx(24, wst_n, 7551)] = si;
+    wst_p[nt_idx(26, wst_n, 7552)] = 0;
+    wst_p[nt_idx(2, wst_n, 7553)] = 1003;
+    wst_p[nt_idx(20, wst_n, 7554)] = 0;
+    wst_p[nt_idx(21, wst_n, 7555)] = 0;
+    wst_p[nt_idx(22, wst_n, 7556)] = (-1);
+    int64_t p = (nodes_p[nt_idx(f, nodes_n, 7557)]).b;
     int64_t i = 0;
-    while ((p>=0)) { int64_t t = ptys_p[nt_idx(((sigs_p[nt_idx(si, sigs_n, 7482)]).params+i), ptys_n, 7482)]; int64_t a = ntu_pol_atom(facs_atom_p, facs_exp_p, facs_n, terms_p, terms_n, pols_p, pols_n, pst_p, pst_n, (3+i)); if (((t>=0)&&(((types_p[nt_idx(t, types_n, 7484)]).kind==5)||((types_p[nt_idx(t, types_n, 7484)]).kind==6)))) { ntu_env_add(env_p, env_n, wst_p, wst_n, (nodes_p[nt_idx(p, nodes_n, 7485)]).a, (-1), a); } else { ntu_env_add(env_p, env_n, wst_p, wst_n, (nodes_p[nt_idx(p, nodes_n, 7487)]).a, a, (-1)); } i += 1; p = (nodes_p[nt_idx(p, nodes_n, 7490)]).next; }
-    wst_p[nt_idx(23, wst_n, 7492)] = 0;
-    int64_t walked = ntu_m_block(src_p, src_n, toks_p, toks_n, nodes_p, nodes_n, types_p, types_n, strs_p, strs_n, flds_p, flds_n, ntys_p, ntys_n, sigs_p, sigs_n, ptys_p, ptys_n, fm_p, fm_n, ffoot_p, ffoot_n, facs_atom_p, facs_exp_p, facs_n, terms_p, terms_n, pols_p, pols_n, pst_p, pst_n, env_p, env_n, cof_p, cof_n, sites_p, sites_n, cks_p, cks_n, cnds_p, cnds_n, pcs_p, pcs_n, budget_p, budget_n, resid_p, resid_n, rargs_p, rargs_n, subst_p, subst_n, slay_p, slay_n, wst_p, wst_n, (nodes_p[nt_idx(f, nodes_n, 7493)]).d);
+    while ((p>=0)) { int64_t t = ptys_p[nt_idx(((sigs_p[nt_idx(si, sigs_n, 7560)]).params+i), ptys_n, 7560)]; int64_t a = ntu_pol_atom(facs_atom_p, facs_exp_p, facs_n, terms_p, terms_n, pols_p, pols_n, pst_p, pst_n, (3+i)); if (((t>=0)&&(((types_p[nt_idx(t, types_n, 7562)]).kind==5)||((types_p[nt_idx(t, types_n, 7562)]).kind==6)))) { ntu_env_add(env_p, env_n, wst_p, wst_n, (nodes_p[nt_idx(p, nodes_n, 7563)]).a, (-1), a); } else { ntu_env_add(env_p, env_n, wst_p, wst_n, (nodes_p[nt_idx(p, nodes_n, 7565)]).a, a, (-1)); } i += 1; p = (nodes_p[nt_idx(p, nodes_n, 7568)]).next; }
+    wst_p[nt_idx(23, wst_n, 7570)] = 0;
+    int64_t walked = ntu_m_block(src_p, src_n, toks_p, toks_n, nodes_p, nodes_n, types_p, types_n, strs_p, strs_n, flds_p, flds_n, ntys_p, ntys_n, sigs_p, sigs_n, ptys_p, ptys_n, fm_p, fm_n, ffoot_p, ffoot_n, facs_atom_p, facs_exp_p, facs_n, terms_p, terms_n, pols_p, pols_n, pst_p, pst_n, env_p, env_n, cof_p, cof_n, sites_p, sites_n, cks_p, cks_n, cnds_p, cnds_n, pcs_p, pcs_n, budget_p, budget_n, resid_p, resid_n, rargs_p, rargs_n, subst_p, subst_n, slay_p, slay_n, wst_p, wst_n, (nodes_p[nt_idx(f, nodes_n, 7571)]).d);
     int64_t sm = ntu_settle_moves(src_p, src_n, toks_p, toks_n, facs_atom_p, facs_exp_p, facs_n, terms_p, terms_n, pols_p, pols_n, pst_p, pst_n, budget_p, budget_n, cnds_p, cnds_n, pcs_p, pcs_n, cks_p, cks_n, sites_p, sites_n, lpes_p, lpes_n, sc_p, sc_n, scratch_p, scratch_n, wst_p, wst_n);
     int64_t total = ntu_ck_add(facs_atom_p, facs_exp_p, facs_n, terms_p, terms_n, pols_p, pols_n, pst_p, pst_n, budget_p, budget_n, cnds_p, cnds_n, pcs_p, pcs_n, cks_p, cks_n, wst_p, wst_n, walked, sm);
-    wst_p[nt_idx(50, wst_n, 7500)] = ntu_bound_moves(src_p, src_n, toks_p, toks_n, nodes_p, nodes_n, facs_atom_p, facs_exp_p, facs_n, terms_p, terms_n, pols_p, pols_n, pst_p, pst_n, budget_p, budget_n, sites_p, sites_n, imgs_p, imgs_n, sc_p, sc_n, scratch_p, scratch_n, wst_p, wst_n, f);
-    if ((wst_p[nt_idx(1, wst_n, 7502)]!=0)) { return (-1); }
-    if ((wst_p[nt_idx(23, wst_n, 7503)]==0)) { return total; }
+    wst_p[nt_idx(50, wst_n, 7578)] = ntu_bound_moves(src_p, src_n, toks_p, toks_n, nodes_p, nodes_n, facs_atom_p, facs_exp_p, facs_n, terms_p, terms_n, pols_p, pols_n, pst_p, pst_n, budget_p, budget_n, sites_p, sites_n, imgs_p, imgs_n, sc_p, sc_n, scratch_p, scratch_n, wst_p, wst_n, f);
+    if ((wst_p[nt_idx(1, wst_n, 7580)]!=0)) { return (-1); }
+    if ((wst_p[nt_idx(23, wst_n, 7581)]==0)) { return total; }
     if ((!ntu_ck_plain(pcs_p, pcs_n, cks_p, cks_n, total))) { return (-1); }
-    int64_t solved = ntu_solve_recurrence(types_p, types_n, sigs_p, sigs_n, ptys_p, ptys_n, facs_atom_p, facs_exp_p, facs_n, terms_p, terms_n, pols_p, pols_n, logs_p, logs_n, pst_p, pst_n, rargs_p, rargs_n, scratch_p, scratch_n, si, ntu_ck_poly(pcs_p, pcs_n, cks_p, cks_n, total), wst_p[nt_idx(23, wst_n, 7507)]);
+    int64_t solved = ntu_solve_recurrence(types_p, types_n, sigs_p, sigs_n, ptys_p, ptys_n, facs_atom_p, facs_exp_p, facs_n, terms_p, terms_n, pols_p, pols_n, logs_p, logs_n, pst_p, pst_n, rargs_p, rargs_n, scratch_p, scratch_n, si, ntu_ck_poly(pcs_p, pcs_n, cks_p, cks_n, total), wst_p[nt_idx(23, wst_n, 7585)]);
     if ((solved<0)) { return (-1); }
     return ntu_ck_one(facs_atom_p, facs_exp_p, facs_n, terms_p, terms_n, pols_p, pols_n, pst_p, pst_n, budget_p, budget_n, cnds_p, cnds_n, pcs_p, pcs_n, cks_p, cks_n, wst_p, wst_n, solved);
 }
@@ -2729,16 +2758,16 @@ static int64_t ntu_m_func(const uint8_t *src_p, int64_t src_n, const struct nt_T
 static bool ntu_touches_struct(const uint8_t *src_p, int64_t src_n, const struct nt_Token *toks_p, int64_t toks_n, const struct nt_Node *nodes_p, int64_t nodes_n, const struct nt_Ty *types_p, int64_t types_n, const struct nt_Sig *sigs_p, int64_t sigs_n, const int64_t *ptys_p, int64_t ptys_n, int64_t sid, int64_t f, int64_t si) {
     int64_t p = 0;
     bool hit = false;
-    while ((p<(sigs_p[nt_idx(si, sigs_n, 7517)]).n_params)) { int64_t t = ptys_p[nt_idx(((sigs_p[nt_idx(si, sigs_n, 7518)]).params+p), ptys_n, 7518)]; if (((t>=0)&&(((types_p[nt_idx(t, types_n, 7519)]).kind==5)||((types_p[nt_idx(t, types_n, 7519)]).kind==6)))) { int64_t e = (types_p[nt_idx(t, types_n, 7520)]).elem; ({ if ((((e>=0)&&((types_p[nt_idx(e, types_n, 7521)]).kind==7))&&((types_p[nt_idx(e, types_n, 7521)]).elem==sid))) { hit = true; } }); } p += 1; }
-    if (ntu_builds_struct(nodes_p, nodes_n, types_p, types_n, sid, (nodes_p[nt_idx(f, nodes_n, 7525)]).d)) { hit = true; }
+    while ((p<(sigs_p[nt_idx(si, sigs_n, 7595)]).n_params)) { int64_t t = ptys_p[nt_idx(((sigs_p[nt_idx(si, sigs_n, 7596)]).params+p), ptys_n, 7596)]; if (((t>=0)&&(((types_p[nt_idx(t, types_n, 7597)]).kind==5)||((types_p[nt_idx(t, types_n, 7597)]).kind==6)))) { int64_t e = (types_p[nt_idx(t, types_n, 7598)]).elem; ({ if ((((e>=0)&&((types_p[nt_idx(e, types_n, 7599)]).kind==7))&&((types_p[nt_idx(e, types_n, 7599)]).elem==sid))) { hit = true; } }); } p += 1; }
+    if (ntu_builds_struct(nodes_p, nodes_n, types_p, types_n, sid, (nodes_p[nt_idx(f, nodes_n, 7603)]).d)) { hit = true; }
     return hit;
 }
 
 static bool ntu_builds_struct(const struct nt_Node *nodes_p, int64_t nodes_n, const struct nt_Ty *types_p, int64_t types_n, int64_t sid, int64_t b) {
     if ((b<0)) { return false; }
     bool hit = false;
-    int64_t s = (nodes_p[nt_idx(b, nodes_n, 7533)]).a;
-    while ((s>=0)) { int64_t k = (nodes_p[nt_idx(s, nodes_n, 7535)]).kind; if ((k==90)) { int64_t init = (nodes_p[nt_idx(s, nodes_n, 7537)]).c; ({ if ((((nodes_p[nt_idx(init, nodes_n, 7538)]).kind==78)&&((nodes_p[nt_idx((nodes_p[nt_idx(init, nodes_n, 7538)]).a, nodes_n, 7538)]).kind==70))) { hit = true; } }); } else { ({ if (((k==92)||(k==93))) { int64_t inner = ({ int64_t nt_t335; if ((k==92)) { nt_t335 = (nodes_p[nt_idx(s, nodes_n, 7540)]).d; } else { nt_t335 = (nodes_p[nt_idx(s, nodes_n, 7540)]).c; } nt_t335; }); ({ if (ntu_builds_struct(nodes_p, nodes_n, types_p, types_n, sid, inner)) { hit = true; } }); } }); } s = (nodes_p[nt_idx(s, nodes_n, 7543)]).next; }
+    int64_t s = (nodes_p[nt_idx(b, nodes_n, 7611)]).a;
+    while ((s>=0)) { int64_t k = (nodes_p[nt_idx(s, nodes_n, 7613)]).kind; if ((k==90)) { int64_t init = (nodes_p[nt_idx(s, nodes_n, 7615)]).c; ({ if ((((nodes_p[nt_idx(init, nodes_n, 7616)]).kind==78)&&((nodes_p[nt_idx((nodes_p[nt_idx(init, nodes_n, 7616)]).a, nodes_n, 7616)]).kind==70))) { hit = true; } }); } else { ({ if (((k==92)||(k==93))) { int64_t inner = ({ int64_t nt_t335; if ((k==92)) { nt_t335 = (nodes_p[nt_idx(s, nodes_n, 7618)]).d; } else { nt_t335 = (nodes_p[nt_idx(s, nodes_n, 7618)]).c; } nt_t335; }); ({ if (ntu_builds_struct(nodes_p, nodes_n, types_p, types_n, sid, inner)) { hit = true; } }); } }); } s = (nodes_p[nt_idx(s, nodes_n, 7621)]).next; }
     return hit;
 }
 
@@ -2766,7 +2795,7 @@ static void ntu_choose_layouts(const uint8_t *src_p, int64_t src_n, const struct
     int64_t sc_n = 40960; int64_t *sc_p = nt_alloc(sc_n, sizeof(int64_t)); { int64_t nt_t357 = 0; for (int64_t nt_i357 = 0; nt_i357 < sc_n; nt_i357++) sc_p[nt_i357] = nt_t357; }
     int64_t wst_n = 4096; int64_t *wst_p = nt_alloc(wst_n, sizeof(int64_t)); { int64_t nt_t358 = 0; for (int64_t nt_i358 = 0; nt_i358 < wst_n; nt_i358++) wst_p[nt_i358] = nt_t358; }
     int64_t sid = 0;
-    while ((sid<n_structs)) { double total_aos = 0.0; double total_soa = 0.0; int64_t which = 0; while ((which<2)) { slay_p[nt_idx(sid, slay_n, 7587)] = which; pst_p[nt_idx(0, pst_n, 7590)] = 0; pst_p[nt_idx(1, pst_n, 7591)] = 0; pst_p[nt_idx(2, pst_n, 7592)] = 0; pst_p[nt_idx(5, pst_n, 7593)] = 0; wst_p[nt_idx(25, wst_n, 7594)] = 0; wst_p[nt_idx(28, wst_n, 7595)] = 0; wst_p[nt_idx(29, wst_n, 7596)] = 0; int64_t pass = 0; while ((pass<2)) { int64_t f = first; int64_t si = 0; while ((f>=0)) { if (((nodes_p[nt_idx(f, nodes_n, 7604)]).kind==110)) { fm_p[nt_idx(si, fm_n, 7605)] = ntu_m_func(src_p, src_n, toks_p, toks_n, nodes_p, nodes_n, types_p, types_n, strs_p, strs_n, flds_p, flds_n, ntys_p, ntys_n, sigs_p, sigs_n, ptys_p, ptys_n, fm_p, fm_n, ffoot_p, ffoot_n, facs_atom_p, facs_exp_p, facs_n, terms_p, terms_n, pols_p, pols_n, pst_p, pst_n, env_p, env_n, cof_p, cof_n, sites_p, sites_n, cks_p, cks_n, cnds_p, cnds_n, pcs_p, pcs_n, budget_p, budget_n, resid_p, resid_n, rargs_p, rargs_n, logs_p, logs_n, scratch_p, scratch_n, subst_p, subst_n, slay_p, slay_n, lpes_p, lpes_n, imgs_p, imgs_n, sc_p, sc_n, wst_p, wst_n, f, si); ntu_foot_flags(src_p, src_n, toks_p, toks_n, nodes_p, nodes_n, sites_p, sites_n, ffoot_p, ffoot_n, wst_p, wst_n, f, si); ntu_foot_ranges(src_p, src_n, toks_p, toks_n, nodes_p, nodes_n, facs_atom_p, facs_exp_p, facs_n, terms_p, terms_n, pols_p, pols_n, pst_p, pst_n, budget_p, budget_n, sites_p, sites_n, ffoot_p, ffoot_n, wst_p, wst_n, f, si); if ((((pass==1)&&(fm_p[nt_idx(si, fm_n, 7614)]>=0))&&ntu_touches_struct(src_p, src_n, toks_p, toks_n, nodes_p, nodes_n, types_p, types_n, sigs_p, sigs_n, ptys_p, ptys_n, sid, f, si))) { double v = ntu_ck_eval(facs_atom_p, facs_exp_p, facs_n, terms_p, terms_n, pols_p, pols_n, pst_p, pst_n, cnds_p, cnds_n, pcs_p, pcs_n, cks_p, cks_n, fm_p[nt_idx(si, fm_n, 7619)], 64.0, 2097152.0, 1000000.0); ({ if ((pst_p[nt_idx(6, pst_n, 7620)]==0)) { if ((which==0)) { total_aos = (total_aos+v); } else { total_soa = (total_soa+v); } } }); } si += 1; } else { ({ if (((nodes_p[nt_idx(f, nodes_n, 7626)]).kind==116)) { si += 1; } }); } f = (nodes_p[nt_idx(f, nodes_n, 7629)]).next; } pass += 1; } which += 1; } slay_p[nt_idx(sid, slay_n, 7635)] = ({ int64_t nt_t361; if ((total_soa<(total_aos*0.999))) { nt_t361 = 1; } else { nt_t361 = 0; } nt_t361; }); sid += 1; }
+    while ((sid<n_structs)) { double total_aos = 0.0; double total_soa = 0.0; int64_t which = 0; while ((which<2)) { slay_p[nt_idx(sid, slay_n, 7665)] = which; pst_p[nt_idx(0, pst_n, 7668)] = 0; pst_p[nt_idx(1, pst_n, 7669)] = 0; pst_p[nt_idx(2, pst_n, 7670)] = 0; pst_p[nt_idx(5, pst_n, 7671)] = 0; wst_p[nt_idx(25, wst_n, 7672)] = 0; wst_p[nt_idx(28, wst_n, 7673)] = 0; wst_p[nt_idx(29, wst_n, 7674)] = 0; int64_t pass = 0; while ((pass<2)) { int64_t f = first; int64_t si = 0; while ((f>=0)) { if (((nodes_p[nt_idx(f, nodes_n, 7682)]).kind==110)) { fm_p[nt_idx(si, fm_n, 7683)] = ntu_m_func(src_p, src_n, toks_p, toks_n, nodes_p, nodes_n, types_p, types_n, strs_p, strs_n, flds_p, flds_n, ntys_p, ntys_n, sigs_p, sigs_n, ptys_p, ptys_n, fm_p, fm_n, ffoot_p, ffoot_n, facs_atom_p, facs_exp_p, facs_n, terms_p, terms_n, pols_p, pols_n, pst_p, pst_n, env_p, env_n, cof_p, cof_n, sites_p, sites_n, cks_p, cks_n, cnds_p, cnds_n, pcs_p, pcs_n, budget_p, budget_n, resid_p, resid_n, rargs_p, rargs_n, logs_p, logs_n, scratch_p, scratch_n, subst_p, subst_n, slay_p, slay_n, lpes_p, lpes_n, imgs_p, imgs_n, sc_p, sc_n, wst_p, wst_n, f, si); ntu_foot_flags(src_p, src_n, toks_p, toks_n, nodes_p, nodes_n, sites_p, sites_n, ffoot_p, ffoot_n, wst_p, wst_n, f, si); ntu_foot_ranges(src_p, src_n, toks_p, toks_n, nodes_p, nodes_n, facs_atom_p, facs_exp_p, facs_n, terms_p, terms_n, pols_p, pols_n, pst_p, pst_n, budget_p, budget_n, sites_p, sites_n, ffoot_p, ffoot_n, wst_p, wst_n, f, si); if ((((pass==1)&&(fm_p[nt_idx(si, fm_n, 7692)]>=0))&&ntu_touches_struct(src_p, src_n, toks_p, toks_n, nodes_p, nodes_n, types_p, types_n, sigs_p, sigs_n, ptys_p, ptys_n, sid, f, si))) { double v = ntu_ck_eval(facs_atom_p, facs_exp_p, facs_n, terms_p, terms_n, pols_p, pols_n, pst_p, pst_n, cnds_p, cnds_n, pcs_p, pcs_n, cks_p, cks_n, fm_p[nt_idx(si, fm_n, 7697)], 64.0, 2097152.0, 1000000.0); ({ if ((pst_p[nt_idx(6, pst_n, 7698)]==0)) { if ((which==0)) { total_aos = (total_aos+v); } else { total_soa = (total_soa+v); } } }); } si += 1; } else { ({ if (((nodes_p[nt_idx(f, nodes_n, 7704)]).kind==116)) { si += 1; } }); } f = (nodes_p[nt_idx(f, nodes_n, 7707)]).next; } pass += 1; } which += 1; } slay_p[nt_idx(sid, slay_n, 7713)] = ({ int64_t nt_t361; if ((total_soa<(total_aos*0.999))) { nt_t361 = 1; } else { nt_t361 = 0; } nt_t361; }); sid += 1; }
 }
 
 static double ntu_ck_eval(const int64_t *facs_atom_p, const int64_t *facs_exp_p, int64_t facs_n, const struct nt_Term *terms_p, int64_t terms_n, const struct nt_Pol *pols_p, int64_t pols_n, int64_t *pst_p, int64_t pst_n, const struct nt_Cnd *cnds_p, int64_t cnds_n, const struct nt_Pce *pcs_p, int64_t pcs_n, const struct nt_Ck *cks_p, int64_t cks_n, int64_t c, double b, double m, double size) {
@@ -2774,24 +2803,24 @@ static double ntu_ck_eval(const int64_t *facs_atom_p, const int64_t *facs_exp_p,
     bool any = false;
     int64_t bad = 0;
     int64_t i = 0;
-    while ((i<(cks_p[nt_idx(c, cks_n, 7648)]).n_pce)) { int64_t p = ((cks_p[nt_idx(c, cks_n, 7649)]).pce+i); bool holds = true; int64_t j = 0; while ((j<(pcs_p[nt_idx(p, pcs_n, 7652)]).n_cnd)) { double w = (ntu_pol_eval(facs_atom_p, facs_exp_p, facs_n, terms_p, terms_n, pols_p, pols_n, pst_p, pst_n, (cnds_p[nt_idx(((pcs_p[nt_idx(p, pcs_n, 7653)]).cnd+j), cnds_n, 7653)]).ws, b, m, size)*b); if ((pst_p[nt_idx(6, pst_n, 7654)]!=0)) { bad = 1; } int64_t fits = ({ int64_t nt_t362; if ((w<m)) { nt_t362 = 1; } else { nt_t362 = 0; } nt_t362; }); if ((fits!=(cnds_p[nt_idx(((pcs_p[nt_idx(p, pcs_n, 7656)]).cnd+j), cnds_n, 7656)]).fits)) { holds = false; } j += 1; } if (holds) { double v = ntu_pol_eval(facs_atom_p, facs_exp_p, facs_n, terms_p, terms_n, pols_p, pols_n, pst_p, pst_n, (pcs_p[nt_idx(p, pcs_n, 7660)]).poly, b, m, size); if ((pst_p[nt_idx(6, pst_n, 7661)]!=0)) { bad = 1; } if (((!any)||(v>best))) { best = v; } any = true; } i += 1; }
-    pst_p[nt_idx(6, pst_n, 7667)] = bad;
+    while ((i<(cks_p[nt_idx(c, cks_n, 7726)]).n_pce)) { int64_t p = ((cks_p[nt_idx(c, cks_n, 7727)]).pce+i); bool holds = true; int64_t j = 0; while ((j<(pcs_p[nt_idx(p, pcs_n, 7730)]).n_cnd)) { double w = (ntu_pol_eval(facs_atom_p, facs_exp_p, facs_n, terms_p, terms_n, pols_p, pols_n, pst_p, pst_n, (cnds_p[nt_idx(((pcs_p[nt_idx(p, pcs_n, 7731)]).cnd+j), cnds_n, 7731)]).ws, b, m, size)*b); if ((pst_p[nt_idx(6, pst_n, 7732)]!=0)) { bad = 1; } int64_t fits = ({ int64_t nt_t362; if ((w<m)) { nt_t362 = 1; } else { nt_t362 = 0; } nt_t362; }); if ((fits!=(cnds_p[nt_idx(((pcs_p[nt_idx(p, pcs_n, 7734)]).cnd+j), cnds_n, 7734)]).fits)) { holds = false; } j += 1; } if (holds) { double v = ntu_pol_eval(facs_atom_p, facs_exp_p, facs_n, terms_p, terms_n, pols_p, pols_n, pst_p, pst_n, (pcs_p[nt_idx(p, pcs_n, 7738)]).poly, b, m, size); if ((pst_p[nt_idx(6, pst_n, 7739)]!=0)) { bad = 1; } if (((!any)||(v>best))) { best = v; } any = true; } i += 1; }
+    pst_p[nt_idx(6, pst_n, 7745)] = bad;
     return best;
 }
 
 static int64_t ntu_pol_leading(const int64_t *facs_atom_p, const int64_t *facs_exp_p, int64_t facs_n, struct nt_Term *terms_p, int64_t terms_n, struct nt_Pol *pols_p, int64_t pols_n, int64_t *pst_p, int64_t pst_n, int64_t p) {
     int64_t top = (0-1);
     int64_t i = 0;
-    while ((i<(pols_p[nt_idx(p, pols_n, 7680)]).n_term)) { int64_t d = ntu_mono_var_degree(facs_atom_p, facs_exp_p, facs_n, (terms_p[nt_idx(((pols_p[nt_idx(p, pols_n, 7681)]).term+i), terms_n, 7681)]).fac, (terms_p[nt_idx(((pols_p[nt_idx(p, pols_n, 7681)]).term+i), terms_n, 7681)]).n_fac); if ((d>top)) { top = d; } i += 1; }
-    int64_t start = pst_p[nt_idx(1, pst_n, 7685)];
+    while ((i<(pols_p[nt_idx(p, pols_n, 7758)]).n_term)) { int64_t d = ntu_mono_var_degree(facs_atom_p, facs_exp_p, facs_n, (terms_p[nt_idx(((pols_p[nt_idx(p, pols_n, 7759)]).term+i), terms_n, 7759)]).fac, (terms_p[nt_idx(((pols_p[nt_idx(p, pols_n, 7759)]).term+i), terms_n, 7759)]).n_fac); if ((d>top)) { top = d; } i += 1; }
+    int64_t start = pst_p[nt_idx(1, pst_n, 7763)];
     i = 0;
-    while ((i<(pols_p[nt_idx(p, pols_n, 7687)]).n_term)) { int64_t t = ((pols_p[nt_idx(p, pols_n, 7688)]).term+i); if ((ntu_mono_var_degree(facs_atom_p, facs_exp_p, facs_n, (terms_p[nt_idx(t, terms_n, 7689)]).fac, (terms_p[nt_idx(t, terms_n, 7689)]).n_fac)==top)) { (terms_p[nt_idx(pst_p[nt_idx(1, pst_n, 7690)], terms_n, 7690)]).fac = (terms_p[nt_idx(t, terms_n, 7690)]).fac; (terms_p[nt_idx(pst_p[nt_idx(1, pst_n, 7691)], terms_n, 7691)]).n_fac = (terms_p[nt_idx(t, terms_n, 7691)]).n_fac; (terms_p[nt_idx(pst_p[nt_idx(1, pst_n, 7692)], terms_n, 7692)]).cn = (terms_p[nt_idx(t, terms_n, 7692)]).cn; (terms_p[nt_idx(pst_p[nt_idx(1, pst_n, 7693)], terms_n, 7693)]).cd = (terms_p[nt_idx(t, terms_n, 7693)]).cd; pst_p[nt_idx(1, pst_n, 7694)] = (pst_p[nt_idx(1, pst_n, 7694)]+1); } i += 1; }
+    while ((i<(pols_p[nt_idx(p, pols_n, 7765)]).n_term)) { int64_t t = ((pols_p[nt_idx(p, pols_n, 7766)]).term+i); if ((ntu_mono_var_degree(facs_atom_p, facs_exp_p, facs_n, (terms_p[nt_idx(t, terms_n, 7767)]).fac, (terms_p[nt_idx(t, terms_n, 7767)]).n_fac)==top)) { (terms_p[nt_idx(pst_p[nt_idx(1, pst_n, 7768)], terms_n, 7768)]).fac = (terms_p[nt_idx(t, terms_n, 7768)]).fac; (terms_p[nt_idx(pst_p[nt_idx(1, pst_n, 7769)], terms_n, 7769)]).n_fac = (terms_p[nt_idx(t, terms_n, 7769)]).n_fac; (terms_p[nt_idx(pst_p[nt_idx(1, pst_n, 7770)], terms_n, 7770)]).cn = (terms_p[nt_idx(t, terms_n, 7770)]).cn; (terms_p[nt_idx(pst_p[nt_idx(1, pst_n, 7771)], terms_n, 7771)]).cd = (terms_p[nt_idx(t, terms_n, 7771)]).cd; pst_p[nt_idx(1, pst_n, 7772)] = (pst_p[nt_idx(1, pst_n, 7772)]+1); } i += 1; }
     return ntu_pol_close(facs_atom_p, facs_exp_p, facs_n, terms_p, terms_n, pols_p, pols_n, pst_p, pst_n, start);
 }
 
 static void ntu_emit_brief(uint8_t *out_p, int64_t out_n, int64_t *est_p, int64_t est_n, const uint8_t *src_p, int64_t src_n, const struct nt_Token *toks_p, int64_t toks_n, int64_t *facs_atom_p, int64_t *facs_exp_p, int64_t facs_n, struct nt_Term *terms_p, int64_t terms_n, struct nt_Pol *pols_p, int64_t pols_n, int64_t *pst_p, int64_t pst_n, const int64_t *logs_p, int64_t logs_n, const int64_t *pnames_p, int64_t pnames_n, const int64_t *parr_p, int64_t parr_n, int64_t p, int64_t *order_p, int64_t order_n, int64_t limit) {
     int64_t q = p;
-    if (((pols_p[nt_idx(p, pols_n, 7705)]).n_term>limit)) { ntu_emit_u(out_p, out_n, est_p, est_n, 226); ntu_emit_u(out_p, out_n, est_p, est_n, 137); ntu_emit_u(out_p, out_n, est_p, est_n, 136); ntu_emit_b(out_p, out_n, est_p, est_n, ((uint8_t)32)); q = ntu_pol_leading(facs_atom_p, facs_exp_p, facs_n, terms_p, terms_n, pols_p, pols_n, pst_p, pst_n, p); }
+    if (((pols_p[nt_idx(p, pols_n, 7783)]).n_term>limit)) { ntu_emit_u(out_p, out_n, est_p, est_n, 226); ntu_emit_u(out_p, out_n, est_p, est_n, 137); ntu_emit_u(out_p, out_n, est_p, est_n, 136); ntu_emit_b(out_p, out_n, est_p, est_n, ((uint8_t)32)); q = ntu_pol_leading(facs_atom_p, facs_exp_p, facs_n, terms_p, terms_n, pols_p, pols_n, pst_p, pst_n, p); }
     ntu_pol_print(out_p, out_n, est_p, est_n, src_p, src_n, toks_p, toks_n, facs_atom_p, facs_exp_p, facs_n, terms_p, terms_n, pols_p, pols_n, logs_p, logs_n, pnames_p, pnames_n, parr_p, parr_n, q, order_p, order_n, 0);
 }
 
@@ -2804,7 +2833,7 @@ static void ntu_main(void) {
     int64_t nodes_n = 524288; struct nt_Node *nodes_p = nt_alloc(nodes_n, sizeof(struct nt_Node)); { struct nt_Node nt_t365 = ((struct nt_Node){.kind = 0, .a = 0, .b = 0, .c = 0, .d = 0, .ival = 0, .next = 0}); for (int64_t nt_i365 = 0; nt_i365 < nodes_n; nt_i365++) nodes_p[nt_i365] = nt_t365; }
     int64_t st_b[] = {0, 0, 0, 0, 0}; int64_t *st_p = st_b; int64_t st_n = (int64_t)(sizeof(st_b) / sizeof(int64_t));
     int64_t first = ntu_parse_program(buf_p, buf_n, toks_p, toks_n, n_toks, st_p, st_n, nodes_p, nodes_n);
-    if ((st_p[nt_idx(2, st_n, 7757)]!=0)) { quit(2); }
+    if ((st_p[nt_idx(2, st_n, 7835)]!=0)) { quit(2); }
     int64_t types_n = 524288; struct nt_Ty *types_p = nt_alloc(types_n, sizeof(struct nt_Ty)); { struct nt_Ty nt_t366 = ((struct nt_Ty){.kind = 0, .elem = 0, .mutable = 0, .size = 0}); for (int64_t nt_i366 = 0; nt_i366 < types_n; nt_i366++) types_p[nt_i366] = nt_t366; }
     int64_t syms_n = 524288; struct nt_Sym *syms_p = nt_alloc(syms_n, sizeof(struct nt_Sym)); { struct nt_Sym nt_t367 = ((struct nt_Sym){.name = 0, .ty = 0, .mutable = 0, .root = 0}); for (int64_t nt_i367 = 0; nt_i367 < syms_n; nt_i367++) syms_p[nt_i367] = nt_t367; }
     int64_t sigs_n = 4096; struct nt_Sig *sigs_p = nt_alloc(sigs_n, sizeof(struct nt_Sig)); { struct nt_Sig nt_t368 = ((struct nt_Sig){.name = (-1), .params = 0, .n_params = 0, .ret = 0, .ext = 0}); for (int64_t nt_i368 = 0; nt_i368 < sigs_n; nt_i368++) sigs_p[nt_i368] = nt_t368; }
@@ -2816,7 +2845,7 @@ static void ntu_main(void) {
     int64_t bad = ntu_check_program(buf_p, buf_n, toks_p, toks_n, nodes_p, nodes_n, types_p, types_n, syms_p, syms_n, sigs_p, sigs_n, ptys_p, ptys_n, strs_p, strs_n, flds_p, flds_n, ntys_p, ntys_n, cst_p, cst_n, first);
     if ((bad!=0)) { quit(3); }
     int64_t slay_n = 1024; int64_t *slay_p = nt_alloc(slay_n, sizeof(int64_t)); { int64_t nt_t374 = 0; for (int64_t nt_i374 = 0; nt_i374 < slay_n; nt_i374++) slay_p[nt_i374] = nt_t374; }
-    ntu_choose_layouts(buf_p, buf_n, toks_p, toks_n, nodes_p, nodes_n, types_p, types_n, strs_p, strs_n, flds_p, flds_n, ntys_p, ntys_n, sigs_p, sigs_n, ptys_p, ptys_n, slay_p, slay_n, first, cst_p[nt_idx(7, cst_n, 7781)]);
+    ntu_choose_layouts(buf_p, buf_n, toks_p, toks_n, nodes_p, nodes_n, types_p, types_n, strs_p, strs_n, flds_p, flds_n, ntys_p, ntys_n, sigs_p, sigs_n, ptys_p, ptys_n, slay_p, slay_n, first, cst_p[nt_idx(7, cst_n, 7859)]);
     int64_t out_n = 4194304; uint8_t *out_p = nt_alloc(out_n, sizeof(uint8_t)); { uint8_t nt_t375 = ((uint8_t)0); for (int64_t nt_i375 = 0; nt_i375 < out_n; nt_i375++) out_p[nt_i375] = nt_t375; }
     int64_t est_b[] = {0, 0, 0}; int64_t *est_p = est_b; int64_t est_n = (int64_t)(sizeof(est_b) / sizeof(int64_t));
     int64_t len = ntu_emit_program(out_p, out_n, est_p, est_n, buf_p, buf_n, toks_p, toks_n, nodes_p, nodes_n, types_p, types_n, strs_p, strs_n, flds_p, flds_n, slay_p, slay_n, ntys_p, ntys_n, sigs_p, sigs_n, ptys_p, ptys_n, first);

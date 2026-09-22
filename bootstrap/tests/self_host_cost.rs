@@ -234,11 +234,31 @@ fn self_hosted_work_agrees_with_bootstrap() {
     let mut exact_moves = 0;
     let mut exact_bounds = 0;
     let mut exact_foot = 0;
+    let mut rejected = 0;
     for f in &files {
-        // only what the self-hosted compiler can read, and only what checks
+        // only what the self-hosted compiler can read
         if Command::new(neant()).arg("parsedump").arg(f).output().unwrap().status.code() == Some(2) { continue; }
-        if !Command::new(neant()).arg("check").arg(f).output().unwrap().status.success() { continue; }
         let name = f.file_name().unwrap().to_string_lossy().to_string();
+        // **A program `neant check` rejects must be rejected here too**, and for the ones it
+        // rejects over a `#[cost]` bound that is the only test of the assertion rule — the checker
+        // parity test runs the checker alone and cannot see a breach, because whether a bound holds
+        // is a question for the cost pass. Checked here, where the cost pass is.
+        if !Command::new(neant()).arg("check").arg(f).output().unwrap().status.success() {
+            let run = Command::new(&reporter)
+                .stdin(std::fs::File::open(f).unwrap()).output().unwrap();
+            let out = String::from_utf8_lossy(&run.stdout);
+            // the reporter prints the checker's verdict and then the parser's; rejected by
+            // either is rejected
+            let mut vs = out.lines();
+            let v = vs.next().unwrap_or("");
+            let vp = vs.next().unwrap_or("");
+            if v == "0" && vp == "0" {
+                failures.push(format!("{name}: `neant check` rejects it, the self-hosted pass \
+                    accepts it — a breached `#[cost]` bound is a check error"));
+            }
+            rejected += 1;
+            continue;
+        }
 
         let report = String::from_utf8_lossy(
             &Command::new(neant()).arg("cost").arg(f).output().unwrap().stdout).into_owned();
@@ -339,6 +359,8 @@ fn self_hosted_work_agrees_with_bootstrap() {
         {EXACT}; {unknown} more it declines. Widening or narrowing the slice means changing EXACT.");
     assert_eq!(exact_moves, EXACT_MOVES, "the self-hosted pass reproduces {exact_moves} moves \
         columns exactly, not {EXACT_MOVES}.");
+    assert!(rejected >= 1, "no in-slice program is rejected any more; the assertion rule has \
+        nothing left testing it");
     assert_eq!(exact_foot, EXACT_FOOT, "the self-hosted pass agrees on {exact_foot} footprint \
         columns, not {EXACT_FOOT}.");
     assert_eq!(exact_bounds, EXACT_BOUNDS, "the self-hosted pass agrees on {exact_bounds} \

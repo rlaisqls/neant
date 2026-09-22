@@ -3680,6 +3680,84 @@ fn c_read(src: &[u8], toks: &[Token], nodes: &[Node], facs: &mut [Fac], terms: &
     acc
 }
 
+// **A `#[cost]` bound is checked asymptotically, not by constants.** Every monomial of the
+// inferred cost must be covered by one of the asserted bound, comparing only the exponents of
+// *size variables* — `B`, `M` and the coefficients do not count. So `8·n + B` is within an asserted
+// `2·n` and `8·n²` is not, which is why `pairs` in `err_assert.nt` is rejected and a merely
+// larger constant is not. `assert::dominated` in `assert.rs`; a `pol_dominates` here would reject
+// programs `neant check` accepts.
+//
+// The log tie-break `assert.rs` applies at equal powers is not reproduced: no bound in the corpus
+// carries a `log`, and a rule with no example is a guess.
+fn mono_asym_ge(facs: &[Fac], u: i64, nu: i64, t: i64, nt: i64) -> bool {
+    let mut ok = true;
+    let mut i = 0;
+    while i < nu {
+        let a = facs[u + i].atom;
+        if a >= 3 && a < 2000 && facs[u + i].exp < mono_exp(facs, t, nt, a) { ok = false; };
+        i += 1;
+    }
+    let mut j = 0;
+    while j < nt {
+        let a = facs[t + j].atom;
+        if a >= 3 && a < 2000 && mono_exp(facs, u, nu, a) < facs[t + j].exp { ok = false; };
+        j += 1;
+    }
+    ok
+}
+
+fn asym_dominated(facs: &[Fac], terms: &[Term], pols: &[Pol], inferred: i64, asserted: i64) -> bool {
+    let mut i = 0;
+    let mut all = true;
+    while i < pols[inferred].n_term {
+        let t = pols[inferred].term + i;
+        let mut any = false;
+        let mut j = 0;
+        while j < pols[asserted].n_term {
+            let u = pols[asserted].term + j;
+            if mono_asym_ge(facs, terms[u].fac, terms[u].n_fac, terms[t].fac, terms[t].n_fac) {
+                any = true;
+            };
+            j += 1;
+        }
+        if !any { all = false; };
+        i += 1;
+    }
+    all
+}
+
+// Does this function keep every `#[cost]` bound it carries? Both columns are checked whether the
+// attribute is a declaration or an assertion — only the *reporting* differs between them — and a
+// `moves` bound is checked against every regime, since a cost that forks must stay within it in
+// all of them.
+fn asserts_hold(src: &[u8], toks: &[Token], nodes: &[Node], facs: &mut [Fac], terms: &mut [Term],
+                pols: &mut [Pol], pst: &mut [i64], pcs: &[Pce], cks: &[Ck], ds: &mut [i64],
+                iw: i64, im: i64, f: i64) -> bool {
+    let at = nodes[f].ival;
+    if at < 0 { return true; }
+    // a bound in real units at declared sizes is a different check, and no golden in this slice
+    // carries one — `err_budget.nt` needs chains before it can be read at all
+    if nodes[at].c >= 0 { return true; }
+    let mut ok = true;
+    if nodes[at].a >= 0 && iw >= 0 {
+        let aw = c_read(src, toks, nodes, facs, terms, pols, pst, ds, f, nodes[at].a);
+        if aw < 0 || !asym_dominated(facs, terms, pols, iw, aw) { ok = false; };
+    };
+    if nodes[at].b >= 0 && im >= 0 {
+        let am = c_read(src, toks, nodes, facs, terms, pols, pst, ds, f, nodes[at].b);
+        if am < 0 {
+            ok = false;
+        } else {
+            let mut pi = 0;
+            while pi < cks[im].n_pce {
+                if !asym_dominated(facs, terms, pols, pcs[cks[im].pce + pi].poly, am) { ok = false; };
+                pi += 1;
+            }
+        };
+    };
+    ok
+}
+
 // `≤ `, which a declared column is prefixed with; the sign is two bytes this printer cannot spell
 fn emit_le(out: &mut [u8], est: &mut [i64]) {
     emit_u(out, est, 226);

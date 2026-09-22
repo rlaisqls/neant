@@ -1478,3 +1478,33 @@ column is an assertion about an inference that still stands, and `neant check` *
 whose assertion is breached — so a checker verdict depends on the cost pass. `self_host_check.rs`
 runs the checker alone and cannot see one, so `err_assert.nt` is listed in `NEEDS_THE_COST_PASS`
 there. Closing it means giving that driver the cost pass, not giving the checker a new rule.
+
+### The assertion half, and the rule that had to be measured
+
+**A `#[cost]` bound is checked asymptotically, not by constants.** `assert::dominated` requires
+every monomial of the inferred cost to be covered by one of the asserted bound, comparing **only
+the exponents of size variables** — coefficients do not count, and neither do `B` and `M`. So:
+
+```
+#[cost(moves_at_most = "2 xs.len()")]   inferred 8·xs.len() + B      within the bound
+#[cost(moves_at_most = "8 a.len()")]    inferred 8·a.len()² + 2·B·a.len()   a violation
+```
+
+A declared `2·xs.len()` against an inferred `8·xs.len() + B` is *not* a breach. That is the rule an
+implementation gets wrong by default: `pol_dominates` is right there, it is the obvious tool, and it
+would reject programs `neant check` accepts. Four probes were needed to find it, because the corpus's
+one violation (`err_assert`) happens to be quadratic-against-linear and so passes either reading.
+
+Both columns are checked whether the attribute is a declaration or an assertion — only the
+*reporting* differs — and a `moves` bound is checked against every regime, since a cost that forks
+must stay within its bound in all of them.
+
+**A breach is a check error**, so the reporter's verdict now accounts for it and not only for the
+checker's own rules. That coupling is where it is tested: `self_host_check.rs` runs the checker
+alone and cannot see a breach, so `self_host_cost.rs` — which has the cost pass — requires every
+in-slice program `neant check` rejects to be rejected there too, and asserts that at least one such
+program exists so the rule cannot quietly stop being tested.
+
+Not reproduced, and said rather than hidden: the log tie-break `assert.rs` applies at equal powers,
+and the numeric `sizes` budget. No bound in the slice carries a `log`, and `err_budget.nt` needs
+chains before it can be read at all — a rule with no example to check it against is a guess.
