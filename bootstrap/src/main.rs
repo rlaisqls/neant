@@ -108,9 +108,18 @@ fn main() {
             if use_iolb { iolb_bounds(&module, &mut costs, &machine); }
             for c in &costs {
                 print!("{}", cost::lock::report(c, &machine));
-                if let (Some(ev), cost::CostResult::Exact { work, moves, .. }) = (&eval, &c.result) {
+                if let (Some(ev), cost::CostResult::Exact { work, moves, span }) = (&eval, &c.result) {
                     if let Some((w, m)) = evaluate(c, work, moves, ev, &machine) {
-                        println!("{:<16}   at {ev}: work {w:.0}  moves {m:.0} bytes", "");
+                        print!("{:<16}   at {ev}: work {w:.0}  moves {m:.0} bytes", "");
+                        if span != work {
+                            if let Some(s) = eval_one(c, span, ev, &machine) {
+                                // `P` defaults to the machine's own core count unless `ev` names one
+                                let p = ev.split(',').find_map(|p| p.split_once('=').filter(|(k, _)| k.trim() == "P").and_then(|(_, v)| v.trim().parse().ok()))
+                                    .unwrap_or(machine.p_cores as f64);
+                                print!("  span {s:.0}  T ≲ work/P + span = {:.0} (P={p:.0})", w / p + s);
+                            }
+                        }
+                        println!();
                     }
                 }
             }
@@ -328,7 +337,7 @@ fn iolb_bounds(module: &ir::Module, costs: &mut [cost::FuncCost], machine: &cost
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-fn evaluate(c: &cost::FuncCost, work: &cost::Cost, moves: &cost::Cost, ev: &str, m: &cost::Machine) -> Option<(f64, f64)> {
+fn eval_one(c: &cost::FuncCost, cost: &cost::Cost, ev: &str, m: &cost::Machine) -> Option<f64> {
     use cost::size::Atom;
     let mut vals: Vec<(String, f64)> = Vec::new();
     for part in ev.split(',') {
@@ -347,5 +356,9 @@ fn evaluate(c: &cost::FuncCost, work: &cost::Cost, moves: &cost::Cost, ev: &str,
             Atom::Log(_) => None, // handled inside eval
         }
     };
-    Some((work.eval(&f, m)?, moves.eval(&f, m)?))
+    cost.eval(&f, m)
+}
+
+fn evaluate(c: &cost::FuncCost, work: &cost::Cost, moves: &cost::Cost, ev: &str, m: &cost::Machine) -> Option<(f64, f64)> {
+    Some((eval_one(c, work, ev, m)?, eval_one(c, moves, ev, m)?))
 }
