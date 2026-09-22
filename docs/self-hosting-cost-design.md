@@ -412,3 +412,30 @@ needs the line count for anything else.
 
 The same `moves` column, string for string, now including the pieces and their conditions. The
 count in the test goes up by five; a function whose cost forks twice must say unknown.
+
+### What building it changed
+
+**31 `moves` columns exact**, up from 26 — all five single-condition regimes, with no regression
+among the twenty-six that already matched. Three things the build changed, and the third is the
+interesting one.
+
+- **A cost arena must not be reset per function.** `Ck` indices are stored per function and printed
+  at the end, so resetting the arena between functions left every earlier function pointing at the
+  last one's costs. `upcase` read `0`. The polynomial arenas are append-only for exactly this
+  reason and the new one had to be too.
+- **Sites on the same array share its footprint.** Two sites walking one array scattered cost the
+  array *once* when it fits, not once per site — `settle_moves` says the same of an arena, "an
+  arena's lines are the arena's, however many sites walk it". `is_palindrome` read `2·s.len()`
+  where the answer is `s.len()`. On the fitting side forked costs combine with `max`; on the other
+  side they still add.
+- **The fork is not for every scatter — only when the walk is longer than the array.** Bounding a
+  scatter by the array it scatters over buys nothing until lines are revisited, so `analyze.rs`
+  forks only when the touches dominate the array's line count, with `B` substituted. Forking
+  unconditionally made `ring.nt`'s `push_all` and `vm.nt`'s `run` *worse* — both went from exact to
+  unknown, because their walks are bounded by something unrelated to the array they scatter over
+  (`xs.len()` touches of `buf`, `fuel` touches of `code`) and the comparison rightly fails.
+
+  That comparison needed the half of `piece::dominates` §7 had left out: the **budget argument**,
+  where each positive term of `q` is a budget the terms of `p` consume from monomials that cover
+  them. `64·s.len() − 64` dominates `s.len()` only through it. The arithmetic is `f64` here because
+  it is `f64` there, and this has to agree rather than merely be right.

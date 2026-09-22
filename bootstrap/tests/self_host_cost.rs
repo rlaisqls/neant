@@ -42,8 +42,11 @@ const COPIES_INSTEAD: &[(&str, &str)] = &[
 const EXACT: usize = 71;
 
 /// The same for `moves`, whose slice is narrower: a function that calls anything is unknown,
-/// because a callee's traffic depends on what is already resident (design §11).
-const EXACT_MOVES: usize = 26;
+/// because a callee's traffic depends on what is already resident (design §11). Five of these are
+/// **piecewise** — a scattered walk costs the array's footprint when it fits in `M` and a line per
+/// touch when it does not — and their two regimes and the condition between them are compared as
+/// one string, exactly as the single-piece ones are (design §13).
+const EXACT_MOVES: usize = 31;
 
 /// `(file, function)` where the self-hosted `moves` differs because **the self-hosted emitter
 /// always lays an array of structs out as AoS** (docs/self-hosting-arrays-design.md §4) while the
@@ -84,20 +87,30 @@ fn rust_report(out: &str) -> BTreeMap<String, Option<String>> {
     m
 }
 
-/// The `moves` column, for the functions that have one and are not piecewise. A regime is not a
-/// polynomial and this slice does not compute one, so those are left out entirely rather than
-/// compared and excused.
+/// The `moves` column. A function whose cost is piecewise has an empty column and its regimes on
+/// the indented lines that follow; those are joined into `poly if cond | poly if cond`, which is
+/// what `compiler/costdump.nt` prints for a forked cost, so the two still compare as strings.
 fn rust_moves(out: &str) -> BTreeMap<String, String> {
     let mut m = BTreeMap::new();
-    for line in out.lines() {
+    let lines: Vec<&str> = out.lines().collect();
+    for (i, line) in lines.iter().enumerate() {
         if line.starts_with(' ') || line.trim().is_empty() { continue; }
-        let Some(i) = line.find(" moves ") else { continue };
-        let rest = &line[i + 7..];
+        let Some(k) = line.find(" moves ") else { continue };
+        let name = line.split_whitespace().next().unwrap_or("").to_string();
+        let rest = &line[k + 7..];
         let Some(j) = rest.find("  ") else { continue };
         let (mv, tag) = (rest[..j].trim(), &rest[j..]);
-        if tag.contains("regime") || mv.is_empty() { continue; }
-        let name = line.split_whitespace().next().unwrap_or("").to_string();
-        m.insert(name, mv.to_string());
+        if !mv.is_empty() { m.insert(name, mv.to_string()); continue; }
+        if !tag.contains("regime") { continue; }
+        // the pieces, in the order the report lists them
+        let mut pieces = Vec::new();
+        for l in lines[i + 1..].iter().take_while(|l| l.starts_with(' ')) {
+            let t = l.trim();
+            let Some(p) = t.strip_prefix("moves ") else { continue };
+            let Some(c) = p.find("  if ") else { continue };
+            pieces.push(format!("{} if {}", p[..c].trim(), p[c + 5..].trim()));
+        }
+        if !pieces.is_empty() { m.insert(name, pieces.join(" | ")); }
     }
     m
 }
