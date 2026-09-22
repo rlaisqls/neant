@@ -1508,3 +1508,65 @@ program exists so the rule cannot quietly stop being tested.
 Not reproduced, and said rather than hidden: the log tie-break `assert.rs` applies at equal powers,
 and the numeric `sizes` budget. No bound in the slice carries a `log`, and `err_budget.nt` needs
 chains before it can be read at all — a rule with no example to check it against is a guess.
+
+## 25. Chains, measured — and the question of who rewrites
+
+Chains are the last thing keeping the front end's slice below the corpus: six files need them
+(`while`, `chains`, `par`, `par_span`, `decl`, `err_budget`), and they are also the prerequisite for
+span and for the numeric `sizes` budget. They are the largest single feature left.
+
+### The surface, as the corpus actually uses it
+
+| part | forms in the corpus |
+|---|---|
+| source | `xs.iter()`, `xs.par()`, `xs.iter().par()` |
+| stages | `.map(\|x\| e)`, `.filter(\|x\| c)`, `.zip(b)`, `.enumerate()` |
+| terminals | `.sum()`, `.count()`, `.any()`, `.all()`, `.max()`, `.min()`, `.fold(init, \|acc, x\| e)` |
+| comprehension | `[e for x in xs]`, `[e for x in xs if c]`, both as a value and terminated |
+| closures | one parameter, and **two** after `zip` (`\|x, y\|`) or `enumerate` (`\|i, x\|`) |
+
+Three of the six files need far less than that whole list. `while.nt` needs
+`o.iter().filter(\|c\| c == b'L').count()` and nothing else; `decl.nt` and `err_budget.nt` need
+`xs.iter().sum()`. So **`iter` → `map`/`filter` → `sum`/`count`, with a one-parameter closure, buys
+half the remaining files** and is the first slice.
+
+### The rule
+
+`types.rs`'s `chain()` flattens `receiver ← stage ← … ← terminal` into a list and builds **one
+loop** over the source with every stage inlined into its body. Fusion is not an optimisation applied
+afterwards; it is the only form the construct has. A comprehension is the same thing with its
+condition as a `filter` and its element as a `map`, pushed in front of whatever follows it — which
+is why `[x * x for x in xs if x > 0.0].sum()` needs no separate machinery.
+
+### Who rewrites, which is the real question
+
+The Rust desugars in the checker because it produces an IR, and it needs types first: `.sum()` over
+`f64` starts at `0.0` and over `i64` at `0`.
+
+This compiler has no IR. `lex → parse → check → emit`, and `emit` and the cost pass walk **the same
+tree the parser built**, with `check` only annotating it. So a chain has to become a loop somewhere,
+and there are only three places:
+
+- **the parser** — but it does not know the element type, so it cannot choose `0` against `0.0`;
+- **the emitter and the cost pass, separately** — two desugarings that must agree, which is exactly
+  the shape of bug this project has spent the session removing;
+- **the checker, by rewriting the tree** — it runs after types are known and before both readers,
+  and it is already the stage that records what it resolved.
+
+The third is the only one that keeps a single desugaring. It makes `check` a *rewriter* rather than
+purely an annotator: `nodes` becomes `&mut`, the checker gets the parser's node allocator, and a
+chain node is overwritten in place by the block that replaces it. That is a real architectural step
+and it is worth naming before it is taken, because everything downstream stays unchanged by it —
+which is the argument for it.
+
+### Build order
+
+1. **The parser**: postfix `.name(args)`, closures, comprehensions. Verifiable on its own against
+   `parsedump`, which has to learn the same node kinds.
+2. **The rewrite**, for `iter → map/filter → sum/count` only, with the checker mutating the tree.
+   `while.nt`, `decl.nt` and `err_budget.nt` come into the slice on that alone, and `err_budget`
+   brings the numeric `sizes` budget with it.
+3. **The rest of the stages and terminals** — `zip`, `enumerate`, `fold`, `any`/`all`/`max`/`min`,
+   two-parameter closures — which is `chains.nt`.
+4. **`.par()` and span**, last, because a `.par()` chain is a chain first and the span rule is a
+   separate calculus on top of it.
