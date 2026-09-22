@@ -584,6 +584,9 @@ fn check_stmt_inner(src: &[u8], toks: &[Token], nodes: &[Node], types: &mut [Ty]
             if s < 0 { cst[2] = 1; return; }
             let bt = syms[s].ty;
             if !is_arrayish(types, bt) { cst[2] = 1; return; }
+            // the base is resolved here rather than through `check_expr`, so its type has to be
+            // recorded here too — the cost pass asks what an assignment target's array holds
+            ntys[nodes[tgt].a] = bt;
             // writing needs an owned `let mut` array or a `&mut [T]`
             if types[bt].kind == 5 && syms[s].mutable == 0 { cst[2] = 1; return; }
             if types[bt].kind == 6 && types[bt].mutable == 0 { cst[2] = 1; return; }
@@ -610,6 +613,7 @@ fn check_stmt_inner(src: &[u8], toks: &[Token], nodes: &[Node], types: &mut [Ty]
                 if !is_arrayish(types, bt) { cst[2] = 1; return; }
                 if types[bt].kind == 5 && syms[s].mutable == 0 { cst[2] = 1; return; }
                 if types[bt].kind == 6 && types[bt].mutable == 0 { cst[2] = 1; return; }
+                ntys[nodes[b0].a] = bt;
             } else {
                 cst[2] = 1;
                 return;

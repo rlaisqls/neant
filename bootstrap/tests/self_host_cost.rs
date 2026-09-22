@@ -8,7 +8,8 @@
 //! must say **unknown** rather than a number. A cost calculus that guesses is worse than one that
 //! declines, so that is asserted and not merely tolerated.
 //!
-//! One group of functions differs **on purpose**, and is listed by name. `ys = xs` on whole arrays
+//! Two groups of functions differ **on purpose**, and are listed by name; a third differs for a
+//! reason nobody has worked out yet, and says so. `ys = xs` on whole arrays
 //! costs 1 when the compiler can prove the assignment is in place and the array's length when it
 //! cannot. The proof is M5's uniqueness analysis; the self-hosted compiler has none, so its
 //! emitter always copies (docs/self-hosting-arrays-design.md §7) and its cost says so. The two
@@ -41,6 +42,33 @@ const COPIES_INSTEAD: &[(&str, &str)] = &[
 /// that widening the slice means changing a number someone has to look at.
 const EXACT: usize = 67;
 
+/// The same for `moves`, whose slice is narrower: a function that calls anything is unknown,
+/// because a callee's traffic depends on what is already resident (design §11).
+const EXACT_MOVES: usize = 25;
+
+/// `(file, function)` where the self-hosted `moves` differs because **the self-hosted emitter
+/// always lays an array of structs out as AoS** (docs/self-hosting-arrays-design.md §4) while the
+/// Rust compiler chooses AoS or SoA from the cost model. Same principle as `COPIES_INSTEAD`,
+/// arrived at independently: a cost is a claim about the code the compiler emits.
+const AOS_INSTEAD: &[(&str, &str)] = &[
+    ("arrayview.nt", "tagged"),
+    ("particles.nt", "step"),
+    ("particles.nt", "kinetic"),
+    ("particles.nt", "centroid_x"),
+    ("structs.nt", "sum_x"),
+    ("structs.nt", "sum_all"),
+    ("structs.nt", "shift"),
+];
+
+/// **Not understood.** `vm.nt`'s `run` is a bytecode interpreter whose dispatch is an `if`/`else if`
+/// chain; `neant cost` reports `3·B·fuel + B` and the self-hosted pass `10·B·fuel + B`. Ten is
+/// what counting one site per (array, index, branch) gives, and three is exactly what ignoring the
+/// branch gives — but `parse.nt`'s `peek` needs the branch counted, or its two reads of `pos[0]`
+/// on either side of an `if` collapse into one and it reports `2·B` where `neant cost` says `3·B`.
+/// Both cannot be right, so one of the two readings of `analyze.rs`'s site identity is wrong and
+/// this is listed as a difference nobody has explained rather than as one somebody chose.
+const UNEXPLAINED_MOVES: &[(&str, &str)] = &[("vm.nt", "run")];
+
 /// The driver is a committed fragment, not a string in this file: a test that embeds the program
 /// it runs drifts from it silently, which this one did once.
 fn driver() -> String {
@@ -64,6 +92,24 @@ fn rust_report(out: &str) -> BTreeMap<String, Option<String>> {
     m
 }
 
+/// The `moves` column, for the functions that have one and are not piecewise. A regime is not a
+/// polynomial and this slice does not compute one, so those are left out entirely rather than
+/// compared and excused.
+fn rust_moves(out: &str) -> BTreeMap<String, String> {
+    let mut m = BTreeMap::new();
+    for line in out.lines() {
+        if line.starts_with(' ') || line.trim().is_empty() { continue; }
+        let Some(i) = line.find(" moves ") else { continue };
+        let rest = &line[i + 7..];
+        let Some(j) = rest.find("  ") else { continue };
+        let (mv, tag) = (rest[..j].trim(), &rest[j..]);
+        if tag.contains("regime") || mv.is_empty() { continue; }
+        let name = line.split_whitespace().next().unwrap_or("").to_string();
+        m.insert(name, mv.to_string());
+    }
+    m
+}
+
 #[test]
 fn self_hosted_work_agrees_with_bootstrap() {
     let stages: String = ["compiler/lex.nt", "compiler/parse.nt", "compiler/check.nt",
@@ -81,14 +127,17 @@ fn self_hosted_work_agrees_with_bootstrap() {
     files.sort();
 
     let (mut exact, mut unknown, mut failures) = (0, 0, Vec::new());
+    let mut exact_moves = 0;
     for f in &files {
         // only what the self-hosted compiler can read, and only what checks
         if Command::new(neant()).arg("parsedump").arg(f).output().unwrap().status.code() == Some(2) { continue; }
         if !Command::new(neant()).arg("check").arg(f).output().unwrap().status.success() { continue; }
         let name = f.file_name().unwrap().to_string_lossy().to_string();
 
-        let want = rust_report(&String::from_utf8_lossy(
-            &Command::new(neant()).arg("cost").arg(f).output().unwrap().stdout));
+        let report = String::from_utf8_lossy(
+            &Command::new(neant()).arg("cost").arg(f).output().unwrap().stdout).into_owned();
+        let want = rust_report(&report);
+        let want_moves = rust_moves(&report);
         let run = Command::new(neant()).arg("run").arg(&nt)
             .stdin(std::fs::File::open(f).unwrap()).output().unwrap();
         assert!(run.status.success(), "the self-hosted cost driver failed on {name}:\n{}",
@@ -97,9 +146,28 @@ fn self_hosted_work_agrees_with_bootstrap() {
         let mut lines = out.lines();
         assert_eq!(lines.next(), Some("0"), "{name}: the self-hosted checker rejected it");
         assert_eq!(lines.next(), Some("0"), "{name}: the self-hosted parser rejected it");
-        let got: BTreeMap<&str, &str> = lines
-            .filter_map(|l| l.split_once('\t')).collect();
+        let rows: Vec<Vec<&str>> = lines.map(|l| l.split('\t').collect()).collect();
+        let got: BTreeMap<&str, &str> = rows.iter()
+            .filter(|r| r.len() >= 2).map(|r| (r[0], r[1])).collect();
+        let got_moves: BTreeMap<&str, &str> = rows.iter()
+            .filter(|r| r.len() >= 3).map(|r| (r[0], r[2])).collect();
 
+        for (fname, mw) in &want_moves {
+            let Some(g) = got_moves.get(fname.as_str()) else { continue };
+            if *g == "unknown" { continue; }
+            let listed = AOS_INSTEAD.contains(&(name.as_str(), fname.as_str()))
+                || UNEXPLAINED_MOVES.contains(&(name.as_str(), fname.as_str()));
+            if g == mw {
+                exact_moves += 1;
+                if listed {
+                    failures.push(format!("{name} {fname} is listed as a moves difference, but the \
+                        two agree — delete it from AOS_INSTEAD or UNEXPLAINED_MOVES"));
+                }
+            } else if !listed {
+                failures.push(format!("{name} {fname}: `neant cost` says moves [{mw}], the \
+                    self-hosted pass says [{g}]"));
+            }
+        }
         for (fname, w) in &want {
             let Some(g) = got.get(fname.as_str()) else { continue };
             let copies = COPIES_INSTEAD.contains(&(name.as_str(), fname.as_str()));
@@ -132,4 +200,6 @@ fn self_hosted_work_agrees_with_bootstrap() {
     assert!(failures.is_empty(), "{} disagreements:\n\n{}", failures.len(), failures.join("\n"));
     assert_eq!(exact, EXACT, "the self-hosted pass reproduces {exact} work columns exactly, not \
         {EXACT}; {unknown} more it declines. Widening or narrowing the slice means changing EXACT.");
+    assert_eq!(exact_moves, EXACT_MOVES, "the self-hosted pass reproduces {exact_moves} moves \
+        columns exactly, not {EXACT_MOVES}.");
 }

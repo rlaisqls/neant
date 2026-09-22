@@ -14,9 +14,11 @@
 // bounds, layout. Each reports **unknown** rather than a number, which is the one thing a cost
 // calculus must do when it does not know.
 //
-// Atoms are the current function's parameters, by position — an array parameter's atom is its
-// length, which is why it prints as `xs.len()`. A loop variable gets an atom above 100, which
-// `pol_sum_over` eliminates before anything is printed.
+// Atoms carry the Rust compiler's own numbering, because both the canonical order of a monomial
+// and the order factors print in follow it: `B` is 0, `M` is 1, `P` is 2, and the current
+// function's parameter `i` is `3 + i` — an array parameter's atom is its length, which is why it
+// prints as `xs.len()`. A loop variable gets an atom above 1000, which `pol_sum_over` eliminates
+// before anything is printed.
 //
 // `wst` is this pass's state:
 //   wst[0] environment length   wst[1] unknown flag   wst[2] next loop atom
@@ -462,10 +464,10 @@ fn w_call(src: &[u8], toks: &[Token], nodes: &[Node], types: &[Ty], ntys: &[i64]
         if sz < 0 {
             // the callee's work may simply not mention this parameter, in which case nothing is
             // lost; asking is cheaper than proving
-            let e = mono_mentions(facs, terms, pols, body, p);
+            let e = mono_mentions(facs, terms, pols, body, 3 + p);
             if e { wst[1] = 1; }
         } else {
-            body = pol_subst(facs, terms, pols, pst, body, p, sz);
+            body = pol_subst(facs, terms, pols, pst, body, 3 + p, sz);
         }
         p += 1;
         a = nodes[a].next;
@@ -663,6 +665,92 @@ fn w_stmt(src: &[u8], toks: &[Token], nodes: &[Node], types: &[Ty], ntys: &[i64]
     pol_zero(facs, terms, pols, pst)
 }
 
+// The trip count of a `while`, the two ways `analyze.rs` finds one. Leaves the induction
+// variable's name token in wst[15] (−1 when the loop has a measure instead and so no variable that
+// walks), the loop atom in wst[17], its entry value in wst[18] and its step in wst[19]. Returns −1
+// when neither way works, which is a `while` with no static bound at all.
+fn while_trip(src: &[u8], toks: &[Token], nodes: &[Node], facs: &mut [Fac], terms: &mut [Term],
+              pols: &mut [Pol], pst: &mut [i64], env: &mut [Env], wst: &mut [i64], cof: &mut [Cof],
+              n: i64) -> i64 {
+    let cond = nodes[n].a;
+    let measure = nodes[n].b;
+    let body = nodes[n].c;
+    let mut trip = -1;
+    let mut atom = -1;
+    let mut lo = -1;
+    let mut step = 1;
+    let mut var = -1;
+
+    if measure >= 0 {
+        // the programmer's measure. Its value at entry is the trip count — but only once the
+        // promise has been checked: a measure that is not shown to fall by at least one every lap
+        // is not a bound, it is a wish.
+        trip = val_of(src, toks, nodes, facs, terms, pols, pst, env, wst, measure);
+        wst[7] = 0;
+        if trip < 0 || !coef_collect(src, toks, nodes, cof, wst, measure, 1) {
+            return -1;
+        }
+        let d = min_dec(src, toks, nodes, cof, wst, body);
+        // every path leaving the loop means it runs once, which needs no measure at all
+        if wst[9] == 2 || (wst[9] == 0 && d < 1) {
+            return -1;
+        }
+        if wst[9] == 1 { trip = pol_const(facs, terms, pols, pst, 1); };
+    } else {
+        // an induction variable in the condition, stepped by a constant in the body
+        if nodes[cond].kind != 66 {
+            return -1;
+        }
+        let op = nodes[cond].ival;
+        let l = nodes[cond].a;
+        let r = nodes[cond].b;
+        let mut bound = -1;
+        let mut asc = true;
+        if nodes[l].kind == 65 && (op == 7 || op == 8 || op == 6) { var = nodes[l].a; bound = r; asc = true; }
+        else if nodes[r].kind == 65 && (op == 9 || op == 10) { var = nodes[r].a; bound = l; asc = true; }
+        else if nodes[l].kind == 65 && (op == 9 || op == 10) { var = nodes[l].a; bound = r; asc = false; }
+        else if nodes[r].kind == 65 && (op == 7 || op == 8) { var = nodes[r].a; bound = l; asc = false; }
+        if bound < 0 {
+            return -1;
+        }
+        wst[4] = 0;
+        wst[6] = 0;
+        wst[8] = 0;
+        step = step_scan(src, toks, nodes, wst, body, var, false);
+        if wst[4] != 1 || wst[6] != 0 || step == 0 {
+            return -1;
+        }
+        if (asc && step < 0) || (!asc && step > 0) {
+            return -1;
+        }
+        // the bound must hold still while the loop runs
+        wst[7] = 0;
+        if !coef_collect(src, toks, nodes, cof, wst, bound, 1)
+            || assigns_any(src, toks, nodes, cof, wst, body, var) {
+            return -1;
+        }
+        let e = val_of(src, toks, nodes, facs, terms, pols, pst, env, wst, bound);
+        let ve = env_find(src, toks, env, wst, var);
+        let i0 = if ve >= 0 { env[ve].val } else { -1 };
+        if e < 0 || i0 < 0 {
+            return -1;
+        }
+        let span = if asc { pol_sub(facs, terms, pols, pst, e, i0) }
+                   else { pol_sub(facs, terms, pols, pst, i0, e) };
+        let mag = if step < 0 { 0 - step } else { step };
+        trip = pol_scale(facs, terms, pols, pst, span, 1, mag);
+        atom = wst[2];
+        wst[2] = atom + 1;
+        lo = i0;
+    }
+
+    wst[15] = var;
+    wst[17] = atom;
+    wst[18] = lo;
+    wst[19] = step;
+    trip
+}
+
 // A `while`: its condition once, then the body a trip count of times, with the trip count found
 // one of the two ways `analyze.rs` finds it. The condition is charged once and the loop one unit
 // per lap, which is what that file does — the `+1` stands for the test.
@@ -678,82 +766,17 @@ fn w_while(src: &[u8], toks: &[Token], nodes: &[Node], types: &[Ty], ntys: &[i64
     let before = pol_add(facs, terms, pols, pst, wcond, wmeas);
     let one = pol_const(facs, terms, pols, pst, 1);
 
-    let mut trip = -1;
-    let mut atom = -1;
-    let mut lo = -1;
-    let mut step = 1;
-    let mut var = -1;
-
-    if measure >= 0 {
-        // the programmer's measure. Its value at entry is the trip count — but only once the
-        // promise has been checked: a measure that is not shown to fall by at least one every lap
-        // is not a bound, it is a wish.
-        trip = val_of(src, toks, nodes, facs, terms, pols, pst, env, wst, measure);
-        wst[7] = 0;
-        if trip < 0 || !coef_collect(src, toks, nodes, cof, wst, measure, 1) {
-            wst[1] = 1;
-            return pol_zero(facs, terms, pols, pst);
-        }
-        let d = min_dec(src, toks, nodes, cof, wst, body);
-        // every path leaving the loop means it runs once, which needs no measure at all
-        if wst[9] == 2 || (wst[9] == 0 && d < 1) {
-            wst[1] = 1;
-            return pol_zero(facs, terms, pols, pst);
-        }
-        if wst[9] == 1 { trip = pol_const(facs, terms, pols, pst, 1); };
-    } else {
-        // an induction variable in the condition, stepped by a constant in the body
-        if nodes[cond].kind != 66 {
-            wst[1] = 1;
-            return pol_zero(facs, terms, pols, pst);
-        }
-        let op = nodes[cond].ival;
-        let l = nodes[cond].a;
-        let r = nodes[cond].b;
-        let mut bound = -1;
-        let mut asc = true;
-        if nodes[l].kind == 65 && (op == 7 || op == 8 || op == 6) { var = nodes[l].a; bound = r; asc = true; }
-        else if nodes[r].kind == 65 && (op == 9 || op == 10) { var = nodes[r].a; bound = l; asc = true; }
-        else if nodes[l].kind == 65 && (op == 9 || op == 10) { var = nodes[l].a; bound = r; asc = false; }
-        else if nodes[r].kind == 65 && (op == 7 || op == 8) { var = nodes[r].a; bound = l; asc = false; }
-        if bound < 0 {
-            wst[1] = 1;
-            return pol_zero(facs, terms, pols, pst);
-        }
-        wst[4] = 0;
-        wst[6] = 0;
-        wst[8] = 0;
-        step = step_scan(src, toks, nodes, wst, body, var, false);
-        if wst[4] != 1 || wst[6] != 0 || step == 0 {
-            wst[1] = 1;
-            return pol_zero(facs, terms, pols, pst);
-        }
-        if (asc && step < 0) || (!asc && step > 0) {
-            wst[1] = 1;
-            return pol_zero(facs, terms, pols, pst);
-        }
-        // the bound must hold still while the loop runs
-        wst[7] = 0;
-        if !coef_collect(src, toks, nodes, cof, wst, bound, 1)
-            || assigns_any(src, toks, nodes, cof, wst, body, var) {
-            wst[1] = 1;
-            return pol_zero(facs, terms, pols, pst);
-        }
-        let e = val_of(src, toks, nodes, facs, terms, pols, pst, env, wst, bound);
-        let ve = env_find(src, toks, env, wst, var);
-        let i0 = if ve >= 0 { env[ve].val } else { -1 };
-        if e < 0 || i0 < 0 {
-            wst[1] = 1;
-            return pol_zero(facs, terms, pols, pst);
-        }
-        let span = if asc { pol_sub(facs, terms, pols, pst, e, i0) }
-                   else { pol_sub(facs, terms, pols, pst, i0, e) };
-        let mag = if step < 0 { 0 - step } else { step };
-        trip = pol_scale(facs, terms, pols, pst, span, 1, mag);
-        atom = wst[2];
-        wst[2] = atom + 1;
-        lo = i0;
+    // the trip count, and with it the induction variable (wst[15]) and the loop atom (wst[17]):
+    // one function knows how to bound a `while`, and the moves walk asks it the same question
+    let trip = while_trip(src, toks, nodes, facs, terms, pols, pst, env, wst, cof, n);
+    if trip < 0 {
+        wst[1] = 1;
+        return pol_zero(facs, terms, pols, pst);
     }
+    let atom = wst[17];
+    let lo = wst[18];
+    let step = wst[19];
+    let var = wst[15];
 
     let saved = wst[0];
     wst[3] = wst[3] + 1;
@@ -778,12 +801,12 @@ fn w_func(src: &[u8], toks: &[Token], nodes: &[Node], types: &[Ty], ntys: &[i64]
           f: i64, si: i64) -> i64 {
     wst[0] = 0;
     wst[1] = 0;
-    wst[2] = 100;
+    wst[2] = 1003;
     let mut p = nodes[f].b;
     let mut i = 0;
     while p >= 0 {
         let t = ptys[sigs[si].params + i];
-        let a = pol_atom(facs, terms, pols, pst, i);
+        let a = pol_atom(facs, terms, pols, pst, 3 + i);
         if t >= 0 && (types[t].kind == 5 || types[t].kind == 6) {
             env_add(env, wst, nodes[p].a, -1, a);
         } else {
@@ -846,14 +869,20 @@ fn emit_superscript(out: &mut [u8], est: &mut [i64], e: i64) {
 // makes a cost read `12·s.len()` and not `12·s`
 fn emit_atom_name(out: &mut [u8], est: &mut [i64], src: &[u8], toks: &[Token], pnames: &[i64],
                   parr: &[i64], atom: i64) {
-    if atom >= 100 {
-        // a loop atom that `pol_sum_over` should have eliminated; printing one is a bug, not a
-        // narrowing, so it is loud
+    if atom == 0 {
+        let b = b"B";
+        emit_bytes(out, est, &b);
+        return;
+    }
+    if atom < 3 || atom >= 1000 {
+        // `M`, `P`, or a loop atom that `pol_sum_over` should have eliminated — none of which can
+        // reach a `work` or a `moves` this slice computes, so printing one is a bug, not a
+        // narrowing, and it is loud
         est[2] = 1;
         return;
     }
-    emit_span(out, est, src, toks, pnames[atom]);
-    if parr[atom] == 1 { let s = b".len()"; emit_bytes(out, est, &s); };
+    emit_span(out, est, src, toks, pnames[atom - 3]);
+    if parr[atom - 3] == 1 { let s = b".len()"; emit_bytes(out, est, &s); };
 }
 
 fn pol_print(out: &mut [u8], est: &mut [i64], src: &[u8], toks: &[Token], facs: &[Fac],
@@ -927,4 +956,422 @@ fn display_before(facs: &[Fac], terms: &[Term], a: i64, b: i64) -> bool {
     let pb = terms[b].cn > 0;
     if pa != pb { return pa; }
     mono_cmp(facs, terms[b].fac, terms[b].n_fac, terms[a].fac, terms[a].n_fac) < 0
+}
+
+// ---- `moves`: cache-line traffic, for a function that calls nothing ----
+//
+// A separate walk from `work`'s. It could have been folded in, but the two ask different questions
+// of the same tree — `work` sums a number per node, `moves` collects *sites* and settles them
+// afterwards — and threading a site table through a walk that does not want it would have made
+// both harder to read.
+//
+// The rule (design §11), for the one-loop slice:
+//
+//   outside every loop            B          one line
+//   stride 0 in the loop          B          the same address every lap
+//   |stride| ≥ B                  t·B        a whole line per touch
+//   otherwise                     B + t·|s|  the line you start on, plus the slide
+//
+// `B` is symbolic in the answer and numeric in the test, exactly as it is in `analyze.rs`: the
+// machine's line is 64 bytes, and `8 < B` is decided here while `8·xs.len() + B` is what prints.
+
+struct Site { arr: i64, idx: i64, inloop: i64, coef: i64, stride: i64, bad: i64, trip: i64, branch: i64,
+             novar: i64 }
+
+// two index expressions that name the same address: structurally equal, with variables compared by
+// the bytes their tokens span. `cs[i].v` and `cs[i].tag` share an index and so share a site, which
+// is what makes an array of structs cost one element rather than two fields.
+fn expr_same(src: &[u8], toks: &[Token], nodes: &[Node], a: i64, b: i64) -> bool {
+    if a < 0 || b < 0 { return a == b; }
+    if nodes[a].kind != nodes[b].kind { return false; }
+    let k = nodes[a].kind;
+    if k == 65 { return name_eq(src, toks, nodes[a].a, nodes[b].a); }
+    if k == 60 { return int_value(src, toks, nodes[a].a) == int_value(src, toks, nodes[b].a); }
+    if k == 66 {
+        return nodes[a].ival == nodes[b].ival
+            && expr_same(src, toks, nodes, nodes[a].a, nodes[b].a)
+            && expr_same(src, toks, nodes, nodes[a].b, nodes[b].b);
+    }
+    if k == 67 || k == 74 {
+        return nodes[a].ival == nodes[b].ival && expr_same(src, toks, nodes, nodes[a].a, nodes[b].a);
+    }
+    if k == 68 {
+        return expr_same(src, toks, nodes, nodes[a].a, nodes[b].a)
+            && expr_same(src, toks, nodes, nodes[a].b, nodes[b].b);
+    }
+    if k == 72 { return expr_same(src, toks, nodes, nodes[a].a, nodes[b].a); }
+    false
+}
+
+// does this block assign to `name`, at any depth
+fn assigns_var(src: &[u8], toks: &[Token], nodes: &[Node], b: i64, name: i64) -> bool {
+    if b < 0 { return false; }
+    let mut hit = false;
+    let mut s = nodes[b].a;
+    while s >= 0 {
+        let k = nodes[s].kind;
+        if k == 91 && nodes[nodes[s].a].kind == 65 && name_eq(src, toks, nodes[nodes[s].a].a, name) {
+            hit = true;
+        } else if k == 92 || k == 93 {
+            let inner = if k == 92 { nodes[s].d } else { nodes[s].c };
+            if assigns_var(src, toks, nodes, inner, name) { hit = true; }
+        } else if k == 95 && nodes[nodes[s].a].kind == 75 {
+            let e = nodes[s].a;
+            if assigns_var(src, toks, nodes, nodes[e].b, name) { hit = true; }
+            if assigns_var(src, toks, nodes, nodes[e].c, name) { hit = true; }
+        }
+        s = nodes[s].next;
+    }
+    hit
+}
+
+// the coefficient of the loop variable in an index, or the "not affine" marker in wst[14]
+fn idx_coef(src: &[u8], toks: &[Token], nodes: &[Node], wst: &mut [i64], e: i64, lv: i64) -> i64 {
+    if e < 0 { wst[14] = 1; return 0; }
+    let k = nodes[e].kind;
+    if k == 60 { return 0; }
+    if k == 65 {
+        if lv >= 0 && name_eq(src, toks, nodes[e].a, lv) { return 1; }
+        // a variable the body assigns is not a constant offset: `buf[head]` with `head` stepped
+        // inside the loop walks the array in a way this slice does not follow, and the assumption
+        // that rounds up is a whole line per touch
+        if assigns_var(src, toks, nodes, wst[22], nodes[e].a) {
+            wst[14] = 1;
+            return 0;
+        }
+        return 0;
+    }
+    if k == 72 { return 0; }
+    if k == 74 { return idx_coef(src, toks, nodes, wst, nodes[e].a, lv); }
+    if k == 66 {
+        let op = nodes[e].ival;
+        if op == 0 || op == 1 {
+            let a = idx_coef(src, toks, nodes, wst, nodes[e].a, lv);
+            let b = idx_coef(src, toks, nodes, wst, nodes[e].b, lv);
+            if op == 0 { return a + b; }
+            return a - b;
+        }
+        if op == 2 {
+            if nodes[nodes[e].a].kind == 60 {
+                return int_value(src, toks, nodes[nodes[e].a].a) * idx_coef(src, toks, nodes, wst, nodes[e].b, lv);
+            }
+            if nodes[nodes[e].b].kind == 60 {
+                return int_value(src, toks, nodes[nodes[e].b].a) * idx_coef(src, toks, nodes, wst, nodes[e].a, lv);
+            }
+        }
+    }
+    // an index the compiler cannot follow — an arena walk, a call — moves by a whole line or more,
+    // which is what `analyze.rs` assumes for the same case. Every assumption rounds up.
+    wst[14] = 1;
+    0
+}
+
+// the bytes one element of this array occupies, or −1. A struct is laid out as C lays it out,
+// which is what `emit.nt` emits, so the size is the fields padded to the widest one.
+fn elem_bytes(types: &[Ty], strs: &[Str], flds: &[Fld], t: i64) -> i64 {
+    if t < 0 { return -1; }
+    if types[t].kind != 5 && types[t].kind != 6 { return -1; }
+    let e = types[t].elem;
+    if e < 0 { return -1; }
+    scalar_bytes(types, strs, flds, e)
+}
+
+fn scalar_bytes(types: &[Ty], strs: &[Str], flds: &[Fld], t: i64) -> i64 {
+    let k = types[t].kind;
+    if k == 0 || k == 1 { return 8; }
+    if k == 2 || k == 3 { return 1; }
+    if k == 7 {
+        let si = types[t].elem;
+        let mut i = 0;
+        let mut total = 0;
+        let mut widest = 1;
+        while i < strs[si].n_fields {
+            let fb = scalar_bytes(types, strs, flds, flds[strs[si].fields + i].ty);
+            if fb > widest { widest = fb; };
+            // each field starts at a multiple of its own size, as C aligns it
+            while total % fb != 0 { total += 1; }
+            total += fb;
+            i += 1;
+        }
+        while total % widest != 0 { total += 1; }
+        return total;
+    }
+    -1
+}
+
+// Record a site, merging it into one already seen at the same array, the same index and the same
+// loop. wst[14] carries "the index is not affine" out of `idx_coef`.
+fn site_add(src: &[u8], toks: &[Token], nodes: &[Node], types: &[Ty], strs: &[Str], flds: &[Fld],
+            ntys: &[i64], facs: &mut [Fac], terms: &mut [Term], pols: &mut [Pol],
+            pst: &mut [i64], env: &mut [Env], cof: &mut [Cof], sites: &mut [Site], wst: &mut [i64], arr: i64, idx: i64) {
+    let t = ntys[arr];
+    let es = elem_bytes(types, strs, flds, t);
+    if es < 0 || nodes[arr].kind != 65 {
+        wst[1] = 1;
+        return;
+    }
+    let mut i = 0;
+    while i < wst[10] {
+        // the same address *on the same path*: two reads of `pos[0]` on either side of an `if`
+        // are two sites, because only one of them happens and the other's line may be gone. The
+        // innermost branch's id stands for the whole path — two sites agree on it exactly when
+        // they agree on every branch they sit inside.
+        if sites[i].inloop == wst[11] && sites[i].branch == wst[20]
+            && name_eq(src, toks, sites[i].arr, nodes[arr].a)
+            && expr_same(src, toks, nodes, sites[i].idx, idx) {
+            return;
+        }
+        i += 1;
+    }
+    wst[14] = 0;
+    let c = idx_coef(src, toks, nodes, wst, idx, wst[12]);
+    let s = wst[10];
+    sites[s].arr = nodes[arr].a;
+    sites[s].idx = idx;
+    sites[s].inloop = wst[11];
+    sites[s].coef = c;
+    sites[s].stride = es;
+    sites[s].bad = wst[14];
+    sites[s].trip = wst[13];
+    sites[s].branch = wst[20];
+    sites[s].novar = if wst[12] < 0 { 1 } else { 0 };
+    wst[10] = s + 1;
+}
+
+fn m_expr(src: &[u8], toks: &[Token], nodes: &[Node], types: &[Ty], strs: &[Str], flds: &[Fld],
+          ntys: &[i64], facs: &mut [Fac], terms: &mut [Term], pols: &mut [Pol],
+            pst: &mut [i64], env: &mut [Env], cof: &mut [Cof], sites: &mut [Site], wst: &mut [i64], n: i64) {
+    if n < 0 || wst[1] != 0 { return; }
+    let k = nodes[n].kind;
+    if k == 68 {
+        m_expr(src, toks, nodes, types, strs, flds, ntys, facs, terms, pols, pst, env, cof, sites, wst, nodes[n].b);
+        site_add(src, toks, nodes, types, strs, flds, ntys, facs, terms, pols, pst, env, cof, sites, wst, nodes[n].a, nodes[n].b);
+        return;
+    }
+    if k == 69 {
+        let base = nodes[n].a;
+        if nodes[base].kind == 68 {
+            m_expr(src, toks, nodes, types, strs, flds, ntys, facs, terms, pols, pst, env, cof, sites, wst, nodes[base].b);
+            site_add(src, toks, nodes, types, strs, flds, ntys, facs, terms, pols, pst, env, cof, sites, wst, nodes[base].a, nodes[base].b);
+            return;
+        }
+        m_expr(src, toks, nodes, types, strs, flds, ntys, facs, terms, pols, pst, env, cof, sites, wst, base);
+        return;
+    }
+    if k == 71 {
+        // a call's moves depend on what is already resident, which is the footprint machinery
+        // (design §11). Only `println`, `min` and `max` touch nothing.
+        if !name_is_println(src, toks, nodes[n].a) && !name_is_min(src, toks, nodes[n].a)
+            && !name_is_max(src, toks, nodes[n].a) {
+            wst[1] = 1;
+            return;
+        }
+        let mut a = nodes[n].b;
+        while a >= 0 {
+            m_expr(src, toks, nodes, types, strs, flds, ntys, facs, terms, pols, pst, env, cof, sites, wst, a);
+            a = nodes[a].next;
+        }
+        return;
+    }
+    if k == 75 {
+        m_expr(src, toks, nodes, types, strs, flds, ntys, facs, terms, pols, pst, env, cof, sites, wst, nodes[n].a);
+        let saved = wst[20];
+        wst[21] = wst[21] + 1;
+        wst[20] = wst[21] * 2;
+        m_block(src, toks, nodes, types, strs, flds, ntys, facs, terms, pols, pst, env, cof, sites, wst, nodes[n].b);
+        wst[20] = wst[21] * 2 + 1;
+        m_block(src, toks, nodes, types, strs, flds, ntys, facs, terms, pols, pst, env, cof, sites, wst, nodes[n].c);
+        wst[20] = saved;
+        return;
+    }
+    if k == 76 {
+        m_block(src, toks, nodes, types, strs, flds, ntys, facs, terms, pols, pst, env, cof, sites, wst, n);
+        return;
+    }
+    if k == 66 {
+        m_expr(src, toks, nodes, types, strs, flds, ntys, facs, terms, pols, pst, env, cof, sites, wst, nodes[n].a);
+        m_expr(src, toks, nodes, types, strs, flds, ntys, facs, terms, pols, pst, env, cof, sites, wst, nodes[n].b);
+        return;
+    }
+    if k == 67 || k == 74 {
+        m_expr(src, toks, nodes, types, strs, flds, ntys, facs, terms, pols, pst, env, cof, sites, wst, nodes[n].a);
+        return;
+    }
+    if k == 70 {
+        let mut fi = nodes[n].b;
+        while fi >= 0 {
+            m_expr(src, toks, nodes, types, strs, flds, ntys, facs, terms, pols, pst, env, cof, sites, wst, nodes[fi].b);
+            fi = nodes[fi].next;
+        }
+        return;
+    }
+    if k == 77 || k == 78 {
+        wst[1] = 1;
+    }
+}
+
+fn m_block(src: &[u8], toks: &[Token], nodes: &[Node], types: &[Ty], strs: &[Str], flds: &[Fld],
+           ntys: &[i64], facs: &mut [Fac], terms: &mut [Term], pols: &mut [Pol],
+            pst: &mut [i64], env: &mut [Env], cof: &mut [Cof], sites: &mut [Site], wst: &mut [i64], n: i64) {
+    if n < 0 || wst[1] != 0 { return; }
+    let saved = wst[0];
+    let mut s = nodes[n].a;
+    while s >= 0 && wst[1] == 0 {
+        m_stmt(src, toks, nodes, types, strs, flds, ntys, facs, terms, pols, pst, env, cof, sites, wst, s);
+        s = nodes[s].next;
+    }
+    m_expr(src, toks, nodes, types, strs, flds, ntys, facs, terms, pols, pst, env, cof, sites, wst, nodes[n].b);
+    wst[0] = saved;
+}
+
+fn m_stmt(src: &[u8], toks: &[Token], nodes: &[Node], types: &[Ty], strs: &[Str], flds: &[Fld],
+          ntys: &[i64], facs: &mut [Fac], terms: &mut [Term], pols: &mut [Pol],
+            pst: &mut [i64], env: &mut [Env], cof: &mut [Cof], sites: &mut [Site], wst: &mut [i64], n: i64) {
+    let k = nodes[n].kind;
+    if k == 90 {
+        let init = nodes[n].c;
+        if nodes[init].kind == 77 || nodes[init].kind == 78 || nodes[init].kind == 64 {
+            // building an array streams every byte of it; the footprint that follows is the
+            // residency question this slice does not answer, so only a leaf that builds nothing
+            // stays in it
+            wst[1] = 1;
+            return;
+        }
+        m_expr(src, toks, nodes, types, strs, flds, ntys, facs, terms, pols, pst, env, cof, sites, wst, init);
+        // the same environment the work walk keeps, and for the same reason: a `while`'s induction
+        // variable needs its entry value, and an array's length is what a loop bound reads
+        let t = ntys[init];
+        if t >= 0 && (types[t].kind == 5 || types[t].kind == 6) {
+            let inner = if nodes[init].kind == 73 { nodes[init].a } else { init };
+            env_add(env, wst, nodes[n].a, -1, arg_len(src, toks, nodes, env, wst, inner));
+        } else {
+            env_add(env, wst, nodes[n].a, val_of(src, toks, nodes, facs, terms, pols, pst, env, wst, init), -1);
+        }
+        return;
+    }
+    if k == 91 {
+        m_expr(src, toks, nodes, types, strs, flds, ntys, facs, terms, pols, pst, env, cof, sites, wst, nodes[n].b);
+        let tgt = nodes[n].a;
+        if nodes[tgt].kind == 68 {
+            m_expr(src, toks, nodes, types, strs, flds, ntys, facs, terms, pols, pst, env, cof, sites, wst, nodes[tgt].b);
+            site_add(src, toks, nodes, types, strs, flds, ntys, facs, terms, pols, pst, env, cof, sites, wst, nodes[tgt].a, nodes[tgt].b);
+        } else if nodes[tgt].kind == 69 && nodes[nodes[tgt].a].kind == 68 {
+            let b = nodes[tgt].a;
+            m_expr(src, toks, nodes, types, strs, flds, ntys, facs, terms, pols, pst, env, cof, sites, wst, nodes[b].b);
+            site_add(src, toks, nodes, types, strs, flds, ntys, facs, terms, pols, pst, env, cof, sites, wst, nodes[b].a, nodes[b].b);
+        } else if nodes[tgt].kind == 65 {
+            if ntys[tgt] >= 0 && (types[ntys[tgt]].kind == 5 || types[ntys[tgt]].kind == 6) {
+                wst[1] = 1;
+            } else {
+                let e = env_find(src, toks, env, wst, nodes[tgt].a);
+                if e >= 0 { env[e].val = -1; }
+            }
+        }
+        return;
+    }
+    if k == 92 || k == 93 {
+        // one loop deep: a site inside two loops is where reuse lives, and reuse is what
+        // `settle_moves` exists for
+        if wst[11] != 0 {
+            wst[1] = 1;
+            return;
+        }
+        wst[11] = 1;
+        if k == 92 {
+            m_expr(src, toks, nodes, types, strs, flds, ntys, facs, terms, pols, pst, env, cof, sites, wst, nodes[n].b);
+            m_expr(src, toks, nodes, types, strs, flds, ntys, facs, terms, pols, pst, env, cof, sites, wst, nodes[n].c);
+            let lo = val_of(src, toks, nodes, facs, terms, pols, pst, env, wst, nodes[n].b);
+            let hi = val_of(src, toks, nodes, facs, terms, pols, pst, env, wst, nodes[n].c);
+            if lo < 0 || hi < 0 {
+                wst[1] = 1;
+                return;
+            }
+            wst[13] = pol_sub(facs, terms, pols, pst, hi, lo);
+            wst[12] = nodes[n].a;
+            env_add(env, wst, nodes[n].a, -1, -1);
+            wst[22] = nodes[n].d;
+            m_block(src, toks, nodes, types, strs, flds, ntys, facs, terms, pols, pst, env, cof, sites, wst, nodes[n].d);
+        } else {
+            let t = while_trip(src, toks, nodes, facs, terms, pols, pst, env, wst, cof, n);
+            if t < 0 {
+                wst[1] = 1;
+                return;
+            }
+            m_expr(src, toks, nodes, types, strs, flds, ntys, facs, terms, pols, pst, env, cof, sites, wst, nodes[n].a);
+            m_expr(src, toks, nodes, types, strs, flds, ntys, facs, terms, pols, pst, env, cof, sites, wst, nodes[n].b);
+            wst[13] = t;
+            // a `while` with a measure has no loop variable at all, so nothing in it is known to
+            // move contiguously; one with an induction variable has that variable
+            wst[12] = wst[15];
+            wst[22] = nodes[n].c;
+            m_block(src, toks, nodes, types, strs, flds, ntys, facs, terms, pols, pst, env, cof, sites, wst, nodes[n].c);
+        }
+        wst[11] = 0;
+        wst[12] = -1;
+        wst[13] = -1;
+        wst[22] = -1;
+        return;
+    }
+    if k == 94 { return; }
+    if k == 95 || k == 96 {
+        m_expr(src, toks, nodes, types, strs, flds, ntys, facs, terms, pols, pst, env, cof, sites, wst, nodes[n].a);
+        return;
+    }
+    wst[1] = 1;
+}
+
+// The moves of a function that calls nothing: its sites, settled by the rule in §11. −1 when this
+// slice cannot say, which a call, a second loop, an array built here or a `moves 0` that was never
+// looked for all produce.
+fn m_func(src: &[u8], toks: &[Token], nodes: &[Node], types: &[Ty], strs: &[Str], flds: &[Fld],
+          ntys: &[i64], sigs: &[Sig], ptys: &[i64], facs: &mut [Fac], terms: &mut [Term],
+          pols: &mut [Pol], pst: &mut [i64], env: &mut [Env], cof: &mut [Cof],
+          sites: &mut [Site], wst: &mut [i64], f: i64, si: i64) -> i64 {
+    wst[0] = 0;
+    wst[1] = 0;
+    wst[10] = 0;
+    wst[11] = 0;
+    wst[12] = -1;
+    wst[13] = -1;
+    wst[20] = 0;
+    wst[21] = 0;
+    wst[22] = -1;
+    let mut p = nodes[f].b;
+    let mut i = 0;
+    while p >= 0 {
+        let t = ptys[sigs[si].params + i];
+        let a = pol_atom(facs, terms, pols, pst, 3 + i);
+        if t >= 0 && (types[t].kind == 5 || types[t].kind == 6) {
+            env_add(env, wst, nodes[p].a, -1, a);
+        } else {
+            env_add(env, wst, nodes[p].a, a, -1);
+        }
+        i += 1;
+        p = nodes[p].next;
+    }
+    m_block(src, toks, nodes, types, strs, flds, ntys, facs, terms, pols, pst, env, cof, sites, wst, nodes[f].d);
+    if wst[1] != 0 { return -1; }
+
+    let b = pol_atom(facs, terms, pols, pst, 0);
+    let mut total = pol_zero(facs, terms, pols, pst);
+    let mut s = 0;
+    while s < wst[10] {
+        let mut one = b;
+        if sites[s].inloop != 0 {
+            let trip = sites[s].trip;
+            let c = if sites[s].coef < 0 { 0 - sites[s].coef } else { sites[s].coef };
+            let stride = c * sites[s].stride;
+            if sites[s].bad != 0 || sites[s].coef == 0 && sites[s].novar != 0 || stride >= 64 {
+                // a whole line per touch — and the same answer for an index the compiler cannot
+                // follow, which is the assumption that rounds up
+                one = pol_mul(facs, terms, pols, pst, trip, b);
+            } else if stride > 0 {
+                let slide = pol_scale(facs, terms, pols, pst, trip, stride, 1);
+                one = pol_add(facs, terms, pols, pst, b, slide);
+            }
+        }
+        total = pol_add(facs, terms, pols, pst, total, one);
+        s += 1;
+    }
+    total
 }

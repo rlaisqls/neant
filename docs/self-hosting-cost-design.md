@@ -282,3 +282,31 @@ must report AoS traffic. The affected functions are listed by name in the test, 
 The `moves` column, string for string, for every leaf function — and `moves 0` must be *earned*:
 reported because the pass walked the body and found no site, not because it did not look. A
 function with a call must say unknown.
+
+### What building it changed
+
+**25 `moves` columns exact**, 35 declined, 8 differing. Seven of the eight are the AoS/SoA
+divergence §11 predicted before a line was written, which is the first time a prediction in one of
+these documents has survived contact unchanged.
+
+- **A site is per *branch*, not per address.** `parse.nt`'s `peek` reads `pos[0]` in an `if`'s
+  condition and again in its then-arm, and those are **two** sites: only one of them happens, and
+  the other's line may be gone by then. Merging them reported `2·B` against `3·B`.
+- **Every assumption rounds up, and two of them were rounding down.** A `while` with a `decreasing`
+  measure has no loop variable at all, so nothing in it is known to move contiguously and every
+  site in it costs a whole line per lap — the first version charged one line for the whole loop. And
+  a variable in an index that the *body assigns* — `buf[head]` with `head` stepped inside the loop —
+  is not a constant offset; the first version read it as one, and `ring.nt`'s `push_all` lost its
+  whole `B·xs.len()` term.
+- **The checker was not recording what it resolved, again.** An assignment target's array
+  (`xs[i] = v`) is resolved by `sym_find` rather than through `check_expr`, so its type was never
+  written into the node table and the cost pass could not ask what its elements weigh. The same
+  omission, in the same place, as the one the `work` slice found for a target that is a plain
+  variable.
+
+**One difference nobody has explained.** `vm.nt`'s `run` — a bytecode interpreter dispatching
+through an `if`/`else if` chain — reports `3·B·fuel + B` from `neant cost` and `10·B·fuel + B`
+here. Ten is one site per (array, index, branch); three is exactly what ignoring the branch gives.
+But `peek` above *needs* the branch counted. Both readings of `analyze.rs`'s site identity cannot
+be right, and rather than pick the one that makes this corpus agree, it is listed in the test as
+`UNEXPLAINED_MOVES` — a difference nobody has explained, not one somebody chose.
