@@ -117,6 +117,10 @@ fn emit_op(out: &mut [u8], est: &mut [i64], op: i64) {
     else { let s = b"||"; emit_bytes(out, est, &s); }
 }
 
+// `est`: est[0] the write cursor, est[1] the temporary counter, est[2] the refusal flag, and
+// est[3] whether the function being emitted returns an owned array — a `return` inside it has to
+// wrap its value in `struct nt_arr` and a statement cannot see the signature otherwise.
+//
 // `nt_t<k>`, a name for a statement expression's value; the prelude's own names all start
 // `nt_println`, `nt_idx` or `nt_alloc`, so there is nothing to collide with
 fn emit_tmp_name(out: &mut [u8], est: &mut [i64], k: i64) {
@@ -601,6 +605,39 @@ fn emit_let_array(out: &mut [u8], est: &mut [i64], src: &[u8], toks: &[Token], n
         emit_b(out, est, b';');
         return;
     }
+    if nodes[init].kind == 71 {
+        // **a call handing back an owned array**: one struct comes out and is unpacked into the
+        // two variables every array is, with the pointer cast back to its element type
+        let k2 = est[1];
+        est[1] = k2 + 1;
+        let a0 = b"struct nt_arr nt_a";
+        emit_bytes(out, est, &a0);
+        emit_int(out, est, k2);
+        let eq0 = b" = ";
+        emit_bytes(out, est, &eq0);
+        emit_expr(out, est, src, toks, nodes, types, strs, flds, slay, sigs, ntys, init);
+        let semi0 = b"; ";
+        emit_bytes(out, est, &semi0);
+        emit_type(out, est, src, toks, types, strs, t);
+        let st0 = b" *";
+        emit_bytes(out, est, &st0);
+        emit_arr_name(out, est, src, toks, name, b'p');
+        let c0 = b" = (";
+        emit_bytes(out, est, &c0);
+        emit_type(out, est, src, toks, types, strs, t);
+        let c1 = b" *)nt_a";
+        emit_bytes(out, est, &c1);
+        emit_int(out, est, k2);
+        let c2 = b".p; int64_t ";
+        emit_bytes(out, est, &c2);
+        emit_arr_name(out, est, src, toks, name, b'n');
+        let c3 = b" = nt_a";
+        emit_bytes(out, est, &c3);
+        emit_int(out, est, k2);
+        let c4 = b".n;";
+        emit_bytes(out, est, &c4);
+        return;
+    }
     if nodes[init].kind == 82 {
         // an allocation with nothing written into it: the fill is the statement after this one
         // (design §26), which is the whole difference between `16·n` and `24·n` of traffic
@@ -938,10 +975,32 @@ fn emit_stmt(out: &mut [u8], est: &mut [i64], src: &[u8], toks: &[Token], nodes:
         emit_bytes(out, est, &r);
         if nodes[n].a >= 0 {
             emit_b(out, est, b' ');
-            emit_expr(out, est, src, toks, nodes, types, strs, flds, slay, sigs, ntys, nodes[n].a);
+            if est[3] != 0 {
+                emit_arr_ret(out, est, src, toks, nodes, nodes[n].a);
+            } else {
+                emit_expr(out, est, src, toks, nodes, types, strs, flds, slay, sigs, ntys, nodes[n].a);
+            };
         };
         emit_b(out, est, b';');
     }
+}
+
+// `((struct nt_arr){ .p = x_p, .n = x_n })` — the value an owned-array return hands back. The
+// expression must be a plain name: an array is only ever returned by naming one.
+fn emit_arr_ret(out: &mut [u8], est: &mut [i64], src: &[u8], toks: &[Token], nodes: &[Node],
+                e: i64) {
+    if nodes[e].kind != 65 {
+        est[2] = 1;
+        return;
+    }
+    let o = b"((struct nt_arr){ .p = ";
+    emit_bytes(out, est, &o);
+    emit_arr_name(out, est, src, toks, nodes[e].a, b'p');
+    let m = b", .n = ";
+    emit_bytes(out, est, &m);
+    emit_arr_name(out, est, src, toks, nodes[e].a, b'n');
+    let c = b" })";
+    emit_bytes(out, est, &c);
 }
 
 // ---- functions and the whole file ----
@@ -952,7 +1011,15 @@ fn emit_signature(out: &mut [u8], est: &mut [i64], src: &[u8], toks: &[Token], n
     // `static` nor `ntu_`-prefixed — the prefix exists to keep *our* names off the runtime's
     let ext = nodes[f].kind == 116;
     if !ext { let st = b"static "; emit_bytes(out, est, &st); };
-    emit_type(out, est, src, toks, types, strs, sigs[si].ret);
+    // **an owned array comes back as a pointer and a length**, which C returns as one struct. One
+    // struct for every element type, with the pointer cast on unpacking, rather than one per type:
+    // a return is a register, not memory, so nothing in the cost model can tell the two apart.
+    if sigs[si].ret >= 0 && types[sigs[si].ret].kind == 5 {
+        let ar = b"struct nt_arr";
+        emit_bytes(out, est, &ar);
+    } else {
+        emit_type(out, est, src, toks, types, strs, sigs[si].ret);
+    };
     emit_b(out, est, b' ');
     if !ext { let pre = b"ntu_"; emit_bytes(out, est, &pre); };
     emit_span(out, est, src, toks, nodes[f].a);
@@ -1007,6 +1074,7 @@ fn emit_signature(out: &mut [u8], est: &mut [i64], src: &[u8], toks: &[Token], n
 fn emit_func(out: &mut [u8], est: &mut [i64], src: &[u8], toks: &[Token], nodes: &[Node],
              types: &[Ty], strs: &[Str], flds: &[Fld], slay: &[i64], sigs: &[Sig], ntys: &[i64], ptys: &[i64], si: i64, f: i64) {
     emit_signature(out, est, src, toks, nodes, types, strs, flds, slay, sigs, ptys, si, f);
+    est[3] = if sigs[si].ret >= 0 && types[sigs[si].ret].kind == 5 { 1 } else { 0 };
     let s = b" {\n";
     emit_bytes(out, est, &s);
     let body = nodes[f].d;
@@ -1023,10 +1091,15 @@ fn emit_func(out: &mut [u8], est: &mut [i64], src: &[u8], toks: &[Token], nodes:
         emit_bytes(out, est, &sp);
         // a body's value is its return, unless the function returns nothing
         if sigs[si].ret != 4 { let r = b"return "; emit_bytes(out, est, &r); };
-        emit_expr(out, est, src, toks, nodes, types, strs, flds, slay, sigs, ntys, nodes[body].b);
+        if sigs[si].ret >= 0 && types[sigs[si].ret].kind == 5 {
+            emit_arr_ret(out, est, src, toks, nodes, nodes[body].b);
+        } else {
+            emit_expr(out, est, src, toks, nodes, types, strs, flds, slay, sigs, ntys, nodes[body].b);
+        };
         let e = b";\n";
         emit_bytes(out, est, &e);
     }
+    est[3] = 0;
     let c = b"}\n\n";
     emit_bytes(out, est, &c);
 }
@@ -1074,7 +1147,7 @@ fn emit_program(out: &mut [u8], est: &mut [i64], src: &[u8], toks: &[Token], nod
     emit_bytes(out, est, &p2);
     let p3 = b"static void nt_println_f64(double v) {\n    char buf[400];\n    if (v != v) { puts(\"NaN\"); return; }\n    if (v == 1.0 / 0.0) { puts(\"inf\"); return; }\n    if (v == -1.0 / 0.0) { puts(\"-inf\"); return; }\n    int prec = 0;\n    for (; prec < 17; prec++) {\n        snprintf(buf, sizeof buf, \"%.*e\", prec, v);\n        if (strtod(buf, NULL) == v) break;\n    }\n    int exp10 = atoi(strchr(buf, 'e') + 1);\n    int decimals = prec - exp10;\n    if (decimals < 0) decimals = 0;\n    snprintf(buf, sizeof buf, \"%.*f\", decimals, v);\n    if (!strchr(buf, '.')) strcat(buf, \".0\");\n    puts(buf);\n}\n\n";
     emit_bytes(out, est, &p3);
-    let p4 = b"static void *nt_alloc(int64_t n, size_t sz) {\n    void *p = malloc(n == 0 ? 1 : (size_t)n * sz);\n    if (!p) { fprintf(stderr, \"out of memory\\n\"); exit(101); }\n    return p;\n}\nstatic inline int64_t nt_idx(int64_t i, int64_t n, int line) {\n    if ((uint64_t)i >= (uint64_t)n) {\n        fprintf(stderr, \"index %lld out of bounds for length %lld (line %d)\\n\", (long long)i, (long long)n, line);\n        exit(101);\n    }\n    return i;\n}\n\n";
+    let p4 = b"struct nt_arr { void *p; int64_t n; };\nstatic void *nt_alloc(int64_t n, size_t sz) {\n    void *p = malloc(n == 0 ? 1 : (size_t)n * sz);\n    if (!p) { fprintf(stderr, \"out of memory\\n\"); exit(101); }\n    return p;\n}\nstatic inline int64_t nt_idx(int64_t i, int64_t n, int line) {\n    if ((uint64_t)i >= (uint64_t)n) {\n        fprintf(stderr, \"index %lld out of bounds for length %lld (line %d)\\n\", (long long)i, (long long)n, line);\n        exit(101);\n    }\n    return i;\n}\n\n";
     emit_bytes(out, est, &p4);
     emit_structs(out, est, src, toks, nodes, types, strs, flds, first);
     let mut f = first;

@@ -1881,3 +1881,33 @@ the same substitution the call path already does for a callee's `moves`, applied
 
 Nothing here is new in kind; it is (2) that makes it more than an afternoon, because a size crossing
 a call boundary is the one thing this pass has so far only ever done for costs.
+
+### Built: the whole corpus is in the slice
+
+**Every golden parses, checks, emits and costs.** work 98, moves 98, bound 109, footprint 111, with
+no differences of any kind; `owned.nt` runs through the self-hosted chain and prints what
+`neant run` prints.
+
+Owned returns took the four pieces §27 named and one it did not.
+
+**An owned return's length is the body's, so the two are compared by element type.** `same_ty`
+makes an array's length part of its type — rightly, since `ys = xs` has to ask — but that is exactly
+what a declared `-> [T]` cannot say: the caller is handed an array whose length is the callee's
+business. `ret_ok` compares elements; a call gets an array with a length of its own.
+
+**In C the pair comes back as one struct.** `struct nt_arr { void *p; int64_t n; }`, one for every
+element type with the pointer cast on unpacking, rather than one struct per type as the Rust emits.
+A return is a register and not memory, so nothing in the cost model can tell the two apart — the
+first place this compiler has emitted *different* C from the Rust for a reason other than a proof it
+could not make.
+
+**And the size had to be read before the scope closed**, which §27 did not see. `w_func` asked the
+environment for the returned array's length after `w_block` returned — and `w_block` restores
+`wst[0]`, the environment's length, on its way out, so the name was already gone. The answer is read
+inside the block, with `wst[52]` saying which block is the function's own. The failure was silent in
+the worst way available: a `−1` that looked exactly like "this function does not return an array".
+
+**One new narrowing, listed.** `owned.nt`'s `sum_doubled` states no footprint bound where
+`neant cost` states `8·a.len()`: that bound is its *callee's*, handed up, and this pass states a
+function's bound from its own sites. `sum_doubled` indexes no parameter array — it passes one to
+`doubled` and walks what comes back.

@@ -329,9 +329,6 @@ mod parsedump {
             if !matches!(f.ret, TypeExpr::Unit) { ty(&f.ret, o)?; }
             return Ok(());
         }
-        // an owned array *returned* is out of the slice: the self-hosted checker rejects
-        // `-> [T]`, comprehension or not, and `owned.nt` is the only golden that does it
-        if matches!(f.ret, TypeExpr::Owned(_)) { return Err("an owned array return".into()); }
         o.push(110);
         for p in &f.params { o.push(111); ty(&p.ty, o)?; }
         if !matches!(f.ret, TypeExpr::Unit) { ty(&f.ret, o)?; }

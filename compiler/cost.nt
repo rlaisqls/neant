@@ -614,6 +614,49 @@ fn arg_len_of(src: &[u8], toks: &[Token], env: &[Env], wst: &[i64], name: i64) -
     env[e].len
 }
 
+// A callee's polynomial in the caller's terms: each parameter's atom replaced by the size of the
+// argument given for it. −1 when an argument's size is not known and the polynomial mentions it.
+fn call_subst(src: &[u8], toks: &[Token], nodes: &[Node], facs: &mut [Fac], terms: &mut [Term],
+              pols: &mut [Pol], pst: &mut [i64], env: &[Env], sigs: &[Sig], wst: &mut [i64],
+              p0: i64, si: i64, arg: i64) -> i64 {
+    let mut body = p0;
+    let mut p = 0;
+    let mut a = arg;
+    while p < sigs[si].n_params && a >= 0 {
+        let inner = if nodes[a].kind == 73 { nodes[a].a } else { a };
+        let v = val_of(src, toks, nodes, facs, terms, pols, pst, env, wst, inner);
+        let sz = if v >= 0 { v } else { arg_len(src, toks, nodes, env, wst, inner) };
+        if sz < 0 {
+            if mono_mentions(facs, terms, pols, body, 3 + p) { return 0 - 1; }
+        } else {
+            body = pol_subst(facs, terms, pols, pst, body, 3 + p, sz);
+        };
+        p += 1;
+        a = nodes[a].next;
+    }
+    if p < sigs[si].n_params { return 0 - 1; }
+    body
+}
+
+
+// the length a `let` gets from a call that hands back an owned array, or −1
+fn call_arr_len(src: &[u8], toks: &[Token], nodes: &[Node], types: &[Ty], facs: &mut [Fac],
+                terms: &mut [Term], pols: &mut [Pol], pst: &mut [i64], env: &[Env], sigs: &[Sig],
+                wst: &mut [i64], init: i64) -> i64 {
+    if nodes[init].kind != 71 { return 0 - 1; }
+    let mut si = 0 - 1;
+    let mut i = 0;
+    while sigs[i].name >= 0 {
+        if si < 0 && name_eq(src, toks, sigs[i].name, nodes[init].a) { si = i; };
+        i += 1;
+    }
+    if si < 0 || si >= 400 || sigs[si].ret < 0 || types[sigs[si].ret].kind != 5 { return 0 - 1; }
+    // the callee's result size, in the callee's atoms, left by `w_func` at `wst[600 + si]`
+    let rs = wst[600 + si];
+    if rs < 0 { return 0 - 1; }
+    call_subst(src, toks, nodes, facs, terms, pols, pst, env, sigs, wst, rs, si, nodes[init].b)
+}
+
 // the length of an array argument, when the caller knows it
 fn arg_len(src: &[u8], toks: &[Token], nodes: &[Node], env: &[Env], wst: &[i64], n: i64) -> i64 {
     if n < 0 || nodes[n].kind != 65 { return -1; }
@@ -651,6 +694,12 @@ fn w_block(src: &[u8], toks: &[Token], nodes: &[Node], types: &[Ty], ntys: &[i64
         let t = w_expr(src, toks, nodes, types, ntys, sigs, fw, facs, terms, pols, pst, env, wst, scratch, cof, rargs, budget, nodes[n].b);
         acc = pol_add(facs, terms, pols, pst, acc, t);
     }
+    // **the length an owned return hands back, read before the scope closes.** A function body's
+    // tail names the array it returns, and by the time `w_func` sees the answer that name is gone:
+    // `wst[0]` is the environment's length and this is where it is restored.
+    if n == wst[52] && nodes[n].b >= 0 && nodes[nodes[n].b].kind == 65 {
+        wst[51] = arg_len_of(src, toks, env, wst, nodes[nodes[n].b].a);
+    };
     wst[0] = saved;
     acc
 }
@@ -716,7 +765,10 @@ fn w_stmt(src: &[u8], toks: &[Token], nodes: &[Node], types: &[Ty], ntys: &[i64]
         let t = ntys[init];
         if t >= 0 && (types[t].kind == 5 || types[t].kind == 6) {
             let inner = if nodes[init].kind == 73 { nodes[init].a } else { init };
-            env_add(env, wst, nodes[n].a, -1, arg_len(src, toks, nodes, env, wst, inner));
+            // an owned array handed back by a call knows its length from the callee's signature
+            let cl = call_arr_len(src, toks, nodes, types, facs, terms, pols, pst, env, sigs, wst, init);
+            let ln = if cl >= 0 { cl } else { arg_len(src, toks, nodes, env, wst, inner) };
+            env_add(env, wst, nodes[n].a, -1, ln);
         } else {
             env_add(env, wst, nodes[n].a, val_of(src, toks, nodes, facs, terms, pols, pst, env, wst, init), -1);
         }
@@ -1125,7 +1177,14 @@ fn w_func(src: &[u8], toks: &[Token], nodes: &[Node], types: &[Ty], ntys: &[i64]
     }
     wst[23] = 0;
     wst[24] = si;
+    // **the length an owned array return hands back**, in this function's own atoms, so a caller
+    // can substitute its arguments into it — the one thing this pass carries across a call that is
+    // not itself a cost (design §27). `w_block` reads it, because only there is the name still in
+    // scope; `wst[52]` says which block is the one to read.
+    wst[51] = 0 - 1;
+    wst[52] = if sigs[si].ret >= 0 && types[sigs[si].ret].kind == 5 { nodes[f].d } else { 0 - 1 };
     let w = w_block(src, toks, nodes, types, ntys, sigs, fw, facs, terms, pols, pst, env, wst, scratch, cof, rargs, budget, nodes[f].d);
+    wst[52] = 0 - 1;
     if wst[1] != 0 { return -1; }
     if wst[23] == 0 { return w; }
     solve_recurrence(types, sigs, ptys, facs, terms, pols, logs, pst, rargs, scratch, si, w, wst[23])
@@ -3198,7 +3257,10 @@ fn m_stmt(src: &[u8], toks: &[Token], nodes: &[Node], types: &[Ty], strs: &[Str]
             let r = if inner >= 0 && nodes[inner].kind == 65 {
                 env_root(src, toks, env, wst, nodes[inner].a)
             } else { nodes[n].a };
-            env_add_rooted(env, wst, nodes[n].a, -1, arg_len(src, toks, nodes, env, wst, inner), r);
+            // an owned array handed back by a call knows its length from the callee's signature
+            let cl = call_arr_len(src, toks, nodes, types, facs, terms, pols, pst, env, sigs, wst, init);
+            let ln = if cl >= 0 { cl } else { arg_len(src, toks, nodes, env, wst, inner) };
+            env_add_rooted(env, wst, nodes[n].a, -1, ln, r);
         } else {
             env_add(env, wst, nodes[n].a, val_of(src, toks, nodes, facs, terms, pols, pst, env, wst, init), -1);
         }

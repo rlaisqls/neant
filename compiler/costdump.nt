@@ -64,7 +64,7 @@ fn main() {
     let mut pnames = [0; 256];
     let mut parr = [0; 256];
     let mut out = [b'\0'; 262144];
-    let mut est = [0, 0, 0];
+    let mut est = [0, 0, 0, 0];
 
     // the same choice the compiler makes before emitting, so the report describes the code
     choose_layouts(&buf, &toks, &nodes, &types, &strs, &flds, &ntys, &sigs, &ptys, &mut slay,
@@ -78,6 +78,7 @@ fn main() {
         while f >= 0 {
             if nodes[f].kind == 110 {
                 fw[si] = w_func(&buf, &toks, &nodes, &types, &ntys, &sigs, &ptys, &fw, &mut facs, &mut terms, &mut pols, &mut pst, &mut env, &mut wst, &mut scratch, &mut cof, &mut rargs, &mut logs, &mut budget, f, si);
+                if si < 400 { wst[600 + si] = wst[51]; };
                 fm[si] = m_func(&buf, &toks, &nodes, &types, &strs, &flds, &ntys, &sigs, &ptys, &fm, &ffoot, &mut facs, &mut terms, &mut pols, &mut pst, &mut env, &mut cof, &mut sites, &mut cks, &mut cnds, &mut pcs, &mut budget, &mut resid, &mut rargs, &mut logs, &mut scratch, &mut subst, &slay, &mut lpes, &mut imgs, &mut sc, &mut wst, f, si);
                 fb[si] = wst[50];
                 // after the walk, since it reads the sites the walk recorded; the second pass is

@@ -50,7 +50,7 @@ fn main() {{
             choose_layouts(&buf, &toks, &nodes, &types, &strs, &flds, &ntys, &sigs, &ptys,
                            &mut slay, first, cst[7]);
             let mut out = [b'\0'; 262144];
-            let mut est = [0, 0, 0];
+            let mut est = [0, 0, 0, 0];
             let len = emit_program(&mut out, &mut est, &buf, &toks, &nodes, &types, &strs, &flds, &slay, &ntys, &sigs, &ptys, first);
             if len < 0 {{
                 // the emitter refused: something in this program is outside its slice

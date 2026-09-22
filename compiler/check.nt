@@ -1226,7 +1226,24 @@ fn check_call(src: &[u8], toks: &[Token], nodes: &mut [Node], types: &mut [Ty], 
     }
     if cst[2] == 0 && k != sigs[si].n_params { cst[2] = 1; }
     if cst[2] != 0 { return -1; }
-    sigs[si].ret
+    let r = sigs[si].ret;
+    if r >= 0 && types[r].kind == 5 {
+        return new_ty_sized(types, cst, 5, types[r].elem, 0, fresh_atom(cst));
+    }
+    r
+}
+
+// **An owned array return carries its length in the signature.** `same_ty` makes an array's length
+// part of its type, so a declared `-> [T]` — which `resolve_ty` gives no length — can never equal
+// the body's, whose length is a real atom. The declaration says the element type and the *body*
+// says the length, which is what `-> [T]` means: the caller is handed an array whose length is the
+// callee's business. So the two are compared by element type, and a call gets an array with a
+// length of its own.
+fn ret_ok(types: &[Ty], declared: i64, got: i64) -> bool {
+    if same_ty(types, declared, got) { return true; }
+    if declared < 0 || got < 0 { return false; }
+    if types[declared].kind != 5 || types[got].kind != 5 { return false; }
+    same_ty(types, types[declared].elem, types[got].elem)
 }
 
 // ---- statements and blocks ----
@@ -1470,7 +1487,7 @@ fn check_stmt_inner(src: &[u8], toks: &[Token], nodes: &mut [Node], types: &mut 
             return;
         }
         let t = check_expr(src, toks, nodes, types, syms, sigs, ptys, strs, flds, ntys, cst, nodes[n].a);
-        if cst[2] == 0 && !same_ty(types, t, cst[6]) { cst[2] = 1; }
+        if cst[2] == 0 && !ret_ok(types, cst[6], t) { cst[2] = 1; }
         return;
     }
     cst[2] = 1;
@@ -1533,7 +1550,7 @@ fn check_func(src: &[u8], toks: &[Token], nodes: &mut [Node], types: &mut [Ty], 
     if cst[2] == 0 {
         if nodes[body].b >= 0 {
             // the body's value is its tail: it must be what the signature says
-            if !same_ty(types, t, sigs[si].ret) { cst[2] = 1; }
+            if !ret_ok(types, sigs[si].ret, t) { cst[2] = 1; }
         } else if sigs[si].ret != 4 && !ends_in_return(nodes, body) {
             cst[2] = 1;
         }
