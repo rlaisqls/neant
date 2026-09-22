@@ -1,0 +1,471 @@
+// Polynomials over size atoms with rational coefficients — the data structure the cost calculus
+// is made of (docs/self-hosting-cost-design.md §5). A fragment, like every other stage: it is
+// compiled by concatenating it after check.nt, and `cost.nt` is what uses it.
+//
+// Three arenas, all flat with a tracked count, all append-only:
+//
+//   Fac   one factor of a monomial: an atom and a positive integer exponent
+//   Term  a coefficient cn/cd over a run of `n_fac` factors starting at `fac`
+//   Pol   a run of `n_term` terms starting at `term`
+//
+// **Canonical form is the whole correctness argument.** Two polynomials are equal exactly when
+// their arenas agree term for term, so every constructor here must leave: factors sorted by atom
+// with no zero exponents, terms sorted by monomial with no zero coefficients and no duplicate
+// monomials, and every rational reduced with a positive denominator. Nothing outside this file
+// writes a Fac or a Term.
+//
+// Rationals are `i64` pairs where the Rust compiler uses `i128`. Overflow is **not detected**;
+// the corpus's largest constant is seven digits, and the first slice's job is parity on it. Said
+// here rather than defended.
+//
+// `pst` is this file's state, the one-element-array idiom again:
+//   pst[0] next free Fac   pst[1] next free Term   pst[2] next free Pol
+
+struct Fac { atom: i64, exp: i64 }
+struct Term { fac: i64, n_fac: i64, cn: i64, cd: i64 }
+struct Pol { term: i64, n_term: i64 }
+
+// ---- rationals ----
+
+fn gcd(a: i64, b: i64) -> i64 {
+    let mut x = if a < 0 { 0 - a } else { a };
+    let mut y = if b < 0 { 0 - b } else { b };
+    while y != 0 {
+        let t = x % y;
+        x = y;
+        y = t;
+    }
+    if x == 0 { 1 } else { x }
+}
+
+// ---- monomials ----
+
+// lexicographic over the (atom, exponent) pairs, which is what a BTreeMap<Atom, Rat> compares as
+// in the Rust one: −1 if a < b, 0 if equal, 1 if a > b
+fn mono_cmp(facs: &[Fac], a: i64, na: i64, b: i64, nb: i64) -> i64 {
+    let mut i = 0;
+    let mut r = 0;
+    while r == 0 && i < na && i < nb {
+        if facs[a + i].atom != facs[b + i].atom {
+            r = if facs[a + i].atom < facs[b + i].atom { 0 - 1 } else { 1 };
+        } else if facs[a + i].exp != facs[b + i].exp {
+            r = if facs[a + i].exp < facs[b + i].exp { 0 - 1 } else { 1 };
+        }
+        i += 1;
+    }
+    if r != 0 { return r; }
+    if na == nb { return 0; }
+    if na < nb { 0 - 1 } else { 1 }
+}
+
+fn mono_degree(facs: &[Fac], f: i64, n: i64) -> i64 {
+    let mut d = 0;
+    let mut i = 0;
+    while i < n {
+        d += facs[f + i].exp;
+        i += 1;
+    }
+    d
+}
+
+// the exponent of `atom` in this monomial, or 0
+fn mono_exp(facs: &[Fac], f: i64, n: i64, atom: i64) -> i64 {
+    let mut i = 0;
+    let mut e = 0;
+    while i < n {
+        if facs[f + i].atom == atom { e = facs[f + i].exp; }
+        i += 1;
+    }
+    e
+}
+
+// a monomial written fresh at the end of the arena: the factors of `f` with `atom`'s exponent
+// changed by `delta`, sorted, zero exponents dropped. Returns the new run's start; its length is
+// left in pst[3].
+fn mono_with(facs: &mut [Fac], pst: &mut [i64], f: i64, n: i64, atom: i64, delta: i64) -> i64 {
+    let start = pst[0];
+    let mut i = 0;
+    let mut placed = false;
+    while i < n {
+        let a = facs[f + i].atom;
+        let e = if a == atom { facs[f + i].exp + delta } else { facs[f + i].exp };
+        if a == atom { placed = true; };
+        if e != 0 {
+            facs[pst[0]].atom = a;
+            facs[pst[0]].exp = e;
+            pst[0] = pst[0] + 1;
+        }
+        i += 1;
+    }
+    if !placed && delta != 0 {
+        facs[pst[0]].atom = atom;
+        facs[pst[0]].exp = delta;
+        pst[0] = pst[0] + 1;
+    }
+    // insertion sort by atom: the runs are two or three long in practice, and there are no
+    // function values to hand a comparison to
+    let mut k = start + 1;
+    while k < pst[0] {
+        let mut j = k;
+        while j > start && facs[j - 1].atom > facs[j].atom {
+            let ta = facs[j - 1].atom;
+            let te = facs[j - 1].exp;
+            facs[j - 1].atom = facs[j].atom;
+            facs[j - 1].exp = facs[j].exp;
+            facs[j].atom = ta;
+            facs[j].exp = te;
+            j -= 1;
+        }
+        k += 1;
+    }
+    pst[3] = pst[0] - start;
+    start
+}
+
+// the product of two monomials, written fresh; its length is left in pst[3]
+fn mono_mul(facs: &mut [Fac], pst: &mut [i64], a: i64, na: i64, b: i64, nb: i64) -> i64 {
+    let start = pst[0];
+    let mut i = 0;
+    while i < na {
+        facs[pst[0]].atom = facs[a + i].atom;
+        facs[pst[0]].exp = facs[a + i].exp;
+        pst[0] = pst[0] + 1;
+        i += 1;
+    }
+    let mut j = 0;
+    while j < nb {
+        let at = facs[b + j].atom;
+        let mut found = -1;
+        let mut k = start;
+        while k < start + na {
+            if facs[k].atom == at { found = k; }
+            k += 1;
+        }
+        if found >= 0 {
+            facs[found].exp = facs[found].exp + facs[b + j].exp;
+        } else {
+            facs[pst[0]].atom = at;
+            facs[pst[0]].exp = facs[b + j].exp;
+            pst[0] = pst[0] + 1;
+        }
+        j += 1;
+    }
+    let mut k = start + 1;
+    while k < pst[0] {
+        let mut j2 = k;
+        while j2 > start && facs[j2 - 1].atom > facs[j2].atom {
+            let ta = facs[j2 - 1].atom;
+            let te = facs[j2 - 1].exp;
+            facs[j2 - 1].atom = facs[j2].atom;
+            facs[j2 - 1].exp = facs[j2].exp;
+            facs[j2].atom = ta;
+            facs[j2].exp = te;
+            j2 -= 1;
+        }
+        k += 1;
+    }
+    pst[3] = pst[0] - start;
+    start
+}
+
+// ---- polynomials ----
+
+// Canonicalise the terms written at [start, pst[1]) into a Pol: sort by monomial, merge equal
+// monomials, drop zero coefficients, reduce every rational. Every constructor ends here, which is
+// what makes arena equality the same thing as mathematical equality.
+fn pol_close(facs: &[Fac], terms: &mut [Term], pols: &mut [Pol], pst: &mut [i64], start: i64) -> i64 {
+    let mut k = start + 1;
+    while k < pst[1] {
+        let mut j = k;
+        while j > start && mono_cmp(facs, terms[j - 1].fac, terms[j - 1].n_fac,
+                                   terms[j].fac, terms[j].n_fac) > 0 {
+            let f = terms[j - 1].fac;
+            let nf = terms[j - 1].n_fac;
+            let cn = terms[j - 1].cn;
+            let cd = terms[j - 1].cd;
+            terms[j - 1].fac = terms[j].fac;
+            terms[j - 1].n_fac = terms[j].n_fac;
+            terms[j - 1].cn = terms[j].cn;
+            terms[j - 1].cd = terms[j].cd;
+            terms[j].fac = f;
+            terms[j].n_fac = nf;
+            terms[j].cn = cn;
+            terms[j].cd = cd;
+            j -= 1;
+        }
+        k += 1;
+    }
+    // merge neighbours with the same monomial, then compact the survivors down
+    let mut write = start;
+    let mut read = start;
+    while read < pst[1] {
+        let mut cn = terms[read].cn;
+        let mut cd = terms[read].cd;
+        let f = terms[read].fac;
+        let nf = terms[read].n_fac;
+        let mut next = read + 1;
+        while next < pst[1] && mono_cmp(facs, f, nf, terms[next].fac, terms[next].n_fac) == 0 {
+            cn = cn * terms[next].cd + terms[next].cn * cd;
+            cd = cd * terms[next].cd;
+            next += 1;
+        }
+        if cn != 0 {
+            let g = gcd(cn, cd);
+            let s = if cd < 0 { 0 - 1 } else { 1 };
+            terms[write].fac = f;
+            terms[write].n_fac = nf;
+            terms[write].cn = s * cn / g;
+            terms[write].cd = s * cd / g;
+            write += 1;
+        }
+        read = next;
+    }
+    pst[1] = write;
+    let p = pst[2];
+    pols[p].term = start;
+    pols[p].n_term = write - start;
+    pst[2] = p + 1;
+    p
+}
+
+fn pol_zero(facs: &[Fac], terms: &mut [Term], pols: &mut [Pol], pst: &mut [i64]) -> i64 {
+    pol_close(facs, terms, pols, pst, pst[1])
+}
+
+fn pol_rat(facs: &[Fac], terms: &mut [Term], pols: &mut [Pol], pst: &mut [i64], n: i64, d: i64) -> i64 {
+    let start = pst[1];
+    if n != 0 {
+        terms[start].fac = 0;
+        terms[start].n_fac = 0;
+        terms[start].cn = n;
+        terms[start].cd = d;
+        pst[1] = start + 1;
+    }
+    pol_close(facs, terms, pols, pst, start)
+}
+
+fn pol_const(facs: &[Fac], terms: &mut [Term], pols: &mut [Pol], pst: &mut [i64], n: i64) -> i64 {
+    pol_rat(facs, terms, pols, pst, n, 1)
+}
+
+// `1·atom¹`
+fn pol_atom(facs: &mut [Fac], terms: &mut [Term], pols: &mut [Pol], pst: &mut [i64], atom: i64) -> i64 {
+    let f = pst[0];
+    facs[f].atom = atom;
+    facs[f].exp = 1;
+    pst[0] = f + 1;
+    let start = pst[1];
+    terms[start].fac = f;
+    terms[start].n_fac = 1;
+    terms[start].cn = 1;
+    terms[start].cd = 1;
+    pst[1] = start + 1;
+    pol_close(facs, terms, pols, pst, start)
+}
+
+fn pol_is_zero(pols: &[Pol], p: i64) -> bool {
+    pols[p].n_term == 0
+}
+
+// the constant this polynomial is, when it is one; `has` is left in pst[4] (1 when it is)
+fn pol_as_int(facs: &[Fac], terms: &[Term], pols: &[Pol], pst: &mut [i64], p: i64) -> i64 {
+    pst[4] = 0;
+    if pols[p].n_term == 0 { pst[4] = 1; return 0; }
+    if pols[p].n_term != 1 { return 0; }
+    let t = pols[p].term;
+    if terms[t].n_fac != 0 || terms[t].cd != 1 { return 0; }
+    pst[4] = 1;
+    terms[t].cn
+}
+
+fn pol_add(facs: &[Fac], terms: &mut [Term], pols: &mut [Pol], pst: &mut [i64], a: i64, b: i64) -> i64 {
+    let start = pst[1];
+    let mut i = 0;
+    while i < pols[a].n_term {
+        terms[pst[1]].fac = terms[pols[a].term + i].fac;
+        terms[pst[1]].n_fac = terms[pols[a].term + i].n_fac;
+        terms[pst[1]].cn = terms[pols[a].term + i].cn;
+        terms[pst[1]].cd = terms[pols[a].term + i].cd;
+        pst[1] = pst[1] + 1;
+        i += 1;
+    }
+    let mut j = 0;
+    while j < pols[b].n_term {
+        terms[pst[1]].fac = terms[pols[b].term + j].fac;
+        terms[pst[1]].n_fac = terms[pols[b].term + j].n_fac;
+        terms[pst[1]].cn = terms[pols[b].term + j].cn;
+        terms[pst[1]].cd = terms[pols[b].term + j].cd;
+        pst[1] = pst[1] + 1;
+        j += 1;
+    }
+    pol_close(facs, terms, pols, pst, start)
+}
+
+fn pol_scale(facs: &[Fac], terms: &mut [Term], pols: &mut [Pol], pst: &mut [i64], a: i64, n: i64, d: i64) -> i64 {
+    let start = pst[1];
+    let mut i = 0;
+    while i < pols[a].n_term {
+        terms[pst[1]].fac = terms[pols[a].term + i].fac;
+        terms[pst[1]].n_fac = terms[pols[a].term + i].n_fac;
+        terms[pst[1]].cn = terms[pols[a].term + i].cn * n;
+        terms[pst[1]].cd = terms[pols[a].term + i].cd * d;
+        pst[1] = pst[1] + 1;
+        i += 1;
+    }
+    pol_close(facs, terms, pols, pst, start)
+}
+
+fn pol_sub(facs: &[Fac], terms: &mut [Term], pols: &mut [Pol], pst: &mut [i64], a: i64, b: i64) -> i64 {
+    let nb = pol_scale(facs, terms, pols, pst, b, 0 - 1, 1);
+    pol_add(facs, terms, pols, pst, a, nb)
+}
+
+fn pol_mul(facs: &mut [Fac], terms: &mut [Term], pols: &mut [Pol], pst: &mut [i64], a: i64, b: i64) -> i64 {
+    // factors and terms are separate arenas, so `mono_mul`'s writes cannot land between two terms
+    // of the result and the two may be interleaved freely
+    let start = pst[1];
+    let mut i = 0;
+    while i < pols[a].n_term {
+        let mut j = 0;
+        while j < pols[b].n_term {
+            let ta = pols[a].term + i;
+            let tb = pols[b].term + j;
+            let cn = terms[ta].cn * terms[tb].cn;
+            let cd = terms[ta].cd * terms[tb].cd;
+            let f = mono_mul(facs, pst, terms[ta].fac, terms[ta].n_fac, terms[tb].fac, terms[tb].n_fac);
+            let nf = pst[3];
+            terms[pst[1]].fac = f;
+            terms[pst[1]].n_fac = nf;
+            terms[pst[1]].cn = cn;
+            terms[pst[1]].cd = cd;
+            pst[1] = pst[1] + 1;
+            j += 1;
+        }
+        i += 1;
+    }
+    pol_close(facs, terms, pols, pst, start)
+}
+
+fn pol_pow(facs: &mut [Fac], terms: &mut [Term], pols: &mut [Pol], pst: &mut [i64], a: i64, e: i64) -> i64 {
+    let mut r = pol_const(facs, terms, pols, pst, 1);
+    let mut k = 0;
+    while k < e {
+        r = pol_mul(facs, terms, pols, pst, r, a);
+        k += 1;
+    }
+    r
+}
+
+fn pol_eq(facs: &[Fac], terms: &[Term], pols: &[Pol], a: i64, b: i64) -> bool {
+    if pols[a].n_term != pols[b].n_term { return false; }
+    let mut i = 0;
+    let mut same = true;
+    while i < pols[a].n_term {
+        let ta = pols[a].term + i;
+        let tb = pols[b].term + i;
+        if terms[ta].cn != terms[tb].cn || terms[ta].cd != terms[tb].cd { same = false; }
+        if mono_cmp(facs, terms[ta].fac, terms[ta].n_fac, terms[tb].fac, terms[tb].n_fac) != 0 {
+            same = false;
+        }
+        i += 1;
+    }
+    same
+}
+
+// ---- substitution and loop sums ----
+
+// `p` with `atom` replaced by the polynomial `q`
+fn pol_subst(facs: &mut [Fac], terms: &mut [Term], pols: &mut [Pol], pst: &mut [i64],
+             p: i64, atom: i64, q: i64) -> i64 {
+    let mut out = pol_zero(facs, terms, pols, pst);
+    let mut i = 0;
+    while i < pols[p].n_term {
+        let t = pols[p].term + i;
+        let e = mono_exp(facs, terms[t].fac, terms[t].n_fac, atom);
+        let rest = mono_with(facs, pst, terms[t].fac, terms[t].n_fac, atom, 0 - e);
+        let n_rest = pst[3];
+        let start = pst[1];
+        terms[start].fac = rest;
+        terms[start].n_fac = n_rest;
+        terms[start].cn = terms[t].cn;
+        terms[start].cd = terms[t].cd;
+        pst[1] = start + 1;
+        let base = pol_close(facs, terms, pols, pst, start);
+        let mut piece = base;
+        if e > 0 {
+            let qe = pol_pow(facs, terms, pols, pst, q, e);
+            piece = pol_mul(facs, terms, pols, pst, base, qe);
+        }
+        out = pol_add(facs, terms, pols, pst, out, piece);
+        i += 1;
+    }
+    out
+}
+
+// `Σ_{k=0}^{n−1} k^j` as a polynomial in `n`, by Faulhaber — the identity that makes a loop's cost
+// a polynomial and the reason rational coefficients are not optional (design §6).
+// Computed from the recurrence S_j(n) = (n^(j+1) − Σ_{i<j} C(j+1,i)·S_i(n)) / (j+1).
+fn pol_faulhaber(facs: &mut [Fac], terms: &mut [Term], pols: &mut [Pol], pst: &mut [i64],
+                 j: i64, n: i64, scratch: &mut [i64]) -> i64 {
+    if j == 0 { return n; }
+    // scratch[i] holds S_i, built upwards
+    scratch[0] = n;
+    let mut m = 1;
+    while m <= j {
+        let mut acc = pol_pow(facs, terms, pols, pst, n, m + 1);
+        let mut i = 0;
+        while i < m {
+            let c = binom(m + 1, i);
+            let s = pol_scale(facs, terms, pols, pst, scratch[i], c, 1);
+            acc = pol_sub(facs, terms, pols, pst, acc, s);
+            i += 1;
+        }
+        scratch[m] = pol_scale(facs, terms, pols, pst, acc, 1, m + 1);
+        m += 1;
+    }
+    scratch[j]
+}
+
+fn binom(n: i64, k: i64) -> i64 {
+    let mut r = 1;
+    let mut i = 0;
+    while i < k {
+        r = r * (n - i) / (i + 1);
+        i += 1;
+    }
+    r
+}
+
+// A loop's cost: `p` is one iteration's cost as a polynomial in `atom`, the loop variable, which
+// runs `lo, lo+step, …` for `trip` iterations. Substitute `atom := lo + step·k` and sum each
+// power of `k` with Faulhaber.
+fn pol_sum_over(facs: &mut [Fac], terms: &mut [Term], pols: &mut [Pol], pst: &mut [i64],
+                p: i64, atom: i64, lo: i64, step: i64, trip: i64, scratch: &mut [i64]) -> i64 {
+    // atom := lo + step·k, with k a fresh atom that cannot collide with a parameter's index
+    let k_atom = 1000000;
+    let kp = pol_atom(facs, terms, pols, pst, k_atom);
+    let sk = pol_scale(facs, terms, pols, pst, kp, step, 1);
+    let shifted = pol_add(facs, terms, pols, pst, lo, sk);
+    let ink = pol_subst(facs, terms, pols, pst, p, atom, shifted);
+    // now sum each term's power of k
+    let mut out = pol_zero(facs, terms, pols, pst);
+    let mut i = 0;
+    while i < pols[ink].n_term {
+        let t = pols[ink].term + i;
+        let e = mono_exp(facs, terms[t].fac, terms[t].n_fac, k_atom);
+        let rest = mono_with(facs, pst, terms[t].fac, terms[t].n_fac, k_atom, 0 - e);
+        let n_rest = pst[3];
+        let start = pst[1];
+        terms[start].fac = rest;
+        terms[start].n_fac = n_rest;
+        terms[start].cn = terms[t].cn;
+        terms[start].cd = terms[t].cd;
+        pst[1] = start + 1;
+        let coeff = pol_close(facs, terms, pols, pst, start);
+        let s = pol_faulhaber(facs, terms, pols, pst, e, trip, scratch);
+        let piece = pol_mul(facs, terms, pols, pst, coeff, s);
+        out = pol_add(facs, terms, pols, pst, out, piece);
+        i += 1;
+    }
+    out
+}
