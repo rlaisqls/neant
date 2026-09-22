@@ -41,44 +41,25 @@ join, a fused pipeline), the compiler compares the two and reports the gap and t
 transformation that closes it:
 
 ```
-matmul           work 10·n³ + 5·n² + 2·n           moves B·n³ + 8·n³ + B·n²           exact
-                 lower bound      moves 8·n³/√M    (matrix product, Hong–Kung 1981)   gap 13033× at M = 2 MiB, B = 64
+matmul           work 10·n³ + 5·n² + 2·n           moves                              exact  (3 regimes)
+                                               moves 24·n² + 2·B·n                if ≈ 8·n² < M
+                                               moves B·n³ + 8·n³ + 2·B·n²         if ≈ B·n + 8·n ≥ M
+                                               moves 8·n³ + 16·n² + 2·B·n         if ≈ B·n + 8·n < M and ≈ 8·n² ≥ M
+                 lower bound      moves 8·n³/√M                      (matrix product, Hong–Kung 1981)   gap 13033× if ≈ B·n + 8·n ≥ M; 1448× if ≈ B·n 
                  `b` moves by 8·n bytes per iteration of the innermost loop: a new line every time (line 7)
-                 tile by 256      work ≈ 10.0509·n³  moves ≈ n³/8     [--apply matmul:tile]        gap 23×
-                 transpose the column operand      moves 16·n³ + …  [--apply matmul:transpose]   gap 2896×
+                 tile by 256      work ≈ 10.0509·n³                 moves ≈ 4.5776e-5·B·n³ + n³/8 if ≈ 8·n ≥ M  …
+                 transpose the column operand work ≈ 10·n³                      moves ≈ 16·n³ if ≈ 16·n ≥ M  …
 ```
 
-That is `neant cost` on the naive triple loop, as it prints today. The function's own line is the
-conservative one — nothing is assumed to fit the cache when the sizes are symbols — and a `main`
-that calls it with `n = 1984` gets the same report with numbers: 6.27e10 bytes against a bound
-of 4.31e7, a gap of 1453×, and 1.59e9 after `--apply matmul:tile`. The two suggestions were not
-looked up: each is the rewrite applied to the IR and the calculus run again on the result, which
-is why the transpose is offered with its real cost and not with a slogan.
-
-**Report.** The cost is not in the source. It lives in four places: an inlay hint after the
-signature; `costs.lock`, one line per function, committed, diffed in every pull request the way
-`Cargo.lock` is; an error when a function falls out of the exact tier, naming the line and why;
-and an attribute when you want to lock one:
-
-```rust
-#[cost(moves_at_most = "n log n")]
-fn sort(xs: &mut [T]) { ... }         // build fails if an edit makes this n²
-```
-
-**Never stay silent.** Inference is undecidable in general, so the compiler will not always have an
-exact answer. It always has *an* answer, and says which kind:
-
-| the code looks like | work | moves |
-|---|---|---|
-| bounded loops over arrays, comprehensions, iterator chains | exact | exact |
-| higher-order: `map f`, callbacks, combinators | parametric in `cost(f)` | parametric |
-| pointer structures inside an inferred region | exact | region-granular bound |
-| structural recursion, or `while` with an inferable measure | recurrence | measured |
-| input-dependent loops, external calls | effect `unbounded` | measured |
-
-"Measured" means the compiler ran it on the sizes it could, fit a curve, and reports that curve
-marked as measured, not proven. A function that falls from exact to measured is a diff in
-`costs.lock`, and the error says what to change to bring it back.
+That is `neant cost` on the naive triple loop, as it prints today. The function's own line is
+**piecewise**: the calculus cannot decide, for a symbolic `n`, whether the column of `b` (`B·n`
+bytes) or the whole matrix (`8·n²`) stays in a cache of `M` bytes, so it says what happens in
+each case and where the thresholds are, and gives the gap to the Hong–Kung bound per regime —
+1448× where the column fits, 13033× where nothing does. A `main` that calls it with `n = 1984`
+decides every test with numbers and gets one piece: 6.27e10 bytes, a gap of 1453×, and 1.59e9
+after `--apply matmul:tile`. The two suggestions were not looked up: each is the rewrite applied
+to the IR and the calculus run again on the result, which is why the transpose is offered with
+its real cost and not with a slogan.
 
 ## What it looks like
 
