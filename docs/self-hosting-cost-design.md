@@ -1583,3 +1583,26 @@ call, because it is a *size* and the checker reads it as one — a chain is a lo
 not. And a closure is **syntax, not a value**: it is parsed only where a stage's argument is
 expected, which is what makes fusion the construct's only form rather than an optimisation applied
 to something more general.
+
+### Step 2a: the checker is a rewriter now
+
+The architectural step §25 named is taken, and it is a no-op — all four columns, the fixpoint and
+every suite are unchanged. `nodes` is `&mut` through the checker, `cst[16]` continues the parser's
+arena from where it stopped, and `nnew` allocates into it.
+
+**A synthetic local is a name token below −1**, `−k − 2`. A rewritten chain needs a counter and an
+accumulator and there is no source text for either; `name_eq` makes two synthetic names equal
+exactly when they are the same number, no source span can equal one, and `emit_span` spells them
+`nt_s<k>`. That closes the gap the emitter design recorded from the beginning — locals are emitted
+by source spelling, so until now a local without source text could not exist.
+
+**What the rewrite still needs, found while preparing it: synthetic *literals*.** The loop a chain
+becomes starts its accumulator at `0` or `0.0` and counts by `1`, and an `Int` node carries a token
+index the readers go to the source for — `int_value(src, toks, nodes[e].a)` — while a `Float` is
+emitted by copying its source span outright. So a literal with no source text is a second
+convention, separate from the one for names. It is small: eight places read an integer literal and
+the emitter is the only other reader, and the shape is the same trick — a negative token index with
+the value carried on the node.
+
+Worth saying because §25's build order did not see it: "the checker rewrites the tree" is not one
+convention but two, and the second one is about values rather than names.

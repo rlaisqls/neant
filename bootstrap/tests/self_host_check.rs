@@ -106,7 +106,8 @@ fn main() {{
         let mut ptys = [0; 4096];
         let mut ntys = [-1; 65536];
         let mut cst = [0; 1024];
-        let bad = check_program(&buf, &toks, &nodes, &mut types, &mut syms, &mut sigs, &mut ptys, &mut strs, &mut flds, &mut ntys, &mut cst, first);
+        cst[16] = st[1];
+    let bad = check_program(&buf, &toks, &mut nodes, &mut types, &mut syms, &mut sigs, &mut ptys, &mut strs, &mut flds, &mut ntys, &mut cst, first);
         println(bad);
         if bad == 0 {{
             dump_ty_list(&nodes, &types, &ntys, first);

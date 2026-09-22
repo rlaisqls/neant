@@ -43,6 +43,14 @@ fn emit_bytes(out: &mut [u8], est: &mut [i64], s: &[u8]) {
 // a token's own source bytes: an identifier's spelling, a float literal's digits — C spells both
 // the same way, which is why no literal was ever parsed into a value
 fn emit_span(out: &mut [u8], est: &mut [i64], src: &[u8], toks: &[Token], t: i64) {
+    // a synthetic local has no source text to copy: it is spelled from its number, and `nt_` keeps
+    // it out of the user's namespace the same way the runtime helpers are kept out
+    if t < 0 - 1 {
+        let p = b"nt_s";
+        emit_bytes(out, est, &p);
+        emit_int(out, est, 0 - t - 2);
+        return;
+    };
     let start = est[0];
     let mut i = 0;
     while i < toks[t].len {

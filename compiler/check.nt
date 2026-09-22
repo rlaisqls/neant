@@ -22,6 +22,8 @@
 //   cst[12] how many arrays have been moved away
 //   cst[13] the symbol table's length at the innermost loop's entry, or −1 outside every loop
 //   cst[14] the top of the `if`-union stash
+//   cst[16] the next free node, so the checker can build the loop a chain desugars to
+//   cst[17] the next synthetic local's number
 //   cst[15] the token this item ends before — the next item's name, or past the end
 //   cst[200 + i]  the declaring name token of the i-th moved array
 //   cst[400 + j]  the stash an `if` arm's moves are held in while the other arm is checked
@@ -115,7 +117,12 @@ fn same_ty(types: &[Ty], a: i64, b: i64) -> bool {
 
 // two identifier tokens name the same thing when their spans hold the same bytes: lex.nt kept
 // `(start, len)` into the source rather than copying, so this is the comparison
+// **A name token below −1 is a synthetic local**, `−t − 2`, which the desugaring of a chain needs:
+// a rewritten loop wants a counter and an accumulator, and there is no source text for either. Two
+// synthetic names are the same name exactly when they are the same number, and no source span can
+// ever equal one — which is what a fresh local has to mean. `emit_span` spells them `nt_s<k>`.
 fn name_eq(src: &[u8], toks: &[Token], a: i64, b: i64) -> bool {
+    if a < 0 - 1 || b < 0 - 1 { return a == b; }
     if a < 0 || b < 0 { return false; }
     if toks[a].len != toks[b].len { return false; }
     let mut i = 0;
@@ -233,6 +240,27 @@ fn used_after(src: &[u8], toks: &[Token], cst: &[i64], name: i64, from: i64) -> 
         t += 1;
     }
     hit
+}
+
+// a node and a synthetic name, for the rewrite: the checker allocates into the same arena the
+// parser filled, continuing from where it stopped
+fn nnew(nodes: &mut [Node], cst: &mut [i64], kind: i64) -> i64 {
+    let i = cst[16];
+    nodes[i].kind = kind;
+    nodes[i].a = 0 - 1;
+    nodes[i].b = 0 - 1;
+    nodes[i].c = 0 - 1;
+    nodes[i].d = 0 - 1;
+    nodes[i].ival = 0 - 1;
+    nodes[i].next = 0 - 1;
+    cst[16] = i + 1;
+    i
+}
+
+fn nfresh(cst: &mut [i64]) -> i64 {
+    let k = cst[17];
+    cst[17] = k + 1;
+    0 - k - 2
 }
 
 // the struct a name token names, or −1
@@ -356,7 +384,7 @@ fn resolve_ty(src: &[u8], toks: &[Token], nodes: &[Node], types: &mut [Ty], strs
 
 // every expression's type is recorded in `ntys`, indexed by node — the table a next stage would
 // read, and what the type dump prints. The rules are in `check_expr_inner`; this only records.
-fn check_expr(src: &[u8], toks: &[Token], nodes: &[Node], types: &mut [Ty], syms: &mut [Sym],
+fn check_expr(src: &[u8], toks: &[Token], nodes: &mut [Node], types: &mut [Ty], syms: &mut [Sym],
               sigs: &[Sig], ptys: &[i64], strs: &[Str], flds: &[Fld], ntys: &mut [i64], cst: &mut [i64], n: i64) -> i64 {
     let before = cst[2];
     let t = check_expr_inner(src, toks, nodes, types, syms, sigs, ptys, strs, flds, ntys, cst, n);
@@ -368,7 +396,7 @@ fn check_expr(src: &[u8], toks: &[Token], nodes: &[Node], types: &mut [Ty], syms
     t
 }
 
-fn check_expr_inner(src: &[u8], toks: &[Token], nodes: &[Node], types: &mut [Ty], syms: &mut [Sym],
+fn check_expr_inner(src: &[u8], toks: &[Token], nodes: &mut [Node], types: &mut [Ty], syms: &mut [Sym],
               sigs: &[Sig], ptys: &[i64], strs: &[Str], flds: &[Fld], ntys: &mut [i64], cst: &mut [i64], n: i64) -> i64 {
     if cst[2] != 0 || n < 0 { return -1; }
     let k = nodes[n].kind;
@@ -578,7 +606,7 @@ fn arg_is_mut(src: &[u8], toks: &[Token], nodes: &[Node], types: &[Ty], syms: &[
     t >= 0 && types[t].kind == 6 && types[t].mutable == 1
 }
 
-fn check_call(src: &[u8], toks: &[Token], nodes: &[Node], types: &mut [Ty], syms: &mut [Sym],
+fn check_call(src: &[u8], toks: &[Token], nodes: &mut [Node], types: &mut [Ty], syms: &mut [Sym],
               sigs: &[Sig], ptys: &[i64], strs: &[Str], flds: &[Fld], ntys: &mut [i64], cst: &mut [i64], n: i64) -> i64 {
     let name = nodes[n].a;
     if name_is_println(src, toks, name) {
@@ -660,7 +688,7 @@ fn check_call(src: &[u8], toks: &[Token], nodes: &[Node], types: &mut [Ty], syms
 // ---- statements and blocks ----
 
 // a block's own scope is the symbol table's length: entering saves it, leaving restores it
-fn check_block(src: &[u8], toks: &[Token], nodes: &[Node], types: &mut [Ty], syms: &mut [Sym],
+fn check_block(src: &[u8], toks: &[Token], nodes: &mut [Node], types: &mut [Ty], syms: &mut [Sym],
                sigs: &[Sig], ptys: &[i64], strs: &[Str], flds: &[Fld], ntys: &mut [i64], cst: &mut [i64], n: i64) -> i64 {
     if cst[2] != 0 || n < 0 { return -1; }
     let saved = cst[1];
@@ -680,14 +708,14 @@ fn check_block(src: &[u8], toks: &[Token], nodes: &[Node], types: &mut [Ty], sym
     t
 }
 
-fn check_stmt(src: &[u8], toks: &[Token], nodes: &[Node], types: &mut [Ty], syms: &mut [Sym],
+fn check_stmt(src: &[u8], toks: &[Token], nodes: &mut [Node], types: &mut [Ty], syms: &mut [Sym],
               sigs: &[Sig], ptys: &[i64], strs: &[Str], flds: &[Fld], ntys: &mut [i64], cst: &mut [i64], n: i64) {
     let before = cst[2];
     check_stmt_inner(src, toks, nodes, types, syms, sigs, ptys, strs, flds, ntys, cst, n);
     if cst[2] != 0 && before == 0 && cst[9] < 0 { cst[9] = n; }
 }
 
-fn check_stmt_inner(src: &[u8], toks: &[Token], nodes: &[Node], types: &mut [Ty], syms: &mut [Sym],
+fn check_stmt_inner(src: &[u8], toks: &[Token], nodes: &mut [Node], types: &mut [Ty], syms: &mut [Sym],
               sigs: &[Sig], ptys: &[i64], strs: &[Str], flds: &[Fld], ntys: &mut [i64], cst: &mut [i64], n: i64) {
     if cst[2] != 0 || n < 0 { return; }
     let k = nodes[n].kind;
@@ -930,7 +958,7 @@ fn collect_sigs(src: &[u8], toks: &[Token], nodes: &[Node], types: &mut [Ty], si
     sigs[cst[3]].name = -1;
 }
 
-fn check_func(src: &[u8], toks: &[Token], nodes: &[Node], types: &mut [Ty], syms: &mut [Sym],
+fn check_func(src: &[u8], toks: &[Token], nodes: &mut [Node], types: &mut [Ty], syms: &mut [Sym],
               sigs: &[Sig], ptys: &[i64], strs: &[Str], flds: &[Fld], ntys: &mut [i64], cst: &mut [i64], f: i64, si: i64) {
     if cst[2] != 0 { return; }
     let saved = cst[1];
@@ -972,7 +1000,7 @@ fn ends_in_return(nodes: &[Node], body: i64) -> bool {
 }
 
 // returns 0 when the program checks, 1 when it does not
-fn check_program(src: &[u8], toks: &[Token], nodes: &[Node], types: &mut [Ty], syms: &mut [Sym],
+fn check_program(src: &[u8], toks: &[Token], nodes: &mut [Node], types: &mut [Ty], syms: &mut [Sym],
                  sigs: &mut [Sig], ptys: &mut [i64], strs: &mut [Str], flds: &mut [Fld],
                  ntys: &mut [i64], cst: &mut [i64], first: i64) -> i64 {
     cst[9] = -1;
