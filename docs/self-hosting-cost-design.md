@@ -869,3 +869,79 @@ So symbolic strides close no column by themselves. They are the cheapest of the 
 they are a prerequisite for two of the nine declines, which is worth knowing before ordering the
 work — and the order that falls out is: layers (2)–(4) first, because `pairs` alone pays for them,
 then the slot re-lay, then this, which by then is the small one.
+
+## 18. The working set is per level and across sites, which is why the fork kept failing
+
+`pairs` derived by hand, the way §16 derived `tiles`, against both printed regimes. Loops `i`
+(trip `N`, lo 0) and `j` (trip `N − i`, lo `i`); sites `a[i]` and `a[j]`, both inside both loops.
+
+| site | at `j` | at `i` | × B |
+|---|---|---|---|
+| `a[j]` | coef 1, 8 B → `1 + 8(N−i)/B`, contiguous | coef 0 → but the lines **mention `i`**, so summed: `N + 4N²/B + 4N/B` | `B·N + 4N² + 4N` |
+| `a[i]` | coef 0, lines `1` do not mention `j` → `1` | coef 1, 8 B, contiguous → `1 + 8N/B` | `B + 8N` |
+
+That is the **fitting** regime. For the other, the level `i` does not fit, every site is summed,
+`a[j]` gives `B·N + 4N² + 4N` and `a[i]` gives `B·N`, totalling `4N² + 2·B·N + 4N` — which is the
+printed `4·a.len()² + 2·B·a.len() + 4·a.len()`, term for term.
+
+### The thing the four "layers" were symptoms of
+
+The condition separating those regimes is the working set at level `i`, and it is
+
+```
+ws = 1  +  (1 + 8(N−i)/B)        the sum over *both* sites of what each touches per lap
+```
+
+substituted at `i`'s extreme — the `i` terms are all negative, so at `lo = 0` — giving `2 + 8N/B`,
+or `2·B + 8·n` in bytes, printed `≈ 8·a.len()`. **A working set is a property of a level, not of a
+site.** The sites in a loop compete for the same cache, so the test is over their sum.
+
+`matmul` proves this and `pairs` cannot, because `pairs`' two sites happen to share a leading term.
+At `matmul`'s level `j` the three sites contribute `1 + 8n/B`, `n` and `1`; the sum is `2 + 8n/B + n`,
+which is the printed `≈ B·n + 8·n`. Taken one site at a time they would give `≈ 8·n`, `≈ B·n` and
+`≈ B` — three conditions, none of them the one that is printed, and the report prints exactly one.
+
+`site_add` settles a site's moves **at the site**, the moment it is seen, and its comment says why:
+
+> settled here rather than in a pass at the end, so that the moves of an `if`'s two arms can be
+> compared: sites in different arms are *alternatives*, and only one of them happens
+
+So it computes the working set from the one site in hand. That is correct wherever a loop holds one
+site, which is every column this slice gets exact today — `tiles` has one, and that is why §16
+worked and generalised wrongly from it. It cannot be correct where a loop holds two.
+
+**This is what the reverted attempt was actually hitting.** Each of the four "layers" — a site that
+does not move with the inner loop, the outer level summing rather than multiplying, the condition
+at the loop's extreme — is a rule about *a level*, being fitted one site at a time into a place that
+only ever holds one site. They did not converge because the fourth fix cannot be made in that place.
+
+### So the change is one change, not four
+
+Defer the settle. `sites[]` already records everything a later pass needs — `arr`, `idx`, `inloop`,
+`coef`, `stride`, `bad`, `trip`, `branch`, `field` — which is not an accident: it is what the Rust's
+`Site` records for exactly this pass. What is missing is per-depth loop state kept for the whole
+function rather than while the loop is open: the atom, `lo`, the step, the trip. `LoopRec` in the
+Rust, four arrays here.
+
+Then, innermost level outwards, for each level:
+
+1. the working set is the **sum** over the sites in that level of the lines each touches per lap
+2. substituted at the level's extreme — at `last()` when the variable's terms are all positive, at
+   `lo` when all negative, and untested (assume it does not fit) when mixed
+3. numeric → decided; symbolic → **fork**, which is where `piece.rs`'s generality earns its place
+4. per site: not fitting → summed; coefficient 0 → the same set, itself summed if it mentions the
+   level's atom; a numeric stride under a line → the slide, added when contiguous and multiplied
+   when not; a numeric stride over a line, or a symbolic one (§17) → summed
+
+and the `if`-arm objection is answered the way the Rust answers it, by grouping on `branch` at the
+end and combining arms with `max` — which the sites already carry and which is the Rust's `group`.
+
+`pol_sum_over`, `pol_subst`, `pol_faulhaber` and `mono_exp` all exist. The pass needs no new
+polynomial machinery, which is the one thing §16 got right.
+
+### What it closes, stated before building it
+
+`pairs`, `stencil` — the latter also needing §17 — and the `main`s that call them. `matmul` needs
+depth 3 as well. Six of the nine declines; the other three are the SoA per-field residency ones and
+are unrelated. If it closes fewer than that, the measurement above is wrong somewhere and the place
+to look is which sites a level collects.
