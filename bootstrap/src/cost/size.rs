@@ -52,7 +52,11 @@ pub enum Atom {
     Var(usize),
     B,
     M,
-    /// `log` of a size expression, from a recurrence or an asserted bound.
+    /// Processors a `.par()` chain divides work over; only appears in the `T ≤ work/P + span`
+    /// bound, never inside `work`, `moves` or `span` themselves.
+    P,
+    /// `log` of a size expression, from a recurrence, an asserted bound, or a `.par()` chain's
+    /// reduction depth.
     Log(Box<Poly>),
 }
 
@@ -403,6 +407,7 @@ impl<'a> fmt::Display for PolyDisplay<'a> {
                 Atom::Var(i) => self.names.get(*i).cloned().unwrap_or_else(|| format!("?{i}")),
                 Atom::B => "B".into(),
                 Atom::M => "M".into(),
+                Atom::P => "P".into(),
                 Atom::Log(inner) => {
                     let s = inner.display(self.names).to_string();
                     if inner.terms.len() == 1 && !s.contains('·') { format!("log {s}") } else { format!("log({s})") }
@@ -427,7 +432,7 @@ impl<'a> fmt::Display for PolyDisplay<'a> {
             if i > 0 { write!(f, "{}", if neg { " − " } else { " + " })?; }
             else if neg { write!(f, "−")?; }
             let mut ordered: Vec<(&Atom, &Rat)> = m.factors.iter().collect();
-            ordered.sort_by_key(|(a, _)| match a { Atom::B => 0, Atom::M => 1, Atom::Var(i) => 2 + *i, Atom::Log(_) => 1_000_000 });
+            ordered.sort_by_key(|(a, _)| match a { Atom::B => 0, Atom::M => 1, Atom::P => 2, Atom::Var(i) => 3 + *i, Atom::Log(_) => 1_000_000 });
             let num: Vec<String> = ordered.iter().filter(|(_, e)| e.n > 0).map(|(a, e)| atom_str(a, **e)).collect();
             let den: Vec<String> = ordered.iter().filter(|(_, e)| e.n < 0).map(|(a, e)| atom_str(a, e.neg())).collect();
             // a rational with a big denominator (a tile count, a division by a constant) reads as

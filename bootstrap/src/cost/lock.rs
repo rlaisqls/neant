@@ -64,6 +64,7 @@ fn leading_numeric(p: &Poly, m: &Machine) -> Option<(Vec<(usize, super::size::Ra
             match a {
                 Atom::B => coef *= (m.b_bytes as f64).powf(e.to_f64()),
                 Atom::M => coef *= (m.m_bytes as f64).powf(e.to_f64()),
+                Atom::P => coef *= (m.p_cores as f64).powf(e.to_f64()),
                 Atom::Var(i) => key.push((*i, *e)),
                 Atom::Log(_) => key.push((usize::MAX, *e)),
             }

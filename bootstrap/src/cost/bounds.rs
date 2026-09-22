@@ -155,7 +155,7 @@ pub fn hbl_bound(n_iters: &Poly, sigma: Rat) -> Poly {
 /// a million. The report's gap for a rewrite is measured against the first.
 pub fn strongest_first(bounds: &mut Vec<Bound>, m: &Machine) {
     bounds.dedup_by(|a, b| a.kind == b.kind && a.moves == b.moves);
-    let at = |p: &Poly| p.eval(&|a| match a { Atom::B => Some(m.b_bytes as f64), Atom::M => Some(m.m_bytes as f64), Atom::Var(_) => Some(1e6), Atom::Log(_) => None }).unwrap_or(0.0);
+    let at = |p: &Poly| p.eval(&|a| match a { Atom::B => Some(m.b_bytes as f64), Atom::M => Some(m.m_bytes as f64), Atom::P => Some(m.p_cores as f64), Atom::Var(_) => Some(1e6), Atom::Log(_) => None }).unwrap_or(0.0);
     // a bound that is a number and not positive at this machine says nothing: `216/√M − M`
     bounds.retain(|b| b.moves.has_vars() || at(&b.moves) > 0.0);
     bounds.sort_by(|a, b| {

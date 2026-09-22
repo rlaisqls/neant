@@ -24,6 +24,8 @@ pub struct Machine {
     pub m_bytes: i128,
     /// Bytes per cache line.
     pub b_bytes: i128,
+    /// Processors a `.par()` chain's `T ≤ work/P + span` bound is evaluated at.
+    pub p_cores: i128,
 }
 
 #[derive(Debug, Clone)]
@@ -148,7 +150,7 @@ pub fn choose_layouts(m: &mut Module, machine: &Machine) -> Vec<LayoutChoice> {
             let at = |c: &FuncCost| -> (f64, String) {
                 match &c.result {
                     CostResult::Exact { moves, .. } => {
-                        let point = |a: Atom| match a { Atom::B => Some(machine.b_bytes as f64), Atom::M => Some(machine.m_bytes as f64), Atom::Var(_) => Some(1e6), Atom::Log(_) => None };
+                        let point = |a: Atom| match a { Atom::B => Some(machine.b_bytes as f64), Atom::M => Some(machine.m_bytes as f64), Atom::P => Some(machine.p_cores as f64), Atom::Var(_) => Some(1e6), Atom::Log(_) => None };
                         (moves.eval(&point, machine).unwrap_or(0.0), super::lock::brief(moves, &c.names))
                     }
                     CostResult::Unknown { .. } => (0.0, "unknown".into()),
@@ -241,7 +243,7 @@ fn tile_choice(an: &mut Analyzer, f: &Func) -> Option<TileChoice> {
     let CostResult::Exact { work, moves } = &c.result else { return None };
     if std::env::var("NEANT_DEBUG_TILE").is_ok() { eprint!("{}", super::lock::report(&c, &machine)); }
     // the reference point: this machine, every size a million — tiling is for large sizes
-    let point = |t: Option<f64>| move |a: Atom| match a { Atom::B => Some(machine.b_bytes as f64), Atom::M => Some(machine.m_bytes as f64), Atom::Var(v) if v == tvar => t, Atom::Var(_) => Some(1e6), Atom::Log(_) => None };
+    let point = |t: Option<f64>| move |a: Atom| match a { Atom::B => Some(machine.b_bytes as f64), Atom::M => Some(machine.m_bytes as f64), Atom::P => Some(machine.p_cores as f64), Atom::Var(v) if v == tvar => t, Atom::Var(_) => Some(1e6), Atom::Log(_) => None };
     let holds = |conds: &[Cond]| conds.iter().all(|c| c.ws.eval(&point(None)).is_some_and(|ws| ((ws * (machine.b_bytes as f64)) < (machine.m_bytes as f64)) == c.fits));
     let mut best: Option<(f64, Poly, bool, Poly, Piece)> = None;
     let half = Poly::atom(Atom::M).scale(Rat::new(1, 2));
@@ -636,7 +638,7 @@ impl<'a, 'b, 'c> Fa<'a, 'b, 'c> {
                     } else {
                         let at = |a: Atom| -> Option<f64> {
                             match a {
-                                Atom::B => Some(m.b_bytes as f64), Atom::M => Some(m.m_bytes as f64),
+                                Atom::B => Some(m.b_bytes as f64), Atom::M => Some(m.m_bytes as f64), Atom::P => Some(m.p_cores as f64),
                                 Atom::Var(i) => declared.sizes.iter().find(|(v, _)| *v == i).map(|(_, x)| *x),
                                 Atom::Log(_) => None,
                             }
@@ -953,6 +955,7 @@ impl<'a, 'b, 'c> Fa<'a, 'b, 'c> {
         p.eval(&|a| match a {
             Atom::B => Some(m.b_bytes as f64),
             Atom::M => Some(m.m_bytes as f64),
+            Atom::P => Some(m.p_cores as f64),
             Atom::Var(_) | Atom::Log(_) => None,
         })
     }

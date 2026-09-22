@@ -4,8 +4,8 @@
 //!   neant run   f.nt [--unchecked] [-- args]  build to a temp file and run it
 //!   neant emit  f.nt [--unchecked]            print the generated C
 //!   neant check f.nt                          parse and type-check only
-//!   neant cost  f.nt [-M bytes] [-B bytes] [--eval n=..,..]
-//!                                             infer work and moves for every function
+//!   neant cost  f.nt [-M bytes] [-B bytes] [-P cores] [--eval n=..,..]
+//!                                             infer work, moves and span for every function
 //!   neant lock  f.nt [--check]                write costs.lock next to the source, or diff it
 //!   neant measure f.nt --fn name [--sizes 1000,4000,...] [--shape p=n*n,...] [--repeat k] [--cpu 5] [--lock]
 //!                                             run the function over a size sweep under perf and fit ~n^k
@@ -34,7 +34,8 @@ fn main() {
     let mut out: Option<PathBuf> = None;
     let mut checked = true;
     let mut passthrough: Vec<String> = Vec::new();
-    let mut machine = cost::Machine { m_bytes: 2 << 20, b_bytes: 64 };
+    let default_p = std::thread::available_parallelism().map(|n| n.get() as i128).unwrap_or(4);
+    let mut machine = cost::Machine { m_bytes: 2 << 20, b_bytes: 64, p_cores: default_p };
     let mut eval: Option<String> = None;
     let mut lock_check = false;
     let mut applies: Vec<String> = Vec::new();
@@ -54,6 +55,7 @@ fn main() {
             "--check" => lock_check = true,
             "-M" => { i += 1; machine.m_bytes = parse_bytes(args.get(i)); }
             "-B" => { i += 1; machine.b_bytes = parse_bytes(args.get(i)); }
+            "-P" => { i += 1; machine.p_cores = args.get(i).and_then(|s| s.parse().ok()).unwrap_or(machine.p_cores); }
             "--eval" => { i += 1; eval = args.get(i).cloned(); }
             "--apply" => { i += 1; applies.extend(args.get(i).map(|s| s.split(',').map(String::from).collect::<Vec<_>>()).unwrap_or_default()); }
             "--fn" => { i += 1; m_fn = args.get(i).cloned(); }
@@ -334,6 +336,7 @@ fn evaluate(c: &cost::FuncCost, work: &cost::Cost, moves: &cost::Cost, ev: &str,
         match a {
             Atom::B => Some(m.b_bytes as f64),
             Atom::M => Some(m.m_bytes as f64),
+            Atom::P => Some(m.p_cores as f64),
             Atom::Var(i) => {
                 let name = c.names.get(i)?;
                 vals.iter().find(|(k, _)| k == name).map(|(_, v)| *v)
