@@ -28,6 +28,9 @@ fn main() {
         b[i] = (i % 5) as f64;
     }
     for r in 0..@R@ {
+        for i in 0..n * n {
+            c[i] = 0.0;
+        }
         matmul(n, &a, &b, &mut c);
     }
     println(c[n + 1]);
