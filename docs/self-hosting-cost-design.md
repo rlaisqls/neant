@@ -1273,3 +1273,69 @@ keyed by `(array, field)`, and a whole-element site has no field. Comparing the 
 `name_eq` read outside the token array, so `stencil`'s four reads of `src` became four entries
 instead of one and the bound came out `40·n² − 160·n + 160` against the wanted
 `16·n² − 64·n + 64` — five arrays' worth where there are two. The ratio was what gave it away.
+
+## 23. The footprint report lines, and retiring §20's approximation
+
+51 `footprint` lines, the largest block of the report still missing, and the one that pays twice:
+it prints what a caller may credit, and it replaces the approximation §20 recorded rather than
+adding a new one beside it.
+
+### What this compiler computes now, and why it is not enough
+
+`foot_flags` gives a parameter's footprint as a **whole field array**: `[base, base + size)` bytes
+per element, scaled by the argument's length at the call. §20 said plainly what that assumes —
+every walk covers the whole array — and that a partial walk would overstate the footprint and
+over-credit its caller. The corpus never showed it because every walk is `for i in 0..xs.len()`.
+
+The report shows it immediately. Half the shapes in the corpus are not whole arrays:
+
+| shape | example | what it needs |
+|---|---|---|
+| a constant index outside every loop | `parse`: `pos: [0, 8)` | a range at depth 0 |
+| an index that is a **parameter**, not a loop variable | `recur`: `xs: [8·i, 8·i + 8)` | the index's constant part as a polynomial |
+| a rational index | `recur`: `xs: [4·hi + 4·lo, …)` | `(lo + hi) / 2`, coefficients ½ |
+| a two-deep nest | `matmul`: `a: [0, 8·n²)` | symbolic coefficients, already built for the bound |
+| a nest that does not start at 0 | `stencil`: `dst: [8·n + 8, 8·n² − 8·n − 8)` | `lo` and `last` per level |
+| a tiled nest | `tri`: `a: [0, 8·n)` | the loop's offset, already chained |
+| one field of an SoA struct | `particles`: `ps: [16·ps.len(), 32·ps.len())` | the field's base, already recorded |
+
+So the work is **`site_range`**: the byte range one site covers over its nest, as a polynomial.
+Everything it needs is already recorded — the per-level polynomial coefficients from §22, each
+loop's first and last value, the site's stride, what one touch covers, and the field's base. What
+is missing is the index's **constant part**, which is the index with every loop variable set to its
+own bound rather than to an atom.
+
+### The rule, corrected
+
+`analyze.rs`'s own `site_range`, with the double count this session removed
+(docs/experiments.md): the affine form already carries each loop's start, so a variable's own
+contribution runs from `0` to `(trip − 1)·step`, and the sign of its coefficient decides which end
+is `lo`.
+
+```
+lo = konst + Σ over levels  (coefficient ≥ 0 ?  0  :  c·(trip−1)·step)
+hi = konst + Σ over levels  (coefficient ≥ 0 ?  c·(trip−1)·step  :  0)
+range = [lo·stride + base,  hi·stride + touch + base)
+```
+
+and `konst` is the index evaluated with every loop variable at zero — which is `val_of` of the
+index followed by `pol_subst` of each loop atom by zero, not a new reader.
+
+### The merge, the residency line, and the order
+
+Several sites on one parameter merge the way `signature_footprint` merges them, which this compiler
+already reproduces on integers and will now do on polynomials: the same range twice is one, two
+disjoint ranges become the span, anything else is the whole array and **not exact**. One inexact
+parameter forfeits the residue for the whole call, and the line then reads `no residue claimed`
+instead of `resident after if … < M`, whose condition is the sum of every parameter's `hi − lo`.
+
+Printed in **parameter order**, which is the order `signature_footprint` sorts by and not the order
+the sites were seen.
+
+### How it will be measured, and the risk
+
+A **fifth column**, whitespace-normalised on both sides so the report's column padding is not part
+of the comparison. The risk is not the printing: it is that footprints feed residency credit, so
+getting a range wrong moves a `moves` column that is exact today. **`moves` staying at 76 is the
+test that matters**, and it is a stronger check on this than the new column is — a wrong range that
+happens to print plausibly will still mis-credit a caller.
