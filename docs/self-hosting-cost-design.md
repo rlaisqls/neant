@@ -1838,3 +1838,46 @@ to give the tree a proper discriminant rather than another sentinel.
 &[f64]) -> [f64]` is an **owned array return**, which this checker rejects independently of anything
 chains do. It is declared out of the parser's slice so the three comparisons keep agreeing, and it
 is the last golden outside.
+
+## 27. Owned array returns — the last golden, measured
+
+`owned.nt` is the only golden left outside the slice, and its comprehension is not the reason:
+
+```neant
+fn doubled(xs: &[f64]) -> [f64] { let ys = [2.0 * x for x in xs]; ys }
+fn sum_doubled(a: &[f64]) -> f64 { let ys = doubled(a); … }
+```
+
+`doubled` alone, with `[1.5; n]` in place of the comprehension, is still rejected.
+
+**Why it is rejected.** `same_ty` treats an array's length as part of its type — *"an array's length
+is part of its type; a view's is not, which is why `&[T]` accepts arrays of any length"* — so the
+declared `-> [f64]`, whose `resolve_ty` gives no size, never equals the body's `ys`, whose size is a
+real atom. The signature has to **carry** the size, which is what M4 built in the Rust and called
+"owned `[T]` returns whose size the signature carries".
+
+**What the costs ask for.** Checking is the easy half; the cost is the half with the substitution:
+
+```
+doubled      work 5·xs.len()       moves 16·xs.len() + B
+sum_doubled  work 9·a.len() + 2    moves 24·a.len() + 2·B
+```
+
+`sum_doubled` never names `doubled`'s parameter, yet its cost is in terms of **its own** `a.len()`.
+So the callee's result size is a polynomial in the callee's atoms that the caller must substitute —
+the same substitution the call path already does for a callee's `moves`, applied to one more thing.
+
+### The pieces
+
+1. **`Sig` carries a result size.** `check_func` accepts an array return whose element type matches
+   and records the body's size; `check_call` hands back an array typed with it. For *checking*, a
+   fresh atom per call would do — `ys`'s length is its own — and only the cost needs more.
+2. **A result-size polynomial per function**, in the callee's atoms, recorded where `fw` and `fm`
+   are, and substituted at the call with the map the call path already builds.
+3. **`let ys = <call>`** in both walks: today an array-typed `let` handles a brace list, a repeat, a
+   byte string and now an allocation, and declines a call.
+4. **The emitter**, which refuses an array `let` whose initialiser is not one of those shapes — the
+   same refusal that made the comprehension a statement-level rewrite.
+
+Nothing here is new in kind; it is (2) that makes it more than an afternoon, because a size crossing
+a call boundary is the one thing this pass has so far only ever done for costs.
