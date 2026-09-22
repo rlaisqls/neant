@@ -180,9 +180,12 @@ parameters, and the first that shrinks everywhere is used:
 
 | every call shrinks `m` … | recurrence | solved as |
 |---|---|---|
-| by a constant `c`, one call | `T(m) = T(m−c) + f` | `f·(m/c + 1)` |
+| by a constant `c`, one call | `T(m) = T(m−c) + f(m)` | unrolled and summed exactly: `Σ_{j=0}^{m/c} f` with every parameter of `m` advanced `j` steps along its shift (Faulhaber) |
 | by a constant, two or more calls | `T(m) = a·T(m−c) + f` | **refused**: exponential |
-| to `m/b`, `a` calls, `f = Θ(m^d)` | `T(m) = a·T(m/b) + f` | master theorem: `a < b^d` → `Θ(f)`; `a = b^d` → `f·log m`; `a > b^d` → `Θ(m^(log_b a))` |
+| to `m/b`, `a` calls | `T(m) = a·T(m/b) + f(m)` | per monomial `g` of `f` with degree `d` in `m`, the geometric series over levels: `a < b^d` → `g·b^d/(b^d − a)`; `a = b^d` → `g·(log_b m + 1)`; `a > b^d` → `g·((a/b^d)·m^(log_b a − d) − 1)/(a/b^d − 1)` — exact rationals; `log` is base 2 and `log_b` is exact when `b` is a power of two |
+
+`msum` (two calls on halves, constant body 13) comes out as `13·(2m − 1)`, which is the exact
+solution at powers of two; binary search as `17·log(hi − lo) + 17`.
 
 Recursive calls under `if` are counted along the heavier branch, not summed — a binary search is
 one call per level, not two. The function's line says `recurrence` instead of `exact`. Mutual

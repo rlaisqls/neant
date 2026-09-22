@@ -384,41 +384,69 @@ impl<'a, 'b, 'c> Fa<'a, 'b, 'c> {
                 }
             }
             if !ok { continue; }
+            // how each parameter in m moves per call: v ↦ v + δ_v (the linear case) — needed to
+            // unroll the recurrence exactly
+            let shifts: Option<Vec<(usize, Rat)>> = {
+                let (args, _, _) = &self.rec_calls[0];
+                mvars.iter().map(|&v| {
+                    let ap = args.get(v).cloned().flatten()?;
+                    let d = ap.sub(&Poly::var(v));
+                    d.as_const().map(|c| (v, c))
+                }).collect()
+            };
             let solve = |f: &Poly| -> Result<Poly, String> {
                 match shrink.unwrap() {
                     Shrink::Linear(c) => {
                         if a > 1 { return Err(format!("{a} recursive calls each shrinking `{}` by a constant: exponential", m.display(&self.names))); }
-                        // T(m) = T(m − c) + f(m)  ⇒  at most (m/c + 1)·f(m)
-                        Ok(f.mul(&m.scale(Rat::new(1, c))).add(f))
+                        // T(m) = f(m) + T(m − c): unrolled, T = Σ_{j=0}^{m/c} f with every
+                        // parameter of m advanced j steps along its shift — exact by summation
+                        const J: usize = usize::MAX / 2 - 1;
+                        let trip = m.scale(Rat::new(1, c)).add(&Poly::constant(1));
+                        match &shifts {
+                            Some(sh) => {
+                                let map: Vec<(usize, Poly)> = sh.iter().map(|(v, d)| (*v, Poly::var(*v).add(&Poly::var(J).scale(*d)))).collect();
+                                let fj = f.subst_many(&map);
+                                Ok(fj.sum_over(J, &Poly::zero(), 1, &trip))
+                            }
+                            None => Ok(f.mul(&trip)),
+                        }
                     }
                     Shrink::Div(b) => {
-                        let d = f.degree_in(&mvars);
-                        let bd = (b as f64).powf(d.to_f64());
-                        let af = a as f64;
-                        if af < bd - 1e-9 {
-                            // leaves are cheaper than the root: a geometric series
-                            let ratio = Rat::new(1000, ((1.0 - af / bd) * 1000.0).round() as i128);
-                            Ok(f.scale(ratio))
-                        } else if (af - bd).abs() < 1e-9 {
-                            Ok(f.mul(&Poly::atom(Atom::Log(Box::new(m.clone())))))
-                        } else {
-                            // T = Θ(m^log_b a): f's top part lifted from degree d to degree k
-                            let k = af.ln() / (b as f64).ln();
-                            let lift = k - d.to_f64();
-                            let lifted = if (lift - lift.round()).abs() < 1e-9 {
-                                m.pow(lift.round() as i128)
+                        // T(m) = a·T(m/b) + f(m): each monomial g of f, of degree d in m, is paid
+                        // once per level with weight (a/b^d)^i, i = 0..log_b m — a geometric series
+                        let mut total = Poly::zero();
+                        let log2b = (b as f64).log2();
+                        let inv_log2b = if (log2b - log2b.round()).abs() < 1e-9 { Rat::new(1, log2b.round() as i128) } else { Rat::new((1000.0 / log2b).round() as i128, 1000) };
+                        for (mono, coef) in &f.terms {
+                            let mut g = Poly::zero();
+                            g.terms.insert(mono.clone(), *coef);
+                            let d = mono.factors.iter().filter(|(at, _)| matches!(at, Atom::Var(i) if mvars.contains(i))).fold(Rat::zero(), |acc, (_, e)| acc.add(*e));
+                            if !d.is_int() || d.n < 0 { return Err("a fractional power of the measure in the body cost".into()); }
+                            let bd: i128 = b.pow(d.n as u32);
+                            if a < bd {
+                                // Σ (a/b^d)^i ≤ b^d / (b^d − a)
+                                total = total.add(&g.scale(Rat::new(bd, bd - a)));
+                            } else if a == bd {
+                                // log_b m + 1 levels, each paying g
+                                let levels = Poly::atom(Atom::Log(Box::new(m.clone()))).scale(inv_log2b).add(&Poly::constant(1));
+                                total = total.add(&g.mul(&levels));
                             } else {
-                                let e = Rat::new((lift * 1000.0).round() as i128, 1000);
-                                let mut mono = super::size::Mono::default();
-                                mono.factors.insert(Atom::Log(Box::new(Poly::zero())), Rat::zero()); // placeholder removed below
-                                mono.factors.clear();
-                                // a non-integer lift of a compound measure is not representable exactly; use m's variables
-                                if mvars.len() == 1 { mono.factors.insert(Atom::Var(mvars[0]), e); let mut p = Poly::zero(); p.terms.insert(mono, Rat::one()); p }
-                                else { return Err(format!("recurrence T = {a}·T(m/{b}) + Θ(m^{}) has a non-integer exponent on a compound measure", d.n)); }
-                            };
-                            let ratio = Rat::new(1000 * a, ((af - bd) * 1000.0).round() as i128);
-                            Ok(f.leading().mul(&lifted).scale(ratio))
+                                // ((a/b^d)^{L+1} − 1)/((a/b^d) − 1) with (a/b^d)^L = m^{log_b a − d}
+                                let k = (a as f64).ln() / (b as f64).ln();
+                                let lift = k - d.n as f64;
+                                let mk = if (lift - lift.round()).abs() < 1e-9 {
+                                    m.pow(lift.round() as i128)
+                                } else if mvars.len() == 1 {
+                                    Poly::var(mvars[0]).mul_atom_pow(Atom::Var(mvars[0]), Rat::new((lift * 1000.0).round() as i128 - 1000, 1000))
+                                } else {
+                                    return Err(format!("recurrence T = {a}·T(m/{b}) + Θ(m^{}) has a non-integer exponent on a compound measure", d.n));
+                                };
+                                let r = Rat::new(a, bd); // a/b^d > 1
+                                let num = mk.scale(r).sub(&Poly::constant(1));
+                                total = total.add(&g.mul(&num).scale(Rat::new(r.d, r.n - r.d)));
+                            }
                         }
+                        Ok(total)
                     }
                 }
             };
