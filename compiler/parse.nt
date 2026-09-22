@@ -1,0 +1,525 @@
+// The second self-hosted stage (docs/self-hosting-parser-design.md), ported from
+// bootstrap/src/parse.rs. **A fragment, not a standalone program**: it uses `Token` and the token
+// kind numbers `compiler/lex.nt` defines, and there is no module system to import them with, so it
+// is compiled by concatenating `lex.nt` then this file then a driver — which is what the eventual
+// self-hosted compiler is anyway, one file.
+//
+// **One change from the design, found while writing it.** §3 planned a second flat `children`
+// arena that every variable-arity node would slice into. That does not work: a nested block parses
+// its own statements *while* the outer block is still collecting its own, so the outer block's
+// entries would not be contiguous. Children are chained through the nodes themselves instead —
+// each `Node` has a `next` (−1 ends the list), a parent points at the first child — which is M4's
+// own arena-of-index-links, one arena instead of two, and no interleaving to get wrong.
+//
+// Node kinds (design §2), disjoint from lex.nt's 0-57 so a mix-up is loud:
+//   60 Int  61 Float  62 Bool  63 Byte  64 Bytes  65 Var  66 Binary  67 Unary  68 Index
+//   69 Field  73 Ref  74 Cast  75 If  76 Block
+//   90 Let  91 Assign  92 For  93 While  94 Break  95 ExprStmt  96 Return
+//   100 TyNamed  101 TyUnit  102 TyArray  103 TySlice  104 TyOwned
+//   110 Func  111 Param
+// Out of this slice, by design §6: StructLit(70), MethodCall/chains(72), ArrayLit(77),
+// ArrayRepeat(78), Lambda(79), Comprehension(80), `extern`, attributes, `struct` definitions.
+//
+// BinOp: 0 Add 1 Sub 2 Mul 3 Div 4 Rem 5 Eq 6 Ne 7 Lt 8 Le 9 Gt 10 Ge 11 And 12 Or
+// UnOp:  0 Neg 1 Not
+//
+// `st` is the parser's whole mutable state, the one-element-array idiom `tests/golden/parse.nt`
+// already uses, widened: st[0] = the token position, st[1] = the next free node, st[2] = 1 once a
+// parse has failed. Every function returns −1 immediately once st[2] is set, so one error stops
+// the parse the way parse.rs's `?` does, without unwinding.
+
+struct Node { kind: i64, a: i64, b: i64, c: i64, d: i64, ival: i64, next: i64 }
+
+fn peek(toks: &[Token], st: &[i64]) -> i64 {
+    toks[st[0]].kind
+}
+fn peek2(toks: &[Token], st: &[i64], n_toks: i64) -> i64 {
+    if st[0] + 1 < n_toks { toks[st[0] + 1].kind } else { 57 }
+}
+fn bump(st: &mut [i64]) -> i64 {
+    let at = st[0];
+    st[0] = at + 1;
+    at
+}
+fn eat(toks: &[Token], st: &mut [i64], k: i64) -> bool {
+    if toks[st[0]].kind == k {
+        st[0] = st[0] + 1;
+        true
+    } else {
+        false
+    }
+}
+// consumes `k` or fails the parse; returns the token's index, or −1
+fn expect(toks: &[Token], st: &mut [i64], k: i64) -> i64 {
+    if toks[st[0]].kind == k {
+        let at = st[0];
+        st[0] = at + 1;
+        at
+    } else {
+        st[2] = 1;
+        -1
+    }
+}
+fn alloc(nodes: &mut [Node], st: &mut [i64], kind: i64) -> i64 {
+    let i = st[1];
+    nodes[i].kind = kind;
+    nodes[i].a = -1;
+    nodes[i].b = -1;
+    nodes[i].c = -1;
+    nodes[i].d = -1;
+    nodes[i].ival = -1;
+    nodes[i].next = -1;
+    st[1] = i + 1;
+    i
+}
+
+// ---- types ----
+
+fn type_expr(toks: &[Token], n_toks: i64, st: &mut [i64], nodes: &mut [Node]) -> i64 {
+    if st[2] != 0 { return -1; }
+    let k = toks[st[0]].kind;
+    if k == 0 {
+        let t = bump(st);
+        let n = alloc(nodes, st, 100);
+        nodes[n].a = t;
+        return n;
+    }
+    if k == 23 {
+        bump(st);
+        expect(toks, st, 24);
+        return alloc(nodes, st, 101);
+    }
+    if k == 25 {
+        bump(st);
+        let elem = type_expr(toks, n_toks, st, nodes);
+        if eat(toks, st, 26) {
+            let n = alloc(nodes, st, 104);
+            nodes[n].a = elem;
+            return n;
+        }
+        expect(toks, st, 30);
+        let count = expr(toks, n_toks, st, nodes);
+        expect(toks, st, 26);
+        let n = alloc(nodes, st, 102);
+        nodes[n].a = elem;
+        nodes[n].b = count;
+        return n;
+    }
+    if k == 51 {
+        bump(st);
+        let m = eat(toks, st, 8);
+        expect(toks, st, 25);
+        let elem = type_expr(toks, n_toks, st, nodes);
+        expect(toks, st, 26);
+        let n = alloc(nodes, st, 103);
+        nodes[n].a = elem;
+        nodes[n].ival = if m { 1 } else { 0 };
+        return n;
+    }
+    st[2] = 1;
+    -1
+}
+
+// ---- expressions, one function per precedence level (no function values to parameterise with) ----
+
+fn expr(toks: &[Token], n_toks: i64, st: &mut [i64], nodes: &mut [Node]) -> i64 {
+    or_level(toks, n_toks, st, nodes)
+}
+
+fn or_level(toks: &[Token], n_toks: i64, st: &mut [i64], nodes: &mut [Node]) -> i64 {
+    let mut lhs = and_level(toks, n_toks, st, nodes);
+    while st[2] == 0 && toks[st[0]].kind == 54 {
+        bump(st);
+        let rhs = and_level(toks, n_toks, st, nodes);
+        let n = alloc(nodes, st, 66);
+        nodes[n].a = lhs;
+        nodes[n].b = rhs;
+        nodes[n].ival = 12;
+        lhs = n;
+    }
+    lhs
+}
+
+fn and_level(toks: &[Token], n_toks: i64, st: &mut [i64], nodes: &mut [Node]) -> i64 {
+    let mut lhs = cmp_level(toks, n_toks, st, nodes);
+    while st[2] == 0 && toks[st[0]].kind == 52 {
+        bump(st);
+        let rhs = cmp_level(toks, n_toks, st, nodes);
+        let n = alloc(nodes, st, 66);
+        nodes[n].a = lhs;
+        nodes[n].b = rhs;
+        nodes[n].ival = 11;
+        lhs = n;
+    }
+    lhs
+}
+
+// comparisons do not chain, exactly as parse.rs has it
+fn cmp_level(toks: &[Token], n_toks: i64, st: &mut [i64], nodes: &mut [Node]) -> i64 {
+    let lhs = add_level(toks, n_toks, st, nodes);
+    if st[2] != 0 { return -1; }
+    let k = toks[st[0]].kind;
+    let op = if k == 36 { 5 } else if k == 37 { 6 } else if k == 38 { 7 }
+        else if k == 39 { 8 } else if k == 40 { 9 } else if k == 41 { 10 } else { -1 };
+    if op < 0 { return lhs; }
+    bump(st);
+    let rhs = add_level(toks, n_toks, st, nodes);
+    let n = alloc(nodes, st, 66);
+    nodes[n].a = lhs;
+    nodes[n].b = rhs;
+    nodes[n].ival = op;
+    n
+}
+
+fn add_level(toks: &[Token], n_toks: i64, st: &mut [i64], nodes: &mut [Node]) -> i64 {
+    let mut lhs = mul_level(toks, n_toks, st, nodes);
+    while st[2] == 0 && (toks[st[0]].kind == 42 || toks[st[0]].kind == 43) {
+        let op = if toks[st[0]].kind == 42 { 0 } else { 1 };
+        bump(st);
+        let rhs = mul_level(toks, n_toks, st, nodes);
+        let n = alloc(nodes, st, 66);
+        nodes[n].a = lhs;
+        nodes[n].b = rhs;
+        nodes[n].ival = op;
+        lhs = n;
+    }
+    lhs
+}
+
+fn mul_level(toks: &[Token], n_toks: i64, st: &mut [i64], nodes: &mut [Node]) -> i64 {
+    let mut lhs = cast_level(toks, n_toks, st, nodes);
+    while st[2] == 0 && (toks[st[0]].kind == 44 || toks[st[0]].kind == 45 || toks[st[0]].kind == 46) {
+        let k = toks[st[0]].kind;
+        let op = if k == 44 { 2 } else if k == 45 { 3 } else { 4 };
+        bump(st);
+        let rhs = cast_level(toks, n_toks, st, nodes);
+        let n = alloc(nodes, st, 66);
+        nodes[n].a = lhs;
+        nodes[n].b = rhs;
+        nodes[n].ival = op;
+        lhs = n;
+    }
+    lhs
+}
+
+fn cast_level(toks: &[Token], n_toks: i64, st: &mut [i64], nodes: &mut [Node]) -> i64 {
+    let mut e = unary_level(toks, n_toks, st, nodes);
+    while st[2] == 0 && toks[st[0]].kind == 16 {
+        bump(st);
+        let ty = type_expr(toks, n_toks, st, nodes);
+        let n = alloc(nodes, st, 74);
+        nodes[n].a = e;
+        nodes[n].b = ty;
+        e = n;
+    }
+    e
+}
+
+fn unary_level(toks: &[Token], n_toks: i64, st: &mut [i64], nodes: &mut [Node]) -> i64 {
+    if st[2] != 0 { return -1; }
+    let k = toks[st[0]].kind;
+    if k == 43 {
+        bump(st);
+        let e = unary_level(toks, n_toks, st, nodes);
+        let n = alloc(nodes, st, 67);
+        nodes[n].a = e;
+        nodes[n].ival = 0;
+        return n;
+    }
+    if k == 55 {
+        bump(st);
+        let e = unary_level(toks, n_toks, st, nodes);
+        let n = alloc(nodes, st, 67);
+        nodes[n].a = e;
+        nodes[n].ival = 1;
+        return n;
+    }
+    if k == 51 {
+        bump(st);
+        let m = eat(toks, st, 8);
+        let e = unary_level(toks, n_toks, st, nodes);
+        let n = alloc(nodes, st, 73);
+        nodes[n].a = e;
+        nodes[n].ival = if m { 1 } else { 0 };
+        return n;
+    }
+    postfix_level(toks, n_toks, st, nodes)
+}
+
+fn postfix_level(toks: &[Token], n_toks: i64, st: &mut [i64], nodes: &mut [Node]) -> i64 {
+    let mut e = primary(toks, n_toks, st, nodes);
+    let mut going = true;
+    while st[2] == 0 && going {
+        let k = toks[st[0]].kind;
+        if k == 25 {
+            bump(st);
+            let idx = expr(toks, n_toks, st, nodes);
+            expect(toks, st, 26);
+            let n = alloc(nodes, st, 68);
+            nodes[n].a = e;
+            nodes[n].b = idx;
+            e = n;
+        } else if k == 33 {
+            bump(st);
+            let name = expect(toks, st, 0);
+            // `.name(` is a method call or a chain stage: out of this slice (design §6)
+            if toks[st[0]].kind == 23 {
+                st[2] = 1;
+                going = false;
+            } else {
+                let n = alloc(nodes, st, 69);
+                nodes[n].a = e;
+                nodes[n].b = name;
+                e = n;
+            }
+        } else {
+            going = false;
+        }
+    }
+    e
+}
+
+fn primary(toks: &[Token], n_toks: i64, st: &mut [i64], nodes: &mut [Node]) -> i64 {
+    if st[2] != 0 { return -1; }
+    let k = toks[st[0]].kind;
+    if k == 1 {
+        let t = bump(st);
+        let n = alloc(nodes, st, 60);
+        nodes[n].a = t;
+        return n;
+    }
+    if k == 2 {
+        let t = bump(st);
+        let n = alloc(nodes, st, 61);
+        nodes[n].a = t;
+        return n;
+    }
+    if k == 3 {
+        let t = bump(st);
+        let n = alloc(nodes, st, 63);
+        nodes[n].a = t;
+        return n;
+    }
+    if k == 4 {
+        let t = bump(st);
+        let n = alloc(nodes, st, 64);
+        nodes[n].a = t;
+        return n;
+    }
+    if k == 14 || k == 15 {
+        let t = bump(st);
+        let n = alloc(nodes, st, 62);
+        nodes[n].a = t;
+        nodes[n].ival = if k == 14 { 1 } else { 0 };
+        return n;
+    }
+    if k == 0 {
+        let t = bump(st);
+        if toks[st[0]].kind == 23 {
+            bump(st);
+            let n = alloc(nodes, st, 71);
+            nodes[n].a = t;
+            let mut last = -1;
+            while st[2] == 0 && toks[st[0]].kind != 24 {
+                let arg = expr(toks, n_toks, st, nodes);
+                if last < 0 { nodes[n].b = arg; } else { nodes[last].next = arg; }
+                last = arg;
+                if !eat(toks, st, 29) { break; }
+            }
+            expect(toks, st, 24);
+            return n;
+        }
+        let n = alloc(nodes, st, 65);
+        nodes[n].a = t;
+        return n;
+    }
+    if k == 23 {
+        bump(st);
+        let e = expr(toks, n_toks, st, nodes);
+        expect(toks, st, 24);
+        return e;
+    }
+    if k == 9 {
+        bump(st);
+        let cond = expr(toks, n_toks, st, nodes);
+        let then = block(toks, n_toks, st, nodes);
+        let n = alloc(nodes, st, 75);
+        nodes[n].a = cond;
+        nodes[n].b = then;
+        if eat(toks, st, 10) {
+            if toks[st[0]].kind == 9 {
+                // `else if` is an else block whose value is the inner if, as parse.rs has it
+                let inner = primary(toks, n_toks, st, nodes);
+                let b = alloc(nodes, st, 76);
+                nodes[b].b = inner;
+                nodes[n].c = b;
+            } else {
+                nodes[n].c = block(toks, n_toks, st, nodes);
+            }
+        }
+        return n;
+    }
+    if k == 27 {
+        return block(toks, n_toks, st, nodes);
+    }
+    st[2] = 1;
+    -1
+}
+
+// ---- statements ----
+
+// a block: `{ stmt* tail? }` — `a` is the first statement, chained by `next`; `b` is the tail
+fn block(toks: &[Token], n_toks: i64, st: &mut [i64], nodes: &mut [Node]) -> i64 {
+    if st[2] != 0 { return -1; }
+    expect(toks, st, 27);
+    let n = alloc(nodes, st, 76);
+    let mut last = -1;
+    let mut going = true;
+    while st[2] == 0 && going {
+        let k = toks[st[0]].kind;
+        if k == 28 || k == 57 {
+            going = false;
+        } else {
+            let s = item(toks, n_toks, st, nodes);
+            if st[2] == 0 {
+                if nodes[s].kind == 95 && toks[st[0]].kind == 28 && nodes[s].ival == 1 {
+                    // an expression with no `;` before the closing brace is the block's value
+                    nodes[n].b = nodes[s].a;
+                    going = false;
+                } else {
+                    if last < 0 { nodes[n].a = s; } else { nodes[last].next = s; }
+                    last = s;
+                }
+            }
+        }
+    }
+    expect(toks, st, 28);
+    n
+}
+
+// one statement, or an expression statement — `ival` is 1 on an ExprStmt that had no `;`, which
+// `block` reads to tell a tail expression from a statement
+fn item(toks: &[Token], n_toks: i64, st: &mut [i64], nodes: &mut [Node]) -> i64 {
+    if st[2] != 0 { return -1; }
+    let k = toks[st[0]].kind;
+    if k == 7 {
+        bump(st);
+        let m = eat(toks, st, 8);
+        let name = expect(toks, st, 0);
+        let n = alloc(nodes, st, 90);
+        nodes[n].a = name;
+        nodes[n].ival = if m { 1 } else { 0 };
+        if eat(toks, st, 31) { nodes[n].b = type_expr(toks, n_toks, st, nodes); }
+        expect(toks, st, 35);
+        nodes[n].c = expr(toks, n_toks, st, nodes);
+        expect(toks, st, 30);
+        return n;
+    }
+    if k == 11 {
+        bump(st);
+        let var = expect(toks, st, 0);
+        expect(toks, st, 12);
+        let n = alloc(nodes, st, 92);
+        nodes[n].a = var;
+        nodes[n].b = expr(toks, n_toks, st, nodes);
+        expect(toks, st, 34);
+        nodes[n].c = expr(toks, n_toks, st, nodes);
+        nodes[n].d = block(toks, n_toks, st, nodes);
+        return n;
+    }
+    if k == 17 {
+        bump(st);
+        let n = alloc(nodes, st, 93);
+        nodes[n].a = expr(toks, n_toks, st, nodes);
+        if eat(toks, st, 19) { nodes[n].b = expr(toks, n_toks, st, nodes); }
+        nodes[n].c = block(toks, n_toks, st, nodes);
+        return n;
+    }
+    if k == 18 {
+        bump(st);
+        expect(toks, st, 30);
+        return alloc(nodes, st, 94);
+    }
+    if k == 13 {
+        bump(st);
+        let n = alloc(nodes, st, 96);
+        if toks[st[0]].kind != 30 { nodes[n].a = expr(toks, n_toks, st, nodes); }
+        expect(toks, st, 30);
+        return n;
+    }
+    let e = expr(toks, n_toks, st, nodes);
+    if st[2] != 0 { return -1; }
+    let a = toks[st[0]].kind;
+    let op = if a == 35 { -1 } else if a == 47 { 0 } else if a == 48 { 1 }
+        else if a == 49 { 2 } else if a == 50 { 3 } else { -2 };
+    if op > -2 {
+        bump(st);
+        let n = alloc(nodes, st, 91);
+        nodes[n].a = e;
+        nodes[n].b = expr(toks, n_toks, st, nodes);
+        nodes[n].ival = op;
+        expect(toks, st, 30);
+        return n;
+    }
+    let n = alloc(nodes, st, 95);
+    nodes[n].a = e;
+    if eat(toks, st, 30) {
+        nodes[n].ival = 0;
+    } else if toks[st[0]].kind == 28 {
+        // no `;` and the block ends here: this is its value, `if` or not — parse.rs checks this
+        // before the `if`/block case below, and getting the two the other way round makes a
+        // trailing `if` a statement instead of the tail it is
+        nodes[n].ival = 1;
+    } else {
+        let ek = nodes[e].kind;
+        if ek == 75 || ek == 76 {
+            nodes[n].ival = 0;
+        } else {
+            st[2] = 1;
+        }
+    }
+    n
+}
+
+// ---- functions ----
+
+// `fn name(p: T, …) -> T { … }` — `a` is the name token, `b` the first Param (chained by `next`),
+// `c` the return type (−1 when `()` was written or omitted), `d` the body block
+fn func(toks: &[Token], n_toks: i64, st: &mut [i64], nodes: &mut [Node]) -> i64 {
+    if st[2] != 0 { return -1; }
+    expect(toks, st, 6);
+    let name = expect(toks, st, 0);
+    let n = alloc(nodes, st, 110);
+    nodes[n].a = name;
+    expect(toks, st, 23);
+    let mut last = -1;
+    while st[2] == 0 && toks[st[0]].kind != 24 {
+        let pname = expect(toks, st, 0);
+        expect(toks, st, 31);
+        let p = alloc(nodes, st, 111);
+        nodes[p].a = pname;
+        nodes[p].b = type_expr(toks, n_toks, st, nodes);
+        if last < 0 { nodes[n].b = p; } else { nodes[last].next = p; }
+        last = p;
+        if !eat(toks, st, 29) { break; }
+    }
+    expect(toks, st, 24);
+    if eat(toks, st, 32) { nodes[n].c = type_expr(toks, n_toks, st, nodes); }
+    nodes[n].d = block(toks, n_toks, st, nodes);
+    n
+}
+
+// every `fn` in the file, chained by `next`; returns the first, or −1 (st[2] says whether that is
+// an empty program or a parse error)
+fn parse_program(toks: &[Token], n_toks: i64, st: &mut [i64], nodes: &mut [Node]) -> i64 {
+    let mut first = -1;
+    let mut last = -1;
+    while st[2] == 0 && toks[st[0]].kind != 57 {
+        let f = func(toks, n_toks, st, nodes);
+        if st[2] == 0 {
+            if last < 0 { first = f; } else { nodes[last].next = f; }
+            last = f;
+        }
+    }
+    first
+}

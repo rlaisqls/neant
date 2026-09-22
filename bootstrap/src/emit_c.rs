@@ -54,7 +54,7 @@ pub fn emit(m: &Module, opts: &Options) -> String {
         e.f = Some(f);
         e.func(f);
     }
-    e.out.push_str("int main(void) { nt_main(); return 0; }\n");
+    e.out.push_str("int main(void) { ntu_main(); return 0; }\n");
     e.out
 }
 
@@ -187,9 +187,12 @@ static void nt_println_f64(double v) {
 
     fn prototype(&mut self, f: &Func) {
         let ret = c_ret(self.m, &f.ret);
-        // an extern names the C symbol itself; our own functions are prefixed and static
+        // an extern names the C symbol itself; our own functions are prefixed and static. The
+        // prefix is `ntu_`, not `nt_`, so a function named `alloc` or `idx` cannot land on one of
+        // this file's own runtime helpers (`nt_alloc`, `nt_idx`, `nt_println_*`) or on a generated
+        // temporary (`nt_end2`) — found by the self-hosted parser, which has an `alloc`
         if f.body.is_none() { let _ = write!(self.out, "{ret} {}(", f.name); }
-        else { let _ = write!(self.out, "static {ret} nt_{}(", f.name); }
+        else { let _ = write!(self.out, "static {ret} ntu_{}(", f.name); }
         if f.params.is_empty() {
             self.out.push_str("void");
         }
@@ -545,7 +548,7 @@ static void nt_println_f64(double v) {
                 let mut parts = Vec::new();
                 for a in args { parts.extend(self.expr(a).parts()); }
                 if callee.body.is_none() { s(format!("{}({})", callee.name, parts.join(", "))) }
-                else { s(format!("nt_{}({})", callee.name, parts.join(", "))) }
+                else { s(format!("ntu_{}({})", callee.name, parts.join(", "))) }
             }
             ExprKind::Println(a) => {
                 let f = match a.ty { Ty::I64 => "nt_println_i64", Ty::F64 => "nt_println_f64", Ty::U8 => "nt_println_u8", _ => "nt_println_bool" };

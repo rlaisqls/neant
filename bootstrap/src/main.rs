@@ -83,6 +83,17 @@ fn main() {
         Ok(s) => s,
         Err(e) => { eprintln!("{}: {e}", file.display()); process::exit(2); }
     };
+    if cmd == "parsedump" {
+        let prog = match lex::lex(&src).and_then(parse::parse) {
+            Ok(p) => p,
+            Err(e) => { eprintln!("{}:{e}", file.display()); process::exit(1); }
+        };
+        match parsedump::program(&prog) {
+            Ok(kinds) => { for k in kinds { println!("{k}"); } }
+            Err(why) => { eprintln!("{}: out of the self-hosted parser's slice: {why}", file.display()); process::exit(2); }
+        }
+        return;
+    }
     if cmd == "lexdump" {
         match lex::lex(&src) {
             Ok(toks) => { for t in &toks { println!("{}", lex_kind_number(&t.tok)); } }
@@ -278,6 +289,96 @@ fn main() {
             }
         }
         other => { eprintln!("unknown command `{other}`"); process::exit(2); }
+    }
+}
+
+/// `compiler/parse.nt`'s node kinds (docs/self-hosting-parser-design.md §2), printed depth-first,
+/// children in the order that document's table lists them — the self-hosted parser's cross-check.
+/// Kinds out of its first slice (struct literals, chains, closures, comprehensions, array
+/// literals) make this print nothing and report that, rather than a number the other side cannot
+/// produce.
+mod parsedump {
+    use crate::ast::*;
+
+    pub fn program(p: &Program) -> Result<Vec<i32>, String> {
+        if !p.structs.is_empty() { return Err("a `struct` definition".into()); }
+        let mut out = Vec::new();
+        for f in &p.funcs { func(f, &mut out)?; }
+        Ok(out)
+    }
+    fn func(f: &Func, o: &mut Vec<i32>) -> Result<(), String> {
+        if f.body.is_none() { return Err("an `extern fn`".into()); }
+        if !f.asserts.is_empty() { return Err("a `#[cost(...)]` attribute".into()); }
+        o.push(110);
+        for p in &f.params { o.push(111); ty(&p.ty, o)?; }
+        if !matches!(f.ret, TypeExpr::Unit) { ty(&f.ret, o)?; }
+        block(f.body.as_ref().unwrap(), o)
+    }
+    fn ty(t: &TypeExpr, o: &mut Vec<i32>) -> Result<(), String> {
+        match t {
+            TypeExpr::Named(_) => { o.push(100); Ok(()) }
+            TypeExpr::Unit => { o.push(101); Ok(()) }
+            TypeExpr::Array(e, n) => { o.push(102); ty(e, o)?; expr(n, o) }
+            TypeExpr::Slice(e, _) => { o.push(103); ty(e, o) }
+            TypeExpr::Owned(e) => { o.push(104); ty(e, o) }
+        }
+    }
+    fn block(b: &Block, o: &mut Vec<i32>) -> Result<(), String> {
+        o.push(76);
+        for s in &b.stmts { stmt(s, o)?; }
+        if let Some(t) = &b.tail { expr(t, o)?; }
+        Ok(())
+    }
+    fn stmt(s: &Stmt, o: &mut Vec<i32>) -> Result<(), String> {
+        match s {
+            Stmt::Let { ty: t, init, .. } => {
+                o.push(90);
+                if let Some(t) = t { ty(t, o)?; }
+                expr(init, o)
+            }
+            Stmt::Assign { target, value, .. } => { o.push(91); expr(target, o)?; expr(value, o) }
+            Stmt::For { start, end, body, .. } => { o.push(92); expr(start, o)?; expr(end, o)?; block(body, o) }
+            Stmt::While { cond, decreasing, body, .. } => {
+                o.push(93);
+                expr(cond, o)?;
+                if let Some(d) = decreasing { expr(d, o)?; }
+                block(body, o)
+            }
+            Stmt::Break(..) => { o.push(94); Ok(()) }
+            Stmt::Expr(e) => { o.push(95); expr(e, o) }
+            Stmt::Return(e, ..) => { o.push(96); if let Some(e) = e { expr(e, o)?; } Ok(()) }
+        }
+    }
+    fn expr(e: &Expr, o: &mut Vec<i32>) -> Result<(), String> {
+        match &e.kind {
+            ExprKind::Int(_) => { o.push(60); Ok(()) }
+            ExprKind::Float(_) => { o.push(61); Ok(()) }
+            ExprKind::Bool(_) => { o.push(62); Ok(()) }
+            ExprKind::Byte(_) => { o.push(63); Ok(()) }
+            ExprKind::Bytes(_) => { o.push(64); Ok(()) }
+            ExprKind::Var(_) => { o.push(65); Ok(()) }
+            ExprKind::Binary(_, l, r) => { o.push(66); expr(l, o)?; expr(r, o) }
+            ExprKind::Unary(_, a) => { o.push(67); expr(a, o) }
+            ExprKind::Index(b, i) => { o.push(68); expr(b, o)?; expr(i, o) }
+            ExprKind::Field(b, _) => { o.push(69); expr(b, o) }
+            ExprKind::Call(_, args) => { o.push(71); for a in args { expr(a, o)?; } Ok(()) }
+            ExprKind::Ref(a, _) => { o.push(73); expr(a, o) }
+            ExprKind::Cast(a, t) => { o.push(74); expr(a, o)?; ty(t, o) }
+            ExprKind::If(c, t, els) => {
+                o.push(75);
+                expr(c, o)?;
+                block(t, o)?;
+                if let Some(b) = els { block(b, o)?; }
+                Ok(())
+            }
+            ExprKind::Block(b) => block(b, o),
+            ExprKind::StructLit(..) => Err("a struct literal".into()),
+            ExprKind::MethodCall(..) => Err("a method call or chain".into()),
+            ExprKind::ArrayLit(_) => Err("an array literal".into()),
+            ExprKind::ArrayRepeat(..) => Err("an `[e; n]` array".into()),
+            ExprKind::Lambda(..) => Err("a closure".into()),
+            ExprKind::Comprehension { .. } => Err("a comprehension".into()),
+        }
     }
 }
 

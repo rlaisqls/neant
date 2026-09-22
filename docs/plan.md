@@ -274,8 +274,20 @@ return value), linked in by a fixed convention rather than a new flag. **First m
 `compiler/lex.nt`, the lexer alone**, exit test passed on every one of the 69 `tests/golden` files,
 not a sample — `neant lexdump` (a debug command added for this) against `bootstrap/src/lex.rs`'s
 own tokenisation, compared kind by kind (`bootstrap/tests/self_host_lex.rs`). `neant cost` on `lex`
-itself — the first data point for what the compiler costs, by its own tool — not yet taken. Not
-designed yet: the parser, checker, IR, emitter, or the fixpoint itself.
+itself — the first data point for what the compiler costs, by its own tool — not yet taken.
+
+**Second milestone done: `compiler/parse.nt`**, designed in
+[self-hosting-parser-design.md](self-hosting-parser-design.md) — one arena of uniform scalar-field
+`Node`s, children chained by a `next` index (the design's flat child-list arena did not survive
+contact: a nested block's statements interleave with the outer block's), each precedence level its
+own inlined function since there are no function values to parameterise one with. Exit test passed:
+of the 69 golden files, the 13 inside the first slice's grammar all produce an identical
+depth-first node-kind sequence to `bootstrap/src/parse.rs` (`neant parsedump`,
+`bootstrap/tests/self_host_parse.rs`), and the negative goldens are required to be rejected by
+both. Two things it found: `parse.rs` checks "block tail" before "`if` needs no `;`" and the order
+matters; and the C emitter put user functions and its own runtime helpers in one namespace, so a
+neant function named `alloc` collided with `nt_alloc` — user functions are now `ntu_`-prefixed.
+Not designed yet: the checker, IR, emitter, or the fixpoint itself.
 
 ## M7 — the constant factor
 

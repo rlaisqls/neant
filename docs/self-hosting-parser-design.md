@@ -92,6 +92,15 @@ Per-`kind` field meaning (children are node indices unless marked *tok*, a token
 
 ## 3. The child-list arena, and the two upper bounds
 
+**This section is wrong, and building it is what showed that (`compiler/parse.nt`).** A flat
+`children` arena filled left to right cannot hold a block's statement list: a nested block parses
+*its* statements while the outer block is still collecting its own, so the outer list's entries are
+not contiguous. Children are chained through the nodes instead — `Node` carries a `next` (−1 ends
+the list) and a parent points at its first child — which is M4's arena-of-index-links again, one
+arena rather than two, with nothing to interleave. `list`/`list_len` in §2's schema are therefore
+`next`, and the `children` parameter below does not exist. Everything else in §2 and §3 stands,
+including the bound: at most one node per token, so `nodes` sized to the token count is enough.
+
 ```rust
 fn parse(toks: &[Token], n_toks: i64, nodes: &mut [Node], children: &mut [i64]) -> i64 { … }
 ```
@@ -156,10 +165,18 @@ to design around yet, not because it is hard to type out:
 
 ## 7. Exit test
 
-Not "all of `tests/golden`" the way the lexer's was — most golden files use at least one
-out-of-scope construct (§6). Instead: a small, dedicated set of programs staying inside the
-covered grammar (arithmetic, comparisons, `if`, `for`/`while`, `let`/`assign`, a handful of
-functions calling each other), checked the same way the lexer was — a `neant parsedump` debug
-command (mirroring `lexdump`, printing each node's `kind` in this document's numbering, depth-first)
-against the self-hosted parser's own output on the same files, in a permanent
-`bootstrap/tests/self_host_parse.rs`.
+**Passed.** Not "all of `tests/golden`" the way the lexer's was — most golden files use at least
+one out-of-scope construct (§6) — but not a hand-picked set either: `neant parsedump` (mirroring
+`lexdump`; prints each node's `kind` in this document's numbering, depth-first, and exits 2 naming
+the construct when a file is outside the slice) partitions the corpus itself, and
+`bootstrap/tests/self_host_parse.rs` compares whatever is inside it. Of 69 files: **13 parse
+inside the slice and all 13 produce an identical node-kind sequence** (`arith`, `ifexpr`, `fib`,
+`forsum`, `block`, `hello`, `baddec` and the small rejection cases — 94 and 108 nodes at the top
+end), 56 are out of slice, and the negative goldens the bootstrap parser rejects are required to
+be rejected by the self-hosted parser too rather than skipped.
+
+**One real difference found by it, in `item()`.** `parse.rs` checks "no `;` and the next token is
+`}`" — the block's tail — *before* the "an `if` or block statement needs no `;`" case. Written the
+other way round, a trailing `if` at the end of a function body becomes a statement instead of the
+block's value, which is a different tree and (once a checker exists) a different type. The order
+is not arbitrary and is now commented at both sites.
