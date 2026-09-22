@@ -33,16 +33,15 @@ fn repo(sub: &str) -> PathBuf {
 /// `(file, function)` where the self-hosted cost is higher because the self-hosted emitter copies
 /// a whole-array assignment the Rust compiler proves is in place. Deleting a line from here is
 /// what growing move checking into `compiler/check.nt` would look like.
-const COPIES_INSTEAD: &[(&str, &str)] = &[
-    ("arrayview.nt", "main"),
-    ("reassign_inplace.nt", "main"),
-    ("reassign_len_size.nt", "main"),
-    ("reassign_named_size.nt", "main"),
-];
+/// **Empty.** It held the four `main`s where this emitter copied a whole-array assignment the Rust
+/// proves is in place — the last divergence between the two compilers, closed when the self-hosted
+/// checker learned to make that proof itself. Kept as a list rather than deleted because the next
+/// deliberate divergence should land here and be argued, not absorbed.
+const COPIES_INSTEAD: &[(&str, &str)] = &[];
 
 /// The number of functions whose `work` the self-hosted pass reproduces exactly. In the test so
 /// that widening the slice means changing a number someone has to look at.
-const EXACT: usize = 72;
+const EXACT: usize = 76;
 
 /// The same for `moves`, whose slice is narrower: a function that calls anything is unknown,
 /// because a callee's traffic depends on what is already resident — which it now computes, so a
@@ -59,7 +58,7 @@ const EXACT: usize = 72;
 /// **Nothing is declined.** Every `moves` column either matches or is one of the four in
 /// `COPIES_INSTEAD` — a footprint is a range now, so a callee that reads two fields of a four-field
 /// particle leaves half the array resident and the next call over the other half pays in full.
-const EXACT_MOVES: usize = 72;
+const EXACT_MOVES: usize = 76;
 
 
 

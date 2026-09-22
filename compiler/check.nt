@@ -196,6 +196,20 @@ fn moved_add(cst: &mut [i64], name: i64) {
     cst[12] = cst[12] + 1;
 }
 
+// a reassignment makes its target live again, whatever it held before
+fn moved_del(src: &[u8], toks: &[Token], cst: &mut [i64], name: i64) {
+    let mut i = 0;
+    let mut w = 0;
+    while i < cst[12] {
+        if !name_eq(src, toks, cst[200 + i], name) {
+            cst[200 + w] = cst[200 + i];
+            w += 1;
+        };
+        i += 1;
+    }
+    cst[12] = w;
+}
+
 fn moved_has(src: &[u8], toks: &[Token], cst: &[i64], name: i64) -> bool {
     let mut i = 0;
     let mut hit = false;
@@ -741,8 +755,40 @@ fn check_stmt_inner(src: &[u8], toks: &[Token], nodes: &[Node], types: &mut [Ty]
             // size variables (design §1), so it compares element types and not lengths: it accepts
             // a length mismatch the Rust checker refuses, which is a narrowing, not a difference
             // of opinion — nothing here decides in-place versus copy.
-            if !same_ty(types, syms[s].ty, v) { cst[2] = 1; }
-            if nodes[n].ival >= 0 && !is_numeric(types, syms[s].ty) { cst[2] = 1; }
+            if !same_ty(types, syms[s].ty, v) { cst[2] = 1; return; }
+            if nodes[n].ival >= 0 && !is_numeric(types, syms[s].ty) { cst[2] = 1; return; }
+            // **`ys = xs` on whole arrays: in place, or a copy.** `ys` takes `xs`'s buffer unless
+            // something can still observe that they became the same memory. Two things force the
+            // copy, and they are the two `types.rs` uses: a loop either name was declared before,
+            // because one lexical assignment stands for every lap and the second would read a
+            // buffer the first gave away; and a view of the source that is read after this point.
+            // The verdict is recorded at the statement as `ntys[n] = −2`, which no type index can
+            // be, so the emitter and the cost pass read the same decision the checker made.
+            let vnode = nodes[n].b;
+            if types[syms[s].ty].kind == 5 && nodes[n].ival < 0 && vnode >= 0
+                && nodes[vnode].kind == 65 {
+                let sv = sym_find(src, toks, syms, cst, nodes[vnode].a);
+                if sv >= 0 && sv != s {
+                    let forced = cst[13] >= 0 && (sv < cst[13] || s < cst[13]);
+                    let mut inplace = !forced;
+                    let mut vi = 0;
+                    while vi < cst[1] {
+                        let vt = syms[vi].ty;
+                        if vi != sv && vt >= 0 && types[vt].kind == 6
+                            && name_eq(src, toks, syms[vi].root, syms[sv].root)
+                            && used_after(src, toks, cst, syms[vi].name, nodes[vnode].a) {
+                            inplace = false;
+                        };
+                        vi += 1;
+                    }
+                    if inplace { ntys[n] = 0 - 2; };
+                    // `xs` is dead either way, and `ys` denotes a value disjoint from everything
+                    // else — in place or not, nothing later can observe which it was
+                    moved_del(src, toks, cst, syms[s].name);
+                    moved_add(cst, syms[sv].name);
+                    syms[s].root = syms[s].name;
+                }
+            };
             return;
         }
         if tk == 68 {

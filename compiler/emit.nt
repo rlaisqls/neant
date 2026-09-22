@@ -795,14 +795,26 @@ fn emit_stmt(out: &mut [u8], est: &mut [i64], src: &[u8], toks: &[Token], nodes:
         emit_expr(out, est, src, toks, nodes, types, strs, flds, slay, sigs, ntys, nodes[n].c);
         emit_b(out, est, b';');
     } else if k == 91 {
-        // `ys = xs` on whole arrays **copies**. Assigning the pointer instead is what the Rust
-        // compiler does when it can prove nothing else is looking at `xs` — that proof is M5's
-        // move and uniqueness checking, which is not in this slice. Copying is the language's
-        // meaning; aliasing is the optimisation, and an emitter that cannot tell must not take it.
-        // `reassign_copy.nt` is the golden that tells the two apart.
+        // `ys = xs` on whole arrays takes `xs`'s buffer when the checker proved nothing else can
+        // observe it (`ntys[n] == −2`), and copies otherwise. Copying is the language's meaning
+        // and taking the buffer is the optimisation, so the emitter does the safe one wherever the
+        // checker did not say. `reassign_copy.nt` is the golden that tells the two apart.
         if nodes[nodes[n].a].kind == 65 && nodes[nodes[n].b].kind == 65 && is_arr(types, ntys[nodes[n].a]) {
             let l = nodes[nodes[n].a].a;
             let r = nodes[nodes[n].b].a;
+            if ntys[n] == 0 - 2 {
+                emit_arr_name(out, est, src, toks, l, b'p');
+                let eq1 = b" = ";
+                emit_bytes(out, est, &eq1);
+                emit_arr_name(out, est, src, toks, r, b'p');
+                let semi = b"; ";
+                emit_bytes(out, est, &semi);
+                emit_arr_name(out, est, src, toks, l, b'n');
+                emit_bytes(out, est, &eq1);
+                emit_arr_name(out, est, src, toks, r, b'n');
+                emit_b(out, est, b';');
+                return;
+            };
             let mc = b"memcpy(";
             emit_bytes(out, est, &mc);
             emit_arr_name(out, est, src, toks, l, b'p');

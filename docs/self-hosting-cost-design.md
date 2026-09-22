@@ -1095,3 +1095,47 @@ before this change. A function that walked half an array would have its footprin
 caller over-credited. That is the next thing this would need if the corpus grew a partial walk, and
 it is `site_range` in `analyze.rs` — which is now within reach, since the settle pass already records
 each site's coefficient against every enclosing loop and each loop's first and last value.
+
+## 21. Both columns agree exactly, and the divergence list is empty
+
+**76 `work` columns and 76 `moves` columns, string for string, with nothing declined and nothing
+differing.** `COPIES_INSTEAD` is empty; so is `AOS_INSTEAD`, deleted earlier; so is the checker's
+`NO_MOVES_YET`. The self-hosted cost pass now reproduces `neant cost` on the whole corpus with no
+exceptions of any kind.
+
+The last four columns closed by the self-hosted checker learning to make a proof it had been
+refusing to guess at. `ys = xs` on whole arrays takes `xs`'s buffer unless something can still
+observe that the two became one, and two things force the copy — the same two `types.rs` uses:
+
+- **a loop either name was declared before**, because one lexical assignment stands for every lap
+  and the second would read a buffer the first gave away;
+- **a view of the source read after the assignment**, which would otherwise be looking at what is
+  now the target's.
+
+The verdict is recorded at the statement as `ntys[n] = −2`, a value no type index can be, and the
+emitter and the cost pass both read it. That is the point: **a cost is a claim about the code this
+compiler emits**, and the only way to keep that true through a change like this is for the claim and
+the code to come from the same decision rather than from two that agree.
+
+### Why the list is emptied rather than deleted
+
+Every deliberate divergence recorded in this project has now been closed:
+
+| list | what it held | closed by |
+|---|---|---|
+| `AOS_INSTEAD` | the emitter always laid struct arrays out as AoS | the compiler choosing its own layout (§ layout design) |
+| `COPIES_INSTEAD` | the emitter always copied `ys = xs` | the checker proving in-place |
+| `NO_MOVES_YET` | five move and aliasing rules the checker did not have | the checker's move rules |
+
+Each was argued as a *narrowing* rather than a disagreement when it was recorded, and each turned
+out to be exactly that. The lists stay as empty constants because the next such narrowing should
+land in one and be argued, not absorbed silently into a number.
+
+### The check that mattered
+
+This change makes the compiler emit a **pointer assignment where it used to emit a `memcpy`**. A
+wrong decision here does not make a report wrong, it makes a program wrong. The safety net is the
+same one the layout choice used: the golden programs go through the whole self-hosted chain and are
+run, and `reassign_inplace`, `reassign_copy`, `reassign_loop` and `arrayview` print exactly what
+`neant run` prints — including `reassign_copy`, which is in the corpus precisely to catch an emitter
+that takes the buffer when a view is still watching.

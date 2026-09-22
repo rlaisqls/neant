@@ -711,12 +711,10 @@ fn w_stmt(src: &[u8], toks: &[Token], nodes: &[Node], types: &[Ty], ntys: &[i64]
         if tk == 65 {
             let t = ntys[tgt];
             if t >= 0 && (types[t].kind == 5 || types[t].kind == 6) {
-                // `ys = xs` on whole arrays. **The self-hosted emitter always copies** (arrays
-                // design §7), because deciding in-place needs M5's uniqueness proof and this
-                // compiler has none — so the cost is the copy's. The Rust compiler charges 1 for
-                // the reassignments it can prove are in place, and there the two reports differ
-                // on purpose: a cost is a claim about the code the compiler emits, and these two
-                // compilers emit different code.
+                // `ys = xs` on whole arrays costs the copy it emits — or 1 where the checker
+                // proved the buffer can just be taken (`ntys[n] == −2`), which is the pointer
+                // assignment the emitter writes there. A cost is a claim about the code this
+                // compiler emits, so the two follow the same decision by construction.
                 let srcn = if nodes[n].b >= 0 && nodes[nodes[n].b].kind == 65 { nodes[nodes[n].b].a } else { -1 };
                 let e = if srcn >= 0 { env_find(src, toks, env, wst, srcn) } else { -1 };
                 let sz = if e >= 0 { env[e].len } else { -1 };
@@ -726,6 +724,10 @@ fn w_stmt(src: &[u8], toks: &[Token], nodes: &[Node], types: &[Ty], ntys: &[i64]
                 }
                 let tgte = env_find(src, toks, env, wst, nodes[tgt].a);
                 if tgte >= 0 { env[tgte].len = sz; };
+                if ntys[n] == 0 - 2 {
+                    let one = pol_const(facs, terms, pols, pst, 1);
+                    return pol_add(facs, terms, pols, pst, w, one);
+                }
                 return pol_add(facs, terms, pols, pst, w, sz);
             }
             // a register: only the operation of `op=` costs, and the value is no longer known
@@ -2988,14 +2990,16 @@ fn m_stmt(src: &[u8], toks: &[Token], nodes: &[Node], types: &[Ty], strs: &[Str]
             acc = ck_add(facs, terms, pols, pst, budget, cnds, pcs, cks, wst, acc, sp);
         } else if nodes[tgt].kind == 65 {
             if ntys[tgt] >= 0 && (types[ntys[tgt]].kind == 5 || types[ntys[tgt]].kind == 6) {
-                // `ys = xs` **copies**, so it streams one array's worth — the same decision the
-                // emitter makes and for the same reason (arrays design §7). Where the Rust proves
-                // the assignment is in place it charges nothing, and there the two reports differ
-                // on purpose, exactly as the `work` column does.
+                // `ys = xs` streams one array's worth when it copies, and nothing at all where
+                // the checker proved the buffer can be taken — the same decision the emitter
+                // reads, from the same place.
                 let es = elem_bytes(types, strs, flds, ntys[tgt]);
                 let srcn = if nodes[n].b >= 0 && nodes[nodes[n].b].kind == 65 { nodes[nodes[n].b].a } else { -1 };
                 let len = if srcn >= 0 { arg_len_of(src, toks, env, wst, srcn) } else { -1 };
-                if es < 0 || len < 0 {
+                if ntys[n] == 0 - 2 {
+                    let e2 = env_find(src, toks, env, wst, nodes[tgt].a);
+                    if e2 >= 0 && len >= 0 { env[e2].len = len; };
+                } else if es < 0 || len < 0 {
                     wst[1] = 1;
                 } else {
                     let e = env_find(src, toks, env, wst, nodes[tgt].a);
