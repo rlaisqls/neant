@@ -223,3 +223,13 @@ met; the kill condition is not.
 **What changed in the numbers.** Sequential calls now credit each other: `dot(&a, &b)` followed by
 `dot(&a, &a)` pays for `a` once. The goldens' `main` lines moved down by those credits and by
 nothing else.
+
+
+## Stage C — a declaration on the boundary, confirmed
+
+`extern fn labs(x: i64) -> i64` declared `work_at_most = "4", moves_at_most = "0"`. `neant measure`
+built the driver with and without the call, 10 000 repeats, three sizes, and subtracted:
+instructions 0.0 per call (gcc inlines its own `labs`), refills 0.0–2.6 bytes per call — process
+noise over the repeats — against a tolerance of one line. Confirmed; the lockfile line reads
+`declared  measured over n = 1000..16000: confirmed`, and `total`, which calls it, `rests on labs
+(declared, extern)`. A small thing measured; the shape of the chain is the point.

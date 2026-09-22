@@ -118,6 +118,14 @@ same for a corpus chosen from the domain where these constraints are assets (con
 kernels, real-time code) — and how far it moved is the measured size of the language's reason to
 exist.
 
+**Status: passed on its own terms, 2026-09-22.** `extern fn` carries a declared cost and effects;
+`neant measure --fn labs` confirms a declaration per call against a baseline driver without the
+call, within the counter's known factors, and `--lock` records `measured over n = …: confirmed`,
+which `neant lock` preserves; every line names what it rests on, transitively (`main rests on total
+(declared, checked); labs (declared, extern)`). The re-count is honest and unchanged: the M3 corpus
+calls no C, so it is still 6 of 11, and the domain corpus that would move the number does not exist
+yet — that is the first thing M4's work should be measured on.
+
 ## M4 — views, layout, regions
 
 Stands on stage A. Structs and views (`&xs[i]`, `&p.field` as (collection, index[, field]),

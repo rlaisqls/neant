@@ -29,6 +29,16 @@ impl Shape {
 /// (by parameter index) at size `n`, and prints something derived from the results so nothing
 /// is optimised away.
 pub fn driver(m: &Module, fid: FuncId, n: i64, repeat: i64, shapes: &[Shape]) -> Module {
+    driver_with(m, fid, n, repeat, shapes, true)
+}
+
+/// The same driver with the call replaced by a constant of the return type: what the setup and
+/// the loop cost on their own, to be subtracted.
+pub fn baseline(m: &Module, fid: FuncId, n: i64, repeat: i64, shapes: &[Shape]) -> Module {
+    driver_with(m, fid, n, repeat, shapes, false)
+}
+
+fn driver_with(m: &Module, fid: FuncId, n: i64, repeat: i64, shapes: &[Shape], with_call: bool) -> Module {
     let f = &m.funcs[fid];
     let line = f.line;
     let mut locals: Vec<Local> = Vec::new();
@@ -68,13 +78,16 @@ pub fn driver(m: &Module, fid: FuncId, n: i64, repeat: i64, shapes: &[Shape]) ->
     }
     // the repeat loop, accumulating the result into something printed
     let r = new_local(&mut locals, "r", Ty::I64, false);
-    let call = Expr { kind: ExprKind::Call(fid, args), ty: f.ret.clone(), line };
-    let (acc_stmts, body): (Vec<Stmt>, Vec<Stmt>) = match &f.ret {
+    let call = if with_call { Expr { kind: ExprKind::Call(fid, args), ty: f.ret.clone(), line } } else {
+        Expr { kind: match f.ret { Ty::F64 => ExprKind::Float(1.0), Ty::Bool => ExprKind::Bool(true), Ty::U8 => ExprKind::Byte(1), Ty::Unit => ExprKind::Bool(true), _ => ExprKind::Local(r) }, ty: if f.ret == Ty::Unit { Ty::Bool } else { f.ret.clone() }, line }
+    };
+    let ret_ty = if with_call { f.ret.clone() } else if f.ret == Ty::Unit { Ty::Bool } else { f.ret.clone() };
+    let (acc_stmts, body): (Vec<Stmt>, Vec<Stmt>) = match &ret_ty {
         Ty::I64 | Ty::F64 | Ty::U8 => {
-            let acc_ty = if f.ret == Ty::F64 { Ty::F64 } else { Ty::I64 };
+            let acc_ty = if ret_ty == Ty::F64 { Ty::F64 } else { Ty::I64 };
             let acc = new_local(&mut locals, "acc", acc_ty.clone(), true);
             let zero = Expr { kind: if acc_ty == Ty::F64 { ExprKind::Float(0.0) } else { ExprKind::Int(0) }, ty: acc_ty.clone(), line };
-            let val = if f.ret == Ty::U8 { Expr { kind: ExprKind::Cast(Box::new(call), Ty::I64), ty: Ty::I64, line } } else { call };
+            let val = if ret_ty == Ty::U8 { Expr { kind: ExprKind::Cast(Box::new(call), Ty::I64), ty: Ty::I64, line } } else { call };
             (vec![Stmt::Let(acc, zero)], vec![Stmt::Assign(LValue::Var(acc), Some(BinOp::Add), val)])
         }
         Ty::Bool => {

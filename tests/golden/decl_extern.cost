@@ -2,4 +2,6 @@ labs             work ≤ 4                          moves ≤ 0                
 total            work ≤ 12·xs.len()                moves ≤ 8·xs.len() + 2·B           declared
                  inferred         work 10·xs.len()                  moves 8·xs.len() + B               within the declaration
                  footprint        xs: [0, 8·xs.len())   resident after if 8·xs.len() < M
+                 rests on         labs (declared, extern)
 main             work 43                           moves 2·B + 48                     exact, io
+                 rests on         total (declared, checked); labs (declared, extern)

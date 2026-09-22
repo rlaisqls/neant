@@ -61,6 +61,9 @@ pub struct FuncCost {
     /// `#[cost(...)]` as parsed: the declared work and moves bounds. When present they are the
     /// function's line in the lockfile and all a caller sees of it.
     pub declared: Declared,
+    /// What this line rests on besides the machine model: the declarations it composes,
+    /// transitively — `labs (declared)`, `read (declared, measured over n = …)`.
+    pub rests_on: Vec<String>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -158,7 +161,7 @@ impl<'a> Analyzer<'a> {
                     names: param_names(f),
                     result: CostResult::Unknown { reason: "mutually recursive with another function; only self-recursion is solved".into(), line: f.line },
                     bounds: vec![], notes: vec![], suggestions: vec![], effects: vec![], violations: vec![], tier: "unknown",
-                    footprint: vec![], resident: None, declared: Declared::default(),
+                    footprint: vec![], resident: None, declared: Declared::default(), rests_on: vec![],
                 });
             } else {
                 self.active[fid] = true;
@@ -315,6 +318,8 @@ struct Fa<'a, 'b, 'c> {
     replay: bool,
     /// whether the innermost open frame has called anything (a loop then needs the second walk)
     has_call: Vec<bool>,
+    /// declarations this function's cost composes, transitively
+    rests_on: Vec<String>,
 }
 
 impl<'a, 'b, 'c> Fa<'a, 'b, 'c> {
@@ -323,7 +328,7 @@ impl<'a, 'b, 'c> Fa<'a, 'b, 'c> {
             an, f, names: param_names(f), sites: vec![], loop_recs: vec![], bounds: vec![], notes: vec![], io: false, self_fid, rec_calls: vec![],
             local_size: HashMap::new(), local_affine: HashMap::new(), initial: HashMap::new(), at_entry: false,
             loops: vec![], work: Cost::zero(), moves: Cost::zero(), saved: vec![], branch: vec![], next_if: 0,
-            local_root: HashMap::new(), resident: vec![], call_moves: Cost::zero(), saved_calls: vec![], replay: false, has_call: vec![],
+            local_root: HashMap::new(), resident: vec![], call_moves: Cost::zero(), saved_calls: vec![], replay: false, has_call: vec![], rests_on: vec![],
         };
         for (i, &p) in f.params.iter().enumerate() {
             let l = &f.locals[p];
@@ -367,7 +372,7 @@ impl<'a, 'b, 'c> Fa<'a, 'b, 'c> {
                 _ if effects.contains(&"unbounded") => CostResult::Unknown { reason: "declared unbounded".into(), line: self.f.line },
                 _ => CostResult::Unknown { reason: "an extern needs `#[cost(work_at_most = …, moves_at_most = …)]` or `uses unbounded`".into(), line: self.f.line },
             };
-            return FuncCost { name: self.f.name.clone(), names: self.names, result, bounds: vec![], notes: vec![], suggestions: vec![], effects, violations, tier: "declared", footprint: vec![], resident: None, declared };
+            return FuncCost { name: self.f.name.clone(), names: self.names, result, bounds: vec![], notes: vec![], suggestions: vec![], effects, violations, tier: "declared", footprint: vec![], resident: None, declared, rests_on: vec![] };
         };
         let mut tier = "exact";
         let walked = self.block(body);
@@ -434,7 +439,7 @@ impl<'a, 'b, 'c> Fa<'a, 'b, 'c> {
             }
         }
         let effects = if self.io { vec!["io"] } else { vec![] };
-        FuncCost { name: self.f.name.clone(), names: self.names, result, bounds: self.bounds, notes: self.notes, suggestions: vec![], effects, violations, tier, footprint, resident, declared }
+        FuncCost { name: self.f.name.clone(), names: self.names, result, bounds: self.bounds, notes: self.notes, suggestions: vec![], effects, violations, tier, footprint, resident, declared, rests_on: self.rests_on }
     }
 
     /// The byte range one access site covers over its loop nest, from its affine index and the
@@ -1367,6 +1372,15 @@ impl<'a, 'b, 'c> Fa<'a, 'b, 'c> {
                 };
                 if !self.replay && callee.effects.contains(&"unbounded") {
                     return Err(Fail::Unknown(format!("calls `{}`, which is declared unbounded", callee.name), e.line));
+                }
+                // provenance: a declared callee is an assumption this line now rests on
+                if !self.replay {
+                    if declared_only {
+                        let how = if cf.body.is_none() { "declared, extern" } else { "declared, checked" };
+                        let tag = format!("{} ({how})", callee.name);
+                        if !self.rests_on.contains(&tag) { self.rests_on.push(tag); }
+                    }
+                    for r in &callee.rests_on { if !self.rests_on.contains(r) { self.rests_on.push(r.clone()); } }
                 }
                 let mut map: Vec<(usize, Poly)> = Vec::new();
                 let mut roots: Vec<Option<LocalId>> = Vec::new();

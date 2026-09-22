@@ -263,6 +263,24 @@ possible, and it is a golden test (`decl.nt` against `decl_extern.nt`).
 `uses unbounded`. It names the C symbol itself (`labs` is libc's), carries its effects as `uses io,
 unbounded`, and is the boundary stage C measures and audits.
 
+## What a line rests on
+
+A line's tier says how its numbers were obtained: `exact` and `recurrence` by the calculus,
+`declared` by a person, `measured` by the machine. A function that composes a declared callee
+rests on that declaration, and says so — `rests on labs (declared, extern)`, or `(declared,
+checked)` when the callee has a body the compiler verified against its declaration — transitively
+up the call graph. The tier column is therefore an audit chain: every number in `costs.lock` is
+traceable to the model, to a declaration someone wrote, or to a measurement someone ran, and
+nothing rests on nothing.
+
+`neant measure --fn labs` on a declared function does not fit a curve; it **confirms the
+declaration**. The driver is built twice, with the call and with a constant in its place, and the
+difference per call — instructions and refills — is compared to the declared work and moves at
+each size, within the counter's known factors — work up to 1.5× + 2, moves up to 2× + one line
+per call, because reads pair, prefetch overfetches and process noise divides by the repeats. The
+verdict, `confirmed` or `EXCEEDED`, and the range it was measured over go into the lockfile with
+`--lock`, and `neant lock` keeps that annotation when it regenerates the file.
+
 ## The measured tier
 
 `neant measure f.nt --fn name [--sizes …] [--shape p=n*n,…] [--repeat k] [--cpu c] [--lock]`

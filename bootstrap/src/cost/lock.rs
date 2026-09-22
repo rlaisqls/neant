@@ -109,6 +109,9 @@ pub fn report(c: &FuncCost, m: &Machine) -> String {
     for v in &c.violations {
         out.push_str(&format!("{:<16} ✗ {v}\n", ""));
     }
+    if !c.rests_on.is_empty() {
+        out.push_str(&format!("{:<16} rests on         {}\n", "", c.rests_on.join("; ")));
+    }
     for s in &c.suggestions {
         match &s.result {
             CostResult::Exact { work, moves } => {
@@ -124,7 +127,24 @@ pub fn report(c: &FuncCost, m: &Machine) -> String {
 }
 
 pub fn render(source_name: &str, costs: &[FuncCost]) -> String {
-    let mut lines: Vec<String> = costs.iter().map(line).collect();
+    render_keeping(source_name, costs, "")
+}
+
+/// Render, keeping from an existing lockfile what a regeneration cannot know: the `measured over`
+/// annotations `neant measure --lock` wrote on declared functions.
+pub fn render_keeping(source_name: &str, costs: &[FuncCost], existing: &str) -> String {
+    let measured: std::collections::HashMap<String, String> = existing.lines()
+        .filter_map(|l| {
+            let name = l.split_whitespace().next()?.to_string();
+            let i = l.find("  measured over")?;
+            Some((name, l[i..].to_string()))
+        }).collect();
+    let mut lines: Vec<String> = costs.iter().map(|c| {
+        let mut l = line(c);
+        if c.tier == "declared" { if let Some(m) = measured.get(&c.name) { l.push_str(m); } }
+        if !c.rests_on.is_empty() { l.push_str(&format!("  rests on {}", c.rests_on.join("; "))); }
+        l
+    }).collect();
     lines.sort();
     let mut out = format!("# neant costs.lock — generated from {source_name}; do not edit\n");
     for l in lines { out.push_str(&l); out.push('\n'); }

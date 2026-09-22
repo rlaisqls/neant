@@ -107,8 +107,9 @@ fn main() {
         }
         "lock" => {
             let costs = cost::analyze(&module, &machine);
-            let rendered = cost::lock::render(&file.file_name().unwrap().to_string_lossy(), &costs);
             let path = file.parent().unwrap_or(Path::new(".")).join("costs.lock");
+            let existing = std::fs::read_to_string(&path).unwrap_or_default();
+            let rendered = cost::lock::render_keeping(&file.file_name().unwrap().to_string_lossy(), &costs, &existing);
             if lock_check {
                 let old = std::fs::read_to_string(&path).unwrap_or_default();
                 let d = cost::lock::diff(&old, &rendered);
@@ -157,19 +158,21 @@ fn main() {
             let costs = cost::analyze(&module, &machine);
             let fc = &costs[fid];
             println!("{}", cost::lock::line(fc));
+            let declared = fc.declared.work.is_some() && fc.declared.moves.is_some();
+            // a declaration is confirmed per call: repeat enough for process noise to divide away
+            let m_repeat = if declared && m_repeat == 1 { 10000 } else { m_repeat };
             let dir = std::env::temp_dir().join(format!("neant-measure-{}", process::id()));
             let _ = std::fs::create_dir_all(&dir);
             let mut ns = Vec::new(); let mut ws = Vec::new(); let mut mvs = Vec::new();
-            println!("  {:>10} {:>16} {:>16}   {}", "n", "instructions", "L2 bytes", "predicted work / moves");
-            for &n in &m_sizes {
-                let drv = cost::measure::driver(&module, fid, n, m_repeat, &shapes);
-                let c = emit_c::emit(&drv, &emit_c::Options { checked: false });
-                let bin = dir.join(format!("m{n}"));
-                if let Err(e) = cc(&c, &bin, &file) { eprintln!("{e}"); process::exit(1); }
+            let mut confirmed = true;
+            // the driver's own setup and loop are measured without the call and subtracted
+            let head = if declared { "declared work / moves, per call" } else { "predicted work / moves" };
+            println!("  {:>10} {:>16} {:>16}   {head}", "n", "instructions", "L2 bytes");
+            let run_perf = |bin: &Path| -> (u64, u64) {
                 let mut best: Option<(u64, u64)> = None;
                 for _ in 0..3 {
                     let mut cmd = if let Some(cpu) = m_cpu { let mut c = Command::new("taskset"); c.arg("-c").arg(cpu.to_string()).arg("perf"); c } else { Command::new("perf") };
-                    let out = cmd.args(["stat", "-x,", "-e", "instructions,l2d_cache_refill"]).arg(&bin).output();
+                    let out = cmd.args(["stat", "-x,", "-e", "instructions,l2d_cache_refill"]).arg(bin).output();
                     let Ok(out) = out else { eprintln!("could not run perf"); process::exit(1) };
                     let err = String::from_utf8_lossy(&out.stderr);
                     let (Some(ins), Some(ref_)) = (cost::measure::perf_count(&err, "instructions"), cost::measure::perf_count(&err, "l2d_cache_refill")) else {
@@ -177,27 +180,58 @@ fn main() {
                     };
                     if best.is_none_or(|(b, _)| ins < b) { best = Some((ins, ref_)); }
                 }
-                let (ins, ref_) = best.unwrap();
-                let pred = match &fc.result {
-                    cost::CostResult::Exact { work, moves } => {
-                        let ev: Vec<String> = f.params.iter().zip(&shapes).map(|(&p, s)| {
-                            let l = &f.locals[p];
-                            let nm = if l.ty.is_arrayish() { format!("{}.len()", l.name) } else { l.name.clone() };
-                            format!("{nm}={}", s.at(n))
-                        }).collect();
-                        evaluate(fc, work, moves, &ev.join(","), &machine).map_or(String::new(), |(w, m)| format!("{:.3e} / {:.3e}", w * m_repeat as f64, m * m_repeat as f64))
+                best.unwrap()
+            };
+            for &n in &m_sizes {
+                let drv = cost::measure::driver(&module, fid, n, m_repeat, &shapes);
+                let base = cost::measure::baseline(&module, fid, n, m_repeat, &shapes);
+                let bin = dir.join(format!("m{n}")); let bbin = dir.join(format!("b{n}"));
+                if let Err(e) = cc(&emit_c::emit(&drv, &emit_c::Options { checked: false }), &bin, &file) { eprintln!("{e}"); process::exit(1); }
+                if let Err(e) = cc(&emit_c::emit(&base, &emit_c::Options { checked: false }), &bbin, &file) { eprintln!("{e}"); process::exit(1); }
+                let (ins, ref_) = run_perf(&bin);
+                let (bins, bref) = run_perf(&bbin);
+                let ins = ins.saturating_sub(bins); let ref_ = ref_.saturating_sub(bref);
+                let bytes = ref_ * machine.b_bytes as u64;
+                let ev: Vec<String> = f.params.iter().zip(&shapes).map(|(&p, s)| {
+                    let l = &f.locals[p];
+                    let nm = if l.ty.is_arrayish() { format!("{}.len()", l.name) } else { l.name.clone() };
+                    format!("{nm}={}", s.at(n))
+                }).collect();
+                let pred = if declared {
+                    let (w, mv) = (cost::Cost::poly(fc.declared.work.clone().unwrap()), cost::Cost::poly(fc.declared.moves.clone().unwrap()));
+                    match evaluate(fc, &w, &mv, &ev.join(","), &machine) {
+                        Some((w, m)) => {
+                            let (pw, pm) = (ins as f64 / m_repeat as f64, bytes as f64 / m_repeat as f64);
+                            // within the counter's known factors: reads pair, prefetch overfetches,
+                            // and process noise divided by the repeats is under a line per call
+                            let ok = pw <= w * 1.5 + 2.0 && pm <= m * 2.0 + machine.b_bytes as f64;
+                            if !ok { confirmed = false; }
+                            format!("{w:.0} / {m:.0}   measured {pw:.1} / {pm:.1} per call   {}", if ok { "✓" } else { "✗ exceeds" })
+                        }
+                        None => String::new(),
                     }
-                    _ => String::new(),
+                } else {
+                    match &fc.result {
+                        cost::CostResult::Exact { work, moves } => evaluate(fc, work, moves, &ev.join(","), &machine).map_or(String::new(), |(w, m)| format!("{:.3e} / {:.3e}", w * m_repeat as f64, m * m_repeat as f64)),
+                        _ => String::new(),
+                    }
                 };
-                println!("  {n:>10} {ins:>16} {:>16}   {pred}", ref_ * machine.b_bytes as u64);
-                ns.push(n as f64); ws.push(ins as f64); mvs.push((ref_ * machine.b_bytes as u64) as f64);
+                println!("  {n:>10} {ins:>16} {bytes:>16}   {pred}");
+                ns.push(n as f64); ws.push(ins as f64); mvs.push(bytes as f64);
             }
             let _ = std::fs::remove_dir_all(&dir);
-            let h = ns.len() / 2;
-            let (kw, km) = (cost::measure::slope(&ns[h..], &ws[h..]), cost::measure::slope(&ns[h..], &mvs[h..]));
             let range = format!("{}..{}", m_sizes.first().copied().unwrap_or(0), m_sizes.last().copied().unwrap_or(0));
-            let measured = format!("{:<16} work ~n^{kw:.2}{:<20} moves ~n^{km:.2}{:<20} measured over n = {range}", name, "", "");
-            println!("{measured}");
+            let measured = if declared {
+                let verdict = if confirmed { "confirmed" } else { "EXCEEDED" };
+                println!("{:<16} declaration {verdict} by measurement over n = {range} (tolerance: work ×1.5 + 2, moves ×2 + one line, per call)", name);
+                format!("{}  measured over n = {range}: {verdict}", cost::lock::line(fc))
+            } else {
+                let h = ns.len() / 2;
+                let (kw, km) = (cost::measure::slope(&ns[h..], &ws[h..]), cost::measure::slope(&ns[h..], &mvs[h..]));
+                let l = format!("{:<16} work ~n^{kw:.2}{:<20} moves ~n^{km:.2}{:<20} measured over n = {range}", name, "", "");
+                println!("{l}");
+                l
+            };
             if m_lock {
                 let path = file.parent().unwrap_or(Path::new(".")).join("costs.lock");
                 let old = std::fs::read_to_string(&path).unwrap_or_else(|_| format!("# neant costs.lock — generated from {}; do not edit\n", file.file_name().unwrap().to_string_lossy()));
