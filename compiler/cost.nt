@@ -1583,8 +1583,37 @@ fn ck_max(facs: &[Fac], terms: &mut [Term], pols: &mut [Pol], pst: &mut [i64], b
 // `field` is the field's name token, or −1 for a whole element. It matters twice: under SoA two
 // fields of one struct are two arrays and never one site, and the stride is the field's own size
 // rather than the element's.
+// `p0`, `p1`, `p2` are the ids of the loops this site sits in, outermost first, −1 where there is
+// no loop at that depth — `Site.path` in `analyze.rs`. A site's moves are a property of the levels
+// it sits in and not of the site alone (design §18), so the levels have to be nameable after the
+// walk has left them.
 struct Site { arr: i64, idx: i64, inloop: i64, coef: i64, stride: i64, bad: i64, trip: i64, branch: i64,
-             novar: i64, field: i64 }
+             novar: i64, field: i64, p0: i64, p1: i64, p2: i64 }
+
+// **A loop record that outlives its loop** — `LoopRec` in `analyze.rs`. The per-depth state in
+// `wst[30..35]` is live only while the loop is open, because the walk settles each site where it
+// stands; a pass that settles levels innermost outwards needs every loop the function ever opened,
+// so these are numbered per function and never reused.
+//
+//   wst[41]            how many loops this function has opened
+//   wst[42 + d]        the id of the loop currently open at depth `d`
+//   wst[100 + 5·id]    the loop variable's name token
+//            + 1       its atom, or −1 for a `while`, which has none and so cannot be summed over
+//            + 2       its first value, as a polynomial — `for j in i..n` starts at `i`
+//            + 3       its step
+//            + 4       its trip count, as a polynomial
+fn lp_open(wst: &mut [i64], depth: i64, var: i64, atom: i64, lo: i64, step: i64, trip: i64) {
+    if depth >= 4 || wst[41] >= 30 { return; }
+    let id = wst[41];
+    wst[41] = id + 1;
+    wst[42 + depth] = id;
+    let b = 100 + 5 * id;
+    wst[b] = var;
+    wst[b + 1] = atom;
+    wst[b + 2] = lo;
+    wst[b + 3] = step;
+    wst[b + 4] = trip;
+}
 
 // two index expressions that name the same address: structurally equal, with variables compared by
 // the bytes their tokens span. `cs[i].v` and `cs[i].tag` share an index and so share a site, which
@@ -1803,6 +1832,9 @@ fn site_add(src: &[u8], toks: &[Token], nodes: &[Node], types: &[Ty], strs: &[St
     sites[s].trip = wst[13];
     sites[s].branch = wst[20];
     sites[s].novar = if wst[12] < 0 { 1 } else { 0 };
+    sites[s].p0 = if wst[11] > 0 { wst[42] } else { -1 };
+    sites[s].p1 = if wst[11] > 1 { wst[43] } else { -1 };
+    sites[s].p2 = if wst[11] > 2 { wst[44] } else { -1 };
     wst[10] = s + 1;
 
     // settled here rather than in a pass at the end, so that the moves of an `if`'s two arms can
@@ -2310,6 +2342,7 @@ fn m_stmt(src: &[u8], toks: &[Token], nodes: &[Node], types: &[Ty], strs: &[Str]
             wst[2] = atom + 1;
             let av = pol_atom(facs, terms, pols, pst, atom);
             env_add(env, wst, nodes[n].a, av, -1);
+            lp_open(wst, depth, nodes[n].a, atom, lo, 1, wst[13]);
             let body = m_block(src, toks, nodes, types, strs, flds, ntys, sigs, ptys, fm, ffoot, facs, terms, pols, pst, env, cof, sites, cks, cnds, pcs, budget, resid, rargs, subst, slay, wst, nodes[n].d);
             acc = ck_add(facs, terms, pols, pst, budget, cnds, pcs, cks, wst, a, b);
             acc = ck_add(facs, terms, pols, pst, budget, cnds, pcs, cks, wst, acc, body);
@@ -2331,6 +2364,9 @@ fn m_stmt(src: &[u8], toks: &[Token], nodes: &[Node], types: &[Ty], strs: &[Str]
                 wst[32 + depth] = t;
                 wst[34 + depth] = -1;
             };
+            // a `while` has no loop atom: nothing accumulated in it can be summed over its
+            // variable, which is `LoopRec.atom = None` in `analyze.rs`
+            lp_open(wst, depth, wst[15], -1, -1, 1, t);
             let body = m_block(src, toks, nodes, types, strs, flds, ntys, sigs, ptys, fm, ffoot, facs, terms, pols, pst, env, cof, sites, cks, cnds, pcs, budget, resid, rargs, subst, slay, wst, nodes[n].c);
             acc = ck_add(facs, terms, pols, pst, budget, cnds, pcs, cks, wst, a, b);
             acc = ck_add(facs, terms, pols, pst, budget, cnds, pcs, cks, wst, acc, body);
@@ -2364,6 +2400,7 @@ fn m_func(src: &[u8], toks: &[Token], nodes: &[Node], types: &[Ty], strs: &[Str]
     wst[1] = 0;
     wst[10] = 0;
     wst[11] = 0;
+    wst[41] = 0;
     wst[12] = -1;
     wst[13] = -1;
     wst[24] = si;
@@ -2450,7 +2487,7 @@ fn choose_layouts(src: &[u8], toks: &[Token], nodes: &[Node], types: &[Ty], strs
     let mut pst = [0, 0, 0, 0, 0, 0, 0, 0];
     let mut env = [Env { name: 0, val: 0, len: 0, root: 0 }; 4096];
     let mut cof = [Cof { name: 0, c: 0 }; 256];
-    let mut sites = [Site { arr: 0, idx: 0, inloop: 0, coef: 0, stride: 0, bad: 0, trip: 0, branch: 0, novar: 0, field: -1 }; 4096];
+    let mut sites = [Site { arr: 0, idx: 0, inloop: 0, coef: 0, stride: 0, bad: 0, trip: 0, branch: 0, novar: 0, field: -1, p0: -1, p1: -1, p2: -1 }; 4096];
     let mut cks = [Ck { pce: 0, n_pce: 0 }; 262144];
     let mut cnds = [Cnd { ws: 0, fits: 0 }; 262144];
     let mut pcs = [Pce { cnd: 0, n_cnd: 0, poly: 0 }; 262144];
@@ -2461,7 +2498,7 @@ fn choose_layouts(src: &[u8], toks: &[Token], nodes: &[Node], types: &[Ty], strs
     let mut scratch = [0; 64];
     let mut ffoot = [0; 65536];
     let mut fm = [-1; 4096];
-    let mut wst = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+    let mut wst = [0; 256];
 
     let mut sid = 0;
     while sid < n_structs {
