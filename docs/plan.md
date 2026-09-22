@@ -243,15 +243,15 @@ structural shape (`O(log n)`, composed correctly across a call) is checked direc
 
 **Measured, exit tests 3–4 decided against the bound as it stands** (docs/experiments.md M5,
 decisions §7; `tests/kernels/par_compute.nt.in`, `par_memory.nt.in`, `par_sweep.py`, wall-clock on
-five same-type big cores). A compute-bound `.par()` chain holds 84% efficiency at `P = 5`; a
-memory-bound one (`.par().sum()`) holds 97% through `P = 3`, then breaks — 61% at `P = 5`, speedup
-barely moving `P = 4 → 5` while compute keeps climbing — and the model predicts the identical curve
-for both, having nothing in it that could tell them apart. **`T ≤ work/P + O(span)` needs a second,
-`moves/BW` term taken as a `max` with the first, a roofline** — decided, not yet built: `BW` itself
-was not fit, and this machine's mixed-cluster case (adding the slower `A725` cores late loses real
-speedup, a scheduling confound OpenMP's static split does not handle, a different question) was
-kept out of the measurement on purpose. Next: fit `BW`, or move on and record the bound as
-qualified rather than exact.
+this machine's ten-core big cluster — all Cortex-X925, checked directly via `midr_el1`, not a
+big.LITTLE mix as an earlier pass of this measurement wrongly assumed). A compute-bound `.par()`
+chain's efficiency stays above a memory-bound one's (`.par().sum()`) at every `P` past 2 — 86% vs
+74% at `P = 4`, 69% vs 53% at `P = 8`, 46% vs 38% at `P = 10` — and the model predicts the identical
+curve for both, having nothing in it that could tell them apart. **`T ≤ work/P + O(span)` needs a
+second, `moves/BW` term taken as a `max` with the first, a roofline** — decided, not yet built: `BW`
+itself was not fit, and part of the `P = 6..10` range ran while another session shared the machine,
+noisier than a quiet rerun would be. Next: fit `BW` on a quiet machine, or move on and record the
+bound as qualified rather than exact.
 
 ## Self-hosting
 

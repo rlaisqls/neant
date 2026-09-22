@@ -7,25 +7,25 @@ alternatives worth remembering, or when a future reader would otherwise ask "why
 ## 7 — `T ≤ work/P + O(span)` is missing a term, on the machine's own evidence
 
 **Decided 2026-09-22, after `tests/kernels/par_sweep.py` measured a compute-bound and a
-memory-bound `.par()` chain across `P` on five same-type cores (experiments.md, M5).**
+memory-bound `.par()` chain across `P` on this machine's ten-core big cluster (experiments.md, M5).**
 
 m5-span-design.md §6 named the risk before building anything: the classical work-span bound has no
 memory-bandwidth term, and M1 had already found `sum`/`dot` bandwidth-bound on one core. The
 question was whether that stayed true across several cores sharing one path to memory, or whether
-enough parallel slack absorbed it. Measured: a compute-bound `.par()` chain holds 84% efficiency at
-`P = 5`; a memory-bound one (`.par().sum()`) holds 97%, then breaks — 75% at `P = 4`, 61% at
-`P = 5`, speedup barely moving from `P = 4` to `P = 5` while compute keeps climbing. The model
-predicts the same curve for both, because `work/P + span` has nothing in it that could tell a
-compute-bound chain from a memory-bound one.
+enough parallel slack absorbed it. Measured: a compute-bound `.par()` chain's efficiency stays above
+a memory-bound one's (`.par().sum()`) at every `P` past 2 — 86% vs 74% at `P = 4`, 69% vs 53% at
+`P = 8`, 46% vs 38% at `P = 10` — whether the machine is quiet or, for part of this run, shared with
+another process's load. The model predicts the same curve for both, because `work/P + span` has
+nothing in it that could tell a compute-bound chain from a memory-bound one.
 
 **Accepted:** the bound needs a second term, `moves/BW` for some aggregate bandwidth `BW`, taken as
 a `max` with `work/P` — a roofline, the same shape the fit test already uses `max` for elsewhere in
 this calculus, not a new kind of machinery. **Not decided:** what `BW` is, or how it is measured —
-five points on five cores show the shape breaking, not enough to fit a constant. Also not settled:
-the mixed-cluster case. A supplementary run across this machine's two core types (X925 and A725, a
-big.LITTLE split) in the same session showed a real loss from adding the slower cluster late — a
-genuine effect, but a scheduling question (OpenMP's static split assumes same-speed cores) distinct
-from the bandwidth question this decision is about, and left open.
+this shows the shape breaking, not enough to fit a constant, and part of the sweep ran under real
+contention from another session's concurrent work, which a quiet rerun should tighten. **Corrected
+in this entry:** an earlier version attributed part of the effect to a big.LITTLE core mismatch
+inside the ten cores swept; `/sys/.../midr_el1` reads the identical part (Cortex-X925) on all ten,
+so that was not it — flagged by another session working the same machine, checked directly.
 
 ## 6 — Improving on the tools' logic where the compiler knows more, not where they know more
 

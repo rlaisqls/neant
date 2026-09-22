@@ -1,14 +1,17 @@
 #!/usr/bin/env python3
 """The span exit tests 3 and 4 (m5-span-design.md §7): wall-clock scaling of a `.par()` chain
-against P, on a list of same-type pinned cores, for a compute-bound kernel and a memory-bound one.
+against P, on a list of pinned cores, for a compute-bound kernel and a memory-bound one.
 
-    par_sweep.py [--cores 5,6,7,8,9] [--runs 5] [kernel ...]
+    par_sweep.py [--cores 5,6,7,8,9,15,16,17,18,19] [--runs 5] [kernel ...]
 
 Prints, per kernel and P, the measured wall-clock time, the speedup over P=1, and the efficiency
 against ideal (speedup / P) — the question is whether speedup tracks P (work/P holds) or flattens
-(bandwidth-bound, per m5-span-design.md §6). Cores are same-type by default (the ten big cores
-split across two clusters, X925 and A725, run at different speeds OpenMP's static schedule does
-not know about — a real confound, not this experiment's question; pass --cores to include both).
+(bandwidth-bound, per m5-span-design.md §6). --cores should list same-type cores in order: mixing
+core types would let OpenMP's static, equal-iteration-count schedule turn a slower core into a
+straggler, a real confound but not this experiment's question. On the development machine, the
+default ten (5-9, 15-19) read the same part (Cortex-X925) at
+`/sys/devices/system/cpu/cpu*/regs/identification/midr_el1` — one cluster, not two; check on a
+different machine before assuming the same.
 """
 import argparse, pathlib, subprocess, sys, tempfile, time
 
@@ -46,7 +49,7 @@ def timed(binary, cores, p, runs):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--cores", default="5,6,7,8,9", help="comma-separated CPU ids, same type, most-pinned first")
+    ap.add_argument("--cores", default="5,6,7,8,9,15,16,17,18,19", help="comma-separated CPU ids, same type, most-pinned first")
     ap.add_argument("--runs", type=int, default=5)
     ap.add_argument("kernels", nargs="*")
     a = ap.parse_args()

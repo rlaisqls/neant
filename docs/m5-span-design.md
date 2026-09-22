@@ -162,12 +162,12 @@ neither scales as predicted, the compute term itself is wrong and `P` is reconsi
    * x).sum()`: predicted span `O(1) + O(log n)` at several `n`, checked structurally (the
    reported polynomial has a `Log` atom at the right coefficient) — this is an assertion about the
    compiler's arithmetic, not yet about the machine.
-3. **Wall-clock scaling, a compute-bound kernel — passed.** `par_compute.nt.in`, `P = 1..5` on five
-   same-type big cores: 84% efficiency at `P = 5`, tracking `work/P` closely (docs/experiments.md
-   M5).
+3. **Wall-clock scaling, a compute-bound kernel — passed.** `par_compute.nt.in`, `P = 1..10` on the
+   machine's ten-core big cluster (all Cortex-X925): efficiency stays above the memory kernel's at
+   every `P` past 2, e.g. 69% vs 53% at `P = 8` (docs/experiments.md M5).
 4. **Wall-clock scaling, a memory-bound kernel — decided §6 against the bound.** `par_memory.nt.in`
-   (`.par().sum()`), same sweep: 61% efficiency at `P = 5`, breaking away from compute's curve by
-   `P = 4`. This test's job was to produce the number that decided §6, not to pass or fail a
+   (`.par().sum()`), same sweep: breaks away from compute's curve by `P = 4` and stays below it out
+   to `P = 10`. This test's job was to produce the number that decided §6, not to pass or fail a
    predetermined bar, and it did (decisions §7).
 5. **The associativity refusal.** `.par()` before `.fold(...)` is rejected with the line and the
    reason; every associative terminal (`sum`, `count`, `max`, `min`, `any`, `all`) accepted.
