@@ -10,6 +10,9 @@
 //!   neant measure f.nt --fn name [--sizes 1000,4000,...] [--shape p=n*n,...] [--repeat k] [--cpu 5] [--lock]
 //!                                             run the function over a size sweep under perf and fit ~n^k
 //!   any command: --apply fn:tile[,fn:transpose]  rewrite a function first
+//!   neant lexdump f.nt   this lexer's token kinds, one per line, numbered per compiler/lex.nt's
+//!                        own scheme (`lex_kind_number`) — the self-hosted lexer's cross-check
+//!                        (bootstrap/tests/self_host_lex.rs, docs/self-hosting-design.md)
 
 mod ast;
 mod cost;
@@ -80,6 +83,13 @@ fn main() {
         Ok(s) => s,
         Err(e) => { eprintln!("{}: {e}", file.display()); process::exit(2); }
     };
+    if cmd == "lexdump" {
+        match lex::lex(&src) {
+            Ok(toks) => { for t in &toks { println!("{}", lex_kind_number(&t.tok)); } }
+            Err(e) => { eprintln!("{}:{e}", file.display()); process::exit(1); }
+        }
+        return;
+    }
     let mut module = match compile(&src) {
         Ok(m) => m,
         Err(e) => { eprintln!("{}:{e}", file.display()); process::exit(1); }
@@ -268,6 +278,25 @@ fn main() {
             }
         }
         other => { eprintln!("unknown command `{other}`"); process::exit(2); }
+    }
+}
+
+/// `compiler/lex.nt`'s numbering, kept in sync by hand (no shared enum across files yet) — used
+/// only by `lexdump`, a temporary cross-check for the self-hosted lexer (self-hosting-design.md).
+fn lex_kind_number(t: &lex::Tok) -> i32 {
+    use lex::Tok::*;
+    match t {
+        Ident(_) => 0, Int(_) => 1, Float(_) => 2, Byte(_) => 3, Bytes(_) => 4, Str(_) => 5,
+        Fn => 6, Let => 7, Mut => 8, If => 9, Else => 10, For => 11, In => 12, Return => 13,
+        True => 14, False => 15, As => 16, While => 17, Break => 18, Decreasing => 19,
+        Extern => 20, Uses => 21, Struct => 22,
+        LParen => 23, RParen => 24, LBracket => 25, RBracket => 26, LBrace => 27, RBrace => 28,
+        Comma => 29, Semi => 30, Colon => 31, Arrow => 32, Dot => 33, DotDot => 34,
+        Eq => 35, EqEq => 36, Ne => 37, Lt => 38, Le => 39, Gt => 40, Ge => 41,
+        Plus => 42, Minus => 43, Star => 44, Slash => 45, Percent => 46,
+        PlusEq => 47, MinusEq => 48, StarEq => 49, SlashEq => 50,
+        Amp => 51, AmpAmp => 52, Pipe => 53, PipePipe => 54, Bang => 55, Hash => 56,
+        Eof => 57,
     }
 }
 

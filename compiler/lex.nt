@@ -1,0 +1,179 @@
+// The first self-hosted stage (docs/self-hosting-design.md §3), ported from bootstrap/src/lex.rs.
+// Deliberately narrower than the Rust lexer, two ways, both because nothing in this repo's own
+// corpus needs the fuller behaviour:
+//   - bytes, not chars: this language's own source is ASCII, checked by the fact that every
+//     `.nt` file `tests/golden` holds already is.
+//   - no escape decoding inside `b"..."` or `".."` (only `b'x'` decodes an escape, since that is
+//     all the corpus's byte-string and string literals ever need); a backslash there becomes a
+//     literal backslash byte in the span rather than an error, which is not exercised by any file
+//     this stage is checked against yet, and is recorded here rather than found by surprise.
+// Numeric literals keep their raw `(start, len)` span; parsing the value is deferred to whoever
+// consumes the token next, so this stage needs no `f64` bit-cast for a `Float` token's value.
+//
+// `kind` numbers a later stage must agree with by hand — there is no shared enum across files yet:
+//   0 Ident   1 Int   2 Float   3 Byte   4 Bytes   5 Str
+//   6 Fn  7 Let  8 Mut  9 If  10 Else  11 For  12 In  13 Return  14 True  15 False  16 As
+//   17 While  18 Break  19 Decreasing  20 Extern  21 Uses  22 Struct
+//   23 LParen  24 RParen  25 LBracket  26 RBracket  27 LBrace  28 RBrace
+//   29 Comma  30 Semi  31 Colon  32 Arrow  33 Dot  34 DotDot
+//   35 Eq  36 EqEq  37 Ne  38 Lt  39 Le  40 Gt  41 Ge
+//   42 Plus  43 Minus  44 Star  45 Slash  46 Percent
+//   47 PlusEq  48 MinusEq  49 StarEq  50 SlashEq
+//   51 Amp  52 AmpAmp  53 Pipe  54 PipePipe  55 Bang  56 Hash
+//   57 Eof
+
+struct Token { kind: i64, start: i64, len: i64, ival: i64 }
+
+fn is_alpha(c: u8) -> bool {
+    (c >= b'a' && c <= b'z') || (c >= b'A' && c <= b'Z') || c == b'_'
+}
+fn is_digit(c: u8) -> bool {
+    c >= b'0' && c <= b'9'
+}
+fn is_alnum(c: u8) -> bool {
+    is_alpha(c) || is_digit(c)
+}
+fn is_space(c: u8) -> bool {
+    c == b' ' || c == b'\t' || c == b'\r' || c == b'\n'
+}
+
+// the keyword an identifier's own span spells, or -1 for a plain identifier: one comparison per
+// keyword, gated by length first, since there is no string equality or match to dispatch with
+fn keyword(src: &[u8], start: i64, len: i64) -> i64 {
+    if len == 2 {
+        if src[start] == b'f' && src[start + 1] == b'n' { return 6; }
+        if src[start] == b'i' && src[start + 1] == b'f' { return 9; }
+        if src[start] == b'i' && src[start + 1] == b'n' { return 12; }
+        if src[start] == b'a' && src[start + 1] == b's' { return 16; }
+    };
+    if len == 3 {
+        if src[start] == b'l' && src[start + 1] == b'e' && src[start + 2] == b't' { return 7; }
+        if src[start] == b'm' && src[start + 1] == b'u' && src[start + 2] == b't' { return 8; }
+        if src[start] == b'f' && src[start + 1] == b'o' && src[start + 2] == b'r' { return 11; }
+    };
+    if len == 4 {
+        if src[start] == b'e' && src[start + 1] == b'l' && src[start + 2] == b's' && src[start + 3] == b'e' { return 10; }
+        if src[start] == b't' && src[start + 1] == b'r' && src[start + 2] == b'u' && src[start + 3] == b'e' { return 14; }
+        if src[start] == b'u' && src[start + 1] == b's' && src[start + 2] == b'e' && src[start + 3] == b's' { return 21; }
+    };
+    if len == 5 {
+        if src[start] == b'f' && src[start + 1] == b'a' && src[start + 2] == b'l' && src[start + 3] == b's' && src[start + 4] == b'e' { return 15; }
+        if src[start] == b'w' && src[start + 1] == b'h' && src[start + 2] == b'i' && src[start + 3] == b'l' && src[start + 4] == b'e' { return 17; }
+        if src[start] == b'b' && src[start + 1] == b'r' && src[start + 2] == b'e' && src[start + 3] == b'a' && src[start + 4] == b'k' { return 18; }
+    };
+    if len == 6 {
+        if src[start] == b'r' && src[start + 1] == b'e' && src[start + 2] == b't' && src[start + 3] == b'u' && src[start + 4] == b'r' && src[start + 5] == b'n' { return 13; }
+        if src[start] == b'e' && src[start + 1] == b'x' && src[start + 2] == b't' && src[start + 3] == b'e' && src[start + 4] == b'r' && src[start + 5] == b'n' { return 20; }
+        if src[start] == b's' && src[start + 1] == b't' && src[start + 2] == b'r' && src[start + 3] == b'u' && src[start + 4] == b'c' && src[start + 5] == b't' { return 22; }
+    };
+    if len == 10 {
+        if src[start] == b'd' && src[start + 1] == b'e' && src[start + 2] == b'c' && src[start + 3] == b'r' && src[start + 4] == b'e' && src[start + 5] == b'a' && src[start + 6] == b's' && src[start + 7] == b'i' && src[start + 8] == b'n' && src[start + 9] == b'g' { return 19; }
+    };
+    -1
+}
+
+// a byte's escaped value inside `b'..'`: the small set the corpus uses, `-1` for anything else
+fn escape(e: u8) -> i64 {
+    if e == b'n' { 10 }
+    else if e == b't' { 9 }
+    else if e == b'r' { 13 }
+    else if e == b'0' { 0 }
+    else if e == b'\\' { 92 }
+    else if e == b'\'' { 39 }
+    else { -1 }
+}
+
+// `n` is the valid prefix of `src` to read — `src` itself is a fixed-capacity buffer, generally
+// larger (`read_file`'s caller pre-allocates it, and there is no sub-array view to pass a smaller
+// one with). Fills `toks` (pre-sized by the caller to `src.len()`, an upper bound: every token
+// consumes at least one byte of `n`) and returns how many it used.
+fn lex(src: &[u8], n: i64, toks: &mut [Token]) -> i64 {
+    let mut i = 0;
+    let mut count = 0;
+    while i < n {
+        let c = src[i];
+        if c == b'\n' {
+            i += 1;
+        } else if is_space(c) {
+            i += 1;
+        } else if c == b'/' && i + 1 < n && src[i + 1] == b'/' {
+            while i < n && src[i] != b'\n' { i += 1; }
+        } else if c == b'b' && i + 1 < n && (src[i + 1] == b'\'' || src[i + 1] == b'"') {
+            let quote = src[i + 1];
+            let start = i + 2;
+            let mut j = start;
+            while j < n && src[j] != quote { j += 1; }
+            if quote == b'\'' {
+                let ival = if j - start == 2 && src[start] == b'\\' { escape(src[start + 1]) } else { src[start] as i64 };
+                toks[count] = Token { kind: 3, start: start, len: j - start, ival: ival };
+            } else {
+                toks[count] = Token { kind: 4, start: start, len: j - start, ival: 0 };
+            }
+            count += 1;
+            i = j + 1;
+        } else if c == b'"' {
+            let start = i + 1;
+            let mut j = start;
+            while j < n && src[j] != b'"' { j += 1; }
+            toks[count] = Token { kind: 5, start: start, len: j - start, ival: 0 };
+            count += 1;
+            i = j + 1;
+        } else if is_alpha(c) {
+            let start = i;
+            while i < n && is_alnum(src[i]) { i += 1; }
+            let kw = keyword(src, start, i - start);
+            let kind = if kw >= 0 { kw } else { 0 };
+            toks[count] = Token { kind: kind, start: start, len: i - start, ival: 0 };
+            count += 1;
+        } else if is_digit(c) {
+            let start = i;
+            while i < n && (is_digit(src[i]) || src[i] == b'_') { i += 1; }
+            let mut is_float = false;
+            if i + 1 < n && src[i] == b'.' && is_digit(src[i + 1]) {
+                is_float = true;
+                i += 1;
+                while i < n && (is_digit(src[i]) || src[i] == b'_') { i += 1; }
+            }
+            if i < n && (src[i] == b'e' || src[i] == b'E') {
+                let mut j = i + 1;
+                if j < n && (src[j] == b'+' || src[j] == b'-') { j += 1; }
+                if j < n && is_digit(src[j]) {
+                    is_float = true;
+                    i = j;
+                    while i < n && is_digit(src[i]) { i += 1; }
+                }
+            }
+            let kind = if is_float { 2 } else { 1 };
+            toks[count] = Token { kind: kind, start: start, len: i - start, ival: 0 };
+            count += 1;
+        } else {
+            let two = i + 1 < n;
+            let c1 = if two { src[i + 1] } else { b'\0' };
+            if c == b'-' && two && c1 == b'>' { toks[count] = Token { kind: 32, start: i, len: 2, ival: 0 }; count += 1; i += 2; }
+            else if c == b'.' && two && c1 == b'.' { toks[count] = Token { kind: 34, start: i, len: 2, ival: 0 }; count += 1; i += 2; }
+            else if c == b'=' && two && c1 == b'=' { toks[count] = Token { kind: 36, start: i, len: 2, ival: 0 }; count += 1; i += 2; }
+            else if c == b'!' && two && c1 == b'=' { toks[count] = Token { kind: 37, start: i, len: 2, ival: 0 }; count += 1; i += 2; }
+            else if c == b'<' && two && c1 == b'=' { toks[count] = Token { kind: 39, start: i, len: 2, ival: 0 }; count += 1; i += 2; }
+            else if c == b'>' && two && c1 == b'=' { toks[count] = Token { kind: 41, start: i, len: 2, ival: 0 }; count += 1; i += 2; }
+            else if c == b'+' && two && c1 == b'=' { toks[count] = Token { kind: 47, start: i, len: 2, ival: 0 }; count += 1; i += 2; }
+            else if c == b'-' && two && c1 == b'=' { toks[count] = Token { kind: 48, start: i, len: 2, ival: 0 }; count += 1; i += 2; }
+            else if c == b'*' && two && c1 == b'=' { toks[count] = Token { kind: 49, start: i, len: 2, ival: 0 }; count += 1; i += 2; }
+            else if c == b'/' && two && c1 == b'=' { toks[count] = Token { kind: 50, start: i, len: 2, ival: 0 }; count += 1; i += 2; }
+            else if c == b'&' && two && c1 == b'&' { toks[count] = Token { kind: 52, start: i, len: 2, ival: 0 }; count += 1; i += 2; }
+            else if c == b'|' && two && c1 == b'|' { toks[count] = Token { kind: 54, start: i, len: 2, ival: 0 }; count += 1; i += 2; }
+            else {
+                let kind = if c == b'(' { 23 } else if c == b')' { 24 } else if c == b'[' { 25 } else if c == b']' { 26 }
+                    else if c == b'{' { 27 } else if c == b'}' { 28 } else if c == b',' { 29 } else if c == b';' { 30 }
+                    else if c == b':' { 31 } else if c == b'.' { 33 } else if c == b'=' { 35 } else if c == b'<' { 38 } else if c == b'>' { 40 }
+                    else if c == b'+' { 42 } else if c == b'-' { 43 } else if c == b'*' { 44 } else if c == b'/' { 45 }
+                    else if c == b'%' { 46 } else if c == b'&' { 51 } else if c == b'!' { 55 } else if c == b'|' { 53 } else if c == b'#' { 56 }
+                    else { -1 };
+                toks[count] = Token { kind: kind, start: i, len: 1, ival: 0 };
+                count += 1;
+                i += 1;
+            }
+        }
+    }
+    toks[count] = Token { kind: 57, start: i, len: 0, ival: 0 };
+    count + 1
+}

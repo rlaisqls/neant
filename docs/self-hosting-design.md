@@ -84,6 +84,16 @@ syntax, no general string/IO feature — one ~30-line C file and one small, fixe
 
 ## 3. Order: the lexer first, and why
 
+**Done (`compiler/lex.nt`).** Built close to the shape below, two differences found while writing
+it, both recorded in `lex.nt`'s own header comment rather than silently: it takes `n: i64`
+separately from `src`, since `src` is the caller's fixed-capacity buffer (`read_file`'s `buf`) and
+there is no sub-array view to hand it a shorter slice of the same array — the first real instance
+of the "pre-sized array with a tracked count" pattern §1 predicted, one level deeper than
+predicted (the count has to travel as its own parameter, not just live inside the array). And
+`Float`'s value is not attempted at all yet — kept as a `(start, len)` span like `Ident`/`Str`,
+not `ival` — so the `f64` bit-cast §3 flagged is deferred again, past this stage, not added here
+after all.
+
 The bootstrap compiler's own stage order (lex → parse → types → ir → emit_c) is also the right
 self-hosting order, but **not attempted as one leap**: the lexer is the only stage with no
 dependency on any other neant-in-neant code, the smallest (188 lines of Rust), and it exercises
@@ -114,12 +124,14 @@ before).
 
 ## 4. Exit test
 
-`neant run` on the self-hosted lexer, called from a small `main` that reads a real `.nt` file
-(`rt.c`'s `read_file`) and prints the token count and the first few kinds: matches
-`bootstrap/src/lex.rs`'s own tokenisation of the same file, checked against the Rust lexer's output
-on a handful of files from `tests/golden`. `neant cost` on `lex` itself: work and moves as a
-function of `src.len()`, the arena's own bound — the first data point for "what does the compiler
-cost, by its own tool," the thing self-hosting was for.
+**Passed, on every file, not a handful.** `bootstrap/tests/self_host_lex.rs`: for all 69 files in
+`tests/golden`, `compiler/lex.nt` run through the neant compiler itself produces the identical
+sequence of token kinds `bootstrap/src/lex.rs` does (compared via `neant lexdump`, a small debug
+command added for exactly this — main.rs's `lex_kind_number` mirrors `compiler/lex.nt`'s numbering
+by hand). Spans and literal values are not compared, only the kind at each position — the set of
+decisions a lexer makes, which is what this stage exists to get right. `neant cost` on `lex` itself
+— work and moves as a function of `n`, the arena's own bound, the first data point for "what does
+the compiler cost, by its own tool" — is not yet taken.
 
 ## 5. What is deliberately not decided here
 
@@ -133,3 +145,11 @@ cost, by its own tool," the thing self-hosting was for.
   actually written, not designed here in the abstract.
 - **Whether `rt.c`'s fixed-linking convention scales past one file** (a parser stage might want its
   own small C helpers too) is left for when a second one is needed.
+
+**One parsing surprise, found writing `lex.nt`, not designed around, just worked past.** An `if`
+with no `else`, used as a statement, followed on the next line by an expression starting with
+unary `-` (`if len == 10 { … }` then `-1`) parses as one expression, `(if …) - 1` — a subtraction,
+not two statements. `keyword()`'s length-gated `if` blocks needed an explicit `;` after each to
+force the split. Whether this is the intended reading of the grammar or a rough edge worth its own
+note in the language docs is not decided here — recorded so the next stage does not rediscover it
+by the same error main.rs's own diagnostics gave (`"-" between "()" and "i64"`).

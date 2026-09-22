@@ -270,10 +270,12 @@ function-with-a-body do it never runs for one without), and `neant build`/`run` 
 generated `.c` file. Fix, not a language feature: a small hand-written `bootstrap/rt.c` whose one
 function matches this language's own pointer+length calling convention exactly (`read_file(path:
 &[u8], buf: &mut [u8]) -> i64`, the caller pre-allocating `buf` and reading the real length off the
-return value), linked in by a fixed convention rather than a new flag. First milestone: the lexer
-alone (188 lines in Rust, no dependency on any other self-hosted stage), exit test a self-hosted
-`lex` matching `bootstrap/src/lex.rs`'s tokenisation of real `.nt` files and getting its own
-`neant cost` line. Not designed yet: the parser, checker, IR, emitter, or the fixpoint itself.
+return value), linked in by a fixed convention rather than a new flag. **First milestone done:
+`compiler/lex.nt`, the lexer alone**, exit test passed on every one of the 69 `tests/golden` files,
+not a sample — `neant lexdump` (a debug command added for this) against `bootstrap/src/lex.rs`'s
+own tokenisation, compared kind by kind (`bootstrap/tests/self_host_lex.rs`). `neant cost` on `lex`
+itself — the first data point for what the compiler costs, by its own tool — not yet taken. Not
+designed yet: the parser, checker, IR, emitter, or the fixpoint itself.
 
 ## M7 — the constant factor
 
