@@ -1,0 +1,11 @@
+struct Particle  layout SoA  decided by step (32·ps.len() + 4·B, AoS 32·ps.len() + B), kinetic (16·ps.len() + 2·B, AoS 32·ps.len() + B), centroid_x (8·ps.len() + B, AoS 32·ps.len() + B), main (9·B + 6656, AoS 4·B + 6168)
+step             work 12·ps.len()                  moves 32·ps.len() + 4·B            exact
+                 lower bound      moves 32·ps.len()                  (footprint, every distinct element crosses once)   gap 1× at M = 2 MiB, B = 64
+                 footprint        ps: [0, 32·ps.len()) (whole array)   no residue claimed
+kinetic          work 10·ps.len() + 1              moves 16·ps.len() + 2·B            exact
+                 lower bound      moves 16·ps.len()                  (footprint, every distinct element crosses once)   gap 1× at M = 2 MiB, B = 64
+                 footprint        ps: [16·ps.len(), 32·ps.len())   resident after if 16·ps.len() < M
+centroid_x       work 4·ps.len() + 2               moves 8·ps.len() + B               exact
+                 lower bound      moves 8·ps.len()                   (footprint, every distinct element crosses once)   gap 1× at M = 2 MiB, B = 64
+                 footprint        ps: [0, 8·ps.len())   resident after if 8·ps.len() < M
+main             work 2187                         moves 9·B + 6656                   exact, io

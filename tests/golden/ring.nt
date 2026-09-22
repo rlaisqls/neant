@@ -1,0 +1,25 @@
+// a ring buffer: the write index wraps, so it is not an affine function of the loop
+fn push_all(buf: &mut [i64], xs: &[i64], start: i64) -> i64 {
+    let mut head = start;
+    for i in 0..xs.len() {
+        buf[head] = xs[i];
+        head = (head + 1) % buf.len();
+    }
+    head
+}
+
+fn sum_ring(buf: &[i64]) -> i64 {
+    let mut s = 0;
+    for i in 0..buf.len() {
+        s += buf[i];
+    }
+    s
+}
+
+fn main() {
+    let mut buf = [0; 5];
+    let xs = [1, 2, 3, 4, 5, 6, 7];
+    let h = push_all(&mut buf, &xs, 0);
+    println(h);
+    println(sum_ring(&buf));
+}

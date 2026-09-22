@@ -1,0 +1,7 @@
+push_all         work 6·xs.len()                   moves B·xs.len() + 8·xs.len() + B  exact
+                 lower bound      moves 8·xs.len()                   (footprint, every distinct element crosses once)   gap 9× at M = 2 MiB, B = 64
+                 footprint        buf: [0, 8·buf.len()) (whole array)  xs: [0, 8·xs.len())   no residue claimed
+sum_ring         work 4·buf.len()                  moves 8·buf.len() + B              exact
+                 lower bound      moves 8·buf.len()                  (footprint, every distinct element crosses once)   gap 1× at M = 2 MiB, B = 64
+                 footprint        buf: [0, 8·buf.len())   resident after if 8·buf.len() < M
+main             work 80                           moves 9·B + 192                    exact, io

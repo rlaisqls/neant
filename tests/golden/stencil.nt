@@ -1,0 +1,27 @@
+// a five-point stencil over a square grid held flat, and a Jacobi sweep that uses it
+fn stencil(src: &[f64], dst: &mut [f64], n: i64) {
+    for i in 1..n - 1 {
+        for j in 1..n - 1 {
+            dst[i * n + j] = 0.25 * (src[(i - 1) * n + j] + src[(i + 1) * n + j] + src[i * n + j - 1] + src[i * n + j + 1]);
+        }
+    }
+}
+
+fn total(g: &[f64]) -> f64 {
+    let mut s = 0.0;
+    for i in 0..g.len() {
+        s += g[i];
+    }
+    s
+}
+
+fn main() {
+    let n = 8;
+    let mut a = [0.0; 64];
+    let mut b = [0.0; 64];
+    for i in 0..64 {
+        a[i] = (i % 5) as f64;
+    }
+    stencil(&a, &mut b, n);
+    println(total(&b));
+}

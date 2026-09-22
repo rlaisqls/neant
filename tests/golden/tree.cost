@@ -1,0 +1,10 @@
+struct TNode     layout AoS  decided by main (7·B + 672, SoA 13·B + 672)
+search           work 9·t.len() + 3                moves                              exact  (2 regimes)
+                                               moves 24·t.len()                   if 24·t.len() < M
+                                               moves 2·B·t.len()                  if 24·t.len() ≥ M
+                 footprint        t: [0, 24·t.len()) (whole array)   no residue claimed
+depth_of         work 10·t.len() + 3               moves                              exact  (2 regimes)
+                                               moves 24·t.len()                   if 24·t.len() < M
+                                               moves 2·B·t.len()                  if 24·t.len() ≥ M
+                 footprint        t: [0, 24·t.len()) (whole array)   no residue claimed
+main             work 236                          moves 7·B + 672                    exact, io

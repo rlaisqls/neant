@@ -1,0 +1,45 @@
+// a binary search tree in an arena: the links are indices into the array that holds the nodes
+struct TNode { key: i64, left: i64, right: i64 }
+
+fn search(t: &[TNode], root: i64, key: i64) -> i64 {
+    let mut i = root;
+    let mut steps = 0;
+    while i >= 0 decreasing t.len() - steps {
+        if t[i].key == key {
+            return i;
+        }
+        if key < t[i].key {
+            i = t[i].left;
+        } else {
+            i = t[i].right;
+        }
+        steps += 1;
+    }
+    -1
+}
+
+fn depth_of(t: &[TNode], root: i64, key: i64) -> i64 {
+    let mut i = root;
+    let mut d = 0;
+    let mut steps = 0;
+    while i >= 0 decreasing t.len() - steps {
+        if t[i].key == key {
+            return d;
+        }
+        if key < t[i].key { i = t[i].left; } else { i = t[i].right; }
+        d += 1;
+        steps += 1;
+    }
+    -1
+}
+
+fn main() {
+    let mut t = [TNode { key: 0, left: -1, right: -1 }; 7];
+    t[0].key = 4; t[0].left = 1; t[0].right = 2;
+    t[1].key = 2; t[1].left = 3; t[1].right = 4;
+    t[2].key = 6; t[2].left = 5; t[2].right = 6;
+    t[3].key = 1; t[4].key = 3; t[5].key = 5; t[6].key = 7;
+    println(search(&t, 0, 5));
+    println(depth_of(&t, 0, 5));
+    println(search(&t, 0, 9));
+}

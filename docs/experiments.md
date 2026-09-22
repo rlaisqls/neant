@@ -373,3 +373,40 @@ past the 2 MiB L2.
 - **At 200 000 the SoA array fits L2 and the repeats are free**, which is why the ratio is 7.4
   there; that point measures residence, not layout.
 
+## M4 — the region rule against a pointer chase
+
+**Question.** A walk whose index is loaded from memory — `i = nodes[i].next` — costs a fresh line
+per step in general, but no more than the arena once the arena is in cache, whatever the order.
+The model says so as two pieces. Does the machine follow the piece that applies?
+
+**Setup.** `tests/kernels/arena.nt.in`: a 16-byte `Node`, its `next` links a full-period LCG
+permutation of `0..n`, so the chase visits every node in an order the prefetcher cannot guess;
+three walks of the whole arena per run. The arena fits the 2 MiB L2 below `n = 131072`.
+
+| `n` | arena | predicted | measured | ratio |
+|---|---|---|---|---|
+| 16 384 | 256 KiB, fits | 1.31e6 | 1.92e5 | 6.8 |
+| 65 536 | 1 MiB, fits | 5.24e6 | 3.31e5 | 15.8 |
+| 262 144 | 4 MiB | 5.87e7 | 7.09e7 | 0.83 |
+| 1 048 576 | 16 MiB | 2.35e8 | 3.25e8 | 0.72 |
+| 4 194 304 | 64 MiB | 9.40e8 | 1.26e9 | 0.75 |
+
+**Findings.**
+
+- **Where the arena does not fit, the model is right within the counter's factors.** The chase
+  pays a line per step and the measured traffic is 1.2–1.4× the prediction, with a measured slope
+  of 1.04 against a predicted 1.00. Without the region rule this is the only thing the model could
+  ever have said, and here it is the true one.
+- **Where the arena fits, the model is conservative by the number of walks, and the reason is
+  stated in the model.** It charges each call the arena, because a site whose index is loaded from
+  memory has no exact range and therefore **claims no residue** — the compiler cannot know that
+  the walk touched every node rather than the first one `n` times, and crediting a caller for what
+  was only possibly touched would be unsound. The machine pays for the arena once: the build
+  writes it, write streams do not register in this counter (M1), and the three walks then read
+  what is already resident. The shape the piece predicts — a cost that is the arena and not the
+  number of steps — is what the machine shows; the constant is the number of calls.
+- **The rule needs the trip count to be comparable with the arena.** `for k in 0..nodes.len()` is
+  bounded by the arena and the rule fires; a separate `steps` parameter is not, and the model
+  says so rather than guessing, because a condition in this calculus can compare a working set
+  with the cache but not two size expressions with each other.
+
