@@ -1562,8 +1562,8 @@ fn site_add(src: &[u8], toks: &[Token], nodes: &[Node], types: &[Ty], strs: &[St
             pst: &mut [i64], env: &mut [Env], cof: &mut [Cof], sites: &mut [Site], cks: &mut [Ck], budget: &mut [f64],
             resid: &mut [Res], rargs: &mut [i64], slay: &[i64], wst: &mut [i64],
             arr: i64, idx: i64, fld: i64) -> i64 {
-    // a site two loops deep needs the per-level working set this slice does not compute
-    if wst[11] > 1 {
+    // three loops deep is past what the loop state here records
+    if wst[11] > 2 {
         wst[1] = 1;
         return ck_zero(facs, terms, pols, pst, cks, budget, wst);
     }
@@ -1640,6 +1640,51 @@ fn site_add(src: &[u8], toks: &[Token], nodes: &[Node], types: &[Ty], strs: &[St
     let cm = if sites[s].coef < 0 { 0 - sites[s].coef } else { sites[s].coef };
     let stride = cm * sites[s].stride;
     let scattered = sites[s].bad != 0 || sites[s].coef == 0 && sites[s].novar != 0;
+    // **Two loops deep**: the lines are counted innermost outwards (design §16). The inner level
+    // gives `1 + slide`; the outer adds its own slide, whose stride reads the inner loop's lower
+    // bound — `for i in ii*4 .. ii*4+4` moves this site by four elements a lap of `ii`.
+    if wst[11] == 2 && !scattered && stride > 0 && stride < 64 {
+        wst[14] = 0;
+        let c_out = idx_coef(src, toks, nodes, wst, idx, wst[30])
+            + sites[s].coef * idx_coef(src, toks, nodes, wst, wst[34 + 1], wst[30]);
+        if wst[14] != 0 {
+            wst[1] = 1;
+            return ck_zero(facs, terms, pols, pst, cks, budget, wst);
+        }
+        let cm0 = if c_out < 0 { 0 - c_out } else { c_out };
+        let s_out = cm0 * sites[s].stride;
+        // the inner level: one line, plus the slide, floored at one line
+        // the slide in lines: `t·s` over the atom `B`, with the test done at this machine's 64
+        let raw_in = pol_scale(facs, terms, pols, pst, sites[s].trip, stride, 1);
+        let test_in = pol_scale(facs, terms, pols, pst, sites[s].trip, stride, 64);
+        let isv = pol_as_f64(facs, terms, pols, pst, test_in);
+        let one = pol_const(facs, terms, pols, pst, 1);
+        let inner_slide = pol_div_atom(facs, terms, pols, pst, raw_in, 0);
+        let islide = if pst[7] != 0 && isv < 1.0 { one } else { inner_slide };
+        let lines_in = pol_add(facs, terms, pols, pst, one, islide);
+        // the working set at the outer level is what the inner one touches per lap; a symbolic one
+        // forks, and a second condition is past this slice
+        let test_lines = pol_add(facs, terms, pols, pst, one, if pst[7] != 0 && isv < 1.0 { one } else { test_in });
+        let wsv = pol_as_f64(facs, terms, pols, pst, test_lines);
+        if pst[7] == 0 || wsv * 64.0 >= 2097152.0 {
+            wst[1] = 1;
+            return ck_zero(facs, terms, pols, pst, cks, budget, wst);
+        }
+        let mut lines = lines_in;
+        if s_out >= 64 || c_out == 0 {
+            if c_out != 0 { lines = pol_mul(facs, terms, pols, pst, lines_in, wst[32]); };
+        } else {
+            let raw_out = pol_scale(facs, terms, pols, pst, wst[32], s_out, 1);
+            let oslide = pol_div_atom(facs, terms, pols, pst, raw_out, 0);
+            lines = pol_add(facs, terms, pols, pst, lines_in, oslide);
+        }
+        let mv = pol_mul(facs, terms, pols, pst, lines, b);
+        return ck_one(cks, wst, mv);
+    }
+    if wst[11] == 2 {
+        wst[1] = 1;
+        return ck_zero(facs, terms, pols, pst, cks, budget, wst);
+    }
     if scattered || stride >= 64 {
         let nofit = pol_mul(facs, terms, pols, pst, trip, b);
         // A walk the compiler cannot follow **forks** (design §13): if the array fits in `M` every
@@ -2047,6 +2092,9 @@ fn m_stmt(src: &[u8], toks: &[Token], nodes: &[Node], types: &[Ty], strs: &[Str]
         let svar = wst[12];
         let strip = wst[13];
         let sbody = wst[22];
+        // the open loops, by depth: wst[30+d] the variable, wst[32+d] the trip, wst[34+d] the
+        // lower bound's node. A site's stride against an *outer* loop reads the inner loop's
+        // bound — `for i in ii*4 .. ii*4+4` moves `a[i]` by four elements a lap of `ii`.
         wst[11] = depth + 1;
         let mut acc = ck_zero(facs, terms, pols, pst, cks, budget, wst);
         if k == 92 {
@@ -2061,6 +2109,11 @@ fn m_stmt(src: &[u8], toks: &[Token], nodes: &[Node], types: &[Ty], strs: &[Str]
             wst[13] = pol_sub(facs, terms, pols, pst, hi, lo);
             wst[12] = nodes[n].a;
             wst[22] = nodes[n].d;
+            if depth < 2 {
+                wst[30 + depth] = nodes[n].a;
+                wst[32 + depth] = wst[13];
+                wst[34 + depth] = nodes[n].b;
+            };
             // the loop variable is bound to an atom, as it is in the work walk: a nested loop's
             // bound may name it, and `for j in i..4` is unbounded without it
             let atom = wst[2];
@@ -2083,6 +2136,11 @@ fn m_stmt(src: &[u8], toks: &[Token], nodes: &[Node], types: &[Ty], strs: &[Str]
             // move contiguously; one with an induction variable has that variable
             wst[12] = wst[15];
             wst[22] = nodes[n].c;
+            if depth < 2 {
+                wst[30 + depth] = wst[15];
+                wst[32 + depth] = t;
+                wst[34 + depth] = -1;
+            };
             let body = m_block(src, toks, nodes, types, strs, flds, ntys, sigs, ptys, fm, ffoot, facs, terms, pols, pst, env, cof, sites, cks, budget, resid, rargs, slay, wst, nodes[n].c);
             acc = ck_add(facs, terms, pols, pst, cks, budget, wst, a, b);
             acc = ck_add(facs, terms, pols, pst, cks, budget, wst, acc, body);
@@ -2199,7 +2257,7 @@ fn choose_layouts(src: &[u8], toks: &[Token], nodes: &[Node], types: &[Ty], strs
     let mut terms = [Term { fac: 0, n_fac: 0, cn: 0, cd: 0 }; 262144];
     let mut pols = [Pol { term: 0, n_term: 0 }; 262144];
     let mut logs = [-1; 1024];
-    let mut pst = [0, 0, 0, 0, 0, 0, 0];
+    let mut pst = [0, 0, 0, 0, 0, 0, 0, 0];
     let mut env = [Env { name: 0, val: 0, len: 0, root: 0 }; 4096];
     let mut cof = [Cof { name: 0, c: 0 }; 256];
     let mut sites = [Site { arr: 0, idx: 0, inloop: 0, coef: 0, stride: 0, bad: 0, trip: 0, branch: 0, novar: 0, field: -1 }; 4096];
@@ -2210,7 +2268,7 @@ fn choose_layouts(src: &[u8], toks: &[Token], nodes: &[Node], types: &[Ty], strs
     let mut scratch = [0; 64];
     let mut ffoot = [0; 65536];
     let mut fm = [-1; 4096];
-    let mut wst = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+    let mut wst = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
 
     let mut sid = 0;
     while sid < n_structs {

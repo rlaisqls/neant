@@ -168,6 +168,19 @@ fn mono_mul(facs: &mut [Fac], pst: &mut [i64], a: i64, na: i64, b: i64, nb: i64)
         }
         k += 1;
     }
+    // an exponent that cancelled to zero is not a factor: `B · B⁻¹` is 1, and leaving `B⁰` in the
+    // run makes two equal monomials compare unequal and prints `8·B⁰·n`
+    let mut w = start;
+    let mut r = start;
+    while r < pst[0] {
+        if facs[r].exp != 0 {
+            facs[w].atom = facs[r].atom;
+            facs[w].exp = facs[r].exp;
+            w += 1;
+        }
+        r += 1;
+    }
+    pst[0] = w;
     pst[3] = pst[0] - start;
     start
 }
@@ -518,4 +531,41 @@ fn pol_eval(facs: &[Fac], terms: &[Term], pols: &[Pol], pst: &mut [i64], p: i64,
         i += 1;
     }
     total
+}
+
+// the constant this polynomial is, as an `f64`, with `pst[7]` set when it is one. Unlike
+// `pol_as_int` this takes a rational: a slide of half a line is a perfectly ordinary answer and
+// has to be compared against one, not rejected for having a denominator.
+fn pol_as_f64(facs: &[Fac], terms: &[Term], pols: &[Pol], pst: &mut [i64], p: i64) -> f64 {
+    pst[7] = 1;
+    let mut v = 0.0;
+    let mut i = 0;
+    while i < pols[p].n_term {
+        let t = pols[p].term + i;
+        if terms[t].n_fac != 0 { pst[7] = 0; };
+        v = v + (terms[t].cn as f64) / (terms[t].cd as f64);
+        i += 1;
+    }
+    v
+}
+
+// `p` divided by an atom — every monomial gains that atom at exponent −1. The line count of a
+// walk is `t·s/B`, and it is divided by the *atom* `B` rather than by the machine's 64 so that
+// the `× B` which turns lines back into bytes cancels it exactly: `(n/4)·32/B · B` is `8·n`, not
+// `B·n/8`.
+fn pol_div_atom(facs: &mut [Fac], terms: &mut [Term], pols: &mut [Pol], pst: &mut [i64],
+                p: i64, atom: i64) -> i64 {
+    let start = pst[1];
+    let mut i = 0;
+    while i < pols[p].n_term {
+        let t = pols[p].term + i;
+        let f = mono_with(facs, pst, terms[t].fac, terms[t].n_fac, atom, 0 - 1);
+        terms[pst[1]].fac = f;
+        terms[pst[1]].n_fac = pst[3];
+        terms[pst[1]].cn = terms[t].cn;
+        terms[pst[1]].cd = terms[t].cd;
+        pst[1] = pst[1] + 1;
+        i += 1;
+    }
+    pol_close(facs, terms, pols, pst, start)
 }

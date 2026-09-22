@@ -51,7 +51,7 @@ const EXACT: usize = 72;
 /// **piecewise** — a scattered walk costs the array's footprint when it fits in `M` and a line per
 /// touch when it does not — and their two regimes and the condition between them are compared as
 /// one string, exactly as the single-piece ones are (design §13).
-const EXACT_MOVES: usize = 63;
+const EXACT_MOVES: usize = 64;
 
 
 

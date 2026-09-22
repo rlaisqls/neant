@@ -703,3 +703,25 @@ Rust's full generality would have to be reproduced rather than narrowed.
 Per-level lines first, and it alone finishes `tri.nt`'s `tiles` — the only one of the seven whose
 answer is a plain polynomial. Then `≈`, which is twenty lines of printing. Multi-condition regimes
 last, and only if the two before it do not already show the shape of what `matmul` needs.
+
+### Per-level lines, built
+
+`tri.nt`'s `tiles` comes out `8·n + 2·B`, exactly as §16 worked it by hand, and `moves` reaches 64.
+The loop state is now per depth — the variable, the trip, and the **lower bound's node** — because
+a site's stride against an *outer* loop is read from the inner loop's bound: `for i in ii*4 ..
+ii*4+4` moves `a[i]` four elements a lap of `ii`, and the coefficient chains through.
+
+Two things in the polynomial layer had to be right for the arithmetic to come out, and neither was:
+
+- **The slide divides by the atom `B`, not by the machine's 64.** Dividing by 64 gives `B·n/8`
+  where the answer is `8·n` — the `× B` that turns lines back into bytes has to cancel it. The
+  *test* (is the slide less than one line?) is still done at this machine's 64; only the value
+  carries the atom.
+- **A monomial must drop an exponent that cancelled to zero.** `B · B⁻¹` is 1, and leaving `B⁰` in
+  the run printed `8·B⁰·n` and, worse, made two equal monomials compare unequal. That is a bug in
+  `mono_mul` that nothing had reached before, because until now no polynomial here had ever had a
+  negative exponent to cancel.
+
+The nine that remain are `matmul`, `stencil` and `tri.nt`'s `pairs`, whose working sets are
+symbolic and fork on a second condition; the `main`s that call them; and the three `main`s where a
+callee under SoA leaves a **per-field** footprint resident, which this slice tracks per array.

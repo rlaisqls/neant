@@ -32,9 +32,9 @@ fn main() {
     let mut facs = [Fac { atom: 0, exp: 0 }; 262144];
     let mut terms = [Term { fac: 0, n_fac: 0, cn: 0, cd: 0 }; 262144];
     let mut pols = [Pol { term: 0, n_term: 0 }; 262144];
-    let mut pst = [0, 0, 0, 0, 0, 0, 0];
+    let mut pst = [0, 0, 0, 0, 0, 0, 0, 0];
     let mut env = [Env { name: 0, val: 0, len: 0, root: 0 }; 4096];
-    let mut wst = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+    let mut wst = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
     let mut sites = [Site { arr: 0, idx: 0, inloop: 0, coef: 0, stride: 0, bad: 0, trip: 0, branch: 0, novar: 0, field: -1 }; 4096];
     let mut fm = [-1; 4096];
     let mut cks = [Ck { fits: 0, nofit: 0, ws: 0 }; 65536];
