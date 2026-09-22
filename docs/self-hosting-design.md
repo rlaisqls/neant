@@ -137,7 +137,8 @@ the compiler cost, by its own tool" — is not yet taken.
 
 - **The parser, checker, IR and emitter** are not designed in this document — each is materially
   bigger than the lexer and should get its own pass at this design once the lexer's arena-of-
-  structs pattern has been built once and is known to work in practice, not just on paper.
+  structs pattern has been built once and is known to work in practice, not just on paper. The
+  parser has since had that pass: [self-hosting-parser-design.md](self-hosting-parser-design.md).
 - **The two-seed fixpoint in CI** (plan.md: the neant-in-neant compiler, compiled by
   `bootstrap/neant.c`, reproduces `bootstrap/neant.c` byte-for-byte or checked-equivalently) is the
   eventual exit condition for the whole effort, not this step's.
