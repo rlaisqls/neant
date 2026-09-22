@@ -64,6 +64,9 @@ pub struct FuncCost {
     /// What this line rests on besides the machine model: the declarations it composes,
     /// transitively — `labs (declared)`, `read (declared, measured over n = …)`.
     pub rests_on: Vec<String>,
+    /// For a function returning an owned array: how many elements, over this function's own size
+    /// atoms. A caller substitutes its argument sizes and knows what it was handed.
+    pub result_size: Option<Poly>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -339,7 +342,7 @@ impl<'a> Analyzer<'a> {
                     name: f.name.clone(),
                     names: param_names(f),
                     result: CostResult::Unknown { reason: "mutually recursive with another function; only self-recursion is solved".into(), line: f.line },
-                    bounds: vec![], notes: vec![], suggestions: vec![], effects: vec![], violations: vec![], tier: "unknown",
+                    bounds: vec![], notes: vec![], suggestions: vec![], effects: vec![], violations: vec![], tier: "unknown", result_size: None,
                     footprint: vec![], resident: None, declared: Declared::default(), rests_on: vec![],
                 });
             } else {
@@ -475,6 +478,10 @@ struct Fa<'a, 'b, 'c> {
     /// has. Two fields of one struct array are disjoint words, so they add; two references to
     /// the same field cover each other, so the larger stands.
     images: HashMap<(LocalId, Option<usize>), Poly>,
+    /// the size of the array this function returns, once the walk has seen it
+    result_size: Option<Poly>,
+    /// the size of the array the last call returned, for the `let` that binds it
+    last_result: Option<Poly>,
     /// A scalar that a statement of the enclosing block stores into, or loads from, an array
     /// element (`c[i·n + j] = acc`): inside that block the scalar *is* that element's running
     /// value, and a statement using it references the element. Register promotion does not
@@ -528,7 +535,7 @@ struct Fa<'a, 'b, 'c> {
 impl<'a, 'b, 'c> Fa<'a, 'b, 'c> {
     fn new(an: &'b mut Analyzer<'a>, f: &'c Func, self_fid: Option<FuncId>) -> Self {
         let mut fa = Fa {
-            an, f, names: param_names(f), sites: vec![], loop_recs: vec![], bounds: vec![], images: HashMap::new(), scalar_alias: HashMap::new(), alias_scopes: vec![], notes: vec![], io: false, self_fid, rec_calls: vec![],
+            an, f, names: param_names(f), sites: vec![], loop_recs: vec![], bounds: vec![], images: HashMap::new(), result_size: None, last_result: None, scalar_alias: HashMap::new(), alias_scopes: vec![], notes: vec![], io: false, self_fid, rec_calls: vec![],
             local_size: HashMap::new(), local_affine: HashMap::new(), initial: HashMap::new(), at_entry: false,
             loops: vec![], work: Cost::zero(), moves: Cost::zero(), saved: vec![], branch: vec![], next_if: 0,
             local_root: HashMap::new(), resident: vec![], call_moves: Cost::zero(), saved_calls: vec![], replay: false, has_call: vec![], rests_on: vec![],
@@ -575,10 +582,16 @@ impl<'a, 'b, 'c> Fa<'a, 'b, 'c> {
                 _ if effects.contains(&"unbounded") => CostResult::Unknown { reason: "declared unbounded".into(), line: self.f.line },
                 _ => CostResult::Unknown { reason: "an extern needs `#[cost(work_at_most = …, moves_at_most = …)]` or `uses unbounded`".into(), line: self.f.line },
             };
-            return FuncCost { name: self.f.name.clone(), names: self.names, result, bounds: vec![], notes: vec![], suggestions: vec![], effects, violations, tier: "declared", footprint: vec![], resident: None, declared, rests_on: vec![] };
+            return FuncCost { name: self.f.name.clone(), names: self.names, result, bounds: vec![], notes: vec![], suggestions: vec![], effects, violations, tier: "declared", footprint: vec![], resident: None, declared, rests_on: vec![], result_size: self.result_size.clone() };
         };
         let mut tier = "exact";
         let walked = self.block(body);
+        // what this function hands back, if it hands back an array
+        if matches!(self.f.ret, Ty::Array(..)) {
+            let returned = body.tail.as_ref().map(|t| &t.kind)
+                .or_else(|| body.stmts.iter().rev().find_map(|s| match s { Stmt::Return(Some(e)) => Some(&e.kind), _ => None }));
+            if let Some(ExprKind::Local(l)) = returned { self.result_size = self.local_size.get(l).cloned(); }
+        }
         let (footprint, resident) = self.signature_footprint();
         let result = match walked {
             Ok(()) => {
@@ -651,7 +664,7 @@ impl<'a, 'b, 'c> Fa<'a, 'b, 'c> {
             self.bounds.push(Bound { kind: "footprint".into(), citation: "every distinct element crosses once".into(), moves: foot, line: self.f.line, cold: true });
         }
         bounds::strongest_first(&mut self.bounds, &m);
-        FuncCost { name: self.f.name.clone(), names: self.names, result, bounds: self.bounds, notes: self.notes, suggestions: vec![], effects, violations, tier, footprint, resident, declared, rests_on: self.rests_on }
+        FuncCost { name: self.f.name.clone(), names: self.names, result, bounds: self.bounds, notes: self.notes, suggestions: vec![], effects, violations, tier, footprint, resident, declared, rests_on: self.rests_on, result_size: self.result_size.clone() }
     }
 
     /// The byte range one access site covers over its loop nest, from its affine index and the
@@ -1474,6 +1487,13 @@ impl<'a, 'b, 'c> Fa<'a, 'b, 'c> {
                 self.expr(e)?;
                 let l = &self.f.locals[*id];
                 if l.ty.is_arrayish() {
+                    if matches!(e.kind, ExprKind::Call(..)) {
+                        // an owned array handed back by a call: the caller owns it, and its size
+                        // is the callee's, in the caller's atoms
+                        if let Some(sz) = self.last_result.take() { self.local_size.insert(*id, sz); }
+                        self.local_root.insert(*id, *id);
+                        return Ok(());
+                    }
                     let src = match &e.kind { ExprKind::Ref(s, _) | ExprKind::Local(s) => Some(*s), _ => None };
                     if let Some(sz) = src.and_then(|s| self.local_size.get(&s).cloned()) {
                         self.local_size.insert(*id, sz);
@@ -1895,6 +1915,7 @@ impl<'a, 'b, 'c> Fa<'a, 'b, 'c> {
                 }
                 w = w.subst_many(&map);
                 mv = mv.subst_many(&map);
+                self.last_result = callee.result_size.as_ref().map(|p| p.subst_many(&map));
                 // the callee's footprint in this function's arrays (none is known of a declared callee)
                 let feet: Vec<(LocalId, Poly, Poly, bool)> = callee.footprint.iter().filter(|_| !declared_only).filter_map(|f| {
                     let root = roots.get(f.param).copied().flatten()?;

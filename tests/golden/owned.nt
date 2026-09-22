@@ -1,0 +1,16 @@
+fn doubled(xs: &[f64]) -> [f64] {
+    let ys = [2.0 * x for x in xs];
+    ys
+}
+
+fn sum_doubled(a: &[f64]) -> f64 {
+    let ys = doubled(a);
+    let mut s = 0.0;
+    for i in 0..ys.len() { s += ys[i]; }
+    s
+}
+
+fn main() {
+    let a = [1.0, 2.0, 3.0, 4.0];
+    println(sum_doubled(&a));
+}

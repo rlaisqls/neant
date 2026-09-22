@@ -43,6 +43,7 @@ pub fn emit(m: &Module, opts: &Options) -> String {
     let mut e = Emitter { m, f: None, opts, out: String::new(), indent: 0, tmp: 0 };
     e.prelude();
     e.structs();
+    e.arr_returns();
     for f in &m.funcs {
         e.f = Some(f);
         e.prototype(f);
@@ -55,6 +56,12 @@ pub fn emit(m: &Module, opts: &Options) -> String {
     }
     e.out.push_str("int main(void) { nt_main(); return 0; }\n");
     e.out
+}
+
+/// The C type a function returns: a scalar, `void`, or the pointer-and-length struct of an
+/// owned array.
+fn c_ret(m: &Module, t: &Ty) -> String {
+    match t { Ty::Array(e, _) => format!("struct nt_arr_{}", c_ty(m, e).replace(' ', "_")), t => c_ty(m, t) }
 }
 
 fn c_ty(m: &Module, t: &Ty) -> String {
@@ -122,6 +129,20 @@ static void nt_println_f64(double v) {
 "#);
     }
 
+    /// One C struct per element type returned as an owned array: the pointer and the length,
+    /// which is what an array is in this compiler.
+    fn arr_returns(&mut self) {
+        let mut seen: Vec<String> = Vec::new();
+        for f in &self.m.funcs {
+            let Ty::Array(e, _) = &f.ret else { continue };
+            let c = c_ty(self.m, e);
+            if seen.contains(&c) { continue; }
+            seen.push(c.clone());
+            let _ = writeln!(self.out, "struct nt_arr_{} {{ {c} *p; int64_t n; }};", c.replace(' ', "_"));
+        }
+        if !seen.is_empty() { self.out.push('\n'); }
+    }
+
     /// One C struct per struct type, in declaration order; fields in declaration order, so the
     /// layout is C's and `Module::size_of` describes it.
     fn structs(&mut self) {
@@ -165,7 +186,7 @@ static void nt_println_f64(double v) {
     }
 
     fn prototype(&mut self, f: &Func) {
-        let ret = c_ty(self.m, &f.ret);
+        let ret = c_ret(self.m, &f.ret);
         // an extern names the C symbol itself; our own functions are prefixed and static
         if f.body.is_none() { let _ = write!(self.out, "{ret} {}(", f.name); }
         else { let _ = write!(self.out, "static {ret} nt_{}(", f.name); }
@@ -217,7 +238,7 @@ static void nt_println_f64(double v) {
         if let Some(t) = &b.tail {
             match target {
                 Target::Return => {
-                    let v = self.expr(t).scalar();
+                    let v = self.ret_val(t);
                     self.line(&format!("return {v};"));
                 }
                 Target::Assign(ref name) => {
@@ -236,6 +257,14 @@ static void nt_println_f64(double v) {
             Stmt::Let(id, e) => {
                 let nm = self.local_name(*id);
                 let ty = self.f.unwrap().locals[*id].ty.clone();
+                if matches!(ty, Ty::Array(..)) && matches!(e.kind, ExprKind::Call(..)) {
+                    let v = self.expr(e).scalar();
+                    let t = self.fresh("a");
+                    self.line(&format!("{} {t} = {v};", c_ret(self.m, &ty)));
+                    self.line(&format!("{} *{nm}_p = {t}.p;", c_ty(self.m, &ty)));
+                    self.line(&format!("int64_t {nm}_n = {t}.n;"));
+                    return;
+                }
                 match self.expr(e) {
                     CVal::Scalar(v) => self.line(&format!("{} {nm} = {v};", c_ty(self.m, &ty))),
                     v => {
@@ -369,7 +398,7 @@ static void nt_println_f64(double v) {
             Stmt::Expr(e) => self.expr_stmt(e),
             Stmt::Return(None) => self.line("return;"),
             Stmt::Return(Some(e)) => {
-                let v = self.expr(e).scalar();
+                let v = self.ret_val(e);
                 self.line(&format!("return {v};"));
             }
         }
@@ -549,6 +578,15 @@ static void nt_println_f64(double v) {
                     }
                 }))
             }
+        }
+    }
+
+    /// The C expression a `return` yields: an array becomes its pointer and length in a struct.
+    fn ret_val(&mut self, e: &Expr) -> String {
+        let ty = e.ty.clone();
+        match self.expr(e) {
+            CVal::Arr(p, n) => format!("(({}){{ .p = {p}, .n = {n} }})", c_ret(self.m, &ty)),
+            v => v.scalar(),
         }
     }
 

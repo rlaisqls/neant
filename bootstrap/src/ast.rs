@@ -48,6 +48,8 @@ pub enum TypeExpr {
     Array(Box<TypeExpr>, Box<Expr>),
     /// `&[T]` / `&mut [T]`
     Slice(Box<TypeExpr>, bool),
+    /// `[T]` as a return type: an owned array, whose size the callee's signature carries
+    Owned(Box<TypeExpr>),
 }
 
 #[derive(Debug, Clone)]

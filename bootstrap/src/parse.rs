@@ -174,6 +174,7 @@ impl Parser {
             Tok::LBracket => {
                 self.next();
                 let elem = self.type_expr()?;
+                if self.eat(&Tok::RBracket) { return Ok(TypeExpr::Owned(Box::new(elem))); }
                 self.expect(Tok::Semi, "`;` in array type")?;
                 let n = self.expr()?;
                 self.expect(Tok::RBracket, "`]`")?;

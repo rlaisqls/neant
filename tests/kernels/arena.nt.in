@@ -1,0 +1,29 @@
+// a pointer chase over an arena: the links are indices, and they are a full-period LCG
+// permutation of 0..n, so the walk visits every node once in an order the prefetcher cannot
+// guess. The model says the walk costs the arena where the arena fits the cache, and a line per
+// step where it does not.
+struct Node { val: i64, next: i64 }
+
+fn walk(nodes: &[Node], head: i64) -> i64 {
+    let mut i = head;
+    let mut s = 0;
+    for k in 0..nodes.len() {
+        s += nodes[i].val;
+        i = nodes[i].next;
+    }
+    s
+}
+
+fn main() {
+    let n = @N@;
+    let mut ns = [Node { val: 1, next: 0 }; n];
+    for k in 0..n {
+        ns[k].val = k;
+        ns[k].next = (k * 1103515245 + 12345) % n;
+    }
+    let mut t = 0;
+    for r in 0..@R@ {
+        t += walk(&ns, 0);
+    }
+    println(t);
+}

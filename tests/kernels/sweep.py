@@ -44,6 +44,10 @@ SWEEP = {
     # layout bought nothing.
     "struct_aos": ([200_000, 800_000, 3_200_000], 5),
     "struct_soa": ([200_000, 800_000, 3_200_000], 5),
+    # the region rule: a pointer chase over an arena, at sizes on both sides of L2 (a 16-byte
+    # node, so the arena fits below n = 131072). Predicted: the arena once where it fits, a line
+    # per step where it does not.
+    "arena": ([16_384, 65_536, 262_144, 1_048_576, 4_194_304], 3),
 }
 
 def run(cmd, **kw):

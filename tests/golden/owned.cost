@@ -1,0 +1,6 @@
+doubled          work 5·xs.len()                   moves 16·xs.len() + B              exact
+                 lower bound      moves 8·xs.len()                   (footprint, every distinct element crosses once)   gap 2× at M = 2 MiB, B = 64
+                 footprint        xs: [0, 8·xs.len())   resident after if 8·xs.len() < M
+sum_doubled      work 9·a.len() + 2                moves 24·a.len() + 2·B             exact
+                 lower bound      moves 8·a.len()                    (footprint, every distinct element crosses once)   gap 3× at M = 2 MiB, B = 64
+main             work 45                           moves 2·B + 128                    exact, io

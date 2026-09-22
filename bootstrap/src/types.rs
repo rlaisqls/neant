@@ -46,8 +46,8 @@ pub fn check(prog: &ast::Program) -> Result<Module> {
             }
         }
         let ret = resolve_type(&f.ret, &struct_ids, f.line, f.col)?;
-        if ret.is_arrayish() {
-            return err(f.line, f.col, "functions return scalars or `()` for now; write into an `&mut [T]` parameter");
+        if matches!(ret, Ty::Slice(..)) {
+            return err(f.line, f.col, "a function returns a value, not a view: write `[T]` for an owned array");
         }
         sigs.insert(f.name.clone(), (i, ptys, ret));
     }
@@ -89,6 +89,11 @@ fn resolve_type(t: &ast::TypeExpr, structs: &HashMap<String, StructId>, line: u3
                 return err(line, col, "element type of a slice must be a scalar or a struct");
             }
             Ty::Slice(Box::new(e), *m, Size::Const(-1))
+        }
+        ast::TypeExpr::Owned(elem) => {
+            let e = resolve_type(elem, structs, line, col)?;
+            if !e.is_scalar() { return err(line, col, "an owned array is returned by value; its elements are scalars for now"); }
+            Ty::Array(Box::new(e), Size::Const(-1))
         }
         ast::TypeExpr::Array(elem, n) => {
             let e = resolve_type(elem, structs, line, col)?;
@@ -159,7 +164,18 @@ fn check_func(f: &ast::Func, sigs: &HashMap<String, (FuncId, Vec<Ty>, Ty)>, stru
             return err(t.line, 0, format!("`{}` returns `{ret}`, but its body has type `{}`", f.name, t.ty));
         }
     }
-    Ok(Func { name: f.name.clone(), params, ret: ret.clone(), locals: cx.locals, sizes: cx.sizes, body: Some(body), uses: vec![], asserts: f.asserts.clone(), line: f.line })
+    // an owned array return carries the size of what is actually returned, so a caller can cost
+    // its loops over the result
+    let mut ret = ret.clone();
+    if let Ty::Array(_, _) = &ret {
+        let returned = body.tail.as_ref().map(|t| t.ty.clone())
+            .or_else(|| body.stmts.iter().rev().find_map(|s| match s { Stmt::Return(Some(e)) => Some(e.ty.clone()), _ => None }));
+        match returned {
+            Some(Ty::Array(e, sz)) => ret = Ty::Array(e, sz),
+            _ => return err(f.line, 0, format!("`{}` returns an owned array, but its body does not end in one", f.name)),
+        }
+    }
+    Ok(Func { name: f.name.clone(), params, ret, locals: cx.locals, sizes: cx.sizes, body: Some(body), uses: vec![], asserts: f.asserts.clone(), line: f.line })
 }
 
 fn ends_in_return(b: &Block) -> bool {
@@ -205,8 +221,8 @@ impl<'a> Ctx<'a> {
             Some(t) => t.ty.clone(),
             None => Ty::Unit,
         };
-        if ty.is_arrayish() {
-            return err(b.line, b.col, "a block cannot have an array value for now");
+        if matches!(ty, Ty::Slice(..)) {
+            return err(b.line, b.col, "a block cannot have a view as its value");
         }
         Ok(Block { stmts, tail, ty })
     }
@@ -306,6 +322,18 @@ impl<'a> Ctx<'a> {
                     }
                     _ => {
                         let ce = self.expr(init)?;
+                        // a call that returns an owned array: the caller owns it, under a size of
+                        // its own named after the call
+                        if let (Ty::Array(elem, _), ExprKind::Call(fid, _)) = (&ce.ty, &ce.kind) {
+                            let nm = format!("{name}.len()");
+                            let sv = self.new_size(nm);
+                            let ty = Ty::Array(elem.clone(), Size::Var(sv));
+                            self.check_declared(&declared, &ty, *line, *col)?;
+                            let id = self.declare(name, ty, *mutable);
+                            self.root.insert(id, id);
+                            let _ = fid;
+                            return Ok(Stmt::Let(id, ce));
+                        }
                         if let Ty::Array(..) = ce.ty {
                             return err(init.line, init.col, "an array cannot be moved into another variable; take a view with `&`");
                         }
@@ -454,6 +482,9 @@ impl<'a> Ctx<'a> {
                     None => None,
                 };
                 let ty = ce.as_ref().map_or(Ty::Unit, |e| e.ty.clone());
+                if let (Ty::Array(a, _), Ty::Array(b, _)) = (&ty, &self.ret) {
+                    if a == b { return Ok(Stmt::Return(ce)); }
+                }
                 if !ty.same_shape(&self.ret) {
                     return err(*line, *col, format!("returning `{ty}` from a function that returns `{}`", self.ret));
                 }
