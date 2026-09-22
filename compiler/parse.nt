@@ -13,12 +13,12 @@
 //
 // Node kinds (design §2), disjoint from lex.nt's 0-57 so a mix-up is loud:
 //   60 Int  61 Float  62 Bool  63 Byte  64 Bytes  65 Var  66 Binary  67 Unary  68 Index
-//   69 Field  73 Ref  74 Cast  75 If  76 Block
+//   69 Field  72 Len (`.len()`)  73 Ref  74 Cast  75 If  76 Block  78 ArrayRepeat (`[e; n]`)
 //   90 Let  91 Assign  92 For  93 While  94 Break  95 ExprStmt  96 Return
 //   100 TyNamed  101 TyUnit  102 TyArray  103 TySlice  104 TyOwned
 //   110 Func  111 Param  112 StructDef  113 FieldDef  114 FieldInit  70 StructLit
 //   115 a struct-name marker, laid down before parsing and never part of the tree
-// Out of this slice, by design §6: MethodCall/chains(72), ArrayLit(77), ArrayRepeat(78),
+// Out of this slice, by design §6: MethodCall/chains other than `.len()`, ArrayLit(77),
 // Lambda(79), Comprehension(80), `extern` and attributes. Structs were added afterwards, the
 // first widening of the slice (docs/self-hosting-structs.md).
 //
@@ -290,10 +290,20 @@ fn postfix_level(src: &[u8], toks: &[Token], n_toks: i64, st: &mut [i64], nodes:
         } else if k == 33 {
             bump(st);
             let name = expect(toks, st, 0);
-            // `.name(` is a method call or a chain stage: out of this slice (design §6)
+            // `.name(` is a method call or a chain stage: out of this slice (design §6), with
+            // `.len()` carved out by name and by shape — the only one the compiler's own source
+            // uses (arrays design §2). `.count()` is still "a method call or chain".
             if toks[st[0]].kind == 23 {
-                st[2] = 1;
-                going = false;
+                if name_is_len(src, toks, name) && toks[st[0] + 1].kind == 24 {
+                    bump(st);
+                    bump(st);
+                    let n = alloc(nodes, st, 72);
+                    nodes[n].a = e;
+                    e = n;
+                } else {
+                    st[2] = 1;
+                    going = false;
+                }
             } else {
                 let n = alloc(nodes, st, 69);
                 nodes[n].a = e;
@@ -305,6 +315,11 @@ fn postfix_level(src: &[u8], toks: &[Token], n_toks: i64, st: &mut [i64], nodes:
         }
     }
     e
+}
+
+fn name_is_len(src: &[u8], toks: &[Token], t: i64) -> bool {
+    toks[t].len == 3 && src[toks[t].start] == b'l' && src[toks[t].start + 1] == b'e'
+        && src[toks[t].start + 2] == b'n'
 }
 
 fn primary(src: &[u8], toks: &[Token], n_toks: i64, st: &mut [i64], nodes: &mut [Node]) -> i64 {
@@ -332,6 +347,17 @@ fn primary(src: &[u8], toks: &[Token], n_toks: i64, st: &mut [i64], nodes: &mut 
         let t = bump(st);
         let n = alloc(nodes, st, 64);
         nodes[n].a = t;
+        return n;
+    }
+    if k == 25 {
+        // `[e; n]` only, and only the repeat form: a brace list is out (arrays design §3). The
+        // language already restricts either to a `let` initialiser, which is checked there.
+        bump(st);
+        let n = alloc(nodes, st, 78);
+        nodes[n].a = expr(src, toks, n_toks, st, nodes);
+        expect(toks, st, 30);
+        nodes[n].b = expr(src, toks, n_toks, st, nodes);
+        expect(toks, st, 26);
         return n;
     }
     if k == 14 || k == 15 {

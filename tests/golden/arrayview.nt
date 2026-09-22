@@ -1,0 +1,55 @@
+// arrays through the whole chain: a byte string and a repeat, `.len()`, indexing, and the same
+// array passed as `&[T]` and as `&mut [T]`. `words.nt` covers bytes; this one covers `[e; n]`,
+// an array of structs, and whole-array reassignment in one place.
+struct Cell { v: i64, tag: u8 }
+
+fn total(xs: &[i64]) -> i64 {
+    let mut t = 0;
+    for i in 0..xs.len() {
+        t += xs[i];
+    }
+    t
+}
+
+fn scale(xs: &mut [i64], k: i64) {
+    for i in 0..xs.len() {
+        xs[i] *= k;
+    }
+}
+
+fn tagged(cs: &[Cell]) -> i64 {
+    let mut n = 0;
+    for i in 0..cs.len() {
+        if cs[i].tag == b'y' {
+            n += cs[i].v;
+        }
+    }
+    n
+}
+
+fn main() {
+    let n = 5;
+    let mut xs = [3; n];
+    xs[0] = 10;
+    xs[4] = 1;
+    println(xs.len());
+    println(total(&xs));
+    scale(&mut xs, 2);
+    println(total(&xs));
+
+    // the same size atom, so the whole array may be reassigned
+    let ys = [7; n];
+    xs = ys;
+    println(total(&xs));
+
+    let mut cs = [Cell { v: 0, tag: b'n' }; 3];
+    cs[0].v = 4;
+    cs[0].tag = b'y';
+    cs[2].v = 6;
+    cs[2].tag = b'y';
+    println(tagged(&cs));
+
+    let s = b"hello";
+    println(s.len());
+    println(s[1]);
+}

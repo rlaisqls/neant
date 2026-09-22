@@ -71,6 +71,9 @@ fn emit_type(out: &mut [u8], est: &mut [i64], src: &[u8], toks: &[Token], types:
         emit_bytes(out, est, &s);
         emit_span(out, est, src, toks, strs[types[t].elem].name);
     }
+    // an array or a view is two C variables, `x_p` and `x_n` (arrays design §1); the type written
+    // here is the element's, and the caller adds the `*`
+    else if k == 5 || k == 6 { emit_type(out, est, src, toks, types, strs, types[t].elem); }
     else { let s = b"void"; emit_bytes(out, est, &s); }
 }
 
@@ -98,6 +101,28 @@ fn emit_tmp_name(out: &mut [u8], est: &mut [i64], k: i64) {
     emit_int(out, est, k);
 }
 
+// the source line a token is on — only the bounds check wants it, and only once per index, so
+// counting newlines from the start of the file is not worth avoiding
+fn line_of(out: &mut [u8], est: &mut [i64], src: &[u8], toks: &[Token], t: i64) {
+    let mut line = 1;
+    let mut i = 0;
+    while i < toks[t].start {
+        if src[i] == b'\n' { line += 1; };
+        i += 1;
+    }
+    emit_int(out, est, line);
+}
+
+fn emit_arr_name(out: &mut [u8], est: &mut [i64], src: &[u8], toks: &[Token], t: i64, suffix: u8) {
+    emit_span(out, est, src, toks, t);
+    emit_b(out, est, b'_');
+    emit_b(out, est, suffix);
+}
+
+fn is_arr(types: &[Ty], t: i64) -> bool {
+    t >= 0 && (types[t].kind == 5 || types[t].kind == 6)
+}
+
 // ---- expressions ----
 
 fn emit_expr(out: &mut [u8], est: &mut [i64], src: &[u8], toks: &[Token], nodes: &[Node],
@@ -117,7 +142,40 @@ fn emit_expr(out: &mut [u8], est: &mut [i64], src: &[u8], toks: &[Token], nodes:
         emit_int(out, est, toks[nodes[n].a].ival);
         emit_b(out, est, b')');
     } else if k == 65 {
-        emit_span(out, est, src, toks, nodes[n].a);
+        // a variable of array or view type is its two names — which is what passing a `&[T]`
+        // parameter straight on to another function needs, and the only place a bare array name
+        // appears in an expression at all
+        if is_arr(types, ntys[n]) {
+            emit_arr_name(out, est, src, toks, nodes[n].a, b'p');
+            let c = b", ";
+            emit_bytes(out, est, &c);
+            emit_arr_name(out, est, src, toks, nodes[n].a, b'n');
+        } else {
+            emit_span(out, est, src, toks, nodes[n].a);
+        }
+    } else if k == 68 {
+        // `xs[i]` is `xs_p[nt_idx(i, xs_n, line)]`: the checker has already refused a base that is
+        // not a variable, so the name is there to take
+        let base = nodes[nodes[n].a].a;
+        emit_arr_name(out, est, src, toks, base, b'p');
+        let o = b"[nt_idx(";
+        emit_bytes(out, est, &o);
+        emit_expr(out, est, src, toks, nodes, types, strs, ntys, nodes[n].b);
+        let c = b", ";
+        emit_bytes(out, est, &c);
+        emit_arr_name(out, est, src, toks, base, b'n');
+        emit_bytes(out, est, &c);
+        line_of(out, est, src, toks, base);
+        let e = b")]";
+        emit_bytes(out, est, &e);
+    } else if k == 72 {
+        emit_arr_name(out, est, src, toks, nodes[nodes[n].a].a, b'n');
+    } else if k == 73 {
+        // `&xs` and `&mut xs` are *two* arguments, the pointer and the length
+        emit_arr_name(out, est, src, toks, nodes[nodes[n].a].a, b'p');
+        let c = b", ";
+        emit_bytes(out, est, &c);
+        emit_arr_name(out, est, src, toks, nodes[nodes[n].a].a, b'n');
     } else if k == 66 {
         // a `u8` arithmetic result is truncated back to `u8`, as the Rust emitter truncates it
         let narrow = ntys[n] >= 0 && types[ntys[n]].kind == 3 && nodes[n].ival <= 4;
@@ -286,6 +344,103 @@ fn emit_if(out: &mut [u8], est: &mut [i64], src: &[u8], toks: &[Token], nodes: &
     };
 }
 
+// `let xs = <array>`: the two names, from the two forms the slice takes (arrays design §3). A
+// byte string becomes a C string literal, which is both shorter than a brace list and the thing C
+// is good at; `[e; n]` becomes `nt_alloc` and a fill loop, as it does in the Rust emitter.
+fn emit_let_array(out: &mut [u8], est: &mut [i64], src: &[u8], toks: &[Token], nodes: &[Node],
+                  types: &[Ty], strs: &[Str], ntys: &[i64], n: i64) {
+    let name = nodes[n].a;
+    let init = nodes[n].c;
+    let t = ntys[init];
+    if nodes[init].kind == 64 {
+        // `let mut s = b"…"` is written to, so it cannot live in `.rodata`: a mutable binding gets
+        // an automatic array, which C initialises from the literal on every entry. An immutable
+        // one keeps the `static const` that a string literal wants to be.
+        let is_mut = nodes[n].ival == 1;
+        if is_mut { let m = b"uint8_t "; emit_bytes(out, est, &m); }
+        else { let c = b"static const uint8_t "; emit_bytes(out, est, &c); };
+        emit_arr_name(out, est, src, toks, name, b'b');
+        let s2 = b"[] = \"";
+        emit_bytes(out, est, &s2);
+        emit_span(out, est, src, toks, nodes[init].a);
+        let q = b"\"; ";
+        emit_bytes(out, est, &q);
+        if is_mut { let m = b"uint8_t *"; emit_bytes(out, est, &m); }
+        else { let c = b"const uint8_t *"; emit_bytes(out, est, &c); };
+        emit_arr_name(out, est, src, toks, name, b'p');
+        let eq = b" = ";
+        emit_bytes(out, est, &eq);
+        emit_arr_name(out, est, src, toks, name, b'b');
+        let s4 = b"; int64_t ";
+        emit_bytes(out, est, &s4);
+        emit_arr_name(out, est, src, toks, name, b'n');
+        emit_bytes(out, est, &eq);
+        // the length is the span's, not `strlen`'s: `lex.nt` does not decode escapes inside
+        // `b"…"`, so a `\n` in the source is two bytes of span and one byte of C string, and only
+        // the C compiler knows which. `sizeof` of the array, minus its terminator, is that answer.
+        let s5 = b"(int64_t)(sizeof(";
+        emit_bytes(out, est, &s5);
+        emit_arr_name(out, est, src, toks, name, b'b');
+        let s6 = b") - 1);";
+        emit_bytes(out, est, &s6);
+        return;
+    }
+    let nm = b"int64_t ";
+    emit_bytes(out, est, &nm);
+    emit_arr_name(out, est, src, toks, name, b'n');
+    let eq = b" = ";
+    emit_bytes(out, est, &eq);
+    emit_expr(out, est, src, toks, nodes, types, strs, ntys, nodes[init].b);
+    let semi = b"; ";
+    emit_bytes(out, est, &semi);
+    emit_type(out, est, src, toks, types, strs, t);
+    let star = b" *";
+    emit_bytes(out, est, &star);
+    emit_arr_name(out, est, src, toks, name, b'p');
+    let al = b" = nt_alloc(";
+    emit_bytes(out, est, &al);
+    emit_arr_name(out, est, src, toks, name, b'n');
+    let sz = b", sizeof(";
+    emit_bytes(out, est, &sz);
+    emit_type(out, est, src, toks, types, strs, t);
+    let close = b")); ";
+    emit_bytes(out, est, &close);
+    // the fill: the element is evaluated once, as `[e; n]` says it is
+    let k = est[1];
+    est[1] = k + 1;
+    let ob = b"{ ";
+    emit_bytes(out, est, &ob);
+    emit_type(out, est, src, toks, types, strs, t);
+    emit_b(out, est, b' ');
+    emit_tmp_name(out, est, k);
+    emit_bytes(out, est, &eq);
+    emit_expr(out, est, src, toks, nodes, types, strs, ntys, nodes[init].a);
+    emit_bytes(out, est, &semi);
+    let f1 = b"for (int64_t nt_i";
+    emit_bytes(out, est, &f1);
+    emit_int(out, est, k);
+    let f2 = b" = 0; nt_i";
+    emit_bytes(out, est, &f2);
+    emit_int(out, est, k);
+    let f3 = b" < ";
+    emit_bytes(out, est, &f3);
+    emit_arr_name(out, est, src, toks, name, b'n');
+    let f4 = b"; nt_i";
+    emit_bytes(out, est, &f4);
+    emit_int(out, est, k);
+    let f5 = b"++) ";
+    emit_bytes(out, est, &f5);
+    emit_arr_name(out, est, src, toks, name, b'p');
+    let f6 = b"[nt_i";
+    emit_bytes(out, est, &f6);
+    emit_int(out, est, k);
+    let f7 = b"] = ";
+    emit_bytes(out, est, &f7);
+    emit_tmp_name(out, est, k);
+    let f8 = b"; }";
+    emit_bytes(out, est, &f8);
+}
+
 // ---- statements ----
 
 // `{ … }`: the statements, then the tail, assigned to `target` when the block has a value
@@ -316,7 +471,12 @@ fn emit_stmt(out: &mut [u8], est: &mut [i64], src: &[u8], toks: &[Token], nodes:
              types: &[Ty], strs: &[Str], ntys: &[i64], n: i64) {
     let k = nodes[n].kind;
     if k == 90 {
-        emit_type(out, est, src, toks, types, strs, ntys[nodes[n].c]);
+        let t = ntys[nodes[n].c];
+        if is_arr(types, t) {
+            emit_let_array(out, est, src, toks, nodes, types, strs, ntys, n);
+            return;
+        }
+        emit_type(out, est, src, toks, types, strs, t);
         emit_b(out, est, b' ');
         emit_span(out, est, src, toks, nodes[n].a);
         let eq = b" = ";
@@ -324,6 +484,22 @@ fn emit_stmt(out: &mut [u8], est: &mut [i64], src: &[u8], toks: &[Token], nodes:
         emit_expr(out, est, src, toks, nodes, types, strs, ntys, nodes[n].c);
         emit_b(out, est, b';');
     } else if k == 91 {
+        // `ys = xs` on whole arrays moves both names; the checker has already agreed the sizes do
+        if nodes[nodes[n].a].kind == 65 && nodes[nodes[n].b].kind == 65 && is_arr(types, ntys[nodes[n].a]) {
+            let l = nodes[nodes[n].a].a;
+            let r = nodes[nodes[n].b].a;
+            emit_arr_name(out, est, src, toks, l, b'p');
+            let eq = b" = ";
+            emit_bytes(out, est, &eq);
+            emit_arr_name(out, est, src, toks, r, b'p');
+            let semi = b"; ";
+            emit_bytes(out, est, &semi);
+            emit_arr_name(out, est, src, toks, l, b'n');
+            emit_bytes(out, est, &eq);
+            emit_arr_name(out, est, src, toks, r, b'n');
+            emit_b(out, est, b';');
+            return;
+        }
         emit_expr(out, est, src, toks, nodes, types, strs, ntys, nodes[n].a);
         emit_b(out, est, b' ');
         if nodes[n].ival >= 0 { emit_op(out, est, nodes[n].ival); };
@@ -405,9 +581,22 @@ fn emit_signature(out: &mut [u8], est: &mut [i64], src: &[u8], toks: &[Token], n
     let mut k = 0;
     if p < 0 { let v = b"void"; emit_bytes(out, est, &v); };
     while p >= 0 {
-        emit_type(out, est, src, toks, types, strs, ptys[sigs[si].params + k]);
-        emit_b(out, est, b' ');
-        emit_span(out, est, src, toks, nodes[p].a);
+        let pt = ptys[sigs[si].params + k];
+        if is_arr(types, pt) {
+            // two C parameters, and `const` when the view does not allow writing
+            if types[pt].kind == 6 && types[pt].mutable == 0 { let c = b"const "; emit_bytes(out, est, &c); };
+            emit_type(out, est, src, toks, types, strs, pt);
+            let star = b" *";
+            emit_bytes(out, est, &star);
+            emit_arr_name(out, est, src, toks, nodes[p].a, b'p');
+            let ln = b", int64_t ";
+            emit_bytes(out, est, &ln);
+            emit_arr_name(out, est, src, toks, nodes[p].a, b'n');
+        } else {
+            emit_type(out, est, src, toks, types, strs, pt);
+            emit_b(out, est, b' ');
+            emit_span(out, est, src, toks, nodes[p].a);
+        }
         k += 1;
         p = nodes[p].next;
         if p >= 0 { let s = b", "; emit_bytes(out, est, &s); };
@@ -485,6 +674,8 @@ fn emit_program(out: &mut [u8], est: &mut [i64], src: &[u8], toks: &[Token], nod
     emit_bytes(out, est, &p2);
     let p3 = b"static void nt_println_f64(double v) {\n    char buf[400];\n    if (v != v) { puts(\"NaN\"); return; }\n    if (v == 1.0 / 0.0) { puts(\"inf\"); return; }\n    if (v == -1.0 / 0.0) { puts(\"-inf\"); return; }\n    int prec = 0;\n    for (; prec < 17; prec++) {\n        snprintf(buf, sizeof buf, \"%.*e\", prec, v);\n        if (strtod(buf, NULL) == v) break;\n    }\n    int exp10 = atoi(strchr(buf, 'e') + 1);\n    int decimals = prec - exp10;\n    if (decimals < 0) decimals = 0;\n    snprintf(buf, sizeof buf, \"%.*f\", decimals, v);\n    if (!strchr(buf, '.')) strcat(buf, \".0\");\n    puts(buf);\n}\n\n";
     emit_bytes(out, est, &p3);
+    let p4 = b"static void *nt_alloc(int64_t n, size_t sz) {\n    void *p = malloc(n == 0 ? 1 : (size_t)n * sz);\n    if (!p) { fprintf(stderr, \"out of memory\\n\"); exit(101); }\n    return p;\n}\nstatic inline int64_t nt_idx(int64_t i, int64_t n, int line) {\n    if ((uint64_t)i >= (uint64_t)n) {\n        fprintf(stderr, \"index %lld out of bounds for length %lld (line %d)\\n\", (long long)i, (long long)n, line);\n        exit(101);\n    }\n    return i;\n}\n\n";
+    emit_bytes(out, est, &p4);
     emit_structs(out, est, src, toks, nodes, types, strs, flds, first);
     let mut f = first;
     let mut si = 0;

@@ -26,10 +26,10 @@ fn dump_node(nodes: &[Node], n: i64) {
     if n < 0 { return; }
     let k = nodes[n].kind;
     println(k);
-    if k == 66 || k == 68 || k == 74 || k == 102 || k == 91 {
+    if k == 66 || k == 68 || k == 74 || k == 102 || k == 91 || k == 78 {
         dump_node(nodes, nodes[n].a);
         dump_node(nodes, nodes[n].b);
-    } else if k == 67 || k == 73 || k == 95 || k == 96 || k == 103 || k == 104 || k == 69 {
+    } else if k == 67 || k == 73 || k == 95 || k == 96 || k == 103 || k == 104 || k == 69 || k == 72 {
         dump_node(nodes, nodes[n].a);
     } else if k == 75 || k == 93 {
         dump_node(nodes, nodes[n].a);

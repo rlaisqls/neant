@@ -18,10 +18,20 @@
 //   cst[7] struct count      cst[8] next free field
 //   cst[9] the node the check failed at, or −1 — set once, by the innermost frame to see the
 //          error flag go up, so it names the smallest expression or statement that is wrong
+//   cst[11] the fresh-size-atom counter
 //   cst[10] the item — function or struct — being read when it failed, which is where the
 //          failures that happen outside an expression (a signature, a field's type) land
 
-struct Ty { kind: i64, elem: i64, mutable: i64 }
+// `size` is meaningful only for an array (kind 5): the *size atom*, which says whether two array
+// types have the same length without saying what it is. Design §1 put size variables out of this
+// slice on the grounds that only the cost model wants them — that was wrong. `ys = xs` on whole
+// arrays type-checks exactly when the two sizes are known to agree, so a checker without atoms
+// either refuses every reassignment (and disagrees with `neant check` on reassign_named_size.nt)
+// or accepts every one (and disagrees on err_reassign_mutable_size.nt). Three disjoint ranges:
+//   0 .. 999999          a token index: the declaration of the immutable local the length names
+//   1000000 + v          an integer literal of value v, so two `[0; 4]` agree
+//   2000000 +            a fresh atom, for a length that may differ between two uses
+struct Ty { kind: i64, elem: i64, mutable: i64, size: i64 }
 struct Sym { name: i64, ty: i64, mutable: i64 }
 struct Sig { name: i64, params: i64, n_params: i64, ret: i64 }
 // a struct type: its name token, and a run of fields in the flat `flds` table
@@ -36,18 +46,30 @@ fn intern_scalars(types: &mut [Ty], cst: &mut [i64]) {
         types[k].kind = k;
         types[k].elem = -1;
         types[k].mutable = 0;
+        types[k].size = -1;
         k += 1;
     }
     cst[0] = 5;
 }
 
 fn new_ty(types: &mut [Ty], cst: &mut [i64], kind: i64, elem: i64, mutable: i64) -> i64 {
+    new_ty_sized(types, cst, kind, elem, mutable, fresh_atom(cst))
+}
+
+fn new_ty_sized(types: &mut [Ty], cst: &mut [i64], kind: i64, elem: i64, mutable: i64, size: i64) -> i64 {
     let i = cst[0];
     types[i].kind = kind;
     types[i].elem = elem;
     types[i].mutable = mutable;
+    types[i].size = size;
     cst[0] = i + 1;
     i
+}
+
+// an atom that equals nothing but itself
+fn fresh_atom(cst: &mut [i64]) -> i64 {
+    cst[11] = cst[11] + 1;
+    1999999 + cst[11]
 }
 
 fn is_scalar(types: &[Ty], t: i64) -> bool {
@@ -66,6 +88,9 @@ fn same_ty(types: &[Ty], a: i64, b: i64) -> bool {
     if a == b { return true; }
     if types[a].kind != types[b].kind { return false; }
     if types[a].kind == 6 && types[a].mutable != types[b].mutable { return false; }
+    // an array's length is part of its type; a view's is not, which is why `&[T]` accepts arrays
+    // of any length and only a whole-array assignment has to ask
+    if types[a].kind == 5 && types[a].size != types[b].size { return false; }
     if types[a].kind == 5 || types[a].kind == 6 {
         return same_ty(types, types[a].elem, types[b].elem);
     }
@@ -187,6 +212,32 @@ fn collect_structs(src: &[u8], toks: &[Token], nodes: &[Node], types: &mut [Ty],
         }
         f = nodes[f].next;
     }
+}
+
+// an integer literal's value. `lex.nt` keeps a numeric literal's span and never parses it — the
+// emitter copies the span through to C — so the one place that needs the number reads it here.
+fn int_value(src: &[u8], toks: &[Token], t: i64) -> i64 {
+    let mut v = 0;
+    let mut i = 0;
+    while i < toks[t].len {
+        let c = src[toks[t].start + i];
+        if c != b'_' { v = v * 10 + ((c as i64) - 48); }
+        i += 1;
+    }
+    v
+}
+
+// the atom for a length expression: an integer literal is its value, an immutable local is its
+// declaration, and anything else — a mutable local above all, which may have changed between two
+// uses — gets an atom of its own
+fn size_atom(src: &[u8], toks: &[Token], nodes: &[Node], syms: &[Sym], cst: &mut [i64], n: i64) -> i64 {
+    if n < 0 { return fresh_atom(cst); }
+    if nodes[n].kind == 60 { return 1000000 + int_value(src, toks, nodes[n].a); }
+    if nodes[n].kind == 65 {
+        let s = sym_find(src, toks, syms, cst, nodes[n].a);
+        if s >= 0 && syms[s].mutable == 0 { return syms[s].name; }
+    }
+    fresh_atom(cst)
 }
 
 // ---- type expressions ----
@@ -319,6 +370,23 @@ fn check_expr_inner(src: &[u8], toks: &[Token], nodes: &[Node], types: &mut [Ty]
         }
         if seen != strs[si].n_fields { cst[2] = 1; return -1; }
         return new_ty(types, cst, 7, si, 0);
+    }
+    if k == 72 {
+        // the receiver must be a variable, as it must for an index: "the receiver of `.len()`
+        // must be a variable for now" is the Rust checker's own message
+        if nodes[nodes[n].a].kind != 65 { cst[2] = 1; return -1; }
+        let a = check_expr(src, toks, nodes, types, syms, sigs, ptys, strs, flds, ntys, cst, nodes[n].a);
+        if cst[2] != 0 { return -1; }
+        if !is_arrayish(types, a) { cst[2] = 1; return -1; }
+        return 0;
+    }
+    if k == 78 {
+        let e = check_expr(src, toks, nodes, types, syms, sigs, ptys, strs, flds, ntys, cst, nodes[n].a);
+        let c = check_expr(src, toks, nodes, types, syms, sigs, ptys, strs, flds, ntys, cst, nodes[n].b);
+        if cst[2] != 0 { return -1; }
+        if c != 0 { cst[2] = 1; return -1; }
+        if !is_scalar(types, e) && (e < 0 || types[e].kind != 7) { cst[2] = 1; return -1; }
+        return new_ty_sized(types, cst, 5, e, 0, size_atom(src, toks, nodes, syms, cst, nodes[n].b));
     }
     if k == 71 { return check_call(src, toks, nodes, types, syms, sigs, ptys, strs, flds, ntys, cst, n); }
     if k == 73 {
@@ -470,9 +538,15 @@ fn check_stmt_inner(src: &[u8], toks: &[Token], nodes: &[Node], types: &mut [Ty]
             let s = sym_find(src, toks, syms, cst, nodes[tgt].a);
             if s < 0 { cst[2] = 1; return; }
             if syms[s].mutable == 0 { cst[2] = 1; return; }
-            if is_arrayish(types, syms[s].ty) { cst[2] = 1; return; }
+            // the target is resolved here rather than through `check_expr`, so its type has to be
+            // recorded here too: the emitter asks whether an assignment's target is an array
+            ntys[tgt] = syms[s].ty;
             let v = check_expr(src, toks, nodes, types, syms, sigs, ptys, strs, flds, ntys, cst, nodes[n].b);
             if cst[2] != 0 { return; }
+            // `ys = xs` on whole arrays is M5's reassignment, and it is allowed. This slice has no
+            // size variables (design §1), so it compares element types and not lengths: it accepts
+            // a length mismatch the Rust checker refuses, which is a narrowing, not a difference
+            // of opinion — nothing here decides in-place versus copy.
             if !same_ty(types, syms[s].ty, v) { cst[2] = 1; }
             if nodes[n].ival >= 0 && !is_numeric(types, syms[s].ty) { cst[2] = 1; }
             return;

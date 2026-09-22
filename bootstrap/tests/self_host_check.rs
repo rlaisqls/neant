@@ -7,7 +7,9 @@
 //!
 //! **Struct probes**: the corpus's only in-slice struct programs are the three negative goldens,
 //! so rejecting every struct would still look like parity. The probes below are written here in
-//! accepted and rejected groups, and each verdict must match `neant check`'s.
+//! accepted and rejected groups, and each verdict must match `neant check`'s. Arrays joined them
+//! for the same reason: the two whole-array-reassignment goldens are the only corpus files that
+//! tell a matching size atom from a fresh one.
 //!
 //! **Types, pinned**: `fib.nt`'s type code for every expression, in depth-first order, hand-checked
 //! once against the source. Accept/reject alone would not notice `1 + 2` typed as `f64`.
@@ -96,14 +98,14 @@ fn main() {{
     if st[2] != 0 {{
         println(2);
     }} else {{
-        let mut types = [Ty {{ kind: 0, elem: 0, mutable: 0 }}; 4096];
+        let mut types = [Ty {{ kind: 0, elem: 0, mutable: 0, size: 0 }}; 4096];
         let mut syms = [Sym {{ name: 0, ty: 0, mutable: 0 }}; 4096];
         let mut sigs = [Sig {{ name: 0, params: 0, n_params: 0, ret: 0 }}; 1024];
         let mut strs = [Str {{ name: 0, fields: 0, n_fields: 0 }}; 1024];
         let mut flds = [Fld {{ name: 0, ty: 0 }}; 4096];
         let mut ptys = [0; 4096];
         let mut ntys = [-1; 65536];
-        let mut cst = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+        let mut cst = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
         let bad = check_program(&buf, &toks, &nodes, &mut types, &mut syms, &mut sigs, &mut ptys, &mut strs, &mut flds, &mut ntys, &mut cst, first);
         println(bad);
         if bad == 0 {{
@@ -187,6 +189,13 @@ fn main() { let mut p = P { x: 1, y: 2 }; p.x = 7; p.y += 1; println(p.x + p.y);
     ("two structs with a shared field name", "struct A { v: i64 }
 struct B { v: f64 }
 fn main() { let a = A { v: 1 }; let b = B { v: 2.0 }; println(a.v); println(b.v); }"),
+    ("len of a byte string and of a repeat", "fn main() { let s = b\"abcd\"; let xs = [7; 3]; println(s.len() + xs.len()); }"),
+    ("an array passed as `&[T]` and as `&mut [T]`", "fn total(xs: &[i64]) -> i64 { let mut t = 0; for i in 0..xs.len() { t += xs[i]; } t }
+fn bump(xs: &mut [i64]) { for i in 0..xs.len() { xs[i] += 1; } }
+fn main() { let mut xs = [2; 4]; bump(&mut xs); println(total(&xs)); }"),
+    ("whole-array reassignment with the same size atom", "fn main() { let n = 6; let mut ys = [0; n]; let xs = [1; n]; ys = xs; println(ys[0] + ys.len()); }"),
+    ("an array of structs", "struct P { x: i64 }
+fn main() { let mut ps = [P { x: 0 }; 3]; ps[1].x = 5; println(ps[1].x + ps.len()); }"),
 ];
 
 const STRUCT_PROBES_BAD: &[(&str, &str)] = &[
@@ -210,6 +219,12 @@ struct B { a: A }
 fn main() { println(1); }"),
     ("a struct where a scalar is wanted", "struct P { x: i64 }
 fn main() { let p = P { x: 1 }; println(p.x + p); }"),
+    ("`.len()` on a scalar", "fn main() { let n = 4; println(n.len()); }"),
+    ("`.len()` on a receiver that is not a variable", "fn main() { println(b\"abc\".len()); }"),
+    ("whole-array reassignment across a mutable length", "fn main() { let mut n = 5; let xs = [1; n]; n = 3; let mut ys = [0; n]; ys = xs; println(ys[0]); }"),
+    ("an element written through a `&[T]`", "fn set(xs: &[i64]) { xs[0] = 1; }
+fn main() { let mut xs = [0; 2]; set(&xs); println(xs[0]); }"),
+    ("an array indexed by something that is not `i64`", "fn main() { let xs = [1; 3]; let f = 1.0; println(xs[f]); }"),
 ];
 
 #[test]
@@ -244,23 +259,22 @@ fn self_hosted_check_agrees_on_struct_probes() {
         failures.len(), STRUCT_PROBES.len() + STRUCT_PROBES_BAD.len(), failures.join("\n"));
 }
 
-/// The fixpoint, as far as it goes: the self-hosted lexer, parser and checker, concatenated, are a
-/// neant program of ~1500 lines — and the self-hosted lexer, parser and checker read it, parse it
-/// and type-check it. Not "a program like the compiler": the compiler's own source, the three
-/// stages that exist, checked by themselves.
+/// The fixpoint's front half: **every** self-hosted stage, concatenated — about 2000 lines of
+/// neant — read, parsed and type-checked by the self-hosted lexer, parser and checker. Not "a
+/// program like the compiler": the compiler's own source, all of it, checked by itself.
 ///
-/// `compiler/emit.nt` is deliberately not in the concatenation. It is still outside the slice —
-/// its first `s.len()` is a method call, which the parser rejects by design — and this test says
-/// where the frontier is, so widening the slice moves the frontier here and not only in prose.
+/// What this does *not* say is that the self-hosted emitter can emit it. Reading is parsing and
+/// type-checking; emitting needs every construct here to work in `emit.nt` as well, and the test
+/// for that is `self_host_emit.rs`, which compares what the compiled program prints.
 #[test]
 fn the_self_hosted_front_end_checks_its_own_source() {
-    let names = ["compiler/lex.nt", "compiler/parse.nt", "compiler/check.nt"];
+    let names = ["compiler/lex.nt", "compiler/parse.nt", "compiler/check.nt", "compiler/emit.nt"];
     let stages = names.map(|p| std::fs::read_to_string(repo(p)).unwrap()).join("\n");
     let dir = std::env::temp_dir().join(format!("neant-self-host-fixpoint-{}", std::process::id()));
     let src_dir = dir.join("src");
     std::fs::create_dir_all(&src_dir).unwrap();
 
-    // the subject: the three stages as one file, which is what a driver concatenates anyway
+    // the subject: the stages as one file, which is what a driver concatenates anyway
     let subject = src_dir.join("frontend.nt");
     std::fs::write(&subject, &stages).unwrap();
     let out = self_hosted(&dir, &stages, &subject);

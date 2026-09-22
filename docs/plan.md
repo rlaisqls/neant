@@ -321,11 +321,23 @@ contains and no golden program does, so the lexer's corpus is now the goldens *a
 and `P { x: 1, x: 2 }` type-checked, because "every initialiser names a field, and the count
 matches" forbids neither a repeat nor the omission that goes with it.
 
-**The frontier is a test now.** `the_self_hosted_front_end_checks_its_own_source` concatenates
-`lex.nt + parse.nt + check.nt` — ~1500 lines — and the self-hosted lexer, parser and checker parse
-and type-check it. `emit.nt` is deliberately outside: it stops at its first `s.len()`. Arrays,
-slices, `.len()`, array literals and `[e; n]` are what remain between here and the whole compiler
-reading itself. Not designed yet: the cost calculus, and the fixpoint itself.
+**Arrays and slices went in next, and the compiler now compiles itself**, designed in
+[self-hosting-arrays-design.md](self-hosting-arrays-design.md). The measurement that opened it was
+unusually precise: `emit.nt` needed exactly `.len()` (once) and `b"…"` bound by `let` (79 times).
+What that pulled in was the array representation itself — every array or view is two C variables,
+`x_p` and `x_n`, which is not a choice because `rt.c` already works that way — plus `nt_alloc`,
+`nt_idx` and the `&x`-is-two-arguments convention. Two tests now pin the fixpoint from both sides:
+`the_self_hosted_front_end_checks_its_own_source` parses and type-checks all four stages (~2000
+lines), and `the_self_hosted_emitter_emits_its_own_source` runs the whole chain over them, writes
+160 KB of C, and `cc` compiles it — 92 functions, no diagnostic. End-to-end behavioural comparison
+went from 7 golden programs to 18.
+
+The remaining gap is `extern fn`. The stages are not a program without a driver, and every driver
+opens with `extern fn read_file(…)`, which the parser still rejects — so the test stops at `cc -c`
+rather than linking and running. That, and then running the self-compiled compiler against itself,
+is the fixpoint. Also found: **size atoms are not only the cost model's** — whole-array
+reassignment cannot be type-checked without them, which the checker design had said the opposite
+of. Not designed yet: the cost calculus.
 
 ## M7 — the constant factor
 

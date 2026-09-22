@@ -390,9 +390,19 @@ mod parsedump {
                 for (_, v) in fields { o.push(114); expr(v, o)?; }
                 Ok(())
             }
+            // `.len()` is the one method the self-hosted parser takes, by name and by shape
+            // (docs/self-hosting-arrays-design.md §2); everything else is still a method call
+            ExprKind::MethodCall(recv, m, args) if m == "len" && args.is_empty() => {
+                o.push(72);
+                expr(recv, o)
+            }
             ExprKind::MethodCall(..) => Err("a method call or chain".into()),
             ExprKind::ArrayLit(_) => Err("an array literal".into()),
-            ExprKind::ArrayRepeat(..) => Err("an `[e; n]` array".into()),
+            ExprKind::ArrayRepeat(e, n) => {
+                o.push(78);
+                expr(e, o)?;
+                expr(n, o)
+            }
             ExprKind::Lambda(..) => Err("a closure".into()),
             ExprKind::Comprehension { .. } => Err("a comprehension".into()),
         }

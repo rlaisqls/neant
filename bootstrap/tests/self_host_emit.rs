@@ -33,14 +33,14 @@ fn main() {{
     if st[2] != 0 {{
         println(-2);
     }} else {{
-        let mut types = [Ty {{ kind: 0, elem: 0, mutable: 0 }}; 4096];
+        let mut types = [Ty {{ kind: 0, elem: 0, mutable: 0, size: 0 }}; 4096];
         let mut syms = [Sym {{ name: 0, ty: 0, mutable: 0 }}; 4096];
         let mut sigs = [Sig {{ name: 0, params: 0, n_params: 0, ret: 0 }}; 1024];
         let mut strs = [Str {{ name: 0, fields: 0, n_fields: 0 }}; 1024];
         let mut flds = [Fld {{ name: 0, ty: 0 }}; 4096];
         let mut ptys = [0; 4096];
         let mut ntys = [-1; 65536];
-        let mut cst = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+        let mut cst = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
         let bad = check_program(&buf, &toks, &nodes, &mut types, &mut syms, &mut sigs, &mut ptys, &mut strs, &mut flds, &mut ntys, &mut cst, first);
         if bad != 0 {{
             println(-1);
@@ -115,11 +115,58 @@ fn self_hosted_emit_runs_the_same() {
     if failures.is_empty() { let _ = std::fs::remove_dir_all(&dir); }
     assert!(compared.len() >= 5, "only {} programs made it through the self-hosted chain; the slice changed", compared.len());
     // a skip is otherwise silent — a program that stops parsing is simply not compared — so the
-    // one golden that exercises structs is named here rather than left to the count
-    assert!(compared.iter().any(|n| n == "structval.nt"),
-        "structval.nt did not reach the comparison; structs fell out of the slice. compared: {compared:?}");
+    // goldens that carry a whole feature of the slice are named here rather than left to a count
+    for want in ["structval.nt", "arrayview.nt", "words.nt"] {
+        assert!(compared.iter().any(|n| n == want),
+            "{want} did not reach the comparison; what it covers fell out of the slice. compared: {compared:?}");
+    }
     if !failures.is_empty() {
         panic!("{} of {} programs differ (artifacts kept in {}):\n\n{}",
             failures.len(), compared.len(), dir.display(), failures.join("\n"));
     }
+}
+
+/// The fixpoint's other half. `self_host_check.rs` shows the self-hosted front end *reads* all
+/// four stages; this one shows the self-hosted emitter **writes** them: the same ~2000 lines go
+/// through the whole self-hosted chain, out as C, and `cc` compiles that C to an object file
+/// without a diagnostic.
+///
+/// It stops at `-c`, on purpose. Linking needs `main`, and `main` lives in a driver that opens
+/// with `extern fn read_file(…)` — `extern` is still outside the parser's slice, so the compiler
+/// cannot yet read the few lines that make it a program. That is the whole remaining gap, and
+/// this test is where it will be closed.
+#[test]
+fn the_self_hosted_emitter_emits_its_own_source() {
+    let names = ["compiler/lex.nt", "compiler/parse.nt", "compiler/check.nt", "compiler/emit.nt"];
+    let stages = names.map(|p| std::fs::read_to_string(repo(p)).unwrap()).join("\n");
+    let dir = std::env::temp_dir().join(format!("neant-self-host-selfemit-{}", std::process::id()));
+    let src_dir = dir.join("src");
+    std::fs::create_dir_all(&src_dir).unwrap();
+
+    let subject = src_dir.join("compiler.nt");
+    std::fs::write(&subject, &stages).unwrap();
+    let c_out = dir.join("compiler.c");
+    let nt = dir.join("selfemit_driver.nt");
+    // the arenas are sized for the compiler's own source, not for a golden
+    let big = driver(&subject.to_string_lossy(), &c_out.to_string_lossy())
+        .replace("[b'\\0'; 65536]", "[b'\\0'; 262144]")
+        .replace("; 65536]", "; 262144]")
+        .replace("; 4096]", "; 16384]");
+    std::fs::write(&nt, format!("{stages}\n{big}")).unwrap();
+
+    let run = Command::new(neant()).arg("run").arg(&nt).output().unwrap();
+    assert!(run.status.success(), "the self-hosted compiler failed on its own source:\n{}",
+        String::from_utf8_lossy(&run.stderr));
+    let wrote: i64 = String::from_utf8_lossy(&run.stdout).trim().parse().unwrap_or(-9);
+    assert!(wrote > 0, "the self-hosted compiler emitted nothing for its own source (code {wrote}): \
+        -2 is the parser, -1 the checker");
+
+    let obj = dir.join("compiler.o");
+    let cc = std::env::var("CC").unwrap_or_else(|_| "cc".into());
+    let built = Command::new(&cc).args(["-c", "-O0", "-std=gnu11", "-w", "-o"])
+        .arg(&obj).arg(&c_out).output().unwrap();
+    assert!(built.status.success(),
+        "cc rejected the C the self-hosted compiler wrote for its own source ({}):\n{}",
+        c_out.display(), String::from_utf8_lossy(&built.stderr));
+    let _ = std::fs::remove_dir_all(&dir);
 }
