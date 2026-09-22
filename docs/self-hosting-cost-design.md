@@ -1139,3 +1139,66 @@ same one the layout choice used: the golden programs go through the whole self-h
 run, and `reassign_inplace`, `reassign_copy`, `reassign_loop` and `arrayview` print exactly what
 `neant run` prints — including `reassign_copy`, which is in the corpus precisely to catch an emitter
 that takes the buffer when a view is still watching.
+
+## 22. The footprint lower bound, designed before building
+
+With both cost columns exact, the largest block of the report still missing is the **lower bound**
+lines. Counted over the corpus: **40 footprint bounds, 1 HBL, 4 others.** The footprint one is
+almost all of it, needs no syntax this compiler lacks, and rests on machinery the settle pass just
+built — so it is next, and the HBL bound (a rational LP over the loop nest) is not.
+
+### What the bound is
+
+`analyze.rs`: *every distinct element of a parameter array crosses once from cold.* Per reference:
+
+1. **`injective_dims`** — the loop variables the index is injective on, by a mixed-radix argument.
+   Sort them ascending by unit stride; each unit must be at least `covered + 1`, where `covered` is
+   the span the smaller ones already reach. Digits that do not overlap cannot collide.
+2. **`image_size`** — how many distinct values that is: summed over each injective loop in turn,
+   innermost outwards, exactly `pol_sum_over`.
+3. × the bytes one touch covers — the *field's* size for a field access, the element's otherwise.
+
+Keyed by `(root array, field)`, keeping the dominating one where a loop nest is walked twice, and
+summed over the parameters. Two references to different fields of one struct array are two entries,
+which is why `kinetic` bounds at `16·ps.len()` and `centroid_x` at `8·ps.len()`.
+
+### What the corpus asks for, measured
+
+| shape | bound | needs |
+|---|---|---|
+| one loop, stride 1, whole array | `8·xs.len()`, `s.len()`, `2·s.len()` | nothing new |
+| several arrays or fields | `16·a.len()`, `24·ps.len()`, `32·ps.len()` | keying by (root, field) |
+| a non-affine site beside an affine one | `ring`'s `8·xs.len()`, `bfs`'s `8·dist.len()` | a site with no readable index contributes nothing |
+| a tiled nest | `tri`'s `tiles` → `8·n` | **the loop's offset** |
+| a two-deep nest | `stencil` → `16·n² − 64·n + 64` | `image_size` over two loops |
+| symbolic strides | `matmul` → `24·n²` | **the coefficient's value** |
+
+Two of those are worth stating before writing any code.
+
+**`tiles` needs the loop's offset, and the settle pass already computes it.** `for i in ii*4..ii*4+4`
+makes `a[i]` injective on *both* `i` and `ii`, because `i`'s own start is `ii*4` — its affine form is
+`i + 4·ii`, so the units are 1 and 4, they nest exactly (`4 ≥ 3 + 1`), and the image is
+`4 · n/4 = n`. This compiler already chains an inner loop's lower bound into an outer coefficient,
+for the stride at each level; the bound wants the same numbers for a different purpose.
+
+**`matmul` needs what §17 concluded was never needed.** That section measured that a symbolic stride
+is never compared with `B` and is only ever a three-way tag, so a coefficient's *value* is wanted
+only when it is a number. That is true of `moves` and it is **not** true here: `injective_dims` sorts
+by unit stride and `image_size` multiplies trip counts, so `a[i*n + k]` needs `n` as a polynomial,
+not as a flag. §17 is not wrong — it is scoped to the walk it was about, and this is the first thing
+to ask a different question of the same index.
+
+So: a second reader of an index, `idx_coef_pol`, returning a **polynomial** coefficient, used only
+by the bound. Not a widening of `idx_coef`, whose three-way answer is exactly right for the walk
+that uses it.
+
+### How it will be measured
+
+A **fourth column** in `compiler/costdump.nt` — `name ⇥ work ⇥ moves ⇥ bound` — compared against the
+`lower bound … (footprint, …)` line of `neant cost`, the way the first three are. A function the
+Rust gives no footprint bound must get none here either; that is the half of the test that keeps a
+bound from being invented.
+
+Order: the single-loop case first, since it is most of the corpus; then the offset, which `tiles`
+alone pays for; then `image_size` over a nest for `stencil`; then the polynomial coefficient for
+`matmul`, last because it is the only one that needs a new reader of the index.
