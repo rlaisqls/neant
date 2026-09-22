@@ -1,0 +1,21 @@
+// streaming reduction: one array read, once per repeat
+fn sum(xs: &[f64]) -> f64 {
+    let mut s = 0.0;
+    for i in 0..xs.len() {
+        s += xs[i];
+    }
+    s
+}
+
+fn main() {
+    let n = @N@;
+    let mut xs = [0.0; n];
+    for i in 0..n {
+        xs[i] = i as f64;
+    }
+    let mut total = 0.0;
+    for r in 0..@R@ {
+        total += sum(&xs);
+    }
+    println(total);
+}

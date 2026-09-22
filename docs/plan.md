@@ -247,9 +247,8 @@ stage0/                 the Rust compiler. Seed one. Frozen after M6, never dele
     lex.rs  parse.rs  ast.rs  resolve.rs  types.rs
     ir.rs               typed IR, every array value carries a size variable
     cost/
-      size.rs           symbolic sizes and their normal form
-      work.rs           the work calculus
-      moves.rs          the I/O-model calculus (docs/cost-model.md is its spec)
+      size.rs           symbolic sizes and costs: rational polynomials over atoms, B and M
+      analyze.rs        the work and moves calculi, one walk (docs/cost-model.md is its spec)
       recur.rs          recurrence extraction and solving           (M3)
       bounds.rs         the lower-bound catalogue                    (M2)
       lock.rs           costs.lock read/write/diff
@@ -261,8 +260,8 @@ compiler/               the compiler in neant. Empty until M6, then the one that
 bootstrap/
   neant.c               compiler/ compiled by itself. Seed two. Regenerated at each release.
 tests/
-  golden/               .nt files with expected cost lines
-  kernels/              the M1 experiment: kernels, sweep driver, perf harness
+  golden/               .nt programs with expected output (.out, .exit), rejection (.err), cost report (.cost)
+  kernels/              the M1 experiment: six kernel templates and sweep.py, the perf harness
   bootstrap.sh          the two-seed fixpoint
 docs/
   plan.md               this file

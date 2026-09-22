@@ -1,0 +1,2 @@
+saxpy            work 6·x.len() + 1                moves 16·x.len()                   exact
+main             work 76                           moves 6·B + 64                     exact

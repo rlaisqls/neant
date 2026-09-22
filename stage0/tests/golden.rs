@@ -1,4 +1,4 @@
-//! Every `tests/golden/*.nt` either runs — stdout must equal `.out`, exit code must equal `.exit`
+//! Every `tests/golden/*.nt` with a `.cost` file must also reproduce it under `neant cost`. It either runs — stdout must equal `.out`, exit code must equal `.exit`
 //! (default 0) — or, when a `.err` file exists, must be rejected with an error containing it.
 
 use std::path::{Path, PathBuf};
@@ -37,6 +37,15 @@ fn golden() {
                 failures.push(format!("{name}: expected error containing `{want}`, got:\n{stderr}"));
             }
             continue;
+        }
+        let cost_file = stem.with_extension("cost");
+        if cost_file.exists() {
+            let want = std::fs::read_to_string(&cost_file).unwrap();
+            let out = Command::new(neant()).arg("cost").arg(nt).output().unwrap();
+            let got = String::from_utf8_lossy(&out.stdout).to_string();
+            if got != want {
+                failures.push(format!("{name}: cost report differs\n--- got ---\n{got}--- want ---\n{want}"));
+            }
         }
         let want_out = std::fs::read_to_string(stem.with_extension("out")).unwrap_or_default();
         let want_exit: i32 = std::fs::read_to_string(stem.with_extension("exit"))

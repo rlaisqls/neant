@@ -1,0 +1,27 @@
+// i-j-k: b is walked down a column in the inner loop
+fn matmul(n: i64, a: &[f64], b: &[f64], c: &mut [f64]) {
+    for i in 0..n {
+        for j in 0..n {
+            let mut acc = 0.0;
+            for k in 0..n {
+                acc += a[i * n + k] * b[k * n + j];
+            }
+            c[i * n + j] = acc;
+        }
+    }
+}
+
+fn main() {
+    let n = @N@;
+    let mut a = [0.0; n * n];
+    let mut b = [0.0; n * n];
+    let mut c = [0.0; n * n];
+    for i in 0..n * n {
+        a[i] = (i % 7) as f64;
+        b[i] = (i % 5) as f64;
+    }
+    for r in 0..@R@ {
+        matmul(n, &a, &b, &mut c);
+    }
+    println(c[n + 1]);
+}

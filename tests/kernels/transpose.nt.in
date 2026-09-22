@@ -1,0 +1,21 @@
+// sequential read, column write: the write moves by a row per inner iteration
+fn transpose(n: i64, a: &[f64], b: &mut [f64]) {
+    for i in 0..n {
+        for j in 0..n {
+            b[j * n + i] = a[i * n + j];
+        }
+    }
+}
+
+fn main() {
+    let n = @N@;
+    let mut a = [0.0; n * n];
+    let mut b = [0.0; n * n];
+    for i in 0..n * n {
+        a[i] = i as f64;
+    }
+    for r in 0..@R@ {
+        transpose(n, &a, &mut b);
+    }
+    println(b[1]);
+}

@@ -1,0 +1,19 @@
+// one stream read, one read+written
+fn saxpy(a: f64, x: &[f64], y: &mut [f64]) {
+    for i in 0..x.len() {
+        y[i] += a * x[i];
+    }
+}
+
+fn main() {
+    let n = @N@;
+    let mut x = [0.0; n];
+    let mut y = [0.0; n];
+    for i in 0..n {
+        x[i] = i as f64;
+    }
+    for r in 0..@R@ {
+        saxpy(0.5, &x, &mut y);
+    }
+    println(y[n - 1]);
+}

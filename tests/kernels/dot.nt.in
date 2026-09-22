@@ -1,0 +1,23 @@
+// two streams
+fn dot(a: &[f64], b: &[f64]) -> f64 {
+    let mut acc = 0.0;
+    for i in 0..a.len() {
+        acc += a[i] * b[i];
+    }
+    acc
+}
+
+fn main() {
+    let n = @N@;
+    let mut a = [0.0; n];
+    let mut b = [0.0; n];
+    for i in 0..n {
+        a[i] = i as f64;
+        b[i] = 1.0;
+    }
+    let mut total = 0.0;
+    for r in 0..@R@ {
+        total += dot(&a, &b);
+    }
+    println(total);
+}

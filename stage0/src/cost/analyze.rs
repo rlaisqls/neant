@@ -1,0 +1,508 @@
+//! The cost calculus: work and moves for every function, in one walk over the typed IR.
+//! The rules are specified in docs/cost-model.md; this file is their implementation and the
+//! comments here say which rule each piece is.
+//!
+//! Work counts primitive operations. Moves counts bytes crossing the cache boundary in the
+//! I/O model: for each array access inside a loop nest, the number of distinct cache lines it
+//! touches is computed level by level from the innermost loop outward, and a level reuses
+//! lines only when the working set of the levels inside it is known to fit in `M`.
+
+use std::collections::{BTreeMap, HashMap};
+
+use crate::ast::BinOp;
+use crate::ir::*;
+
+use super::size::{Atom, Poly, Rat};
+
+#[derive(Debug, Clone, Copy)]
+pub struct Machine {
+    /// Bytes of the cache whose boundary moves are counted across.
+    pub m_bytes: i128,
+    /// Bytes per cache line.
+    pub b_bytes: i128,
+}
+
+#[derive(Debug, Clone)]
+pub enum CostResult {
+    Exact { work: Poly, moves: Poly },
+    Unknown { reason: String, line: u32 },
+}
+
+#[derive(Debug, Clone)]
+pub struct FuncCost {
+    pub name: String,
+    /// Names of `Atom::Var(i)` for this function. The first `params.len()` are the parameters,
+    /// in order, so a caller can substitute by position.
+    pub names: Vec<String>,
+    pub result: CostResult,
+}
+
+pub fn analyze(m: &Module, machine: &Machine) -> Vec<FuncCost> {
+    let mut an = Analyzer { m, machine: *machine, done: vec![None; m.funcs.len()], active: vec![false; m.funcs.len()] };
+    for i in 0..m.funcs.len() {
+        an.func(i);
+    }
+    an.done.into_iter().map(|c| c.unwrap()).collect()
+}
+
+struct Analyzer<'a> {
+    m: &'a Module,
+    machine: Machine,
+    done: Vec<Option<FuncCost>>,
+    active: Vec<bool>,
+}
+
+impl<'a> Analyzer<'a> {
+    fn func(&mut self, fid: FuncId) -> &FuncCost {
+        if self.done[fid].is_none() {
+            let f = &self.m.funcs[fid];
+            if self.active[fid] {
+                // a cycle: recursion is a recurrence, which stage 0 does not solve yet (M3)
+                self.done[fid] = Some(FuncCost {
+                    name: f.name.clone(),
+                    names: param_names(f),
+                    result: CostResult::Unknown { reason: "recursive; recurrences are not solved yet".into(), line: f.line },
+                });
+            } else {
+                self.active[fid] = true;
+                let fc = Fa::new(self, f, None).run();
+                self.active[fid] = false;
+                self.done[fid] = Some(fc);
+            }
+        }
+        self.done[fid].as_ref().unwrap()
+    }
+}
+
+fn param_names(f: &Func) -> Vec<String> {
+    f.params.iter().map(|&p| {
+        let l = &f.locals[p];
+        if l.ty.is_arrayish() { format!("{}.len()", l.name) } else { l.name.clone() }
+    }).collect()
+}
+
+/// An index expression as an affine function of the enclosing loop variables, with
+/// coefficients that are size polynomials.
+#[derive(Debug, Clone, Default)]
+struct Affine {
+    coeffs: BTreeMap<LocalId, Poly>,
+    konst: Poly,
+}
+
+impl Affine {
+    fn constant(p: Poly) -> Affine { Affine { coeffs: BTreeMap::new(), konst: p } }
+    fn var(l: LocalId) -> Affine {
+        let mut a = Affine::default();
+        a.coeffs.insert(l, Poly::constant(1));
+        a
+    }
+    fn add(&self, o: &Affine) -> Affine {
+        let mut c = self.coeffs.clone();
+        for (l, p) in &o.coeffs {
+            let np = c.get(l).map_or(p.clone(), |x| x.add(p));
+            if np.is_zero() { c.remove(l); } else { c.insert(*l, np); }
+        }
+        Affine { coeffs: c, konst: self.konst.add(&o.konst) }
+    }
+    fn scale(&self, p: &Poly) -> Affine {
+        Affine { coeffs: self.coeffs.iter().map(|(l, c)| (*l, c.mul(p))).collect(), konst: self.konst.mul(p) }
+    }
+    fn is_const(&self) -> bool { self.coeffs.is_empty() }
+}
+
+#[derive(Clone, Copy, PartialEq)]
+enum Bound { Upper, Lower }
+
+struct Loop {
+    var: LocalId,
+    trip: Poly,
+    start: Poly,
+    end: Poly,
+    /// The loop's start as an affine function of the loops outside it, so that an index written
+    /// in terms of this variable is seen to move with the outer loops too. `None` when the start
+    /// is not affine, in which case any index using this variable is treated as non-affine.
+    offset: Option<Affine>,
+}
+
+enum Fail {
+    Unknown(String, u32),
+}
+
+struct Fa<'a, 'b> {
+    an: &'b mut Analyzer<'a>,
+    f: &'a Func,
+    names: Vec<String>,
+    /// size in elements of every array/slice local
+    local_size: HashMap<LocalId, Poly>,
+    /// value of every immutable i64 local that is an affine expression
+    local_affine: HashMap<LocalId, Affine>,
+    loops: Vec<Loop>,
+    work: Poly,
+    moves: Poly,
+}
+
+impl<'a, 'b> Fa<'a, 'b> {
+    /// With `bindings`, the function is analysed for one call site: each parameter's size is
+    /// the caller's polynomial rather than the parameter's own atom, so every fit and stride
+    /// decision inside is made with the caller's numbers. The result is then already in the
+    /// caller's atom space.
+    fn new(an: &'b mut Analyzer<'a>, f: &'a Func, bindings: Option<&[Poly]>) -> Self {
+        let mut fa = Fa {
+            an, f, names: param_names(f),
+            local_size: HashMap::new(), local_affine: HashMap::new(),
+            loops: vec![], work: Poly::zero(), moves: Poly::zero(),
+        };
+        for (i, &p) in f.params.iter().enumerate() {
+            let l = &f.locals[p];
+            let size = bindings.map_or_else(|| Poly::var(i), |b| b[i].clone());
+            if l.ty.is_arrayish() {
+                fa.local_size.insert(p, size);
+            } else if l.ty == Ty::I64 {
+                fa.local_affine.insert(p, Affine::constant(size));
+            }
+        }
+        fa
+    }
+
+    fn run(mut self) -> FuncCost {
+        let result = match self.block(&self.f.body) {
+            Ok(()) => CostResult::Exact { work: self.work.clone(), moves: self.moves.clone() },
+            Err(Fail::Unknown(reason, line)) => CostResult::Unknown { reason, line },
+        };
+        FuncCost { name: self.f.name.clone(), names: self.names, result }
+    }
+
+    fn machine(&self) -> Machine { self.an.machine }
+
+    /// Product of the trip counts of the enclosing loops: how many times the current point runs.
+    fn outer(&self) -> Poly {
+        self.loops.iter().fold(Poly::constant(1), |acc, l| acc.mul(&l.trip))
+    }
+    fn add_work(&mut self, p: Poly) {
+        let o = self.outer();
+        self.work = self.work.add(&p.mul(&o));
+    }
+    fn add_work_n(&mut self, n: i128) { self.add_work(Poly::constant(n)); }
+
+    /// Numeric value of a polynomial with `B` and `M` at their machine values, if it has no
+    /// size variables. The fit test and the stride test are decided with this.
+    fn numeric(&self, p: &Poly) -> Option<f64> {
+        let m = self.machine();
+        if p.has_vars() { return None; }
+        p.eval(&|a| match a {
+            Atom::B => Some(m.b_bytes as f64),
+            Atom::M => Some(m.m_bytes as f64),
+            Atom::Var(_) => None,
+        })
+    }
+
+    // ---- size expressions ----
+
+    /// An `i64` expression as a size polynomial: literals, size parameters, `.len()`, immutable
+    /// lets bound to such, and `+ - *` of them. A loop variable is replaced by the bound of its
+    /// range that maximises the result (`Upper`) or minimises it (`Lower`), so a triangular
+    /// loop is bounded by its rectangular hull.
+    fn size_of(&self, e: &Expr, bound: Bound) -> Option<Poly> {
+        let flip = |b: Bound| if b == Bound::Upper { Bound::Lower } else { Bound::Upper };
+        match &e.kind {
+            ExprKind::Int(v) => Some(Poly::constant(*v as i128)),
+            ExprKind::Local(l) => {
+                if let Some(lp) = self.loops.iter().find(|lp| lp.var == *l) {
+                    return Some(if bound == Bound::Upper { lp.end.clone() } else { lp.start.clone() });
+                }
+                let a = self.local_affine.get(l)?;
+                if !a.is_const() { return None; }
+                Some(a.konst.clone())
+            }
+            ExprKind::Len(l) => self.local_size.get(l).cloned(),
+            ExprKind::Cast(inner, Ty::I64) => self.size_of(inner, bound),
+            ExprKind::Binary(BinOp::Add, a, b) => Some(self.size_of(a, bound)?.add(&self.size_of(b, bound)?)),
+            ExprKind::Binary(BinOp::Sub, a, b) => Some(self.size_of(a, bound)?.sub(&self.size_of(b, flip(bound))?)),
+            ExprKind::Binary(BinOp::Mul, a, b) => {
+                let pa = self.size_of(a, bound)?;
+                let pb = self.size_of(b, bound)?;
+                Some(pa.mul(&pb))
+            }
+            ExprKind::Binary(BinOp::Div, a, b) => {
+                let pb = self.size_of(b, bound)?;
+                let d = pb.as_const()?;
+                if d.is_zero() || !d.is_int() { return None; }
+                Some(self.size_of(a, bound)?.scale(Rat::new(1, d.n)))
+            }
+            ExprKind::Block(b) if b.stmts.is_empty() => self.size_of(b.tail.as_ref()?, bound),
+            _ => None,
+        }
+    }
+
+    /// An index expression as an affine function of the loop variables in scope.
+    fn affine(&self, e: &Expr) -> Option<Affine> {
+        match &e.kind {
+            ExprKind::Int(v) => Some(Affine::constant(Poly::constant(*v as i128))),
+            ExprKind::Local(l) => {
+                if let Some(lp) = self.loops.iter().find(|lp| lp.var == *l) {
+                    return lp.offset.as_ref().map(|off| Affine::var(*l).add(off));
+                }
+                self.local_affine.get(l).cloned()
+            }
+            ExprKind::Len(l) => self.local_size.get(l).map(|p| Affine::constant(p.clone())),
+            ExprKind::Cast(inner, Ty::I64) => self.affine(inner),
+            ExprKind::Binary(BinOp::Div, a, b) => {
+                let pb = self.affine(b)?;
+                if !pb.is_const() { return None; }
+                let d = pb.konst.as_const()?;
+                if d.is_zero() || !d.is_int() { return None; }
+                Some(self.affine(a)?.scale(&Poly::from_rat(Rat::new(1, d.n))))
+            }
+            ExprKind::Binary(BinOp::Add, a, b) => Some(self.affine(a)?.add(&self.affine(b)?)),
+            ExprKind::Binary(BinOp::Sub, a, b) => {
+                let nb = self.affine(b)?.scale(&Poly::constant(-1));
+                Some(self.affine(a)?.add(&nb))
+            }
+            ExprKind::Binary(BinOp::Mul, a, b) => {
+                let (pa, pb) = (self.affine(a)?, self.affine(b)?);
+                if pa.is_const() { Some(pb.scale(&pa.konst)) }
+                else if pb.is_const() { Some(pa.scale(&pb.konst)) }
+                else { None }
+            }
+            ExprKind::Block(b) if b.stmts.is_empty() => self.affine(b.tail.as_ref()?),
+            _ => None,
+        }
+    }
+
+    fn elem_bytes(&self, l: LocalId) -> i128 {
+        match self.f.locals[l].ty.elem() {
+            Some(Ty::Bool) => 1,
+            _ => 8,
+        }
+    }
+
+    // ---- the moves rule ----
+
+    /// Lines touched by one access site over the whole enclosing loop nest, times B, added to
+    /// moves. Level by level from the innermost loop out:
+    ///
+    ///   lines(inner of innermost) = 1
+    ///   lines(level) = lines(inner) × t                      if the inner working set does not fit M
+    ///                = lines(inner) × 1                      if the access does not move with this loop
+    ///                = lines(inner) × t                      if it moves by a whole line or more
+    ///                = lines(inner) × t·s/B                  if it moves by s < B bytes per iteration
+    ///
+    /// The working set is lines(inner)·B; it fits when that is a known number ≤ M. A symbolic
+    /// working set is assumed not to fit, and a non-affine index is assumed to move by a whole
+    /// line or more. Every assumption rounds up.
+    fn access(&mut self, arr: LocalId, idx: &Expr) {
+        let es = self.elem_bytes(arr);
+        let aff = self.affine(idx);
+        let m = self.machine();
+        let mut lines = Poly::constant(1);
+        for lp in self.loops.iter().rev() {
+            let fits = self.numeric(&lines).is_some_and(|l| l * m.b_bytes as f64 <= m.m_bytes as f64);
+            if !fits {
+                lines = lines.mul(&lp.trip);
+                continue;
+            }
+            let stride = aff.as_ref().map(|a| a.coeffs.get(&lp.var).cloned().unwrap_or_else(Poly::zero).scale(Rat::int(es)));
+            let factor = match stride {
+                None => lp.trip.clone(),
+                Some(s) if s.is_zero() => Poly::constant(1),
+                Some(s) => match self.numeric(&s) {
+                    Some(sb) if sb.abs() >= m.b_bytes as f64 => lp.trip.clone(),
+                    Some(sb) => {
+                        // t·|s|/B, but never below one line
+                        let f = lp.trip.scale(Rat::new(sb.abs() as i128, 1)).mul_atom_pow(Atom::B, Rat::int(-1));
+                        match self.numeric(&f) { Some(v) if v < 1.0 => Poly::constant(1), _ => f }
+                    }
+                    None => lp.trip.clone(),
+                },
+            };
+            lines = lines.mul(&factor);
+        }
+        self.moves = self.moves.add(&lines.mul_atom_pow(Atom::B, Rat::int(1)));
+    }
+
+    /// A sequential pass over `n` elements of `es` bytes, once per enclosing iteration.
+    fn stream(&mut self, n: &Poly, es: i128) {
+        let bytes = n.scale(Rat::int(es));
+        let o = self.outer();
+        self.moves = self.moves.add(&bytes.mul(&o));
+    }
+
+    // ---- the walk ----
+
+    fn block(&mut self, b: &Block) -> Result<(), Fail> {
+        for s in &b.stmts { self.stmt(s)?; }
+        if let Some(t) = &b.tail { self.expr(t)?; }
+        Ok(())
+    }
+
+    fn stmt(&mut self, s: &Stmt) -> Result<(), Fail> {
+        match s {
+            Stmt::Let(id, e) => {
+                self.expr(e)?;
+                self.add_work_n(1);
+                let l = &self.f.locals[*id];
+                if l.ty.is_arrayish() {
+                    let src = match &e.kind { ExprKind::Ref(s, _) | ExprKind::Local(s) => Some(*s), _ => None };
+                    if let Some(sz) = src.and_then(|s| self.local_size.get(&s).cloned()) {
+                        self.local_size.insert(*id, sz);
+                    }
+                } else if l.ty == Ty::I64 && !l.mutable {
+                    if let Some(a) = self.affine(e) { self.local_affine.insert(*id, a); }
+                }
+                Ok(())
+            }
+            Stmt::LetRepeat(id, e, n) => {
+                self.expr(e)?;
+                self.expr(n)?;
+                let Some(size) = self.size_of(n, Bound::Upper) else {
+                    return Err(Fail::Unknown(format!("the length of `{}` is not a size expression", self.f.locals[*id].name), n.line));
+                };
+                self.add_work(size.clone());
+                let es = self.elem_bytes(*id);
+                self.stream(&size, es);
+                self.local_size.insert(*id, size);
+                Ok(())
+            }
+            Stmt::LetArray(id, elems) => {
+                for e in elems { self.expr(e)?; }
+                let k = elems.len() as i128;
+                self.add_work_n(k);
+                let es = self.elem_bytes(*id);
+                self.stream(&Poly::constant(k), es);
+                self.local_size.insert(*id, Poly::constant(k));
+                Ok(())
+            }
+            Stmt::Assign(lv, op, e) => {
+                self.expr(e)?;
+                self.add_work_n(if op.is_some() { 2 } else { 1 });
+                if let LValue::Index(arr, idx, _) = lv {
+                    self.expr(idx)?;
+                    self.add_work_n(1);
+                    self.access(*arr, idx);
+                }
+                Ok(())
+            }
+            Stmt::For { var, start, end, body } => {
+                self.expr(start)?;
+                self.expr(end)?;
+                let (Some(lo), Some(hi)) = (self.size_of(start, Bound::Lower), self.size_of(end, Bound::Upper)) else {
+                    return Err(Fail::Unknown("loop bound is not a size expression".into(), start.line.max(end.line)));
+                };
+                // the trip count is exact when the outer loop variables cancel between the two
+                // bounds (`ii*T .. ii*T+T` is `T`); otherwise the rectangular hull
+                let a_lo = self.affine(start);
+                let a_hi = self.affine(end);
+                let mut trip = match (&a_lo, &a_hi) {
+                    (Some(l), Some(h)) => {
+                        let d = h.add(&l.scale(&Poly::constant(-1)));
+                        if d.is_const() { d.konst } else { hi.sub(&lo) }
+                    }
+                    _ => hi.sub(&lo),
+                };
+                if let Some(c) = trip.as_const() { if c.n < 0 { trip = Poly::zero(); } }
+                self.loops.push(Loop { var: *var, trip, start: lo, end: hi, offset: a_lo });
+                self.add_work_n(1); // increment and compare, per iteration
+                let r = self.block(body);
+                self.loops.pop();
+                r
+            }
+            Stmt::Expr(e) => self.expr(e),
+            Stmt::Return(Some(e)) => self.expr(e),
+            Stmt::Return(None) => Ok(()),
+        }
+    }
+
+    fn expr(&mut self, e: &Expr) -> Result<(), Fail> {
+        match &e.kind {
+            ExprKind::Int(_) | ExprKind::Float(_) | ExprKind::Bool(_) | ExprKind::Local(_) | ExprKind::Ref(..) => Ok(()),
+            ExprKind::Len(_) => { self.add_work_n(1); Ok(()) }
+            ExprKind::Binary(_, a, b) => { self.expr(a)?; self.expr(b)?; self.add_work_n(1); Ok(()) }
+            ExprKind::Unary(_, a) | ExprKind::Cast(a, _) => { self.expr(a)?; self.add_work_n(1); Ok(()) }
+            ExprKind::Println(a) => { self.expr(a)?; self.add_work_n(1); Ok(()) }
+            ExprKind::Index(arr, idx) => {
+                self.expr(idx)?;
+                self.add_work_n(1);
+                self.access(*arr, idx);
+                Ok(())
+            }
+            ExprKind::If(c, t, els) => {
+                self.expr(c)?;
+                self.add_work_n(1);
+                // both branches are charged: an upper bound, tight when one is empty
+                self.block(t)?;
+                if let Some(b) = els { self.block(b)?; }
+                Ok(())
+            }
+            ExprKind::Block(b) => self.block(b),
+            ExprKind::Call(fid, args) => {
+                for a in args { self.expr(a)?; }
+                self.add_work_n(1);
+                let cf = &self.an.m.funcs[*fid];
+                // every argument's size, when this call site knows them all
+                let bindings: Option<Vec<Poly>> = args.iter().zip(&cf.params).map(|(a, &p)| {
+                    if cf.locals[p].ty.is_arrayish() {
+                        match &a.kind { ExprKind::Ref(s, _) | ExprKind::Local(s) => self.local_size.get(s).cloned(), _ => None }
+                    } else if cf.locals[p].ty == Ty::I64 {
+                        self.size_of(a, Bound::Upper)
+                    } else {
+                        Some(Poly::zero()) // not a size; never read
+                    }
+                }).collect();
+                if let Some(b) = bindings {
+                    if self.an.active[*fid] {
+                        return Err(Fail::Unknown(format!("calls `{}`, whose cost is unknown (recursive; recurrences are not solved yet)", cf.name), e.line));
+                    }
+                    self.an.active[*fid] = true;
+                    let fc = Fa::new(self.an, cf, Some(&b)).run();
+                    self.an.active[*fid] = false;
+                    let (w, mv) = match fc.result {
+                        CostResult::Exact { work, moves } => (work, moves),
+                        CostResult::Unknown { reason, .. } => {
+                            let reason = if reason.starts_with("calls `") { reason }
+                                else { format!("calls `{}`, whose cost is unknown ({reason})", cf.name) };
+                            return Err(Fail::Unknown(reason, e.line));
+                        }
+                    };
+                    let o = self.outer();
+                    self.work = self.work.add(&w.mul(&o));
+                    self.moves = self.moves.add(&mv.mul(&o));
+                    return Ok(());
+                }
+                // otherwise: the callee's symbolic cost, with the atoms it uses substituted
+                let callee = self.an.func(*fid).clone();
+                let (cw, cm) = match &callee.result {
+                    CostResult::Exact { work, moves } => (work.clone(), moves.clone()),
+                    CostResult::Unknown { reason, .. } => {
+                        let reason = if reason.starts_with("calls `") { reason.clone() }
+                            else { format!("calls `{}`, whose cost is unknown ({reason})", callee.name) };
+                        return Err(Fail::Unknown(reason, e.line));
+                    }
+                };
+                let mut w = cw;
+                let mut mv = cm;
+                let cf = &self.an.m.funcs[*fid];
+                for (i, (a, &p)) in args.iter().zip(&cf.params).enumerate() {
+                    let used = w.terms.keys().chain(mv.terms.keys()).any(|m| m.factors.contains_key(&Atom::Var(i)));
+                    if !used { continue; }
+                    let by = if cf.locals[p].ty.is_arrayish() {
+                        match &a.kind { ExprKind::Ref(s, _) | ExprKind::Local(s) => self.local_size.get(s).cloned(), _ => None }
+                    } else {
+                        self.size_of(a, Bound::Upper)
+                    };
+                    let Some(by) = by else {
+                        return Err(Fail::Unknown(
+                            format!("argument {} to `{}` is not a size expression, and `{}`'s cost depends on it", i + 1, callee.name, callee.name),
+                            a.line,
+                        ));
+                    };
+                    w = w.subst(i, &by);
+                    mv = mv.subst(i, &by);
+                }
+                let o = self.outer();
+                self.work = self.work.add(&w.mul(&o));
+                self.moves = self.moves.add(&mv.mul(&o));
+                Ok(())
+            }
+        }
+    }
+}
