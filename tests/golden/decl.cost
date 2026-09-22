@@ -1,0 +1,8 @@
+mag              work ≤ 4                          moves ≤ 0                          declared
+                 inferred         work 3                            moves 0                            within the declaration
+total            work ≤ 12·xs.len()                moves ≤ 8·xs.len() + 2·B           declared
+                 inferred         work 10·xs.len()                  moves 8·xs.len() + B               within the declaration
+                 footprint        xs: [0, 8·xs.len())   resident after if 8·xs.len() < M
+small_sum        work 4·xs.len()                   moves 8·xs.len() + B               exact
+                 footprint        xs: [0, 8·xs.len())   resident after if 8·xs.len() < M
+main             work 56                           moves 3·B + 80                     exact, io

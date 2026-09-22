@@ -10,7 +10,10 @@ pub struct Func {
     pub name: String,
     pub params: Vec<Param>,
     pub ret: TypeExpr,
-    pub body: Block,
+    /// `None` for an `extern fn`: a declaration whose cost is what `#[cost]` says
+    pub body: Option<Block>,
+    /// `uses io, unbounded` — declared effects (only meaningful on an `extern`)
+    pub uses: Vec<String>,
     /// `#[cost(key = "expr", ...)]` — asserted cost bounds, checked after inference
     pub asserts: Vec<(String, String, u32, u32)>,
     pub line: u32,

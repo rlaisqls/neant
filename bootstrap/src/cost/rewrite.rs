@@ -91,7 +91,7 @@ fn replace_at(b: &mut Block, path: &[usize], with: Vec<Stmt>) {
 /// so the function still computes the product rather than adding to `C`'s old contents.
 pub fn tile(f: &Func, t: i64) -> Option<Func> {
     let mut path = Vec::new();
-    let nv = find_naive(&f.body, &mut path)?;
+    let nv = find_naive(f.body.as_ref()?, &mut path)?;
     let mut g = f.clone();
     let line = nv.mac_line();
     let ii = new_local(&mut g, "ii", Ty::I64, false);
@@ -126,7 +126,7 @@ pub fn tile(f: &Func, t: i64) -> Option<Func> {
             ], tail: None, ty: Ty::Unit } },
         ], tail: None, ty: Ty::Unit } },
     ], tail: None, ty: Ty::Unit } };
-    replace_at(&mut g.body, &nv.path, vec![clear, tiled]);
+    replace_at(g.body.as_mut().unwrap(), &nv.path, vec![clear, tiled]);
     Some(g)
 }
 
@@ -135,7 +135,7 @@ pub fn tile(f: &Func, t: i64) -> Option<Func> {
 /// and the inner loop reads it along a row.
 pub fn transpose(f: &Func) -> Option<Func> {
     let mut path = Vec::new();
-    let nv = find_naive(&f.body, &mut path)?;
+    let nv = find_naive(f.body.as_ref()?, &mut path)?;
     let mac = as_mac(&nv.mac)?;
     let line = mac.line;
     // which operand's index is `k·<coeff≠1> + j·1`? Coefficient of k is the row length.
@@ -175,11 +175,11 @@ pub fn transpose(f: &Func) -> Option<Func> {
         }
     }
     // splice: the build before the nest, the nest with its mac replaced
-    let mut nest = match stmt_at(&g.body, &nv.path) { Some(s) => s.clone(), None => return None };
+    let mut nest = match stmt_at(g.body.as_ref()?, &nv.path) { Some(s) => s.clone(), None => return None };
     replace_mac(&mut nest, &new_mac);
     let mut with = build;
     with.push(nest);
-    replace_at(&mut g.body, &nv.path, with);
+    replace_at(g.body.as_mut().unwrap(), &nv.path, with);
     Some(g)
 }
 

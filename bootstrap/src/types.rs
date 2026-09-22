@@ -33,6 +33,9 @@ pub fn check(prog: &ast::Program) -> Result<Module> {
         }
         sigs.insert(f.name.clone(), (i, ptys, ret));
     }
+    if let Some(m) = prog.funcs.iter().find(|f| f.name == "main") {
+        if m.body.is_none() { return err(m.line, m.col, "`main` cannot be extern"); }
+    }
     let main = sigs.get("main");
     match main {
         None => return err(1, 1, "no `fn main()`"),
@@ -118,7 +121,16 @@ fn check_func(f: &ast::Func, sigs: &HashMap<String, (FuncId, Vec<Ty>, Ty)>) -> R
         let id = cx.declare(&p.name, ty, false);
         params.push(id);
     }
-    let body = cx.block(&f.body)?;
+    let Some(ast_body) = &f.body else {
+        for u in &f.uses {
+            if u != "io" && u != "unbounded" { return err(f.line, f.col, format!("unknown effect `{u}`; effects are `io` and `unbounded`")); }
+        }
+        return Ok(Func { name: f.name.clone(), params, ret: ret.clone(), locals: cx.locals, sizes: cx.sizes, body: None, uses: f.uses.clone(), asserts: f.asserts.clone(), line: f.line });
+    };
+    if !f.uses.is_empty() {
+        return err(f.line, f.col, "effects are inferred for a function with a body; `uses` belongs on an `extern`");
+    }
+    let body = cx.block(ast_body)?;
     if body.tail.is_none() && *ret != Ty::Unit && !ends_in_return(&body) {
         return err(f.line, f.col, format!("`{}` returns `{ret}` but its body has no value", f.name));
     }
@@ -127,7 +139,7 @@ fn check_func(f: &ast::Func, sigs: &HashMap<String, (FuncId, Vec<Ty>, Ty)>) -> R
             return err(t.line, 0, format!("`{}` returns `{ret}`, but its body has type `{}`", f.name, t.ty));
         }
     }
-    Ok(Func { name: f.name.clone(), params, ret: ret.clone(), locals: cx.locals, sizes: cx.sizes, body, asserts: f.asserts.clone(), line: f.line })
+    Ok(Func { name: f.name.clone(), params, ret: ret.clone(), locals: cx.locals, sizes: cx.sizes, body: Some(body), uses: vec![], asserts: f.asserts.clone(), line: f.line })
 }
 
 fn ends_in_return(b: &Block) -> bool {

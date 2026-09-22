@@ -58,6 +58,17 @@ pub struct FuncCost {
     /// (its total working set, in lines, under `M`); `None` when some range is not exact, so
     /// no residue is claimed.
     pub resident: Option<Cond>,
+    /// `#[cost(...)]` as parsed: the declared work and moves bounds. When present they are the
+    /// function's line in the lockfile and all a caller sees of it.
+    pub declared: Declared,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct Declared {
+    pub work: Option<Poly>,
+    pub moves: Option<Poly>,
+    /// `sizes = "n <= 512, a.len() <= 4096"`: the size bounds a budget is checked under
+    pub sizes: Vec<(usize, f64)>,
 }
 
 /// A byte range of one parameter's array: `[lo, hi)`.
@@ -147,7 +158,7 @@ impl<'a> Analyzer<'a> {
                     names: param_names(f),
                     result: CostResult::Unknown { reason: "mutually recursive with another function; only self-recursion is solved".into(), line: f.line },
                     bounds: vec![], notes: vec![], suggestions: vec![], effects: vec![], violations: vec![], tier: "unknown",
-                    footprint: vec![], resident: None,
+                    footprint: vec![], resident: None, declared: Declared::default(),
                 });
             } else {
                 self.active[fid] = true;
@@ -327,8 +338,39 @@ impl<'a, 'b, 'c> Fa<'a, 'b, 'c> {
     }
 
     fn run(mut self) -> FuncCost {
+        // the declaration, parsed once: bounds and the size limits budgets are checked under
+        let mut declared = Declared::default();
+        let mut violations = Vec::new();
+        for (key, text, line, _) in &self.f.asserts {
+            match key.as_str() {
+                "work_at_most" | "moves_at_most" => match super::assert::parse(text, &self.names) {
+                    Ok(p) => { if key == "work_at_most" { declared.work = Some(p); } else { declared.moves = Some(p); } }
+                    Err(e) => violations.push(format!("line {line}: in `{key} = \"{text}\"`: {e}")),
+                },
+                "sizes" => {
+                    for part in text.split(',') {
+                        let Some((name, val)) = part.split_once("<=") else { violations.push(format!("line {line}: `sizes` entries are `name <= value`")); continue };
+                        match (self.names.iter().position(|n| n == name.trim()), val.trim().parse::<f64>()) {
+                            (Some(i), Ok(v)) => declared.sizes.push((i, v)),
+                            _ => violations.push(format!("line {line}: `sizes`: `{}` is not a size of this function or `{}` is not a number", name.trim(), val.trim())),
+                        }
+                    }
+                }
+                other => violations.push(format!("line {line}: unknown bound `{other}`; use `work_at_most`, `moves_at_most`, `sizes`")),
+            }
+        }
+        // an extern has no body: its cost is its declaration, or unknown
+        let Some(body) = &self.f.body else {
+            let effects: Vec<&'static str> = self.f.uses.iter().filter_map(|u| match u.as_str() { "io" => Some("io"), "unbounded" => Some("unbounded"), _ => None }).collect();
+            let result = match (&declared.work, &declared.moves) {
+                (Some(w), Some(m)) => CostResult::Exact { work: Cost::poly(w.clone()), moves: Cost::poly(m.clone()) },
+                _ if effects.contains(&"unbounded") => CostResult::Unknown { reason: "declared unbounded".into(), line: self.f.line },
+                _ => CostResult::Unknown { reason: "an extern needs `#[cost(work_at_most = …, moves_at_most = …)]` or `uses unbounded`".into(), line: self.f.line },
+            };
+            return FuncCost { name: self.f.name.clone(), names: self.names, result, bounds: vec![], notes: vec![], suggestions: vec![], effects, violations, tier: "declared", footprint: vec![], resident: None, declared };
+        };
         let mut tier = "exact";
-        let walked = self.block(&self.f.body);
+        let walked = self.block(body);
         let (footprint, resident) = self.signature_footprint();
         let result = match walked {
             Ok(()) => {
@@ -350,28 +392,39 @@ impl<'a, 'b, 'c> Fa<'a, 'b, 'c> {
             }
             Err(Fail::Unknown(reason, line)) => CostResult::Unknown { reason, line },
         };
-        // `#[cost(...)]`: every asserted bound must dominate what was inferred
-        let mut violations = Vec::new();
-        for (key, text, line, _) in &self.f.asserts {
-            let which = match key.as_str() {
-                "work_at_most" => "work",
-                "moves_at_most" => "moves",
-                other => { violations.push(format!("line {line}: unknown bound `{other}`; use `work_at_most` or `moves_at_most`")); continue; }
-            };
-            let asserted = match super::assert::parse(text, &self.names) {
-                Ok(p) => p,
-                Err(e) => { violations.push(format!("line {line}: in `{key} = \"{text}\"`: {e}")); continue; }
-            };
+        // `#[cost(...)]`: the inferred cost must stay within the declaration. Without `sizes`,
+        // by asymptotic dominance in every regime; with `sizes`, as numbers at those bounds and
+        // the machine's B and M — a budget in real units.
+        let m = self.machine();
+        let line_of = |key: &str| self.f.asserts.iter().find(|a| a.0 == key).map_or(self.f.line, |a| a.2);
+        for (which, asserted) in [("work", declared.work.clone()), ("moves", declared.moves.clone())] {
+            let Some(asserted) = asserted else { continue };
+            let line = line_of(&format!("{which}_at_most"));
             match &result {
                 CostResult::Exact { work, moves } => {
-                    // every piece must be dominated: the bound holds in every regime
                     let inferred = if which == "work" { work } else { moves };
-                    for piece in &inferred.pieces {
-                        if !super::assert::dominated(&piece.poly, &asserted) {
-                            let when = if piece.conds.is_empty() { String::new() } else { format!(" when {}", piece.conds.iter().map(|c| c.display(&self.names)).collect::<Vec<_>>().join(" and ")) };
-                            violations.push(format!(
-                                "line {line}: `{}` is asserted {which} at most {} but its {which} is {}{when}",
-                                self.f.name, asserted.display(&self.names), piece.poly.display(&self.names)));
+                    if declared.sizes.is_empty() {
+                        for piece in &inferred.pieces {
+                            if !super::assert::dominated(&piece.poly, &asserted) {
+                                let when = if piece.conds.is_empty() { String::new() } else { format!(" when {}", piece.conds.iter().map(|c| c.display(&self.names)).collect::<Vec<_>>().join(" and ")) };
+                                violations.push(format!(
+                                    "line {line}: `{}` is asserted {which} at most {} but its {which} is {}{when}",
+                                    self.f.name, asserted.display(&self.names), piece.poly.display(&self.names)));
+                            }
+                        }
+                    } else {
+                        let at = |a: Atom| -> Option<f64> {
+                            match a {
+                                Atom::B => Some(m.b_bytes as f64), Atom::M => Some(m.m_bytes as f64),
+                                Atom::Var(i) => declared.sizes.iter().find(|(v, _)| *v == i).map(|(_, x)| *x),
+                                Atom::Log(_) => None,
+                            }
+                        };
+                        match (inferred.eval(&at, &m), asserted.eval(&at)) {
+                            (Some(got), Some(limit)) if got > limit => violations.push(format!(
+                                "line {line}: `{}` has a {which} budget of {limit:.0} at the declared sizes but needs {got:.0}", self.f.name)),
+                            (None, _) | (_, None) => violations.push(format!("line {line}: `{}`'s {which} budget cannot be evaluated: every size the cost mentions needs a bound in `sizes`", self.f.name)),
+                            _ => {}
                         }
                     }
                 }
@@ -381,7 +434,7 @@ impl<'a, 'b, 'c> Fa<'a, 'b, 'c> {
             }
         }
         let effects = if self.io { vec!["io"] } else { vec![] };
-        FuncCost { name: self.f.name.clone(), names: self.names, result, bounds: self.bounds, notes: self.notes, suggestions: vec![], effects, violations, tier, footprint, resident }
+        FuncCost { name: self.f.name.clone(), names: self.names, result, bounds: self.bounds, notes: self.notes, suggestions: vec![], effects, violations, tier, footprint, resident, declared }
     }
 
     /// The byte range one access site covers over its loop nest, from its affine index and the
@@ -1297,14 +1350,24 @@ impl<'a, 'b, 'c> Fa<'a, 'b, 'c> {
                 let callee = self.an.func(*fid).clone();
                 if !self.replay && callee.effects.contains(&"io") { self.io = true; }
                 let cf = &self.an.m.funcs[*fid];
-                let (mut w, mut mv) = match &callee.result {
-                    CostResult::Exact { work, moves } => (work.clone(), moves.clone()),
-                    CostResult::Unknown { reason, .. } => {
-                        let reason = if reason.starts_with("calls `") { reason.clone() }
-                            else { format!("calls `{}`, whose cost is unknown ({reason})", callee.name) };
-                        return Err(Fail::Unknown(reason, e.line));
+                // a declared callee is seen through its declaration only: its bounds, no footprint
+                // and no residue — what a caller could know without the body
+                let declared_only = callee.declared.work.is_some() && callee.declared.moves.is_some();
+                let (mut w, mut mv) = if declared_only {
+                    (Cost::poly(callee.declared.work.clone().unwrap()), Cost::poly(callee.declared.moves.clone().unwrap()))
+                } else {
+                    match &callee.result {
+                        CostResult::Exact { work, moves } => (work.clone(), moves.clone()),
+                        CostResult::Unknown { reason, .. } => {
+                            let reason = if reason.starts_with("calls `") { reason.clone() }
+                                else { format!("calls `{}`, whose cost is unknown ({reason})", callee.name) };
+                            return Err(Fail::Unknown(reason, e.line));
+                        }
                     }
                 };
+                if !self.replay && callee.effects.contains(&"unbounded") {
+                    return Err(Fail::Unknown(format!("calls `{}`, which is declared unbounded", callee.name), e.line));
+                }
                 let mut map: Vec<(usize, Poly)> = Vec::new();
                 let mut roots: Vec<Option<LocalId>> = Vec::new();
                 for (i, (a, &p)) in args.iter().zip(&cf.params).enumerate() {
@@ -1330,8 +1393,8 @@ impl<'a, 'b, 'c> Fa<'a, 'b, 'c> {
                 }
                 w = w.subst_many(&map);
                 mv = mv.subst_many(&map);
-                // the callee's footprint in this function's arrays
-                let feet: Vec<(LocalId, Poly, Poly, bool)> = callee.footprint.iter().filter_map(|f| {
+                // the callee's footprint in this function's arrays (none is known of a declared callee)
+                let feet: Vec<(LocalId, Poly, Poly, bool)> = callee.footprint.iter().filter(|_| !declared_only).filter_map(|f| {
                     let root = roots.get(f.param).copied().flatten()?;
                     Some((root, f.lo.subst_many(&map), f.hi.subst_many(&map), f.exact))
                 }).collect();
@@ -1360,7 +1423,7 @@ impl<'a, 'b, 'c> Fa<'a, 'b, 'c> {
                 }
                 // after the call: what it leaves resident replaces what was
                 self.resident.clear();
-                if let Some(cond) = &callee.resident {
+                if let (Some(cond), false) = (&callee.resident, declared_only) {
                     let cond = Cond { ws: cond.ws.subst_many(&map), fits: true };
                     for (root, lo, hi, exact) in feet { if exact { self.resident.push(Res { root, lo, hi, conds: vec![cond.clone()] }); } }
                 }

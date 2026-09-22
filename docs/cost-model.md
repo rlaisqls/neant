@@ -225,20 +225,43 @@ site: its cost is the solved recurrence in its own parameters, substituted.
 `io` is inferred: a function that prints, or calls one that does, carries `, io` on its line.
 Nothing is declared.
 
-## `#[cost(...)]`
+## `#[cost(...)]` — declarations first
 
 ```
-#[cost(work_at_most = "a.len()", moves_at_most = "16 a.len()")]
-fn dot(a: &[f64], b: &[f64]) -> f64 { … }
+#[cost(work_at_most = "12 xs.len()", moves_at_most = "8 xs.len() + 2 B")]
+fn total(xs: &[i64]) -> i64 { … }
+
+#[cost(moves_at_most = "4096", sizes = "xs.len() <= 256")]
+fn small_sum(xs: &[f64]) -> f64 { … }
+
+#[cost(work_at_most = "4", moves_at_most = "0")]
+extern fn labs(x: i64) -> i64;
 ```
 
-The bound is written over the function's own size names — `a.len()`, `n` — with `B`, `M`,
-`log x`, `√M`, `^k` or superscripts, `·` or juxtaposition for products, `/` for division by one
-term. It is checked by **asymptotic dominance**: every term of the inferred cost must be
-dominated by some term of the bound — exponent by exponent on every size variable, with a
-higher `log` power breaking ties. Coefficients do not count. A bound that fails, or that is
-asserted on a function whose cost is unknown, is a build error on every command, with both
-polynomials in the message.
+A bound is written over the function's own size names — `a.len()`, `n` — with `B`, `M`, `log x`,
+`√M`, `^k` or superscripts, `·` or juxtaposition for products, `/` for division by one term.
+
+**The declaration is the function's line.** When a function declares its cost, that declaration is
+what `costs.lock` records and what the report shows first; the inferred cost is printed under it
+as `inferred … within the declaration` or `outside`, and outside is a build error on every
+command. A function without a declaration has its inferred cost as its line, as before.
+
+**Two ways to check.** Without `sizes`, by **asymptotic dominance** in every regime: each piece of
+the inferred cost must be dominated term by term by the bound, `log` powers breaking ties,
+coefficients ignored. With `sizes = "n <= 512, a.len() <= 4096"`, as **numbers**: the inferred
+cost is evaluated at those size bounds and the machine's `B` and `M` — regime conditions decided,
+the applicable pieces' maximum taken — and must not exceed the bound evaluated the same way. This
+is a budget in real units (`moves_at_most = "4096"`), which the asymptotic check cannot express.
+
+**A caller sees only the declaration.** When a callee is declared, the caller composes the
+declared work and moves and nothing else: no footprint, no residue, no credit. Delete the callee's
+body and keep its declaration — `extern fn` is exactly that — and every caller checks the same.
+That is the property that makes separate compilation, binary distribution and interface budgets
+possible, and it is a golden test (`decl.nt` against `decl_extern.nt`).
+
+**`extern fn`** has no body. Its cost is its declaration; without one it is unknown unless declared
+`uses unbounded`. It names the C symbol itself (`labs` is libc's), carries its effects as `uses io,
+unbounded`, and is the boundary stage C measures and audits.
 
 ## The measured tier
 

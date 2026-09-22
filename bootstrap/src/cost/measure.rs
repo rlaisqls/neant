@@ -92,7 +92,7 @@ pub fn driver(m: &Module, fid: FuncId, n: i64, repeat: i64, shapes: &[Shape]) ->
     }
     let main = Func {
         name: "main".into(), params: vec![], ret: Ty::Unit, locals, sizes: vec![],
-        body: Block { stmts, tail: None, ty: Ty::Unit }, asserts: vec![], line,
+        body: Some(Block { stmts, tail: None, ty: Ty::Unit }), uses: vec![], asserts: vec![], line,
     };
     let mut out = m.clone();
     match out.funcs.iter().position(|f| f.name == "main") {

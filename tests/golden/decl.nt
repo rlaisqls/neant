@@ -1,0 +1,28 @@
+// declarations first: the callee's line is its declaration, and the caller is checked against
+// that declaration alone
+#[cost(work_at_most = "4", moves_at_most = "0")]
+fn mag(x: i64) -> i64 {
+    if x < 0 { -x } else { x }
+}
+
+#[cost(work_at_most = "12 xs.len()", moves_at_most = "8 xs.len() + 2 B")]
+fn total(xs: &[i64]) -> i64 {
+    let mut s = 0;
+    for i in 0..xs.len() {
+        s += mag(xs[i]);
+    }
+    s
+}
+
+// a budget in real units, checked at the declared size bound: 256 doubles are 2048 bytes
+#[cost(moves_at_most = "4096", sizes = "xs.len() <= 256")]
+fn small_sum(xs: &[f64]) -> f64 {
+    xs.iter().sum()
+}
+
+fn main() {
+    let xs = [3, -4, 5];
+    println(total(&xs));
+    let ys = [1.5, 2.5];
+    println(small_sum(&ys));
+}

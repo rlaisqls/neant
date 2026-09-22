@@ -1,0 +1,5 @@
+labs             work ≤ 4                          moves ≤ 0                          declared
+total            work ≤ 12·xs.len()                moves ≤ 8·xs.len() + 2·B           declared
+                 inferred         work 10·xs.len()                  moves 8·xs.len() + B               within the declaration
+                 footprint        xs: [0, 8·xs.len())   resident after if 8·xs.len() < M
+main             work 43                           moves 2·B + 48                     exact, io

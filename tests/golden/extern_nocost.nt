@@ -1,0 +1,2 @@
+extern fn labs(x: i64) -> i64;
+fn main() { println(labs(-3)); }

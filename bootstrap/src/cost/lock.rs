@@ -133,6 +133,14 @@ pub fn render(source_name: &str, costs: &[FuncCost]) -> String {
 
 pub fn line(c: &FuncCost) -> String {
     let fx = if c.effects.is_empty() { String::new() } else { format!(", {}", c.effects.join(", ")) };
+    // a declared function's line is its declaration; the inference is what gets checked against it
+    if let (Some(w), Some(mv)) = (&c.declared.work, &c.declared.moves) {
+        let sizes = if c.declared.sizes.is_empty() { String::new() } else {
+            format!("  sizes {}", c.declared.sizes.iter().map(|(i, v)| format!("{} ≤ {v}", c.names.get(*i).cloned().unwrap_or_default())).collect::<Vec<_>>().join(", "))
+        };
+        let ok = if c.violations.is_empty() { "declared" } else { "declared ✗" };
+        return format!("{:<16} work ≤ {:<26} moves ≤ {:<26} {ok}{fx}{sizes}", c.name, w.display(&c.names).to_string(), mv.display(&c.names).to_string());
+    }
     match &c.result {
         CostResult::Exact { work, moves } => format!(
             "{:<16} work {:<28} moves {:<28} {}{fx}",
@@ -150,6 +158,15 @@ fn human(b: i128) -> String {
 /// own line underneath so the regimes can be read.
 pub fn pretty_line(c: &FuncCost) -> String {
     let fx = if c.effects.is_empty() { String::new() } else { format!(", {}", c.effects.join(", ")) };
+    if c.declared.work.is_some() && c.declared.moves.is_some() {
+        let mut s = line(c);
+        if c.tier != "declared" {
+            if let CostResult::Exact { work, moves } = &c.result {
+                s.push_str(&format!("\n{:<16} inferred         work {:<28} moves {:<28} {}", "", brief(work, &c.names), brief(moves, &c.names), if c.violations.is_empty() { "within the declaration" } else { "outside the declaration" }));
+            }
+        }
+        return s;
+    }
     match &c.result {
         CostResult::Exact { work, moves } => {
             let mut s = format!("{:<16} work {:<28} moves {:<28} {}{fx}", c.name, brief(work, &c.names), brief_poly(moves.pieces.iter().min_by_key(|p| p.conds.len()).map(|p| &p.poly).unwrap_or(&Poly::zero()), &c.names), c.tier);

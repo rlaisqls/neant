@@ -1,7 +1,8 @@
-dot              work 6·a.len()                    moves 16·a.len() + 2·B             exact
+dot              work ≤ a.len()                    moves ≤ 16·a.len()                 declared
+                 inferred         work 6·a.len()                    moves 16·a.len() + 2·B             within the declaration
                  footprint        a: [0, 8·a.len())  b: [0, 8·a.len())   resident after if 16·a.len() < M
 pairs            work 6·a.len()² + 2·a.len()       moves                              exact  (2 regimes)
                                                moves 16·a.len() + 2·B             if ≈ 8·a.len() < M
                                                moves 8·a.len()² + 2·B·a.len()     if ≈ 8·a.len() ≥ M
                  footprint        a: [0, 8·a.len())   resident after if 8·a.len() < M
-main             work 83                           moves 4·B + 120                    exact, io
+main             work 73                           moves 2·B + 120                    exact, io

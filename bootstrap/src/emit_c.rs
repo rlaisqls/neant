@@ -122,7 +122,9 @@ static void nt_println_f64(double v) {
 
     fn prototype(&mut self, f: &Func) {
         let ret = c_ty(&f.ret);
-        let _ = write!(self.out, "static {ret} nt_{}(", f.name);
+        // an extern names the C symbol itself; our own functions are prefixed and static
+        if f.body.is_none() { let _ = write!(self.out, "{ret} {}(", f.name); }
+        else { let _ = write!(self.out, "static {ret} nt_{}(", f.name); }
         if f.params.is_empty() {
             self.out.push_str("void");
         }
@@ -142,12 +144,13 @@ static void nt_println_f64(double v) {
     }
 
     fn func(&mut self, f: &Func) {
+        let Some(body) = &f.body else { return };
         self.prototype(f);
         self.out.push_str(" {\n");
         self.indent = 1;
         self.tmp = 0;
         let ret_scalar = f.ret != Ty::Unit;
-        self.block_body(&f.body, if ret_scalar { Target::Return } else { Target::Discard });
+        self.block_body(body, if ret_scalar { Target::Return } else { Target::Discard });
         self.out.push_str("}\n\n");
     }
 
@@ -357,7 +360,8 @@ static void nt_println_f64(double v) {
                         CVal::Arr(p, n) => { parts.push(p); parts.push(n); }
                     }
                 }
-                s(format!("nt_{}({})", callee.name, parts.join(", ")))
+                if callee.body.is_none() { s(format!("{}({})", callee.name, parts.join(", "))) }
+                else { s(format!("nt_{}({})", callee.name, parts.join(", "))) }
             }
             ExprKind::Println(a) => {
                 let f = match a.ty { Ty::I64 => "nt_println_i64", Ty::F64 => "nt_println_f64", Ty::U8 => "nt_println_u8", _ => "nt_println_bool" };

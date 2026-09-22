@@ -96,6 +96,12 @@ charged the maximum over implementations.
 and it captures what makes separate compilation, binary distribution and interface budgets
 possible.
 
+**Status: passed, 2026-09-22.** `sizes` budgets in real units; the declaration is the lockfile
+line; a declared callee is composed through its declaration only; `extern fn` is a bodiless
+declaration naming the C symbol. `tests/golden/decl.nt` and `decl_extern.nt` are the exit test:
+the same caller, the same declaration, one callee with a body and one without, both check. `dyn`
+does not exist in the language yet, so its inversion waits for it.
+
 ## Stage C — the boundary
 
 **Claim.** Scope — the reason this is a language — survives the call into C, as a number rather

@@ -1,0 +1,5 @@
+#[cost(moves_at_most = "1024", sizes = "xs.len() <= 256")]
+fn sum(xs: &[f64]) -> f64 {
+    xs.iter().sum()
+}
+fn main() { let ys = [1.0, 2.0]; println(sum(&ys)); }

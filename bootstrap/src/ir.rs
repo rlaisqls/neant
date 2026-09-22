@@ -78,7 +78,10 @@ pub struct Func {
     pub ret: Ty,
     pub locals: Vec<Local>,
     pub sizes: Vec<SizeInfo>,
-    pub body: Block,
+    /// `None` for an `extern`: no body, cost and effects from the declaration
+    pub body: Option<Block>,
+    /// declared effects of an extern
+    pub uses: Vec<String>,
     /// `#[cost(...)]` bounds: (key, expression text, line, col)
     pub asserts: Vec<(String, String, u32, u32)>,
     pub line: u32,

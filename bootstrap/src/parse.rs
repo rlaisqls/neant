@@ -70,6 +70,7 @@ impl Parser {
             self.expect(Tok::RBracket, "`]`")?;
         }
         let (line, col) = self.here();
+        let is_extern = self.eat(&Tok::Extern);
         self.expect(Tok::Fn, "`fn`")?;
         let (name, _, _) = self.ident("function name")?;
         self.expect(Tok::LParen, "`(`")?;
@@ -83,8 +84,21 @@ impl Parser {
         }
         self.expect(Tok::RParen, "`)`")?;
         let ret = if self.eat(&Tok::Arrow) { self.type_expr()? } else { TypeExpr::Unit };
-        let body = self.block()?;
-        Ok(Func { name, params, ret, body, asserts, line, col })
+        let mut uses = Vec::new();
+        if self.eat(&Tok::Uses) {
+            loop {
+                let (e, _, _) = self.ident("an effect (`io`, `unbounded`)")?;
+                uses.push(e);
+                if !self.eat(&Tok::Comma) { break; }
+            }
+        }
+        let body = if is_extern {
+            self.expect(Tok::Semi, "`;` after an extern declaration")?;
+            None
+        } else {
+            Some(self.block()?)
+        };
+        Ok(Func { name, params, ret, body, uses, asserts, line, col })
     }
 
     fn type_expr(&mut self) -> Result<TypeExpr> {
@@ -420,6 +434,7 @@ fn describe(t: &Tok) -> String {
                 Tok::MinusEq => "-=", Tok::StarEq => "*=", Tok::SlashEq => "/=", Tok::Amp => "&",
                 Tok::AmpAmp => "&&", Tok::Pipe => "|", Tok::PipePipe => "||", Tok::Bang => "!", Tok::Hash => "#",
                 Tok::While => "while", Tok::Break => "break", Tok::Decreasing => "decreasing",
+                Tok::Extern => "extern", Tok::Uses => "uses",
                 _ => "?",
             };
             format!("`{s}`")

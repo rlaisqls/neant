@@ -1,0 +1,17 @@
+// the same caller, checked against a callee that has no body at all: libc's labs
+#[cost(work_at_most = "4", moves_at_most = "0")]
+extern fn labs(x: i64) -> i64;
+
+#[cost(work_at_most = "12 xs.len()", moves_at_most = "8 xs.len() + 2 B")]
+fn total(xs: &[i64]) -> i64 {
+    let mut s = 0;
+    for i in 0..xs.len() {
+        s += labs(xs[i]);
+    }
+    s
+}
+
+fn main() {
+    let xs = [3, -4, 5];
+    println(total(&xs));
+}

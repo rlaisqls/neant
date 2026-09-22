@@ -1,0 +1,2 @@
+labs             unknown: an extern needs `#[cost(work_at_most = …, moves_at_most = …)]` or `uses unbounded` (line 1)
+main             unknown: calls `labs`, whose cost is unknown (an extern needs `#[cost(work_at_most = …, moves_at_most = …)]` or `uses unbounded`) (line 2)
