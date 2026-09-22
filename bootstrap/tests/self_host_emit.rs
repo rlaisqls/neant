@@ -134,76 +134,69 @@ fn self_hosted_emit_runs_the_same() {
 }
 
 
-/// **The fixpoint.** Everything above compares the self-hosted compiler against the Rust one.
-/// This compares it against *itself*, which is the only test that says the thing is a compiler
-/// rather than a program that agrees with one.
+
+/// **The fixpoint, and seed two.** Everything above compares the self-hosted compiler against the
+/// Rust one. This compares it against *itself*, which is the only test that says the thing is a
+/// compiler rather than a program that agrees with one.
 ///
-/// 1. `stage1` is the four stages plus the driver that makes them a program — neant source, run
-///    by the Rust compiler's interpreter.
-/// 2. `stage1` reads its own source and writes `stage2.c`; `cc` compiles that with `rt.c` into a
-///    native binary.
+/// 1. `stage1` is `compiler/*.nt` concatenated — the four stages and `main.nt`, the committed
+///    driver — as neant source, run by the Rust compiler's interpreter.
+/// 2. `stage1` reads its own source from stdin and writes C; `cc` compiles that with `rt.c` into
+///    a native binary.
 /// 3. `stage2` reads the same source and writes C again.
 ///
-/// **That C must be byte-identical to `stage2.c`.** A compiler that has reached its fixpoint emits
-/// itself; one that has not — because it is compiled differently from how it compiles, or because
-/// some construct survives one pass and not the next — does not. Nothing about the Rust compiler
-/// is in the comparison: it built stage2 and then stepped out.
+/// **That C must be byte-identical to what stage1 wrote,** and to the committed `bootstrap/neant.c`. A
+/// compiler that has reached its fixpoint emits itself; one that has not — because it is compiled
+/// differently from how it compiles, or because some construct survives one pass and not the next
+/// — does not. Nothing about the Rust compiler is in the first comparison: it built stage2 and
+/// then stepped out.
 ///
-/// It also grew out of a weaker test that stopped at `cc -c`, because `main` lived in a driver and
-/// `extern fn` was outside the slice. It is not outside any more.
+/// The second comparison is what keeps **seed two** honest. `bootstrap/neant.c` is checked in so that a C
+/// compiler and nothing else can rebuild the chain, and a checked-in artifact that nothing checks
+/// is a file that silently stops matching its source. Regenerate it with `compiler/build.sh`.
 #[test]
 fn the_self_hosted_compiler_reaches_its_fixpoint() {
-    let names = ["compiler/lex.nt", "compiler/parse.nt", "compiler/check.nt", "compiler/emit.nt"];
-    let stages = names.map(|p| std::fs::read_to_string(repo(p)).unwrap()).join("\n");
+    let names = ["compiler/lex.nt", "compiler/parse.nt", "compiler/check.nt", "compiler/emit.nt",
+                 "compiler/main.nt"];
+    // concatenated in dependency order, which is the whole build system: there is no module
+    // system, so these are fragments of one program (compiler/build.sh does the same)
+    let stage1_src: String = names.iter().map(|p| std::fs::read_to_string(repo(p)).unwrap()).collect();
     let dir = std::env::temp_dir().join(format!("neant-fixpoint-{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
-
-    // the arenas are sized for the compiler's own source, not for a golden
-    let big = |d: String| d.replace("[b'\\0'; 65536]", "[b'\\0'; 262144]")
-        .replace("; 65536]", "; 262144]").replace("; 4096]", "; 16384]");
-
-    // stage1: reads `input.nt`, writes `emitted.c`. Its own source is what it will be given.
-    let input = dir.join("input.nt");
-    let emitted = dir.join("emitted.c");
-    let stage1 = dir.join("stage1.nt");
-    let stage1_src = format!("{stages}\n{}",
-        big(driver(&input.to_string_lossy(), &emitted.to_string_lossy())));
+    let stage1 = dir.join("all.nt");
     std::fs::write(&stage1, &stage1_src).unwrap();
 
     // stage1 compiles stage1, under the Rust compiler
+    let run = Command::new(neant()).arg("run").arg(&stage1)
+        .stdin(std::fs::File::open(&stage1).unwrap()).output().unwrap();
+    assert!(run.status.success(), "stage1 failed on its own source (exit {:?}: 2 parser, \
+        3 checker, 4 emitter, 5 size):\n{}", run.status.code(), String::from_utf8_lossy(&run.stderr));
     let stage2_c = dir.join("stage2.c");
-    let bootstrap_driver = dir.join("bootstrap.nt");
-    std::fs::write(&bootstrap_driver, format!("{stages}\n{}",
-        big(driver(&stage1.to_string_lossy(), &stage2_c.to_string_lossy())))).unwrap();
-    let run = Command::new(neant()).arg("run").arg(&bootstrap_driver).output().unwrap();
-    assert!(run.status.success(), "stage1 failed on its own source:\n{}",
-        String::from_utf8_lossy(&run.stderr));
-    let wrote: i64 = String::from_utf8_lossy(&run.stdout).trim().parse().unwrap_or(-9);
-    assert!(wrote > 0, "stage1 emitted nothing for its own source (code {wrote}; \
-        -2 parser, -1 checker, -3 emitter)");
+    std::fs::write(&stage2_c, &run.stdout).unwrap();
+    assert!(run.stdout.len() > 1000, "stage1 emitted {} bytes for its own source", run.stdout.len());
 
     // stage2: the same compiler, native
     let stage2 = dir.join("stage2");
     let cc = std::env::var("CC").unwrap_or_else(|_| "cc".into());
     let built = Command::new(&cc).args(["-O1", "-std=gnu11", "-w", "-o"]).arg(&stage2)
         .arg(&stage2_c).arg(repo("bootstrap/rt.c")).output().unwrap();
-    assert!(built.status.success(), "cc rejected stage2.c ({}):\n{}",
+    assert!(built.status.success(), "cc rejected the C stage1 wrote for its own source ({}):\n{}",
         stage2_c.display(), String::from_utf8_lossy(&built.stderr));
 
     // stage2 compiles stage1 — the same input stage1 was just given
-    std::fs::copy(&stage1, &input).unwrap();
-    let out = Command::new(&stage2).output().unwrap();
-    assert!(out.status.success(), "stage2 failed on stage1's source:\n{}",
-        String::from_utf8_lossy(&out.stderr));
-    let wrote2: i64 = String::from_utf8_lossy(&out.stdout).trim().parse().unwrap_or(-9);
-    assert!(wrote2 > 0, "stage2 emitted nothing for stage1's source (code {wrote2})");
-
-    let a = std::fs::read(&stage2_c).unwrap();
-    let b = std::fs::read(&emitted).unwrap();
-    assert_eq!(a.len(), b.len(),
+    let again = Command::new(&stage2).stdin(std::fs::File::open(&stage1).unwrap()).output().unwrap();
+    assert!(again.status.success(), "stage2 failed on stage1's source (exit {:?})", again.status.code());
+    assert_eq!(again.stdout.len(), run.stdout.len(),
         "stage2 emitted {} bytes where stage1 emitted {} — the compiler does not reach its \
-         fixpoint (artifacts in {})", b.len(), a.len(), dir.display());
-    assert!(a == b, "stage2's output differs from stage1's although the lengths match \
-        (artifacts in {})", dir.display());
+         fixpoint (artifacts in {})", again.stdout.len(), run.stdout.len(), dir.display());
+    assert!(again.stdout == run.stdout,
+        "stage2's output differs from stage1's although the lengths match (artifacts in {})",
+        dir.display());
+
+    // seed two, as committed
+    let seed = std::fs::read(repo("bootstrap/neant.c")).expect("bootstrap/neant.c is missing; run compiler/build.sh");
+    assert!(seed == run.stdout,
+        "bootstrap/neant.c is {} bytes and the compiler now emits {} — seed two is stale; \
+         regenerate it with compiler/build.sh", seed.len(), run.stdout.len());
     let _ = std::fs::remove_dir_all(&dir);
 }

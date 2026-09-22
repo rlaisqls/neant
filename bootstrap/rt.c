@@ -12,6 +12,7 @@
 
 #include <stdint.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 
 // `write_file(path: &[u8], buf: &[u8], n: i64)`: the mirror of `read_file`, for the self-hosted
@@ -50,3 +51,30 @@ int64_t read_file(const uint8_t *path_p, int64_t path_n, uint8_t *buf_p, int64_t
     fclose(f);
     return (int64_t)got;
 }
+
+// `read_stdin(buf: &mut [u8]) -> i64` and `write_stdout(buf: &[u8], n: i64) -> i64`: the same
+// convention as the pair above, over the streams instead of a named file. They exist so the
+// self-hosted compiler can be an ordinary filter — `neant-self < x.nt > x.c` — rather than a
+// program with its paths compiled in. That is what `compiler/main.nt` uses, and what makes seed
+// two (`neant.c`) a thing you can run, not only a thing a test builds.
+//
+// The language has no argv, and giving it one would mean the emitted `main` taking arguments and
+// a way to pass them across a translation unit for every program, linked or not. A filter needs
+// neither, and is the convention the input already has.
+int64_t read_stdin(uint8_t *buf_p, int64_t buf_n) {
+    size_t got = fread(buf_p, 1, (size_t)buf_n, stdin);
+    if (got == (size_t)buf_n && fgetc(stdin) != EOF) return -1;
+    return (int64_t)got;
+}
+
+int64_t write_stdout(const uint8_t *buf_p, int64_t buf_cap, int64_t n) {
+    if (n < 0 || n > buf_cap) return -1;
+    size_t put = fwrite(buf_p, 1, (size_t)n, stdout);
+    if (fflush(stdout) != 0) return -1;
+    return (int64_t)put;
+}
+
+// `quit(code: i64)`: libc's `exit` cannot be declared directly, because an `extern fn` names the C
+// symbol and neant's `i64` is `int64_t` where libc's is `int` — two declarations of `exit` that
+// disagree, which `cc` refuses. One line of shim rather than an integer-width rule in the language.
+void quit(int64_t code) { exit((int)code); }

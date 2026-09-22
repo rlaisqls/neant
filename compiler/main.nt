@@ -1,0 +1,70 @@
+// The fifth and last piece: the driver that makes the other four a program. Concatenate
+// lex.nt, parse.nt, check.nt, emit.nt and this, and you have a compiler — the same one
+// `bootstrap/tests/self_host_emit.rs` assembles, except that this one is committed and reads
+// its input rather than having a path compiled into it.
+//
+//     neant run compiler/all.nt < x.nt > x.c        (under the Rust compiler)
+//     ./neant-self          < x.nt > x.c            (seed two, built by itself)
+//
+// A filter, not a program with arguments. The language has no argv, and adding one would mean
+// the emitted `main` taking parameters and carrying them across a translation unit for every
+// program whether it wants them or not; stdin and stdout need none of that, and are the shape
+// the input already has. `read_stdin`/`write_stdout` are in `bootstrap/rt.c`, next to the
+// `read_file`/`write_file` pair they are modelled on.
+//
+// Exit codes, so a shell can tell the three failures apart:
+//   0  emitted        2  the parser rejected it     3  the checker rejected it
+//   4  the emitter refused — a construct outside the self-hosted slice
+//   5  the input did not fit, or the output did not
+//
+// The arenas are fixed, as every pass in this repo's arenas are: 256 KiB of source, one token
+// and one node per byte of it, and 1 MiB of C out. The compiler's own source is 80 KiB and
+// emits 180 KiB, so this is roughly 3× headroom; a source that does not fit exits 5 rather
+// than writing something short and calling it a success.
+
+extern fn read_stdin(buf: &mut [u8]) -> i64 uses io, unbounded;
+extern fn write_stdout(buf: &[u8], n: i64) -> i64 uses io, unbounded;
+extern fn quit(code: i64) uses io;
+
+fn main() {
+    let mut buf = [b'\0'; 262144];
+    let n = read_stdin(&mut buf);
+    if n < 0 {
+        quit(5);
+    }
+
+    let mut toks = [Token { kind: 0, start: 0, len: 0, ival: 0 }; 262144];
+    let n_toks = lex(&buf, n, &mut toks);
+
+    let mut nodes = [Node { kind: 0, a: 0, b: 0, c: 0, d: 0, ival: 0, next: 0 }; 262144];
+    let mut st = [0, 0, 0, 0, 0];
+    let first = parse_program(&buf, &toks, n_toks, &mut st, &mut nodes);
+    if st[2] != 0 {
+        quit(2);
+    }
+
+    let mut types = [Ty { kind: 0, elem: 0, mutable: 0, size: 0 }; 65536];
+    let mut syms = [Sym { name: 0, ty: 0, mutable: 0 }; 65536];
+    let mut sigs = [Sig { name: -1, params: 0, n_params: 0, ret: 0, ext: 0 }; 4096];
+    let mut strs = [Str { name: 0, fields: 0, n_fields: 0 }; 1024];
+    let mut flds = [Fld { name: 0, ty: 0 }; 4096];
+    let mut ptys = [0; 16384];
+    let mut ntys = [-1; 262144];
+    let mut cst = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+    let bad = check_program(&buf, &toks, &nodes, &mut types, &mut syms, &mut sigs, &mut ptys,
+                            &mut strs, &mut flds, &mut ntys, &mut cst, first);
+    if bad != 0 {
+        quit(3);
+    }
+
+    let mut out = [b'\0'; 1048576];
+    let mut est = [0, 0, 0];
+    let len = emit_program(&mut out, &mut est, &buf, &toks, &nodes, &types, &strs, &flds, &ntys,
+                           &sigs, &ptys, first);
+    if len < 0 {
+        quit(4);
+    }
+    if write_stdout(&out, len) != len {
+        quit(5);
+    }
+}
