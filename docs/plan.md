@@ -191,7 +191,8 @@ outright — not deferred to a per-iteration check, since the same statement wou
 the next lap (`err_move_loop`). A local born inside the loop body may be moved freely lap to lap,
 since lexically it is a fresh binding each time. What m4-design.md §2 also named — passing an
 array by value (`f(xs)`, a parameter of type `[T]`) — is not done: parameters are still views
-only, so the only move source is a `let`. Next: uniqueness, which needs this to have a subject.
+only, so the only move source is a `let`. Next: uniqueness, which needs this to have a subject —
+designed in [m5-design.md](m5-design.md), not yet built.
 
 ## Self-hosting
 
