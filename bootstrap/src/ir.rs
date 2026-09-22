@@ -21,6 +21,7 @@ pub enum Ty {
     I64,
     F64,
     Bool,
+    U8,
     Unit,
     /// An owned array `[T; n]`. Only ever the type of a local.
     Array(Box<Ty>, Size),
@@ -29,8 +30,9 @@ pub enum Ty {
 }
 
 impl Ty {
-    pub fn is_scalar(&self) -> bool { matches!(self, Ty::I64 | Ty::F64 | Ty::Bool) }
-    pub fn is_numeric(&self) -> bool { matches!(self, Ty::I64 | Ty::F64) }
+    pub fn is_scalar(&self) -> bool { matches!(self, Ty::I64 | Ty::F64 | Ty::Bool | Ty::U8) }
+    pub fn is_numeric(&self) -> bool { matches!(self, Ty::I64 | Ty::F64 | Ty::U8) }
+    pub fn elem_bytes(&self) -> i128 { match self { Ty::Bool | Ty::U8 => 1, _ => 8 } }
     pub fn is_arrayish(&self) -> bool { matches!(self, Ty::Array(..) | Ty::Slice(..)) }
     pub fn elem(&self) -> Option<&Ty> {
         match self { Ty::Array(t, _) | Ty::Slice(t, _, _) => Some(t), _ => None }
@@ -54,6 +56,7 @@ impl fmt::Display for Ty {
             Ty::I64 => write!(f, "i64"),
             Ty::F64 => write!(f, "f64"),
             Ty::Bool => write!(f, "bool"),
+            Ty::U8 => write!(f, "u8"),
             Ty::Unit => write!(f, "()"),
             Ty::Array(t, Size::Const(n)) => write!(f, "[{t}; {n}]"),
             Ty::Array(t, Size::Var(_)) => write!(f, "[{t}; n]"),
@@ -76,6 +79,8 @@ pub struct Func {
     pub locals: Vec<Local>,
     pub sizes: Vec<SizeInfo>,
     pub body: Block,
+    /// `#[cost(...)]` bounds: (key, expression text, line, col)
+    pub asserts: Vec<(String, String, u32, u32)>,
     pub line: u32,
 }
 
@@ -112,6 +117,9 @@ pub enum Stmt {
     LetBuild { id: LocalId, len: Expr, var: LocalId, body: Block },
     Assign(LValue, Option<crate::ast::BinOp>, Expr),
     For { var: LocalId, start: Expr, end: Expr, body: Block },
+    /// `decreasing` is the programmer's measure, when the compiler needs one.
+    While { cond: Expr, decreasing: Option<Expr>, body: Block, line: u32 },
+    Break,
     Expr(Expr),
     Return(Option<Expr>),
 }
@@ -134,6 +142,7 @@ pub enum ExprKind {
     Int(i64),
     Float(f64),
     Bool(bool),
+    Byte(u8),
     Local(LocalId),
     Binary(crate::ast::BinOp, Box<Expr>, Box<Expr>),
     Unary(crate::ast::UnOp, Box<Expr>),

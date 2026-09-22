@@ -1,0 +1,53 @@
+// recursive descent over bytes: expr := term ('+' term)*, term := atom ('*' atom)*,
+// atom := digit+ | '(' expr ')'. The position travels in a one-element slice. The three
+// functions call each other, which the calculus does not solve: another measured-tier case.
+fn peek(s: &[u8], pos: &[i64]) -> u8 {
+    if pos[0] < s.len() { s[pos[0]] } else { 0 as u8 }
+}
+
+fn number(s: &[u8], pos: &mut [i64]) -> i64 {
+    let mut v = 0;
+    while peek(s, pos) >= b'0' && peek(s, pos) <= b'9' decreasing s.len() - pos[0] {
+        v = v * 10 + (s[pos[0]] - b'0') as i64;
+        pos[0] += 1;
+    }
+    v
+}
+
+fn atom(s: &[u8], pos: &mut [i64]) -> i64 {
+    if peek(s, pos) == b'(' {
+        pos[0] += 1;
+        let v = expr(s, pos);
+        pos[0] += 1;
+        v
+    } else {
+        number(s, pos)
+    }
+}
+
+fn term(s: &[u8], pos: &mut [i64]) -> i64 {
+    let mut v = atom(s, pos);
+    while peek(s, pos) == b'*' decreasing s.len() - pos[0] {
+        pos[0] += 1;
+        v = v * atom(s, pos);
+    }
+    v
+}
+
+fn expr(s: &[u8], pos: &mut [i64]) -> i64 {
+    let mut v = term(s, pos);
+    while peek(s, pos) == b'+' decreasing s.len() - pos[0] {
+        pos[0] += 1;
+        v = v + term(s, pos);
+    }
+    v
+}
+
+fn main() {
+    let src = b"2+3*(4+1)*2";
+    let mut pos = [0];
+    println(expr(&src, &mut pos));
+    let src2 = b"(1+2)*(3+4)";
+    let mut pos2 = [0];
+    println(expr(&src2, &mut pos2));
+}

@@ -1,0 +1,38 @@
+// breadth-first search over a graph in compressed rows: the inner loop's bounds are loaded
+// from memory, so no static bound exists — this is a function for the measured tier
+fn bfs(offsets: &[i64], edges: &[i64], dist: &mut [i64], queue: &mut [i64], src: i64) -> i64 {
+    let n = dist.len();
+    for i in 0..n {
+        dist[i] = -1;
+    }
+    dist[src] = 0;
+    queue[0] = src;
+    let mut head = 0;
+    let mut tail = 1;
+    let mut reached = 1;
+    while head < tail decreasing n - head {
+        let u = queue[head];
+        head += 1;
+        for e in offsets[u]..offsets[u + 1] {
+            let v = edges[e];
+            if dist[v] < 0 {
+                dist[v] = dist[u] + 1;
+                queue[tail] = v;
+                tail += 1;
+                reached += 1;
+            }
+        }
+    }
+    reached
+}
+
+fn main() {
+    // 0→1, 0→2, 1→3, 2→3, 3→4 ; 5 is isolated
+    let offsets = [0, 2, 3, 4, 5, 5, 5];
+    let edges = [1, 2, 3, 3, 4];
+    let mut dist = [0; 6];
+    let mut queue = [0; 6];
+    println(bfs(&offsets, &edges, &mut dist, &mut queue, 0));
+    println(dist[4]);
+    println(dist[5]);
+}

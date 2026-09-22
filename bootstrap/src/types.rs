@@ -59,6 +59,7 @@ fn resolve_type(t: &ast::TypeExpr, line: u32, col: u32) -> Result<Ty> {
             "i64" => Ty::I64,
             "f64" => Ty::F64,
             "bool" => Ty::Bool,
+            "u8" => Ty::U8,
             other => return err(line, col, format!("unknown type `{other}`")),
         },
         ast::TypeExpr::Slice(elem, m) => {
@@ -123,7 +124,7 @@ fn check_func(f: &ast::Func, sigs: &HashMap<String, (FuncId, Vec<Ty>, Ty)>) -> R
             return err(t.line, 0, format!("`{}` returns `{ret}`, but its body has type `{}`", f.name, t.ty));
         }
     }
-    Ok(Func { name: f.name.clone(), params, ret: ret.clone(), locals: cx.locals, sizes: cx.sizes, body, line: f.line })
+    Ok(Func { name: f.name.clone(), params, ret: ret.clone(), locals: cx.locals, sizes: cx.sizes, body, asserts: f.asserts.clone(), line: f.line })
 }
 
 fn ends_in_return(b: &Block) -> bool {
@@ -184,6 +185,13 @@ impl<'a> Ctx<'a> {
                 };
                 // arrays are born here and only here
                 match &init.kind {
+                    ast::ExprKind::Bytes(bytes) => {
+                        let out: Vec<Expr> = bytes.iter().map(|b| Expr { kind: ExprKind::Byte(*b), ty: Ty::U8, line: init.line }).collect();
+                        let ty = Ty::Array(Box::new(Ty::U8), Size::Const(out.len() as i64));
+                        self.check_declared(&declared, &ty, *line, *col)?;
+                        let id = self.declare(name, ty, *mutable);
+                        Ok(Stmt::LetArray(id, out))
+                    }
                     ast::ExprKind::ArrayLit(elems) => {
                         let mut out = Vec::new();
                         for e in elems {
@@ -341,6 +349,32 @@ impl<'a> Ctx<'a> {
                 }
                 Ok(Stmt::For { var: id, start: s, end: e, body: b })
             }
+            ast::Stmt::While { cond, decreasing, body, line, col } => {
+                let c = self.expr(cond)?;
+                if c.ty != Ty::Bool {
+                    return err(cond.line, cond.col, format!("`while` condition is `{}`, not `bool`", c.ty));
+                }
+                let d = match decreasing {
+                    Some(m) => {
+                        let cm = self.expr(m)?;
+                        if cm.ty != Ty::I64 { return err(m.line, m.col, format!("a `decreasing` measure is `i64`, found `{}`", cm.ty)); }
+                        Some(cm)
+                    }
+                    None => None,
+                };
+                self.in_loop += 1;
+                let b = self.block(body)?;
+                self.in_loop -= 1;
+                if b.ty != Ty::Unit {
+                    return err(body.line, body.col, format!("a loop body has type `()`, found `{}`", b.ty));
+                }
+                let _ = col;
+                Ok(Stmt::While { cond: c, decreasing: d, body: b, line: *line })
+            }
+            ast::Stmt::Break(line, col) => {
+                if self.in_loop == 0 { return err(*line, *col, "`break` outside a loop"); }
+                Ok(Stmt::Break)
+            }
             ast::Stmt::Expr(e) => {
                 let ce = self.expr(e)?;
                 if ce.ty.is_arrayish() {
@@ -383,6 +417,8 @@ impl<'a> Ctx<'a> {
             ast::ExprKind::Int(v) => mk(ExprKind::Int(*v), Ty::I64),
             ast::ExprKind::Float(v) => mk(ExprKind::Float(*v), Ty::F64),
             ast::ExprKind::Bool(v) => mk(ExprKind::Bool(*v), Ty::Bool),
+            ast::ExprKind::Byte(v) => mk(ExprKind::Byte(*v), Ty::U8),
+            ast::ExprKind::Bytes(_) => err(e.line, e.col, "a byte string can only initialise a `let`"),
             ast::ExprKind::Var(n) => {
                 let id = self.lookup(n).map_or_else(|| err(e.line, e.col, format!("unknown variable `{n}`")), Ok)?;
                 let ty = self.locals[id].ty.clone();
@@ -520,7 +556,7 @@ impl<'a> Ctx<'a> {
                 let ci = self.expr(inner)?;
                 let target = resolve_type(ty, e.line, e.col)?;
                 if !ci.ty.is_numeric() || !target.is_numeric() {
-                    return err(e.line, e.col, format!("`as` converts between `i64` and `f64`; found `{}` as `{target}`", ci.ty));
+                    return err(e.line, e.col, format!("`as` converts between `i64`, `f64` and `u8`; found `{}` as `{target}`", ci.ty));
                 }
                 mk(ExprKind::Cast(Box::new(ci), target.clone()), target)
             }
@@ -686,7 +722,7 @@ impl<'a> Ctx<'a> {
             "sum" => {
                 if vals.len() != 1 || !cur_ty.is_numeric() { return err(tline, tcol, format!("`.sum()` needs one numeric value per element, found `{cur_ty}`")); }
                 let acc = self.fresh_local("acc", cur_ty.clone(), true);
-                let zero = if cur_ty == Ty::F64 { ExprKind::Float(0.0) } else { ExprKind::Int(0) };
+                let zero = match cur_ty { Ty::F64 => ExprKind::Float(0.0), Ty::U8 => ExprKind::Byte(0), _ => ExprKind::Int(0) };
                 (acc, Expr { kind: zero, ty: cur_ty.clone(), line }, vec![Stmt::Assign(LValue::Var(acc), Some(BinOp::Add), self.local_expr(vals[0], line))])
             }
             "count" => {
@@ -697,7 +733,7 @@ impl<'a> Ctx<'a> {
                 if vals.len() != 1 || !cur_ty.is_numeric() { return err(tline, tcol, format!("`.{term_name}()` needs one numeric value per element, found `{cur_ty}`")); }
                 let acc = self.fresh_local("acc", cur_ty.clone(), true);
                 let seen = self.fresh_local("seen", Ty::Bool, true);
-                let zero = if cur_ty == Ty::F64 { ExprKind::Float(0.0) } else { ExprKind::Int(0) };
+                let zero = match cur_ty { Ty::F64 => ExprKind::Float(0.0), Ty::U8 => ExprKind::Byte(0), _ => ExprKind::Int(0) };
                 let cmp = if term_name == "max" { BinOp::Gt } else { BinOp::Lt };
                 let better = Expr { kind: ExprKind::Binary(cmp, Box::new(self.local_expr(vals[0], line)), Box::new(self.local_expr(acc, line))), ty: Ty::Bool, line };
                 let notseen = Expr { kind: ExprKind::Unary(UnOp::Not, Box::new(self.local_expr(seen, line))), ty: Ty::Bool, line };

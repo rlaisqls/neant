@@ -143,6 +143,14 @@ gets a line.
 a parser — every function of which has a `costs.lock` line, none of which says nothing, and a
 golden test that each line is the expected *kind* (exact / parametric / recurrence / measured).
 
+**Status: passed, 2026-09-22.** `while` takes an inferred induction variable or a declared
+`decreasing` measure read at entry; `break`, `u8` and byte strings exist; self-recursion is solved
+(linear, divide-and-conquer, logarithmic; exponential refused; mutual recursion named); `io` is
+inferred; `#[cost]` fails the build by asymptotic dominance; `neant measure` fits `~n^k` under
+perf and writes a `measured` line. The corpus is `tests/golden/{words,vm,bfs,parse}.nt`: every
+function has a line, and the `.cost` goldens lock the kind of each. Higher-order costs did not
+arise — closures are inlined into their chain, and there are no function values yet.
+
 ### M4 — Views, layout, regions
 
 The part of the design that makes the moves model apply to programs with structure in them.

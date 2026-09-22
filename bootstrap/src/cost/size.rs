@@ -36,12 +36,18 @@ impl Rat {
     pub fn to_f64(self) -> f64 { self.n as f64 / self.d as f64 }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum Atom {
     /// A size variable, indexed into the owning function's name table.
     Var(usize),
     B,
     M,
+    /// `log` of a size expression, from a recurrence or an asserted bound.
+    Log(Box<Poly>),
+}
+
+impl Atom {
+    pub fn clone_ref(&self) -> Box<Atom> { Box::new(self.clone()) }
 }
 
 /// A product of atoms with nonzero exponents. The empty product is 1.
@@ -57,11 +63,12 @@ impl Mono {
         f.insert(a, Rat::one());
         Mono { factors: f }
     }
+    pub fn has_atom(&self, a: &Atom) -> bool { self.factors.contains_key(a) }
     fn mul(&self, o: &Mono) -> Mono {
         let mut f = self.factors.clone();
         for (a, e) in &o.factors {
             let ne = f.get(a).map_or(*e, |x| x.add(*e));
-            if ne.is_zero() { f.remove(a); } else { f.insert(*a, ne); }
+            if ne.is_zero() { f.remove(a); } else { f.insert(a.clone(), ne); }
         }
         Mono { factors: f }
     }
@@ -71,7 +78,7 @@ impl Mono {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
 pub struct Poly {
     pub terms: BTreeMap<Mono, Rat>,
 }
@@ -124,7 +131,7 @@ impl Poly {
         self.mul(&p)
     }
     /// Integer power, for substitution.
-    fn pow(&self, k: i128) -> Poly {
+    pub fn pow(&self, k: i128) -> Poly {
         let mut r = Poly::constant(1);
         for _ in 0..k { r = r.mul(self); }
         r
@@ -144,7 +151,7 @@ impl Poly {
         let mut f = m1.factors.clone();
         for (a, e) in &m2.factors {
             let ne = f.get(a).map_or(e.neg(), |x| x.add(e.neg()));
-            if ne.is_zero() { f.remove(a); } else { f.insert(*a, ne); }
+            if ne.is_zero() { f.remove(a); } else { f.insert(a.clone(), ne); }
         }
         let mut p = Poly::zero();
         p.terms.insert(Mono { factors: f }, Rat::new(c1.n * c2.d, c1.d * c2.n));
@@ -160,7 +167,7 @@ impl Poly {
         }
     }
     pub fn has_vars(&self) -> bool {
-        self.terms.keys().any(|m| m.factors.keys().any(|a| matches!(a, Atom::Var(_))))
+        self.terms.keys().any(|m| m.factors.keys().any(|a| matches!(a, Atom::Var(_) | Atom::Log(_))))
     }
     /// Evaluate with every atom given a value. `None` if some atom is missing.
     pub fn eval(&self, f: &dyn Fn(Atom) -> Option<f64>) -> Option<f64> {
@@ -168,22 +175,58 @@ impl Poly {
         for (m, c) in &self.terms {
             let mut v = c.to_f64();
             for (a, e) in &m.factors {
-                v *= f(*a)?.powf(e.to_f64());
+                let base = match a {
+                    Atom::Log(inner) => inner.eval(f)?.max(1.0).ln(),
+                    other => f(other.clone())?,
+                };
+                v *= base.powf(e.to_f64());
             }
             total += v;
         }
         Some(total)
     }
+    /// Replace several variables at once, so a substitution can mention the variables it replaces.
+    pub fn subst_many(&self, map: &[(usize, Poly)]) -> Poly {
+        // route through fresh temporaries: shift every replaced variable to a high index first
+        let shift = 1_000_000usize;
+        let mut p = self.clone();
+        for (i, (v, _)) in map.iter().enumerate() { p = p.subst(*v, &Poly::var(shift + i)); }
+        for (i, (_, by)) in map.iter().enumerate() { p = p.subst(shift + i, by); }
+        p
+    }
+    /// The size variables this polynomial mentions.
+    pub fn vars(&self) -> Vec<usize> {
+        let mut out = Vec::new();
+        for m in self.terms.keys() {
+            for a in m.factors.keys() {
+                if let Atom::Var(i) = a { if !out.contains(i) { out.push(*i); } }
+            }
+        }
+        out
+    }
+    /// Highest total degree over the given variables.
+    pub fn degree_in(&self, vars: &[usize]) -> Rat {
+        self.terms.keys().map(|m| m.factors.iter().filter(|(a, _)| matches!(a, Atom::Var(i) if vars.contains(i))).fold(Rat::zero(), |acc, (_, e)| acc.add(*e))).max().unwrap_or(Rat::zero())
+    }
+
     /// Replace one size variable by a polynomial. The variable's exponents must be
     /// nonnegative integers; a fractional exponent on a variable never arises in the calculus.
     pub fn subst(&self, var: usize, by: &Poly) -> Poly {
         let mut out = Poly::zero();
         for (m, c) in &self.terms {
-            let mut rest = m.clone();
-            let e = rest.factors.remove(&Atom::Var(var));
+            let mut rest = Mono::one();
             let mut t = Poly::zero();
+            let mut var_pow: Option<Rat> = None;
+            for (a, e) in &m.factors {
+                match a {
+                    Atom::Var(v) if *v == var => var_pow = Some(*e),
+                    // a log of an expression that mentions the variable: substitute inside
+                    Atom::Log(inner) => { rest.factors.insert(Atom::Log(Box::new(inner.subst(var, by))), *e); }
+                    other => { rest.factors.insert(other.clone(), *e); }
+                }
+            }
             t.terms.insert(rest, *c);
-            if let Some(e) = e {
+            if let Some(e) = var_pow {
                 let k = if e.is_int() && e.n >= 0 { e.n } else { 0 };
                 t = t.mul(&by.pow(k));
             }
@@ -222,6 +265,10 @@ impl<'a> fmt::Display for PolyDisplay<'a> {
                 Atom::Var(i) => self.names.get(*i).cloned().unwrap_or_else(|| format!("?{i}")),
                 Atom::B => "B".into(),
                 Atom::M => "M".into(),
+                Atom::Log(inner) => {
+                    let s = inner.display(self.names).to_string();
+                    if inner.terms.len() == 1 && !s.contains('·') { format!("log {s}") } else { format!("log({s})") }
+                }
             }
         };
         let atom_str = |a: &Atom, e: Rat| -> String {
@@ -240,7 +287,7 @@ impl<'a> fmt::Display for PolyDisplay<'a> {
             if i > 0 { write!(f, "{}", if neg { " − " } else { " + " })?; }
             else if neg { write!(f, "−")?; }
             let mut ordered: Vec<(&Atom, &Rat)> = m.factors.iter().collect();
-            ordered.sort_by_key(|(a, _)| match a { Atom::B => 0, Atom::M => 1, Atom::Var(i) => 2 + *i });
+            ordered.sort_by_key(|(a, _)| match a { Atom::B => 0, Atom::M => 1, Atom::Var(i) => 2 + *i, Atom::Log(_) => 1_000_000 });
             let num: Vec<String> = ordered.iter().filter(|(_, e)| e.n > 0).map(|(a, e)| atom_str(a, **e)).collect();
             let den: Vec<String> = ordered.iter().filter(|(_, e)| e.n < 0).map(|(a, e)| atom_str(a, e.neg())).collect();
             // a rational with a big denominator (a tile count, a division by a constant) reads as

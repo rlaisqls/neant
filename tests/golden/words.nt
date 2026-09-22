@@ -1,0 +1,52 @@
+// string processing over bytes: word count, uppercase in place, palindrome with two indices
+fn is_space(c: u8) -> bool {
+    c == b' ' || c == b'\n' || c == b'\t'
+}
+
+fn count_words(s: &[u8]) -> i64 {
+    let mut n = 0;
+    let mut in_word = false;
+    for i in 0..s.len() {
+        let sp = is_space(s[i]);
+        if !sp && !in_word {
+            n += 1;
+        }
+        in_word = !sp;
+    }
+    n
+}
+
+fn upcase(s: &mut [u8]) {
+    for i in 0..s.len() {
+        if s[i] >= b'a' && s[i] <= b'z' {
+            s[i] = s[i] - 32 as u8;
+        }
+    }
+}
+
+// two indices walking inward: the compiler cannot find the induction variable, so the
+// measure is declared
+fn is_palindrome(s: &[u8]) -> bool {
+    let mut i = 0;
+    let mut j = s.len() - 1;
+    let mut ok = true;
+    while i < j decreasing j - i {
+        if s[i] != s[j] {
+            ok = false;
+        }
+        i += 1;
+        j -= 1;
+    }
+    ok
+}
+
+fn main() {
+    let mut text = b"the quick  brown fox\njumps over";
+    println(count_words(&text));
+    upcase(&mut text);
+    println(text[4]);
+    let p = b"racecar";
+    println(is_palindrome(&p));
+    let q = b"racecars";
+    println(is_palindrome(&q));
+}

@@ -8,13 +8,19 @@ pub enum Tok {
     Ident(String),
     Int(i64),
     Float(f64),
-    Fn, Let, Mut, If, Else, For, In, Return, True, False, As,
+    /// `b'a'`
+    Byte(u8),
+    /// `b"..."`
+    Bytes(Vec<u8>),
+    /// `"..."` — only inside attributes for now
+    Str(String),
+    Fn, Let, Mut, If, Else, For, In, Return, True, False, As, While, Break, Decreasing,
     LParen, RParen, LBracket, RBracket, LBrace, RBrace,
     Comma, Semi, Colon, Arrow, Dot, DotDot,
     Eq, EqEq, Ne, Lt, Le, Gt, Ge,
     Plus, Minus, Star, Slash, Percent,
     PlusEq, MinusEq, StarEq, SlashEq,
-    Amp, AmpAmp, Pipe, PipePipe, Bang,
+    Amp, AmpAmp, Pipe, PipePipe, Bang, Hash,
     Eof,
 }
 
@@ -51,6 +57,53 @@ pub fn lex(src: &str) -> Result<Vec<Token>> {
             while i < chars.len() && chars[i] != '\n' { i += 1; }
             continue;
         }
+        // byte and byte-string literals: b'x', b"..."
+        if c == 'b' && matches!(chars.get(i + 1), Some('\'') | Some('"')) {
+            let quote = chars[i + 1];
+            let mut j = i + 2;
+            let mut bytes = Vec::new();
+            loop {
+                let Some(&ch) = chars.get(j) else { return err(l, cl, "unterminated byte literal") };
+                if ch == quote { break; }
+                if ch == '\n' { return err(l, cl, "byte literal runs past the end of the line"); }
+                if ch == '\\' {
+                    let Some(&esc) = chars.get(j + 1) else { return err(l, cl, "unterminated escape") };
+                    bytes.push(match esc {
+                        'n' => b'\n', 't' => b'\t', 'r' => b'\r', '0' => 0, '\\' => b'\\', '\'' => b'\'', '"' => b'"',
+                        other => return err(l, cl, format!("unknown escape `\\{other}`")),
+                    });
+                    j += 2;
+                    continue;
+                }
+                if !ch.is_ascii() { return err(l, cl, "byte literals hold ASCII only"); }
+                bytes.push(ch as u8);
+                j += 1;
+            }
+            let tok = if quote == '\'' {
+                if bytes.len() != 1 { return err(l, cl, "a byte literal `b'..'` holds exactly one byte"); }
+                Tok::Byte(bytes[0])
+            } else { Tok::Bytes(bytes) };
+            push!(tok, l, cl);
+            col += (j + 1 - i) as u32;
+            i = j + 1;
+            continue;
+        }
+        // string literal (attributes)
+        if c == '"' {
+            let mut j = i + 1;
+            let mut s = String::new();
+            loop {
+                let Some(&ch) = chars.get(j) else { return err(l, cl, "unterminated string") };
+                if ch == '"' { break; }
+                if ch == '\n' { return err(l, cl, "string runs past the end of the line"); }
+                s.push(ch);
+                j += 1;
+            }
+            push!(Tok::Str(s), l, cl);
+            col += (j + 1 - i) as u32;
+            i = j + 1;
+            continue;
+        }
         // identifier / keyword
         if c.is_ascii_alphabetic() || c == '_' {
             let start = i;
@@ -61,6 +114,7 @@ pub fn lex(src: &str) -> Result<Vec<Token>> {
                 "fn" => Tok::Fn, "let" => Tok::Let, "mut" => Tok::Mut, "if" => Tok::If,
                 "else" => Tok::Else, "for" => Tok::For, "in" => Tok::In, "return" => Tok::Return,
                 "true" => Tok::True, "false" => Tok::False, "as" => Tok::As,
+                "while" => Tok::While, "break" => Tok::Break, "decreasing" => Tok::Decreasing,
                 _ => Tok::Ident(word),
             };
             push!(tok, l, cl);
@@ -120,7 +174,7 @@ pub fn lex(src: &str) -> Result<Vec<Token>> {
                     '{' => Tok::LBrace, '}' => Tok::RBrace, ',' => Tok::Comma, ';' => Tok::Semi,
                     ':' => Tok::Colon, '.' => Tok::Dot, '=' => Tok::Eq, '<' => Tok::Lt, '>' => Tok::Gt,
                     '+' => Tok::Plus, '-' => Tok::Minus, '*' => Tok::Star, '/' => Tok::Slash,
-                    '%' => Tok::Percent, '&' => Tok::Amp, '!' => Tok::Bang, '|' => Tok::Pipe,
+                    '%' => Tok::Percent, '&' => Tok::Amp, '!' => Tok::Bang, '|' => Tok::Pipe, '#' => Tok::Hash,
                     _ => return err(l, cl, format!("unexpected character `{c}`")),
                 };
                 (t, 1)

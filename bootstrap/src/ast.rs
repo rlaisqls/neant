@@ -11,6 +11,8 @@ pub struct Func {
     pub params: Vec<Param>,
     pub ret: TypeExpr,
     pub body: Block,
+    /// `#[cost(key = "expr", ...)]` — asserted cost bounds, checked after inference
+    pub asserts: Vec<(String, String, u32, u32)>,
     pub line: u32,
     pub col: u32,
 }
@@ -47,6 +49,9 @@ pub enum Stmt {
     /// `target = value`, or `target op= value` when `op` is set.
     Assign { target: Expr, op: Option<BinOp>, value: Expr, line: u32, col: u32 },
     For { var: String, start: Expr, end: Expr, body: Block, line: u32, col: u32 },
+    /// `while cond [decreasing measure] { body }`
+    While { cond: Expr, decreasing: Option<Expr>, body: Block, line: u32, col: u32 },
+    Break(u32, u32),
     Expr(Expr),
     Return(Option<Expr>, u32, u32),
 }
@@ -63,6 +68,9 @@ pub enum ExprKind {
     Int(i64),
     Float(f64),
     Bool(bool),
+    Byte(u8),
+    /// `b"..."` — an array literal of bytes
+    Bytes(Vec<u8>),
     Var(String),
     Binary(BinOp, Box<Expr>, Box<Expr>),
     Unary(UnOp, Box<Expr>),

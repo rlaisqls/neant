@@ -24,6 +24,7 @@ fn leading_numeric(p: &Poly, m: &Machine) -> Option<(Vec<(usize, super::size::Ra
                 Atom::B => coef *= (m.b_bytes as f64).powf(e.to_f64()),
                 Atom::M => coef *= (m.m_bytes as f64).powf(e.to_f64()),
                 Atom::Var(i) => key.push((*i, *e)),
+                Atom::Log(_) => key.push((usize::MAX, *e)),
             }
         }
         *groups.entry(key).or_insert(0.0) += coef;
@@ -55,6 +56,9 @@ pub fn report(c: &FuncCost, m: &Machine) -> String {
     for n in &c.notes {
         out.push_str(&format!("{:<16} {n}\n", ""));
     }
+    for v in &c.violations {
+        out.push_str(&format!("{:<16} ✗ {v}\n", ""));
+    }
     for s in &c.suggestions {
         match &s.result {
             CostResult::Exact { work, moves } => {
@@ -78,12 +82,13 @@ pub fn render(source_name: &str, costs: &[FuncCost]) -> String {
 }
 
 pub fn line(c: &FuncCost) -> String {
+    let fx = if c.effects.is_empty() { String::new() } else { format!(", {}", c.effects.join(", ")) };
     match &c.result {
         CostResult::Exact { work, moves } => format!(
-            "{:<16} work {:<28} moves {:<28} exact",
-            c.name, work.display(&c.names).to_string(), moves.display(&c.names).to_string()
+            "{:<16} work {:<28} moves {:<28} {}{fx}",
+            c.name, work.display(&c.names).to_string(), moves.display(&c.names).to_string(), c.tier
         ),
-        CostResult::Unknown { reason, line } => format!("{:<16} unknown: {reason} (line {line})", c.name),
+        CostResult::Unknown { reason, line } => format!("{:<16} unknown: {reason} (line {line}){fx}", c.name),
     }
 }
 

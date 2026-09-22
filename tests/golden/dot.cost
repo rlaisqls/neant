@@ -1,2 +1,2 @@
 dot              work 6·a.len() + 2                moves 16·a.len()                   exact
-main             work 1362                         moves 5·B + 4048                   exact
+main             work 1362                         moves 5·B + 4048                   exact, io

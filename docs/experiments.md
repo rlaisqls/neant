@@ -169,3 +169,30 @@ Distance to the Hong–Kung bound at this size: naive 1453×, tiled 37× predict
 M2's exit criterion is met: the report in the README is the compiler's output on the code in
 the README, and the two rewrites it offers move the measured refills as their costed lines say —
 one of them better than a person did by hand.
+
+
+## M3 — the measured tier, checked against a known function
+
+`neant measure` was pointed at a function whose cost the calculus knows, so its instructions
+and refills could be read against the prediction.
+
+```
+count_lt         work 8·xs.len() + 4               moves 8·xs.len()                   exact
+           n     instructions         L2 bytes   predicted work / moves
+       20000           482625           211200   6.400e5 / 6.400e5
+      320000          5882661          2512320   1.024e7 / 1.024e7
+     5120000         92282669         81693248   1.638e8 / 1.638e8
+count_lt         work ~n^0.99                     moves ~n^1.26                     measured over n = 20000..5120000
+```
+
+Work: the slope is 1, and 4.5 instructions per element against the model's 8 operations — the
+unit differs, the shape agrees. Moves: half the predicted bytes at the top (the read-stream
+pairing from M1, finding 3), and a slope above 1 because the two smallest sizes fit in L2 and
+were repeated four times.
+
+**Finding 6: a pure write stream does not refill.** BFS on the chain graph the driver builds
+initialises `dist` — 20 MB at the top size — and the whole run registered 5×10⁵ bytes of
+refills. Full-line store streams on this core go into write-streaming mode and bypass L2
+allocation; a write-only pass is invisible to `l2d_cache_refill`. Reads pair up (M1), stores
+vanish: what the counter calls a refill is a narrower thing than what the model calls a move,
+and the difference is stable per access kind.

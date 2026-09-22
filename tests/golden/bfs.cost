@@ -1,0 +1,2 @@
+bfs              unknown: loop bound is not a size expression (line 16)
+main             unknown: calls `bfs`, whose cost is unknown (loop bound is not a size expression) (line 35)

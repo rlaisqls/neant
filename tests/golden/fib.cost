@@ -1,3 +1,3 @@
-fib              unknown: calls `fib`, whose cost is unknown (recursive; recurrences are not solved yet) (line 3)
-fact             unknown: calls `fact`, whose cost is unknown (recursive; recurrences are not solved yet) (line 7)
-main             unknown: calls `fib`, whose cost is unknown (recursive; recurrences are not solved yet) (line 11)
+fib              unknown: 2 recursive calls each shrinking `n` by a constant: exponential (line 3)
+fact             work 5·n + 5                      moves 0                            recurrence
+main             unknown: calls `fib`, whose cost is unknown (2 recursive calls each shrinking `n` by a constant: exponential) (line 11)

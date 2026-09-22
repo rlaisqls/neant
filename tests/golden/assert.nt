@@ -1,0 +1,27 @@
+#[cost(work_at_most = "a.len()", moves_at_most = "16 a.len()")]
+fn dot(a: &[f64], b: &[f64]) -> f64 {
+    let n = a.len();
+    let mut acc = 0.0;
+    for i in 0..n {
+        acc += a[i] * b[i];
+    }
+    acc
+}
+
+#[cost(work_at_most = "a.len()^2")]
+fn pairs(a: &[i64]) -> i64 {
+    let mut s = 0;
+    for i in 0..a.len() {
+        for j in 0..a.len() {
+            s += a[i] * a[j];
+        }
+    }
+    s
+}
+
+fn main() {
+    let x = [1.0, 2.0];
+    println(dot(&x, &x));
+    let y = [1, 2, 3];
+    println(pairs(&y));
+}

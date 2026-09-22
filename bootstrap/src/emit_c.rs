@@ -55,6 +55,7 @@ fn c_ty(t: &Ty) -> &'static str {
         Ty::I64 => "int64_t",
         Ty::F64 => "double",
         Ty::Bool => "bool",
+        Ty::U8 => "uint8_t",
         Ty::Unit => "void",
         Ty::Array(e, _) | Ty::Slice(e, _, _) => c_ty(e),
     }
@@ -90,6 +91,7 @@ static void *nt_alloc(int64_t n, size_t sz) {
         }
         self.out.push_str(r#"static void nt_println_i64(int64_t v) { printf("%lld\n", (long long)v); }
 static void nt_println_bool(bool v) { puts(v ? "true" : "false"); }
+static void nt_println_u8(uint8_t v) { printf("%u\n", (unsigned)v); }
 static void nt_println_f64(double v) {
     // as Rust prints: shortest digits that round-trip, never an exponent, `.0` on integral values
     char buf[400];
@@ -255,6 +257,15 @@ static void nt_println_f64(double v) {
                 self.indent -= 1;
                 self.line("}");
             }
+            Stmt::While { cond, body, .. } => {
+                let c = self.expr(cond).scalar();
+                self.line(&format!("while ({c}) {{"));
+                self.indent += 1;
+                self.block_body(body, Target::Discard);
+                self.indent -= 1;
+                self.line("}");
+            }
+            Stmt::Break => self.line("break;"),
             Stmt::Expr(e) => self.expr_stmt(e),
             Stmt::Return(None) => self.line("return;"),
             Stmt::Return(Some(e)) => {
@@ -308,6 +319,7 @@ static void nt_println_f64(double v) {
             }
             ExprKind::Float(v) => s(format!("{v:?}")),
             ExprKind::Bool(v) => s(if *v { "true".into() } else { "false".into() }),
+            ExprKind::Byte(v) => s(format!("((uint8_t){v})")),
             ExprKind::Local(id) => {
                 let nm = self.local_name(*id);
                 if self.f.unwrap().locals[*id].ty.is_arrayish() {
@@ -319,7 +331,8 @@ static void nt_println_f64(double v) {
             ExprKind::Binary(op, a, b) => {
                 let av = self.expr(a).scalar();
                 let bv = self.expr(b).scalar();
-                s(format!("({av} {} {bv})", op.c_str()))
+                if e.ty == Ty::U8 { s(format!("((uint8_t)({av} {} {bv}))", op.c_str())) }
+                else { s(format!("({av} {} {bv})", op.c_str())) }
             }
             ExprKind::Unary(op, a) => {
                 let av = self.expr(a).scalar();
@@ -347,7 +360,7 @@ static void nt_println_f64(double v) {
                 s(format!("nt_{}({})", callee.name, parts.join(", ")))
             }
             ExprKind::Println(a) => {
-                let f = match a.ty { Ty::I64 => "nt_println_i64", Ty::F64 => "nt_println_f64", _ => "nt_println_bool" };
+                let f = match a.ty { Ty::I64 => "nt_println_i64", Ty::F64 => "nt_println_f64", Ty::U8 => "nt_println_u8", _ => "nt_println_bool" };
                 let v = self.expr(a).scalar();
                 s(format!("{f}({v})"))
             }

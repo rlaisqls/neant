@@ -123,6 +123,82 @@ measured number can come in under the prediction.
 - **Recursion.** A recursive function is *unknown* until recurrences are solved (M3).
 - **Branches** are summed, not maxed.
 
+## Loops without a range
+
+A `while` gets a trip count in one of two ways, or none.
+
+- **An induction variable.** `while i < e { … i += c … }` runs at most `(e − i₀)/c` times when
+  `i` is a mutable `i64` stepped by the constant `c` exactly once in the body and nowhere else,
+  `e` is a size expression that the body does not assign, and `i₀` — the last thing assigned to
+  `i` before the loop — is one too. `i > e` with `i -= c` is the mirror. The variable then acts
+  as a loop variable for the stride rule, so `xs[i]` inside is a sequential access.
+- **A declared measure.** `while cond decreasing m { … }` runs at most `m` times, where `m` is
+  read *at entry*: mutable locals in it stand for what they were last assigned. `decreasing
+  j − i` after `let mut i = 0; let mut j = s.len() − 1` is `s.len() − 1`. The programmer is
+  promising `m` goes down by at least one per iteration; the compiler does not check it.
+- **Neither**, or a measure that reads memory (`decreasing s.len() − pos[0]`): the function's
+  cost is unknown, the message says which, and `neant measure` is the way to a number.
+
+`break` changes nothing: every bound here is an upper bound.
+
+## Recursion
+
+A function that calls itself is a recurrence. The body's own cost `f` is computed with the
+self-calls charged nothing; then some **measure** must shrink at every self-call — an `i64`
+parameter `p`, `xs.len() − p` for a slice and an index, or `hi − lo` for two indices. The
+candidates are tried in that order over every call site, with the arguments substituted for the
+parameters, and the first that shrinks everywhere is used:
+
+| every call shrinks `m` … | recurrence | solved as |
+|---|---|---|
+| by a constant `c`, one call | `T(m) = T(m−c) + f` | `f·(m/c + 1)` |
+| by a constant, two or more calls | `T(m) = a·T(m−c) + f` | **refused**: exponential |
+| to `m/b`, `a` calls, `f = Θ(m^d)` | `T(m) = a·T(m/b) + f` | master theorem: `a < b^d` → `Θ(f)`; `a = b^d` → `f·log m`; `a > b^d` → `Θ(m^(log_b a))` |
+
+Recursive calls under `if` are counted along the heavier branch, not summed — a binary search is
+one call per level, not two. The function's line says `recurrence` instead of `exact`. Mutual
+recursion is not solved; the message says so. A recursive callee is never specialised at a call
+site: its cost is the solved recurrence in its own parameters, substituted.
+
+## Effects
+
+`io` is inferred: a function that prints, or calls one that does, carries `, io` on its line.
+Nothing is declared.
+
+## `#[cost(...)]`
+
+```
+#[cost(work_at_most = "a.len()", moves_at_most = "16 a.len()")]
+fn dot(a: &[f64], b: &[f64]) -> f64 { … }
+```
+
+The bound is written over the function's own size names — `a.len()`, `n` — with `B`, `M`,
+`log x`, `√M`, `^k` or superscripts, `·` or juxtaposition for products, `/` for division by one
+term. It is checked by **asymptotic dominance**: every term of the inferred cost must be
+dominated by some term of the bound — exponent by exponent on every size variable, with a
+higher `log` power breaking ties. Coefficients do not count. A bound that fails, or that is
+asserted on a function whose cost is unknown, is a build error on every command, with both
+polynomials in the message.
+
+## The measured tier
+
+`neant measure f.nt --fn name [--sizes …] [--shape p=n*n,…] [--repeat k] [--cpu c] [--lock]`
+
+For a function the calculus cannot bound, the compiler writes a `main` that builds every
+parameter at size `n` — slices filled with `i`, `i as f64`, `i % 251`; integers set to `n`; the
+shape of each parameter in `n` given by `--shape` — calls the function, and prints something
+derived from the result so nothing is optimised away. It builds that at each size, runs it under
+`perf stat` for instructions and L2 refills, and fits `~n^k` to each over the upper half of the
+sweep. `--lock` writes the line into `costs.lock`:
+
+```
+bfs              work ~n^0.99                     moves ~n^0.26                     measured over n = 10000..2560000
+```
+
+A measured line is a fit, not a proof, and says so. When the function does have a static cost,
+the table prints the prediction beside every measurement, so `measure` doubles as a check on
+the calculus for that one function.
+
 ## Lower bounds
 
 For some computations the catalogue knows what *any* program must move, and the report says how

@@ -1,0 +1,68 @@
+// while with an induction variable, with a declared measure, break, bytes
+fn count_lt(xs: &[i64], limit: i64) -> i64 {
+    let mut i = 0;
+    let mut n = 0;
+    while i < xs.len() {
+        if xs[i] < limit {
+            n += 1;
+        }
+        i += 1;
+    }
+    n
+}
+
+fn first_zero(xs: &[i64]) -> i64 {
+    let mut i = 0;
+    while i < xs.len() {
+        if xs[i] == 0 {
+            break;
+        }
+        i += 1;
+    }
+    i
+}
+
+fn collatz_steps(n0: i64, fuel: i64) -> i64 {
+    let mut n = n0;
+    let mut steps = 0;
+    let mut left = fuel;
+    while n != 1 && left > 0 decreasing left {
+        n = if n % 2 == 0 { n / 2 } else { 3 * n + 1 };
+        steps += 1;
+        left -= 1;
+    }
+    steps
+}
+
+fn upper(s: &[u8], out: &mut [u8]) {
+    for i in 0..s.len() {
+        let c = s[i];
+        out[i] = if c >= b'a' && c <= b'z' { c - 32 as u8 } else { c };
+    }
+}
+
+fn countdown(from: i64) -> i64 {
+    let mut i = from;
+    let mut acc = 0;
+    while i > 0 {
+        acc += i;
+        i -= 2;
+    }
+    acc
+}
+
+fn main() {
+    let xs = [5, 3, 0, 8, 1];
+    println(count_lt(&xs, 4));
+    println(first_zero(&xs));
+    println(collatz_steps(27, 1000));
+    let s = b"hello, World";
+    let mut o = [b' '; 12];
+    upper(&s, &mut o);
+    println(o[0]);
+    println(o[7]);
+    println(o.iter().filter(|c| c == b'L').count());
+    println(countdown(9));
+    println(b'a' as i64);
+    println((65 as u8) + 1 as u8);
+}

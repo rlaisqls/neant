@@ -51,6 +51,24 @@ impl Parser {
     }
 
     fn func(&mut self) -> Result<Func> {
+        let mut asserts = Vec::new();
+        while self.at(&Tok::Hash) {
+            self.next();
+            self.expect(Tok::LBracket, "`[`")?;
+            let (attr, al, ac) = self.ident("attribute name")?;
+            if attr != "cost" { return err(al, ac, format!("unknown attribute `{attr}`; only `#[cost(...)]` exists")); }
+            self.expect(Tok::LParen, "`(`")?;
+            while !self.at(&Tok::RParen) {
+                let (key, kl, kc) = self.ident("`work_at_most` or `moves_at_most`")?;
+                self.expect(Tok::Eq, "`=`")?;
+                let (vl, vc) = self.here();
+                let Tok::Str(val) = self.next().tok else { return err(vl, vc, "a cost bound is a string: `\"n log n\"`") };
+                asserts.push((key, val, kl, kc));
+                if !self.eat(&Tok::Comma) { break; }
+            }
+            self.expect(Tok::RParen, "`)`")?;
+            self.expect(Tok::RBracket, "`]`")?;
+        }
         let (line, col) = self.here();
         self.expect(Tok::Fn, "`fn`")?;
         let (name, _, _) = self.ident("function name")?;
@@ -66,7 +84,7 @@ impl Parser {
         self.expect(Tok::RParen, "`)`")?;
         let ret = if self.eat(&Tok::Arrow) { self.type_expr()? } else { TypeExpr::Unit };
         let body = self.block()?;
-        Ok(Func { name, params, ret, body, line, col })
+        Ok(Func { name, params, ret, body, asserts, line, col })
     }
 
     fn type_expr(&mut self) -> Result<TypeExpr> {
@@ -144,6 +162,18 @@ impl Parser {
                 let e = if self.at(&Tok::Semi) { None } else { Some(self.expr()?) };
                 self.expect(Tok::Semi, "`;`")?;
                 Ok(Item::Stmt(Stmt::Return(e, line, col)))
+            }
+            Tok::While => {
+                self.next();
+                let cond = self.expr()?;
+                let decreasing = if self.eat(&Tok::Decreasing) { Some(self.expr()?) } else { None };
+                let body = self.block()?;
+                Ok(Item::Stmt(Stmt::While { cond, decreasing, body, line, col }))
+            }
+            Tok::Break => {
+                self.next();
+                self.expect(Tok::Semi, "`;`")?;
+                Ok(Item::Stmt(Stmt::Break(line, col)))
             }
             _ => {
                 let e = self.expr()?;
@@ -283,6 +313,8 @@ impl Parser {
         match self.peek().clone() {
             Tok::Int(v) => { self.next(); mk(ExprKind::Int(v)) }
             Tok::Float(v) => { self.next(); mk(ExprKind::Float(v)) }
+            Tok::Byte(v) => { self.next(); mk(ExprKind::Byte(v)) }
+            Tok::Bytes(v) => { self.next(); mk(ExprKind::Bytes(v)) }
             Tok::True => { self.next(); mk(ExprKind::Bool(true)) }
             Tok::False => { self.next(); mk(ExprKind::Bool(false)) }
             Tok::Ident(name) => {
@@ -371,6 +403,9 @@ fn describe(t: &Tok) -> String {
         Tok::Ident(s) => format!("`{s}`"),
         Tok::Int(v) => format!("`{v}`"),
         Tok::Float(v) => format!("`{v}`"),
+        Tok::Byte(v) => format!("`b'{}'`", *v as char),
+        Tok::Bytes(_) => "a byte string".to_string(),
+        Tok::Str(_) => "a string".to_string(),
         Tok::Eof => "end of file".to_string(),
         other => {
             let s = match other {
@@ -383,7 +418,8 @@ fn describe(t: &Tok) -> String {
                 Tok::Le => "<=", Tok::Gt => ">", Tok::Ge => ">=", Tok::Plus => "+", Tok::Minus => "-",
                 Tok::Star => "*", Tok::Slash => "/", Tok::Percent => "%", Tok::PlusEq => "+=",
                 Tok::MinusEq => "-=", Tok::StarEq => "*=", Tok::SlashEq => "/=", Tok::Amp => "&",
-                Tok::AmpAmp => "&&", Tok::Pipe => "|", Tok::PipePipe => "||", Tok::Bang => "!",
+                Tok::AmpAmp => "&&", Tok::Pipe => "|", Tok::PipePipe => "||", Tok::Bang => "!", Tok::Hash => "#",
+                Tok::While => "while", Tok::Break => "break", Tok::Decreasing => "decreasing",
                 _ => "?",
             };
             format!("`{s}`")

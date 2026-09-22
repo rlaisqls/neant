@@ -43,6 +43,12 @@ pub struct FuncCost {
     pub notes: Vec<String>,
     /// Rewrites that were tried on this function, with what they cost.
     pub suggestions: Vec<Suggestion>,
+    /// Inferred effects: `io` when it prints or calls something that does.
+    pub effects: Vec<&'static str>,
+    /// How the cost was obtained: `exact`, or `recurrence` when a self-recursion was solved.
+    pub tier: &'static str,
+    /// `#[cost]` bounds this function breaks, as sentences.
+    pub violations: Vec<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -65,11 +71,11 @@ pub fn analyze(m: &Module, machine: &Machine) -> Vec<FuncCost> {
         let t = rewrite::tile_side(machine.m_bytes, 8);
         let mut sugg = Vec::new();
         if let Some(g) = rewrite::tile(f, t) {
-            let r = Fa::new(&mut an, &g, None, vec![]).run().result;
+            let r = Fa::new(&mut an, &g, None, vec![], None).run().result;
             sugg.push(Suggestion { label: format!("tile by {t}"), flag: format!("{}:tile", f.name), result: r });
         }
         if let Some(g) = rewrite::transpose(f) {
-            let r = Fa::new(&mut an, &g, None, vec![]).run().result;
+            let r = Fa::new(&mut an, &g, None, vec![], None).run().result;
             sugg.push(Suggestion { label: "transpose the column operand".into(), flag: format!("{}:transpose", f.name), result: r });
         }
         an.done[i].as_mut().unwrap().suggestions = sugg;
@@ -111,12 +117,12 @@ impl<'a> Analyzer<'a> {
                 self.done[fid] = Some(FuncCost {
                     name: f.name.clone(),
                     names: param_names(f),
-                    result: CostResult::Unknown { reason: "recursive; recurrences are not solved yet".into(), line: f.line },
-                    bounds: vec![], notes: vec![], suggestions: vec![],
+                    result: CostResult::Unknown { reason: "mutually recursive with another function; only self-recursion is solved".into(), line: f.line },
+                    bounds: vec![], notes: vec![], suggestions: vec![], effects: vec![], violations: vec![], tier: "unknown",
                 });
             } else {
                 self.active[fid] = true;
-                let fc = Fa::new(self, f, None, vec![]).run();
+                let fc = Fa::new(self, f, None, vec![], Some(fid)).run();
                 self.active[fid] = false;
                 self.done[fid] = Some(fc);
             }
@@ -205,10 +211,20 @@ struct Fa<'a, 'b, 'c> {
     loop_recs: Vec<LoopRec>,
     bounds: Vec<Bound>,
     notes: Vec<String>,
+    io: bool,
+    /// the function being analysed, when it may call itself
+    self_fid: Option<FuncId>,
+    /// each self-call: the argument sizes by parameter (None when not a size), how many times
+    /// the site runs per invocation, and its line
+    rec_calls: Vec<(Vec<Option<Poly>>, Poly, u32)>,
     /// size in elements of every array/slice local
     local_size: HashMap<LocalId, Poly>,
     /// value of every immutable i64 local that is an affine expression
     local_affine: HashMap<LocalId, Affine>,
+    /// the value a mutable i64 local was last assigned, as a size, for `while` trip counts
+    initial: HashMap<LocalId, Poly>,
+    /// while set, `size_of` reads a mutable local as that entry value: for a `decreasing` measure
+    at_entry: bool,
     loops: Vec<Loop>,
     work: Poly,
     moves: Poly,
@@ -219,7 +235,7 @@ impl<'a, 'b, 'c> Fa<'a, 'b, 'c> {
     /// the caller's polynomial rather than the parameter's own atom, so every fit and stride
     /// decision inside is made with the caller's numbers. The result is then already in the
     /// caller's atom space.
-    fn new(an: &'b mut Analyzer<'a>, f: &'c Func, bindings: Option<&[Poly]>, inherited: Vec<Loop>) -> Self {
+    fn new(an: &'b mut Analyzer<'a>, f: &'c Func, bindings: Option<&[Poly]>, inherited: Vec<Loop>, self_fid: Option<FuncId>) -> Self {
         let mut loop_recs = Vec::new();
         let mut loops = Vec::new();
         for l in inherited {
@@ -227,8 +243,8 @@ impl<'a, 'b, 'c> Fa<'a, 'b, 'c> {
             loops.push(Loop { id: loop_recs.len() - 1, ..l });
         }
         let mut fa = Fa {
-            an, f, names: param_names(f), sites: vec![], loop_recs, bounds: vec![], notes: vec![],
-            local_size: HashMap::new(), local_affine: HashMap::new(),
+            an, f, names: param_names(f), sites: vec![], loop_recs, bounds: vec![], notes: vec![], io: false, self_fid, rec_calls: vec![],
+            local_size: HashMap::new(), local_affine: HashMap::new(), initial: HashMap::new(), at_entry: false,
             loops, work: Poly::zero(), moves: Poly::zero(),
         };
         for (i, &p) in f.params.iter().enumerate() {
@@ -244,14 +260,142 @@ impl<'a, 'b, 'c> Fa<'a, 'b, 'c> {
     }
 
     fn run(mut self) -> FuncCost {
+        let mut tier = "exact";
         let result = match self.block(&self.f.body) {
             Ok(()) => {
                 self.settle_moves();
-                CostResult::Exact { work: self.work.clone(), moves: self.moves.clone() }
+                if self.rec_calls.is_empty() {
+                    CostResult::Exact { work: self.work.clone(), moves: self.moves.clone() }
+                } else {
+                    tier = "recurrence";
+                    match self.solve_recurrence() {
+                        Ok((work, moves)) => CostResult::Exact { work, moves },
+                        Err(reason) => CostResult::Unknown { reason, line: self.rec_calls[0].2 },
+                    }
+                }
             }
             Err(Fail::Unknown(reason, line)) => CostResult::Unknown { reason, line },
         };
-        FuncCost { name: self.f.name.clone(), names: self.names, result, bounds: self.bounds, notes: self.notes, suggestions: vec![] }
+        // `#[cost(...)]`: every asserted bound must dominate what was inferred
+        let mut violations = Vec::new();
+        for (key, text, line, _) in &self.f.asserts {
+            let which = match key.as_str() {
+                "work_at_most" => "work",
+                "moves_at_most" => "moves",
+                other => { violations.push(format!("line {line}: unknown bound `{other}`; use `work_at_most` or `moves_at_most`")); continue; }
+            };
+            let asserted = match super::assert::parse(text, &self.names) {
+                Ok(p) => p,
+                Err(e) => { violations.push(format!("line {line}: in `{key} = \"{text}\"`: {e}")); continue; }
+            };
+            match &result {
+                CostResult::Exact { work, moves } => {
+                    let inferred = if which == "work" { work } else { moves };
+                    if !super::assert::dominated(inferred, &asserted) {
+                        violations.push(format!(
+                            "line {line}: `{}` is asserted {which} at most {} but its {which} is {}",
+                            self.f.name, asserted.display(&self.names), inferred.display(&self.names)));
+                    }
+                }
+                CostResult::Unknown { reason, .. } => {
+                    violations.push(format!("line {line}: `{}` asserts {which} at most {} but its cost is unknown: {reason}", self.f.name, asserted.display(&self.names)));
+                }
+            }
+        }
+        let effects = if self.io { vec!["io"] } else { vec![] };
+        FuncCost { name: self.f.name.clone(), names: self.names, result, bounds: self.bounds, notes: self.notes, suggestions: vec![], effects, violations, tier }
+    }
+
+    /// The body's own cost `f` (self-calls charged nothing) and the self-calls make a
+    /// recurrence in some measure `m` that every call shrinks: an `i64` parameter, `len − p`,
+    /// or `hi − lo`. Shrinking by a constant with one call is a sum, `T = f·m/c`; with more
+    /// calls it is exponential and refused. Shrinking by a factor `b` with `a` calls is the
+    /// master theorem on the degree `d` of `f` in `m`.
+    fn solve_recurrence(&self) -> Result<(Poly, Poly), String> {
+        let mut a_poly = Poly::zero();
+        for (_, o, _) in &self.rec_calls { a_poly = a_poly.add(o); }
+        let a = match a_poly.as_const() {
+            Some(c) if c.is_int() && c.n >= 1 => c.n,
+            _ => return Err("the number of recursive calls per invocation depends on the input".into()),
+        };
+        // candidate measures over the parameter atoms
+        let mut cands: Vec<Poly> = Vec::new();
+        let ps: Vec<(usize, &Local)> = self.f.params.iter().enumerate().map(|(i, &p)| (i, &self.f.locals[p])).collect();
+        for (i, l) in &ps { if l.ty == Ty::I64 { cands.push(Poly::var(*i)); } }
+        for (i, l) in &ps { if l.ty == Ty::I64 { for (j, s) in &ps { if s.ty.is_arrayish() { cands.push(Poly::var(*j).sub(&Poly::var(*i))); } } } }
+        for (i, l) in &ps { if l.ty == Ty::I64 { for (k, q) in &ps { if k != i && q.ty == Ty::I64 { cands.push(Poly::var(*k).sub(&Poly::var(*i))); } } } }
+        #[derive(PartialEq, Clone, Copy)]
+        enum Shrink { Linear(i128), Div(i128) }
+        for m in &cands {
+            let mvars = m.vars();
+            let mut shrink: Option<Shrink> = None;
+            let mut ok = true;
+            for (args, _, _) in &self.rec_calls {
+                let mut map = Vec::new();
+                for &v in &mvars {
+                    match args.get(v) { Some(Some(p)) => map.push((v, p.clone())), _ => { ok = false; break; } }
+                }
+                if !ok { break; }
+                let mp = m.subst_many(&map);
+                let d = m.sub(&mp);
+                let this = if let Some(c) = d.as_const() {
+                    if c.n > 0 && c.is_int() { Shrink::Linear(c.n) } else { ok = false; break; }
+                } else {
+                    let mut found = None;
+                    for b in 2..=8i128 {
+                        if let Some(k) = mp.scale(Rat::int(b)).sub(m).as_const() { if k.n <= 0 { found = Some(Shrink::Div(b)); break; } }
+                    }
+                    match found { Some(s) => s, None => { ok = false; break; } }
+                };
+                match (shrink, this) {
+                    (None, s) => shrink = Some(s),
+                    (Some(Shrink::Linear(c1)), Shrink::Linear(c2)) => shrink = Some(Shrink::Linear(c1.min(c2))),
+                    (Some(Shrink::Div(b1)), Shrink::Div(b2)) if b1 == b2 => {}
+                    _ => { ok = false; break; }
+                }
+            }
+            if !ok { continue; }
+            let solve = |f: &Poly| -> Result<Poly, String> {
+                match shrink.unwrap() {
+                    Shrink::Linear(c) => {
+                        if a > 1 { return Err(format!("{a} recursive calls each shrinking `{}` by a constant: exponential", m.display(&self.names))); }
+                        // T(m) = T(m − c) + f(m)  ⇒  at most (m/c + 1)·f(m)
+                        Ok(f.mul(&m.scale(Rat::new(1, c))).add(f))
+                    }
+                    Shrink::Div(b) => {
+                        let d = f.degree_in(&mvars);
+                        let bd = (b as f64).powf(d.to_f64());
+                        let af = a as f64;
+                        if af < bd - 1e-9 {
+                            // leaves are cheaper than the root: a geometric series
+                            let ratio = Rat::new(1000, ((1.0 - af / bd) * 1000.0).round() as i128);
+                            Ok(f.scale(ratio))
+                        } else if (af - bd).abs() < 1e-9 {
+                            Ok(f.mul(&Poly::atom(Atom::Log(Box::new(m.clone())))))
+                        } else {
+                            // T = Θ(m^log_b a): f's top part lifted from degree d to degree k
+                            let k = af.ln() / (b as f64).ln();
+                            let lift = k - d.to_f64();
+                            let lifted = if (lift - lift.round()).abs() < 1e-9 {
+                                m.pow(lift.round() as i128)
+                            } else {
+                                let e = Rat::new((lift * 1000.0).round() as i128, 1000);
+                                let mut mono = super::size::Mono::default();
+                                mono.factors.insert(Atom::Log(Box::new(Poly::zero())), Rat::zero()); // placeholder removed below
+                                mono.factors.clear();
+                                // a non-integer lift of a compound measure is not representable exactly; use m's variables
+                                if mvars.len() == 1 { mono.factors.insert(Atom::Var(mvars[0]), e); let mut p = Poly::zero(); p.terms.insert(mono, Rat::one()); p }
+                                else { return Err(format!("recurrence T = {a}·T(m/{b}) + Θ(m^{}) has a non-integer exponent on a compound measure", d.n)); }
+                            };
+                            let ratio = Rat::new(1000 * a, ((af - bd) * 1000.0).round() as i128);
+                            Ok(f.leading().mul(&lifted).scale(ratio))
+                        }
+                    }
+                }
+            };
+            return Ok((solve(&self.work)?, solve(&self.moves)?));
+        }
+        Err("no argument shrinks toward a base case across every recursive call; the measure must be an `i64` parameter, `xs.len() − p`, or `hi − lo`".into())
     }
 
     fn machine(&self) -> Machine { self.an.machine }
@@ -274,7 +418,7 @@ impl<'a, 'b, 'c> Fa<'a, 'b, 'c> {
         p.eval(&|a| match a {
             Atom::B => Some(m.b_bytes as f64),
             Atom::M => Some(m.m_bytes as f64),
-            Atom::Var(_) => None,
+            Atom::Var(_) | Atom::Log(_) => None,
         })
     }
 
@@ -292,6 +436,7 @@ impl<'a, 'b, 'c> Fa<'a, 'b, 'c> {
                 if let Some(lp) = self.loops.iter().find(|lp| lp.var == Some(*l)) {
                     return Some(if bound == Dir::Upper { lp.end.clone() } else { lp.start.clone() });
                 }
+                if self.at_entry && self.f.locals[*l].mutable { return self.initial.get(l).cloned(); }
                 let a = self.local_affine.get(l)?;
                 if !a.is_const() { return None; }
                 Some(a.konst.clone())
@@ -357,10 +502,7 @@ impl<'a, 'b, 'c> Fa<'a, 'b, 'c> {
     }
 
     fn elem_bytes(&self, l: LocalId) -> i128 {
-        match self.f.locals[l].ty.elem() {
-            Some(Ty::Bool) => 1,
-            _ => 8,
-        }
+        self.f.locals[l].ty.elem().map_or(8, |t| t.elem_bytes())
     }
 
     // ---- the moves rule ----
@@ -498,6 +640,8 @@ impl<'a, 'b, 'c> Fa<'a, 'b, 'c> {
                     }
                 } else if l.ty == Ty::I64 && !l.mutable {
                     if let Some(a) = self.affine(e) { self.local_affine.insert(*id, a); }
+                } else if l.ty == Ty::I64 {
+                    match self.size_of(e, Dir::Upper) { Some(p) => { self.initial.insert(*id, p); } None => { self.initial.remove(id); } }
                 }
                 Ok(())
             }
@@ -540,6 +684,11 @@ impl<'a, 'b, 'c> Fa<'a, 'b, 'c> {
             Stmt::Assign(lv, op, e) => {
                 self.recognise(s);
                 self.expr(e)?;
+                if let (LValue::Var(v), None) = (lv, op) {
+                    if self.f.locals[*v].ty == Ty::I64 {
+                        match self.size_of(e, Dir::Upper) { Some(p) if self.loops.is_empty() => { self.initial.insert(*v, p); } _ => { self.initial.remove(v); } }
+                    }
+                } else if let LValue::Var(v) = lv { self.initial.remove(v); }
                 self.add_work_n(if op.is_some() { 2 } else { 1 });
                 if let LValue::Index(arr, idx, _) = lv {
                     self.expr(idx)?;
@@ -573,19 +722,79 @@ impl<'a, 'b, 'c> Fa<'a, 'b, 'c> {
                 self.loops.pop();
                 r
             }
+            Stmt::Break => Ok(()),
+            Stmt::While { cond, decreasing, body, line } => {
+                self.expr(cond)?;
+                // the trip count: the programmer's measure, else an induction variable found in
+                // the condition and stepped by a constant in the body
+                // (trip, induction variable and its entry value, when there is one)
+                let found = match decreasing {
+                    Some(m) => {
+                        self.expr(m)?;
+                        // the measure's value at entry: mutable locals read as what they were last assigned
+                        self.at_entry = true;
+                        let v = self.size_of(m, Dir::Upper);
+                        self.at_entry = false;
+                        let Some(v) = v else {
+                            return Err(Fail::Unknown("the `decreasing` measure is not a size expression — it reads memory or a value the compiler cannot follow — so this loop has no static bound; `neant measure` can fit one".into(), m.line));
+                        };
+                        Some((v, None))
+                    }
+                    None => self.induction_trip(cond, body),
+                };
+                let Some((trip, ind)) = found else {
+                    return Err(Fail::Unknown("`while` has no measure the compiler can find; write `while cond decreasing <expr>` with an `i64` that goes down by at least one every iteration".into(), *line));
+                };
+                let (var, offset) = match ind {
+                    Some((v, i0)) => (Some(v), Some(Affine::constant(i0))),
+                    None => (None, None),
+                };
+                self.loop_recs.push(LoopRec { var, trip: trip.clone() });
+                self.loops.push(Loop { id: self.loop_recs.len() - 1, var, trip: trip.clone(), start: Poly::zero(), end: trip, offset });
+                self.add_work_n(1);
+                let r = self.block(body);
+                self.loops.pop();
+                r
+            }
             Stmt::Expr(e) => self.expr(e),
             Stmt::Return(Some(e)) => self.expr(e),
             Stmt::Return(None) => Ok(()),
         }
     }
 
+    /// `while i < e { … i += c … }` runs at most `(e − i₀)/c` times when `i` is a mutable local
+    /// stepped by the constant `c` exactly once in the body and nowhere else, `e` is a size
+    /// expression, and `i₀` — the last assignment to `i` before the loop — is one too.
+    /// `i > e` with `i -= c` is the mirror. Anything else is not an induction variable.
+    fn induction_trip(&self, cond: &Expr, body: &Block) -> Option<(Poly, Option<(LocalId, Poly)>)> {
+        let ExprKind::Binary(op, l, r) = &cond.kind else { return None };
+        // normalise to (var, bound, ascending)
+        let (var, bound, asc) = match (&l.kind, &r.kind, op) {
+            (ExprKind::Local(v), _, BinOp::Lt | BinOp::Le | BinOp::Ne) => (*v, &**r, true),
+            (_, ExprKind::Local(v), BinOp::Gt | BinOp::Ge) => (*v, &**l, true),
+            (ExprKind::Local(v), _, BinOp::Gt | BinOp::Ge) => (*v, &**r, false),
+            (_, ExprKind::Local(v), BinOp::Lt | BinOp::Le) => (*v, &**l, false),
+            _ => return None,
+        };
+        if !self.f.locals[var].mutable || self.f.locals[var].ty != Ty::I64 { return None; }
+        let step = single_step(body, var)?;
+        if (asc && step <= 0) || (!asc && step >= 0) { return None; }
+        if assigns(body, |l| l != var && bound_mentions(bound, l)) { return None; }
+        let e = self.size_of(bound, if asc { Dir::Upper } else { Dir::Lower })?;
+        let i0 = self.initial.get(&var)?.clone();
+        let span = if asc { e.sub(&i0) } else { i0.sub(&e) };
+        // the variable steps by |step| per iteration: indices in it move by step·elem bytes,
+        // which the stride rule sees through the loop variable's coefficient
+        Some((span.scale(Rat::new(1, step.abs() as i128)), Some((var, i0))))
+    }
+
     fn expr(&mut self, e: &Expr) -> Result<(), Fail> {
         match &e.kind {
-            ExprKind::Int(_) | ExprKind::Float(_) | ExprKind::Bool(_) | ExprKind::Local(_) | ExprKind::Ref(..) => Ok(()),
+            ExprKind::Int(_) | ExprKind::Float(_) | ExprKind::Bool(_) | ExprKind::Byte(_) | ExprKind::Local(_) | ExprKind::Ref(..) => Ok(()),
             ExprKind::Len(_) => { self.add_work_n(1); Ok(()) }
             ExprKind::Binary(_, a, b) | ExprKind::MinMax(_, a, b) => { self.expr(a)?; self.expr(b)?; self.add_work_n(1); Ok(()) }
             ExprKind::Unary(_, a) | ExprKind::Cast(a, _) => { self.expr(a)?; self.add_work_n(1); Ok(()) }
-            ExprKind::Println(a) => { self.expr(a)?; self.add_work_n(1); Ok(()) }
+            ExprKind::Println(a) => { self.expr(a)?; self.add_work_n(1); self.io = true; Ok(()) }
             ExprKind::Index(arr, idx) => {
                 self.expr(idx)?;
                 self.add_work_n(1);
@@ -595,18 +804,39 @@ impl<'a, 'b, 'c> Fa<'a, 'b, 'c> {
             ExprKind::If(c, t, els) => {
                 self.expr(c)?;
                 self.add_work_n(1);
-                // both branches are charged: an upper bound, tight when one is empty
+                // both branches are charged: an upper bound, tight when one is empty — except
+                // for recursive call sites, which are counted along the heavier path only, or a
+                // binary search would read as two calls per level and come out linear
+                let before = self.rec_calls.len();
                 self.block(t)?;
+                let then_calls: Vec<_> = self.rec_calls.drain(before..).collect();
                 if let Some(b) = els { self.block(b)?; }
+                let else_n = self.rec_calls.len() - before;
+                if then_calls.len() > else_n {
+                    self.rec_calls.truncate(before);
+                    self.rec_calls.extend(then_calls);
+                }
                 Ok(())
             }
             ExprKind::Block(b) => self.block(b),
             ExprKind::Call(fid, args) => {
                 for a in args { self.expr(a)?; }
                 self.add_work_n(1);
+                if Some(*fid) == self.self_fid {
+                    let cf = &self.an.m.funcs[*fid];
+                    let sizes: Vec<Option<Poly>> = args.iter().zip(&cf.params).map(|(a, &p)| {
+                        if cf.locals[p].ty.is_arrayish() {
+                            match &a.kind { ExprKind::Ref(s, _) | ExprKind::Local(s) => self.local_size.get(s).cloned(), _ => None }
+                        } else { self.size_of(a, Dir::Upper) }
+                    }).collect();
+                    let o = self.outer();
+                    self.rec_calls.push((sizes, o, e.line));
+                    return Ok(());
+                }
                 let cf = &self.an.m.funcs[*fid];
-                // every argument's size, when this call site knows them all
-                let bindings: Option<Vec<Poly>> = args.iter().zip(&cf.params).map(|(a, &p)| {
+                // every argument's size, when this call site knows them all — unless the callee
+                // recurses, whose cost is a recurrence in its own parameters and must stay symbolic
+                let bindings: Option<Vec<Poly>> = if calls_itself(cf, *fid) { None } else { args.iter().zip(&cf.params).map(|(a, &p)| {
                     if cf.locals[p].ty.is_arrayish() {
                         match &a.kind { ExprKind::Ref(s, _) | ExprKind::Local(s) => self.local_size.get(s).cloned(), _ => None }
                     } else if cf.locals[p].ty == Ty::I64 {
@@ -614,10 +844,10 @@ impl<'a, 'b, 'c> Fa<'a, 'b, 'c> {
                     } else {
                         Some(Poly::zero()) // not a size; never read
                     }
-                }).collect();
+                }).collect() };
                 if let Some(b) = bindings {
                     if self.an.active[*fid] {
-                        return Err(Fail::Unknown(format!("calls `{}`, whose cost is unknown (recursive; recurrences are not solved yet)", cf.name), e.line));
+                        return Err(Fail::Unknown(format!("calls `{}`, whose cost is unknown (mutually recursive with this function; only self-recursion is solved)", cf.name), e.line));
                     }
                     // the caller's loops go with the call when no argument depends on them,
                     // as loops without a variable: every access inside reuses across them if it fits
@@ -627,8 +857,9 @@ impl<'a, 'b, 'c> Fa<'a, 'b, 'c> {
                     } else { vec![] };
                     let inherits = !inherited.is_empty();
                     self.an.active[*fid] = true;
-                    let fc = Fa::new(self.an, cf, Some(&b), inherited).run();
+                    let fc = Fa::new(self.an, cf, Some(&b), inherited, Some(*fid)).run();
                     self.an.active[*fid] = false;
+                    if fc.effects.contains(&"io") { self.io = true; }
                     let o = if inherits { Poly::constant(1) } else { self.outer() };
                     for bd in fc.bounds {
                         self.bounds.push(Bound { moves: bd.moves.mul(&o), ..bd });
@@ -651,6 +882,7 @@ impl<'a, 'b, 'c> Fa<'a, 'b, 'c> {
                 }
                 // otherwise: the callee's symbolic cost, with the atoms it uses substituted
                 let callee = self.an.func(*fid).clone();
+                if callee.effects.contains(&"io") { self.io = true; }
                 let (cw, cm) = match &callee.result {
                     CostResult::Exact { work, moves } => (work.clone(), moves.clone()),
                     CostResult::Unknown { reason, .. } => {
@@ -686,4 +918,90 @@ impl<'a, 'b, 'c> Fa<'a, 'b, 'c> {
             }
         }
     }
+}
+
+/// The constant `var` is stepped by in `body`, when it is assigned exactly once there as
+/// `var += c`, `var -= c`, `var = var + c` or `var = var - c`. Nested loops count as assignments
+/// too many times.
+fn single_step(body: &Block, var: LocalId) -> Option<i64> {
+    let mut found: Option<i64> = None;
+    let mut count = 0;
+    fn walk(b: &Block, var: LocalId, found: &mut Option<i64>, count: &mut usize, nested: bool) {
+        for s in &b.stmts {
+            match s {
+                Stmt::Assign(LValue::Var(v), op, e) if *v == var => {
+                    *count += if nested { 2 } else { 1 };
+                    let step = match (op, &e.kind) {
+                        (Some(BinOp::Add), ExprKind::Int(c)) => Some(*c),
+                        (Some(BinOp::Sub), ExprKind::Int(c)) => Some(-*c),
+                        (None, ExprKind::Binary(BinOp::Add, a, c)) if matches!(a.kind, ExprKind::Local(l) if l == var) => if let ExprKind::Int(c) = c.kind { Some(c) } else { None },
+                        (None, ExprKind::Binary(BinOp::Sub, a, c)) if matches!(a.kind, ExprKind::Local(l) if l == var) => if let ExprKind::Int(c) = c.kind { Some(-c) } else { None },
+                        _ => None,
+                    };
+                    *found = step;
+                }
+                Stmt::For { body, .. } | Stmt::While { body, .. } => walk(body, var, found, count, true),
+                Stmt::Expr(Expr { kind: ExprKind::If(_, t, e), .. }) => {
+                    walk(t, var, found, count, nested);
+                    if let Some(e) = e { walk(e, var, found, count, nested); }
+                }
+                _ => {}
+            }
+        }
+    }
+    walk(body, var, &mut found, &mut count, false);
+    if count == 1 { found } else { None }
+}
+
+fn assigns(body: &Block, mut pred: impl FnMut(LocalId) -> bool) -> bool {
+    fn walk(b: &Block, pred: &mut dyn FnMut(LocalId) -> bool) -> bool {
+        b.stmts.iter().any(|s| match s {
+            Stmt::Assign(LValue::Var(v), _, _) => pred(*v),
+            Stmt::For { body, .. } | Stmt::While { body, .. } => walk(body, pred),
+            Stmt::Expr(Expr { kind: ExprKind::If(_, t, e), .. }) => walk(t, pred) || e.as_ref().is_some_and(|e| walk(e, pred)),
+            _ => false,
+        })
+    }
+    walk(body, &mut pred)
+}
+
+fn bound_mentions(e: &Expr, l: LocalId) -> bool {
+    match &e.kind {
+        ExprKind::Local(v) => *v == l,
+        ExprKind::Len(v) => *v == l,
+        ExprKind::Binary(_, a, b) | ExprKind::MinMax(_, a, b) => bound_mentions(a, l) || bound_mentions(b, l),
+        ExprKind::Unary(_, a) | ExprKind::Cast(a, _) => bound_mentions(a, l),
+        _ => false,
+    }
+}
+
+/// Does `f`'s body call function `fid` — itself?
+fn calls_itself(f: &Func, fid: FuncId) -> bool {
+    fn in_block(b: &Block, fid: FuncId) -> bool {
+        b.stmts.iter().any(|s| in_stmt(s, fid)) || b.tail.as_ref().is_some_and(|e| in_expr(e, fid))
+    }
+    fn in_stmt(s: &Stmt, fid: FuncId) -> bool {
+        match s {
+            Stmt::Let(_, e) | Stmt::Expr(e) | Stmt::Return(Some(e)) => in_expr(e, fid),
+            Stmt::LetRepeat(_, a, b) => in_expr(a, fid) || in_expr(b, fid),
+            Stmt::LetArray(_, es) => es.iter().any(|e| in_expr(e, fid)),
+            Stmt::LetBuild { len, body, .. } => in_expr(len, fid) || in_block(body, fid),
+            Stmt::Assign(lv, _, e) => in_expr(e, fid) || matches!(lv, LValue::Index(_, i, _) if in_expr(i, fid)),
+            Stmt::For { start, end, body, .. } => in_expr(start, fid) || in_expr(end, fid) || in_block(body, fid),
+            Stmt::While { cond, decreasing, body, .. } => in_expr(cond, fid) || decreasing.as_ref().is_some_and(|d| in_expr(d, fid)) || in_block(body, fid),
+            Stmt::Break | Stmt::Return(None) => false,
+        }
+    }
+    fn in_expr(e: &Expr, fid: FuncId) -> bool {
+        match &e.kind {
+            ExprKind::Call(f, args) => *f == fid || args.iter().any(|a| in_expr(a, fid)),
+            ExprKind::Binary(_, a, b) | ExprKind::MinMax(_, a, b) => in_expr(a, fid) || in_expr(b, fid),
+            ExprKind::Unary(_, a) | ExprKind::Cast(a, _) | ExprKind::Println(a) => in_expr(a, fid),
+            ExprKind::Index(_, i) => in_expr(i, fid),
+            ExprKind::If(c, t, els) => in_expr(c, fid) || in_block(t, fid) || els.as_ref().is_some_and(|b| in_block(b, fid)),
+            ExprKind::Block(b) => in_block(b, fid),
+            _ => false,
+        }
+    }
+    in_block(&f.body, fid)
 }

@@ -1,2 +1,2 @@
 sum_to           work 3·n + 1                      moves 0                            exact
-main             work 112                          moves 0                            exact
+main             work 112                          moves 0                            exact, io
