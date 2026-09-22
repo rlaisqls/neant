@@ -298,7 +298,16 @@ different rule — plus twenty hand-written probes, each a broken form and its f
 must flip (they include the `&mut [T]`/`&[T]` argument direction both ways); and `fib.nt`'s
 per-expression type codes pinned after hand-checking each one against the source. Building it
 produced the start of a typed IR ahead of schedule: the exit test needed each node's type, so the
-checker records one. Not designed yet: the IR proper, the emitter, or the fixpoint itself.
+checker records one. **Fourth milestone done, and the chain is end-to-end: `compiler/emit.nt`**, designed in
+[self-hosting-emitter-design.md](self-hosting-emitter-design.md). A neant program now reads a
+`.nt` file, lexes, parses, type-checks and writes C, and `cc` compiles it: for the seven golden
+programs inside the slice, **its output equals `neant run`'s byte for byte**
+(`bootstrap/tests/self_host_emit.rs`) — the first test here that compares behaviour rather than a
+representation. `bootstrap/rt.c` gained `write_file` for it, whose first signature dropped the
+length argument because a neant view passes as two C arguments — the same convention mismatch that
+motivated writing the shim in the first place. Locals are emitted by their source spelling, so
+same-block shadowing fails in `cc` rather than silently; fixing it is the next thing the checker
+should record (design §3). Not designed yet: the cost calculus, and the fixpoint itself.
 
 ## M7 — the constant factor
 

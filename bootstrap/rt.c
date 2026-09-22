@@ -14,6 +14,28 @@
 #include <stdio.h>
 #include <string.h>
 
+// `write_file(path: &[u8], buf: &[u8], n: i64)`: the mirror of `read_file`, for the self-hosted
+// emitter's output (docs/self-hosting-emitter-design.md §1). Returns the byte count written, or −1.
+//
+// Note the parameter list: a neant view passes as *two* C arguments, pointer and length, so the
+// declared `buf: &[u8], n: i64` is `buf_p, buf_cap, n` here — `buf_cap` is the whole array's
+// length and `n` is how much of it to write. Writing `buf_cap` instead is exactly the bug this
+// signature had first, and the reason `read_file` was written to this convention rather than
+// libc's in the first place.
+int64_t write_file(const uint8_t *path_p, int64_t path_n, const uint8_t *buf_p, int64_t buf_cap, int64_t n) {
+    if (n < 0 || n > buf_cap) return -1;
+    int64_t buf_n = n;
+    char pathbuf[4096];
+    if (path_n < 0 || path_n >= (int64_t)sizeof(pathbuf)) return -1;
+    memcpy(pathbuf, path_p, (size_t)path_n);
+    pathbuf[path_n] = '\0';
+    FILE *f = fopen(pathbuf, "wb");
+    if (!f) return -1;
+    size_t put = fwrite(buf_p, 1, (size_t)buf_n, f);
+    if (fclose(f) != 0) return -1;
+    return (int64_t)put;
+}
+
 int64_t read_file(const uint8_t *path_p, int64_t path_n, uint8_t *buf_p, int64_t buf_n) {
     char pathbuf[4096];
     if (path_n < 0 || path_n >= (int64_t)sizeof(pathbuf)) return -1;

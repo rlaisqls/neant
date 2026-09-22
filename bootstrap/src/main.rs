@@ -418,7 +418,7 @@ fn cc(c: &str, out: &Path, src: &Path) -> Result<(), String> {
     // the self-hosting I/O bridge (docs/self-hosting-design.md §2): a fixed convention, not a
     // flag — bootstrap/rt.c is linked in whenever the generated C actually calls into it
     let rt_c = Path::new(env!("CARGO_MANIFEST_DIR")).join("rt.c");
-    if c.contains("read_file(") && rt_c.exists() { cmd.arg(&rt_c); }
+    if (c.contains("read_file(") || c.contains("write_file(")) && rt_c.exists() { cmd.arg(&rt_c); }
     let status = cmd
         .arg("-o").arg(out)
         .arg(&cfile)
