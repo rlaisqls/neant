@@ -367,7 +367,17 @@ it reports 31 functions' work and 28 functions' moves in 20 ms — and produced 
 **cost-model finding about the model**, measured and written up in experiments.md: `emit_bytes`
 was charged a cache line per byte because the one-element-array idiom hides the cursor, the
 rewrite the model advised cut the predicted traffic 32×, and the machine measured 0.65% fewer L2
-refills and no wall-clock change. The estimate improved; the program did not. **Regimes arrived with it**: a cost may fork once, so a scattered walk costs the array's footprint
+refills and no wall-clock change. The estimate improved; the program did not. The **layout choice** is designed in
+[self-hosting-layout-design.md](self-hosting-layout-design.md) and is the first piece of
+self-hosting work that changes what the compiler *emits* rather than what it computes: the Rust
+compiler picks AoS or SoA per struct from the cost model and the self-hosted emitter always emits
+AoS, which is nine of the thirteen recorded differences. The arrays design chose that deliberately,
+because the layout decision belongs to a cost calculus that was not self-hosted — a premise that
+has now expired. The measurement that makes it tractable: **no in-slice golden ever reads or writes
+a whole struct element of an array**, only fields, so SoA emission needs four forms rather than the
+general case.
+
+**Regimes arrived with it**: a cost may fork once, so a scattered walk costs the array's footprint
 when it fits in `M` and a line per touch when it does not, and all five single-condition piecewise
 goldens come out exact — the language's distinctive feature, in the self-hosted compiler, for the
 first time. Multi-condition regimes, recurrences, span are still out — nor are M5's moves and uniqueness (the emitter takes the safe branch and copies),
