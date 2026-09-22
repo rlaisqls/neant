@@ -1652,3 +1652,30 @@ a budget breach is a check error and the checker-only driver cannot see one. And
 `count_lt` and `first_zero` get no footprint bound: a `while` is given no loop atom by this pass, so
 a site inside one has no image to count. Their `moves` is exact; only the bound is missing, and in
 the safe direction.
+
+### Step 3, measured: the shape the desugaring has to produce
+
+Chains do not all cost the same per element, and the differences say exactly what shape
+`analyze.rs` desugars to. Hand-written loops were compared against the chains they should equal:
+
+| chain | work/elem | the loop that matches it |
+|---|---|---|
+| `xs.iter().sum()` | 4 | `let e = xs[i]; a += e;` |
+| `xs.iter().count()` | **4** | `let e = xs[i]; a += 1;` |
+| `.map(\|x\| x*2.0).sum()` | 5 | `let x = xs[i]; a += x*2.0;` — the map's result may be bound or inlined, both are 5 |
+| `.filter(\|x\| x<0.0).count()` | 6 | `let x = xs[i]; if x < 0.0 { a += 1; }` |
+| `.map(\|x\| x>0.0).any()` | 5 | `let m = e > 0.0; a = a \|\| m;` |
+| `[x*x for x in xs if x>0.0].sum()` | 7 | `let x = xs[i]; if x > 0.0 { let m = x*x; a += m; }` |
+| `xs.iter().max()` | **7** | not any of the obvious three: `a = max(a, e)` and `if e > a { a = e; }` both measure 5 |
+
+**`count` reads the element.** That is the one this step fixed: a bare `.count()` with no stages had
+been desugared to a loop that never touches the array, which costs 3 per element where the answer is
+4 and moves nothing where the answer is `8·xs.len() + B`. The element is bound unconditionally now,
+which leaves every already-matching form unchanged — binding a register costs nothing — and makes
+`count` right. Nothing in the slice reached it yet; it was a latent wrong answer, not a visible one.
+
+**`max` and `min` are not yet explained.** Both cost 7 per element where the two obvious loops cost
+5, and the difference is not a constant — it is 2 *per element*. Whatever `analyze.rs` builds for
+them does more than compare and assign, and guessing it would be exactly the kind of invented rule
+this project keeps out. They stay unbuilt until measured, along with `zip`, `enumerate`, `fold` and
+the array-valued comprehension that `owned.nt` needs.

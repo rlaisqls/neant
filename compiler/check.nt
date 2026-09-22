@@ -786,11 +786,16 @@ fn check_chain(src: &[u8], toks: &[Token], nodes: &mut [Node], types: &mut [Ty],
     // the element, and one statement per stage
     let sv2 = mk_var(nodes, cst, sname);
     let ivv = mk_var(nodes, cst, iv);
-    let mut cure = nnew(nodes, cst, 68);
-    nodes[cure].a = sv2;
-    nodes[cure].b = ivv;
+    let ix = nnew(nodes, cst, 68);
+    nodes[ix].a = sv2;
+    nodes[ix].b = ivv;
+    // **the element is always bound**, even when nothing looks at it: `xs.iter().count()` reads
+    // each element in `analyze.rs`'s model, and a desugaring that skipped the read would cost 3 per
+    // element where the answer is 4 and move nothing where the answer is `8·xs.len() + B`
+    let ev = nfresh(cst);
     let mut blk = body;
-    let mut last = 0 - 1;
+    let mut last = blk_add(nodes, blk, 0 - 1, mk_let(nodes, cst, ev, ix, 0));
+    let mut cure = mk_var(nodes, cst, ev);
     let mut j = st0 - 2;
     while j >= 1 {
         let stg = cst[40 + j];
