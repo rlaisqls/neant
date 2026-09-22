@@ -356,7 +356,7 @@ calls halve the measure, which is the master theorem rather than `fib`'s exponen
 *on purpose*, because `ys = xs` costs 1 when
 in place and the array's length when copied — the self-hosted emitter has no uniqueness proof and
 always copies, so its cost says so. Charging 1 for parity would have been a cost report for code
-this compiler does not emit. **`moves`'s first slice landed too**: 55 columns exact for functions that call nothing, by the rule
+this compiler does not emit. **`moves`'s first slice landed too**: 56 columns exact for functions that call nothing, by the rule
 `t·s + B` for a contiguous site and `t·B` for a strided one, with 7 differing because the
 self-hosted emitter always lays an array of structs out as AoS while the Rust compiler chooses —
 the same principle as the `ys = xs` divergences, arrived at independently, and predicted in the

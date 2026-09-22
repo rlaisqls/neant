@@ -624,3 +624,17 @@ and both are checked, where before only the first was looked at.
 golden function's `work` is either reproduced string for string or differs for one of the two
 recorded reasons. `moves` is at 55, and its eight declines are all one thing: a site inside two
 loops.
+
+### The cold/warm replay
+
+`warm.nt` is the golden that exists for one question: what does calling the same function over the
+same array twenty times cost? Its `main` does exactly that, once over 1.6 MB and once over 32 MB.
+
+The first lap of a loop finds nothing of the callee's resident and pays in full; every later lap
+finds what the previous one left. So the loop costs `cold + (t − 1)·warm`, where `warm` is `cold`
+less the callee's own footprints, each credited only where it fits in `M`. The two halves of
+`warm.nt` are the two sides of that: the 1.6 MB array is paid for **once** and the 32 MB array
+**twenty times**, and `40·B + 675200000` comes out exactly.
+
+**56 `moves` columns exact.** The seven declines are one thing — a site inside two loops — and
+`matmul`, `stencil` and `tri` are all of it.

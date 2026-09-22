@@ -1653,17 +1653,38 @@ fn m_expr(src: &[u8], toks: &[Token], nodes: &[Node], types: &[Ty], strs: &[Str]
             if si < 0 && name_eq(src, toks, sigs[i].name, nodes[n].a) { si = i; }
             i += 1;
         }
-        // A call inside a loop needs the callee's traffic per lap against what the previous lap
-        // left resident, which is `leave_loop`'s cold/warm replay and is not here — **unless the
-        // callee touches nothing**, in which case there is nothing to replay. `count_words` calls
-        // `is_space` on every byte and that is the whole of its difficulty.
         if wst[11] != 0 {
+            // a callee that touches nothing has nothing to replay
             if si >= 0 && si != wst[24] && fm[si] >= 0 && cks[fm[si]].ws < 0
                 && pol_is_zero(pols, cks[fm[si]].fits) && !walks_anything(ffoot, sigs, si) {
                 return acc;
             }
-            wst[1] = 1;
-            return acc;
+            if si < 0 || fm[si] < 0 || si == wst[24] || wst[13] < 0 {
+                wst[1] = 1;
+                return acc;
+            }
+            // **The cold/warm replay.** The first lap finds nothing of the callee's resident and
+            // pays in full; every later lap finds what the previous one left. So the loop costs
+            // `cold + (t − 1)·warm`, and `warm` is `cold` less the callee's own footprints —
+            // each credited only where it fits in `M`. `warm.nt` is the golden this exists for: it
+            // calls `sum` twenty times over a 1.6 MB array and twenty times over a 32 MB one, and
+            // pays once for the first and twenty times for the second.
+            let cold = call_moves(src, toks, nodes, types, strs, flds, sigs, ptys, fm, ffoot, facs,
+                                  terms, pols, pst, env, cks, budget, resid, rargs, wst, n, si);
+            if wst[1] != 0 { return acc; }
+            let warm = call_moves(src, toks, nodes, types, strs, flds, sigs, ptys, fm, ffoot, facs,
+                                  terms, pols, pst, env, cks, budget, resid, rargs, wst, n, si);
+            if wst[1] != 0 { return acc; }
+            let one = pol_const(facs, terms, pols, pst, 1);
+            let rest = pol_sub(facs, terms, pols, pst, wst[13], one);
+            if cks[warm].ws >= 0 || cks[cold].ws >= 0 {
+                wst[1] = 1;
+                return acc;
+            }
+            let laps = pol_mul(facs, terms, pols, pst, cks[warm].fits, rest);
+            let total = pol_add(facs, terms, pols, pst, cks[cold].fits, laps);
+            let ct = ck_one(cks, wst, total);
+            return ck_add(facs, terms, pols, pst, cks, budget, wst, acc, ct);
         }
         if si == wst[24] {
             // a self-call: the recurrence is solved once the body is walked, so the call itself
