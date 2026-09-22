@@ -215,3 +215,70 @@ What the build changed:
   error shows up multiplied rather than smeared.
 - **A block's tail is a statement to this analysis.** An `if` in tail position still runs, and
   `min_dec` has to walk it or a measure that falls only in the tail reads as not falling at all.
+
+## 11. `moves`, the next slice
+
+`work` counts instructions. `moves` counts **cache-line traffic in the I/O model**, and it is the
+half of the cost object this language exists for — a compiler that reports only `work` is an
+instruction counter with an unusual syntax.
+
+### The measurement
+
+Of the 76 golden functions with a `moves` column: **19 are `moves 0`**, 49 are a plain polynomial,
+8 need regimes. Splitting them the other way, **44 call nothing else in their module** and 31 of
+those have non-zero moves. The commonest shapes:
+
+```
+8·xs.len() + B     16·a.len() + 2·B    9·cs.len() + 2·B    3·B    7·B + 56
+```
+
+A polynomial in the size atoms **and in `B`**, the cache line.
+
+### The rule, which is simpler than the engine that produces it
+
+For a site walking an array with stride `s` bytes over `t` iterations:
+
+```
+moves = t·s + B      when s < B   (contiguous: every byte crosses, plus the partial line at each end)
+      = t·B          when s ≥ B   (strided: a whole line per touch)
+```
+
+and a function's moves are the sum over its sites. That reproduces `dot`'s two arrays as
+`16·a.len() + 2·B` and `total`'s one as `8·xs.len() + B`, exactly.
+
+`bootstrap/src/cost/analyze.rs`'s `settle_moves` computes the same thing the general way — lines
+per loop level, innermost out, with the working set at each level tested against `M` — and that
+generality is where **regimes** come from, and where a nested loop's reuse is found. Both are out.
+
+### Scope
+
+**In:** a function that calls nothing, whose array accesses are affine in the enclosing loop
+variables. Each distinct `(array, index shape)` inside a loop is one site.
+
+**Out:**
+
+- **Calls.** A callee's moves depend on what is already resident, which is the footprint machinery
+  — `repeat.nt`'s `main` calls `total` three times over one array and pays for it **once**, because
+  after the first call the array is in `M`. Reporting the sum would be wrong by 16 000. So a call
+  makes moves unknown, and 24 functions go with it.
+- **Regimes.** A working set whose fit in `M` is symbolic forks, and the fork is the piecewise
+  machinery §2 already excluded. 8 functions.
+- **Nested-loop reuse.** `matmul`'s inner loop re-reads a row that may still be resident. That is
+  `settle_moves`'s whole point and it is not approximable by the rule above.
+
+### AoS, and the second deliberate divergence
+
+The Rust compiler **chooses** AoS or SoA per struct from the cost model, and the choice changes
+moves: `arrayview.nt`'s `tagged` reads `9·cs.len() + 2·B` under the SoA the Rust compiler picked
+and would read `32·cs.len() + 2·B` under AoS. **The self-hosted emitter always emits AoS**
+(self-hosting-arrays-design.md §4), so its moves are AoS moves.
+
+This is the same principle as the four `ys = xs` divergences the `work` slice found, arrived at
+independently: a cost is a claim about the code the compiler emits, so a compiler that emits AoS
+must report AoS traffic. The affected functions are listed by name in the test, as those four are.
+
+### Exit test
+
+The `moves` column, string for string, for every leaf function — and `moves 0` must be *earned*:
+reported because the pass walked the body and found no site, not because it did not look. A
+function with a call must say unknown.
