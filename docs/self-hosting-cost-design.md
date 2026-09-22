@@ -563,3 +563,25 @@ The only other thing needed was the rule the `work` walk already had and the `mo
 
 **47 `moves` columns exact**, up from 43. Every remaining difference is still AoS/SoA, and the 20
 declined are nested loops, calls inside loops, and whole-array reassignment.
+
+### A callee's regime travels to its caller
+
+`moves` 47 → 51, and both steps were about refusals that had outlived their reason.
+
+- **A forked callee hands its condition up.** `call_moves` refused any callee whose own cost was
+  piecewise, on the grounds that the caller would inherit a condition and one is all there is. But
+  a caller with no condition of its own can simply *take* the callee's, and `ck_add` already
+  refuses later if it turns out to have had a different one. Every regime in this corpus reaches a
+  `main` this way — `sum_list`, `stencil` and `is_palindrome` are all piecewise and all called — so
+  `arena.nt`'s and `tree.nt`'s `main`s came back for free. Where the condition's truth is already
+  known at this machine's `M`, it is decided rather than carried, so no report grows a fork it does
+  not need.
+- **`ys = xs` streams one array.** The moves walk had refused it while the emitter had long since
+  decided to copy. The cost is the copy's, multiplied by the trip count when it is inside a loop —
+  `reassign_loop.nt`'s `main` is two laps of a three-element copy and comes out exactly. The three
+  `main`s where the Rust *proves* the assignment is in place now differ for the same recorded
+  reason their `work` columns already did, and the test lets a `moves` difference be excused by
+  either list.
+
+**51 exact, 13 differing in two understood families, 12 declined** — and the twelve are three
+things: nested loops (`matmul`, `stencil`, `tri`), a call inside a loop (`words`), and `msum`.

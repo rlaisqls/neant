@@ -48,7 +48,7 @@ const EXACT: usize = 71;
 /// **piecewise** — a scattered walk costs the array's footprint when it fits in `M` and a line per
 /// touch when it does not — and their two regimes and the condition between them are compared as
 /// one string, exactly as the single-piece ones are (design §13).
-const EXACT_MOVES: usize = 47;
+const EXACT_MOVES: usize = 51;
 
 /// `(file, function)` where the self-hosted `moves` differs because **the self-hosted emitter
 /// always lays an array of structs out as AoS** (docs/self-hosting-arrays-design.md §4) while the
@@ -189,10 +189,13 @@ fn self_hosted_work_agrees_with_bootstrap() {
         for (fname, mw) in &want_moves {
             let Some(g) = got_moves.get(fname.as_str()) else { continue };
             if *g == "unknown" { continue; }
-            let listed = AOS_INSTEAD.contains(&(name.as_str(), fname.as_str()));
+            // a `moves` column may differ for either reason: the emitter lays structs out as AoS,
+            // and it copies a whole-array assignment the Rust proves is in place
+            let listed = AOS_INSTEAD.contains(&(name.as_str(), fname.as_str()))
+                || COPIES_INSTEAD.contains(&(name.as_str(), fname.as_str()));
             if g == mw {
                 exact_moves += 1;
-                if listed {
+                if AOS_INSTEAD.contains(&(name.as_str(), fname.as_str())) {
                     failures.push(format!("{name} {fname} is listed as a moves difference, but the \
                         two agree — delete it from AOS_INSTEAD"));
                 }

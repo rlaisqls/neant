@@ -587,6 +587,13 @@ fn bytes_len(src: &[u8], toks: &[Token], t: i64) -> i64 {
     n
 }
 
+// the length a name is bound to, when the walk knows it
+fn arg_len_of(src: &[u8], toks: &[Token], env: &[Env], wst: &[i64], name: i64) -> i64 {
+    let e = env_find(src, toks, env, wst, name);
+    if e < 0 { return -1; }
+    env[e].len
+}
+
 // the length of an array argument, when the caller knows it
 fn arg_len(src: &[u8], toks: &[Token], nodes: &[Node], env: &[Env], wst: &[i64], n: i64) -> i64 {
     if n < 0 || nodes[n].kind != 65 { return -1; }
@@ -1698,14 +1705,13 @@ fn call_moves(src: &[u8], toks: &[Token], nodes: &[Node], types: &[Ty], strs: &[
               terms: &mut [Term], pols: &mut [Pol], pst: &mut [i64], env: &mut [Env],
               cks: &mut [Ck], budget: &mut [f64], resid: &mut [Res], rargs: &mut [i64],
               wst: &mut [i64], n: i64, si: i64) -> i64 {
+    // A callee whose own cost forks hands its condition up: the caller adopts it, and `ck_add`
+    // refuses later if the caller already had a different one. Every regime in this corpus reaches
+    // `main` this way — `sum_list`, `stencil` and `is_palindrome` are all piecewise and all called.
     let c = fm[si];
-    if cks[c].ws >= 0 {
-        // a callee whose own cost forks would make the caller's fork depend on the callee's, and
-        // one condition is all this slice carries
-        wst[1] = 1;
-        return ck_zero(facs, terms, pols, pst, cks, budget, wst);
-    }
     let mut body = cks[c].fits;
+    let mut bodyn = cks[c].nofit;
+    let mut ws = cks[c].ws;
     let mut newn = 0;
     wst[27] = 0;
     let mut p = 0;
@@ -1716,8 +1722,13 @@ fn call_moves(src: &[u8], toks: &[Token], nodes: &[Node], types: &[Ty], strs: &[
         let len = if v >= 0 { v } else { arg_len(src, toks, nodes, env, wst, inner) };
         if len < 0 {
             if mono_mentions(facs, terms, pols, body, 3 + p) { wst[1] = 1; }
+            if ws >= 0 && mono_mentions(facs, terms, pols, ws, 3 + p) { wst[1] = 1; }
         } else {
             body = pol_subst(facs, terms, pols, pst, body, 3 + p, len);
+            if ws >= 0 {
+                bodyn = pol_subst(facs, terms, pols, pst, bodyn, 3 + p, len);
+                ws = pol_subst(facs, terms, pols, pst, ws, 3 + p, len);
+            };
         }
         let t = ptys[sigs[si].params + p];
         if ffoot[si * 16 + p] == 2 { wst[27] = 1; };
@@ -1764,7 +1775,17 @@ fn call_moves(src: &[u8], toks: &[Token], nodes: &[Node], types: &[Ty], strs: &[
     }
     wst[26] = newn;
     let net = pol_sub(facs, terms, pols, pst, body, credit);
-    ck_one(cks, wst, net)
+    if ws < 0 { return ck_one(cks, wst, net); }
+    // a condition whose truth this machine already knows is not a regime: decide it here rather
+    // than carry a fork the report would have to print
+    let wsv = pol_as_int(facs, terms, pols, pst, ws);
+    if pst[4] != 0 {
+        if wsv < 2097152 { return ck_one(cks, wst, net); }
+        let netn = pol_sub(facs, terms, pols, pst, bodyn, credit);
+        return ck_one(cks, wst, netn);
+    }
+    let netn = pol_sub(facs, terms, pols, pst, bodyn, credit);
+    ck_fork(cks, wst, net, netn, ws)
 }
 
 fn m_block(src: &[u8], toks: &[Token], nodes: &[Node], types: &[Ty], strs: &[Str], flds: &[Fld],
@@ -1860,7 +1881,25 @@ fn m_stmt(src: &[u8], toks: &[Token], nodes: &[Node], types: &[Ty], strs: &[Str]
             acc = ck_add(facs, terms, pols, pst, cks, budget, wst, acc, sp);
         } else if nodes[tgt].kind == 65 {
             if ntys[tgt] >= 0 && (types[ntys[tgt]].kind == 5 || types[ntys[tgt]].kind == 6) {
-                wst[1] = 1;
+                // `ys = xs` **copies**, so it streams one array's worth — the same decision the
+                // emitter makes and for the same reason (arrays design §7). Where the Rust proves
+                // the assignment is in place it charges nothing, and there the two reports differ
+                // on purpose, exactly as the `work` column does.
+                let es = elem_bytes(types, strs, flds, ntys[tgt]);
+                let srcn = if nodes[n].b >= 0 && nodes[nodes[n].b].kind == 65 { nodes[nodes[n].b].a } else { -1 };
+                let len = if srcn >= 0 { arg_len_of(src, toks, env, wst, srcn) } else { -1 };
+                if es < 0 || len < 0 {
+                    wst[1] = 1;
+                } else {
+                    let e = env_find(src, toks, env, wst, nodes[tgt].a);
+                    if e >= 0 { env[e].len = len; };
+                    let mut bytes = pol_scale(facs, terms, pols, pst, len, es, 1);
+                    if wst[11] != 0 && wst[13] >= 0 {
+                        bytes = pol_mul(facs, terms, pols, pst, bytes, wst[13]);
+                    };
+                    let cb = ck_one(cks, wst, bytes);
+                    acc = ck_add(facs, terms, pols, pst, cks, budget, wst, acc, cb);
+                }
             } else {
                 let e = env_find(src, toks, env, wst, nodes[tgt].a);
                 if e >= 0 { env[e].val = -1; }
