@@ -39,6 +39,11 @@ SWEEP = {
     "matmul_tile_420": ([1600, 2496], 1, "matmul_naive", ["--apply", "matmul:tile=420"]),
     # the side the model chooses once partial fits are excluded
     "matmul_tile_206": ([1600, 2496], 1, "matmul_naive", ["--apply", "matmul:tile=206"]),
+    # the M4 layout kill condition: reading one field of every element, the same loop under the
+    # two layouts. Predicted 24·n against 8·n; if the measured ratio does not move, owning the
+    # layout bought nothing.
+    "struct_aos": ([200_000, 800_000, 3_200_000], 5),
+    "struct_soa": ([200_000, 800_000, 3_200_000], 5),
 }
 
 def run(cmd, **kw):

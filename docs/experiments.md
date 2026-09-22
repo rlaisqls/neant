@@ -340,3 +340,36 @@ Predicted bytes are the model's; the ratio is predicted over measured.
   cost-model § What the model does not see. Nothing in the calculus corrects for it yet except
   the tile choice.
 
+## M4 — the layout kill condition
+
+**Question.** The one thing M4 claims is that the compiler owns the layout of a struct array,
+because nothing in the program can hold an address into one. The claim is worth something only if
+the choice moves the machine. `sum_x` reads one field of every element of `[Point{x,y,z}; n]`:
+the model says `24·n` bytes under AoS (every line of the array is fetched for a third of its
+bytes) and `8·n` under SoA (one stream). Does the measured traffic move by that factor?
+
+**Setup.** `tests/kernels/struct_aos.nt.in` and `struct_soa.nt.in`, the same loop with
+`#[layout(aos)]` and `#[layout(soa)]`; five repeats of the read over a freshly written array;
+`l2d_cache_refill × 64` on core 5. AoS spans `24·n` bytes, so every size past `n = 100_000` is
+past the 2 MiB L2.
+
+| `n` | AoS pred / meas | SoA pred / meas | measured AoS ÷ SoA | predicted |
+|---|---|---|---|---|
+| 200 000 | 3.36e7 / 2.02e7 | 8.00e6 / 2.71e6 | 7.4 | 3 |
+| 800 000 | 1.34e8 / 1.08e8 | 5.76e7 / 2.68e7 | 4.0 | 3 |
+| 3 200 000 | 5.38e8 / 4.58e8 | 2.30e8 / 1.23e8 | 3.7 | 3 |
+
+**Findings.**
+
+- **The kill condition is not met: the layout moves the machine.** At the two sizes where
+  neither layout fits L2 the measured ratio is 3.7–4.0 against a predicted 3.0. The M4 gate
+  stands, and with it the one mechanism claim of the README — projections return values, so the
+  representation is the compiler's to choose.
+- **The measured advantage is larger than the model's, and the reason is the counter.** The AoS
+  walk touches every line and its prediction is close (ratios 1.17–1.24); the SoA walk is a pure
+  read stream, which M1 already measured as registering at about half (ratios 1.88–2.95, the same
+  band as `sum` and `dot`). The counter under-reports exactly the case the layout improves, so
+  the real advantage is if anything nearer the modelled 3× than the table's 3.7×.
+- **At 200 000 the SoA array fits L2 and the repeats are free**, which is why the ratio is 7.4
+  there; that point measures residence, not layout.
+

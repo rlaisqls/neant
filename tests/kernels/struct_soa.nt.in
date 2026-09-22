@@ -1,0 +1,22 @@
+// one field of every element of a struct array, laid out one array per field
+#[layout(soa)] struct Point { x: f64, y: f64, z: f64 }
+
+fn sum_x(ps: &[Point]) -> f64 {
+    let mut s = 0.0;
+    for i in 0..ps.len() {
+        s += ps[i].x;
+    }
+    s
+}
+
+fn main() {
+    let mut ps = [Point { x: 1.0, y: 2.0, z: 3.0 }; @N@];
+    for i in 0..@N@ {
+        ps[i].x = (i % 7) as f64;
+    }
+    let mut t = 0.0;
+    for r in 0..@R@ {
+        t += sum_x(&ps);
+    }
+    println(t);
+}

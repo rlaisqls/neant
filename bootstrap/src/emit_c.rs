@@ -16,11 +16,17 @@ pub struct Options {
 enum CVal {
     Scalar(String),
     Arr(String, String),
+    /// A struct array laid out one array per field: a pointer each, and the length.
+    Soa(Vec<String>, String),
 }
 
 impl CVal {
     fn scalar(self) -> String {
-        match self { CVal::Scalar(s) => s, CVal::Arr(p, _) => p }
+        match self { CVal::Scalar(s) => s, CVal::Arr(p, _) => p, CVal::Soa(ps, _) => ps.into_iter().next().unwrap_or_default() }
+    }
+    /// The C arguments this value becomes at a call, and the parts a `let` binds.
+    fn parts(self) -> Vec<String> {
+        match self { CVal::Scalar(s) => vec![s], CVal::Arr(p, n) => vec![p, n], CVal::Soa(ps, n) => ps.into_iter().chain(std::iter::once(n)).collect() }
     }
 }
 
@@ -129,6 +135,29 @@ static void nt_println_f64(double v) {
         if !self.m.structs.is_empty() { self.out.push('\n'); }
     }
 
+    /// The fields of a struct array laid out one array per field, or `None` for anything else.
+    fn soa_of(&self, t: &Ty) -> Option<&'a [(String, Ty)]> {
+        match t.elem() {
+            Some(Ty::Struct(i)) if self.m.structs[*i].layout == Layout::Soa => Some(&self.m.structs[*i].fields),
+            _ => None,
+        }
+    }
+    /// The C declarations for an array-valued name: `(type, name)` pairs, pointers then length.
+    fn arr_decls(&self, nm: &str, t: &Ty, cst: bool) -> Vec<(String, String)> {
+        let c = if cst { "const " } else { "" };
+        match self.soa_of(t) {
+            Some(fields) => fields.iter().map(|(f, ft)| (format!("{c}{} *", c_ty(self.m, ft)), format!("{nm}_{f}_p"))).collect(),
+            None => vec![(format!("{c}{} *", c_ty(self.m, t)), format!("{nm}_p"))],
+        }
+    }
+    /// The value of an array-valued local: its pointers and its length.
+    fn arr_val(&self, nm: &str, t: &Ty) -> CVal {
+        match self.soa_of(t) {
+            Some(fields) => CVal::Soa(fields.iter().map(|(f, _)| format!("{nm}_{f}_p")).collect(), format!("{nm}_n")),
+            None => CVal::Arr(format!("{nm}_p"), format!("{nm}_n")),
+        }
+    }
+
     fn local_name(&self, id: LocalId) -> String {
         let l = &self.f.unwrap().locals[id];
         // compiler-made locals are `base#n`; the id suffix already makes every name unique
@@ -148,9 +177,10 @@ static void nt_println_f64(double v) {
             let l = &f.locals[p];
             let nm = self.local_name(p);
             match &l.ty {
-                Ty::Slice(e, m, _) => {
-                    let cst = if *m { "" } else { "const " };
-                    let _ = write!(self.out, "{cst}{} *restrict {nm}_p, int64_t {nm}_n", c_ty(self.m, e));
+                Ty::Slice(_, m, _) => {
+                    let decls = self.arr_decls(&nm, &l.ty, !*m);
+                    for (ty, name) in &decls { let _ = write!(self.out, "{ty}restrict {name}, "); }
+                    let _ = write!(self.out, "int64_t {nm}_n");
                 }
                 t => { let _ = write!(self.out, "{} {nm}", c_ty(self.m, t)); }
             }
@@ -208,46 +238,72 @@ static void nt_println_f64(double v) {
                 let ty = self.f.unwrap().locals[*id].ty.clone();
                 match self.expr(e) {
                     CVal::Scalar(v) => self.line(&format!("{} {nm} = {v};", c_ty(self.m, &ty))),
-                    CVal::Arr(p, n) => {
+                    v => {
+                        let parts = v.parts();
                         let cst = matches!(ty, Ty::Slice(_, false, _));
-                        let cst = if cst { "const " } else { "" };
-                        self.line(&format!("{cst}{} *{nm}_p = {p};", c_ty(self.m, &ty)));
-                        self.line(&format!("int64_t {nm}_n = {n};"));
+                        let decls = self.arr_decls(&nm, &ty, cst);
+                        for ((dty, dnm), val) in decls.iter().zip(&parts) { self.line(&format!("{dty}{dnm} = {val};")); }
+                        self.line(&format!("int64_t {nm}_n = {};", parts.last().unwrap()));
                     }
                 }
             }
             Stmt::LetArray(id, elems) => {
                 let nm = self.local_name(*id);
                 let ty = self.f.unwrap().locals[*id].ty.clone();
-                let vals: Vec<String> = elems.iter().map(|e| self.expr(e).scalar()).collect();
-                self.line(&format!("{} {nm}_buf[{}] = {{{}}};", c_ty(self.m, &ty), vals.len(), vals.join(", ")));
-                self.line(&format!("{} *{nm}_p = {nm}_buf;", c_ty(self.m, &ty)));
-                self.line(&format!("int64_t {nm}_n = {};", vals.len()));
+                let n = elems.len();
+                match self.soa_of(&ty).map(|f| f.to_vec()) {
+                    Some(fields) => {
+                        let vals: Vec<String> = elems.iter().map(|e| self.expr(e).scalar()).collect();
+                        for (k, (f, ft)) in fields.iter().enumerate() {
+                            let parts: Vec<String> = vals.iter().map(|v| format!("({v}).{f}")).collect();
+                            self.line(&format!("{} {nm}_{f}_buf[{n}] = {{{}}};", c_ty(self.m, ft), parts.join(", ")));
+                            self.line(&format!("{} *{nm}_{f}_p = {nm}_{f}_buf;", c_ty(self.m, ft)));
+                            let _ = k;
+                        }
+                    }
+                    None => {
+                        let vals: Vec<String> = elems.iter().map(|e| self.expr(e).scalar()).collect();
+                        self.line(&format!("{} {nm}_buf[{n}] = {{{}}};", c_ty(self.m, &ty), vals.join(", ")));
+                        self.line(&format!("{} *{nm}_p = {nm}_buf;", c_ty(self.m, &ty)));
+                    }
+                }
+                self.line(&format!("int64_t {nm}_n = {n};"));
             }
             Stmt::LetBuild { id, len, var, body } => {
                 let nm = self.local_name(*id);
                 let ty = self.f.unwrap().locals[*id].ty.clone();
-                let cty = c_ty(self.m, &ty);
                 let nv = self.expr(len).scalar();
                 let k = self.local_name(*var);
                 self.line(&format!("int64_t {nm}_n = {nv};"));
-                self.line(&format!("{cty} *{nm}_p = nt_alloc({nm}_n, sizeof({cty}));"));
+                self.alloc(&nm, &ty);
                 self.line(&format!("for (int64_t {k} = 0; {k} < {nm}_n; {k}++) {{"));
                 self.indent += 1;
-                self.block_body(body, Target::Assign(format!("{nm}_p[{k}]")));
+                match self.soa_of(&ty).map(|f| f.to_vec()) {
+                    Some(fields) => {
+                        let tmp = self.fresh("e");
+                        self.line(&format!("{} {tmp};", c_ty(self.m, ty.elem().unwrap())));
+                        self.block_body(body, Target::Assign(tmp.clone()));
+                        for (f, _) in &fields { self.line(&format!("{nm}_{f}_p[{k}] = {tmp}.{f};")); }
+                    }
+                    None => self.block_body(body, Target::Assign(format!("{nm}_p[{k}]"))),
+                }
                 self.indent -= 1;
                 self.line("}");
             }
             Stmt::LetRepeat(id, e, n) => {
                 let nm = self.local_name(*id);
                 let ty = self.f.unwrap().locals[*id].ty.clone();
-                let cty = c_ty(self.m, &ty);
+                let cty = c_ty(self.m, ty.elem().unwrap_or(&ty));
                 let nv = self.expr(n).scalar();
                 self.line(&format!("int64_t {nm}_n = {nv};"));
-                self.line(&format!("{cty} *{nm}_p = nt_alloc({nm}_n, sizeof({cty}));"));
+                self.alloc(&nm, &ty);
                 let v = self.expr(e).scalar();
                 let k = self.fresh("k");
-                self.line(&format!("{{ {cty} {k}v = {v}; for (int64_t {k} = 0; {k} < {nm}_n; {k}++) {nm}_p[{k}] = {k}v; }}"));
+                let stores = match self.soa_of(&ty).map(|f| f.to_vec()) {
+                    Some(fields) => fields.iter().map(|(f, _)| format!("{nm}_{f}_p[{k}] = {k}v.{f};")).collect::<Vec<_>>().join(" "),
+                    None => format!("{nm}_p[{k}] = {k}v;"),
+                };
+                self.line(&format!("{{ {cty} {k}v = {v}; for (int64_t {k} = 0; {k} < {nm}_n; {k}++) {{ {stores} }} }}"));
             }
             Stmt::Assign(lv, op, e) => {
                 let v = self.expr(e).scalar();
@@ -259,8 +315,18 @@ static void nt_println_f64(double v) {
                     }
                     LValue::Index(id, idx, line) => {
                         let nm = self.local_name(*id);
+                        let ty = self.f.unwrap().locals[*id].ty.clone();
                         let i = self.expr(idx).scalar();
-                        self.line(&format!("{nm}_p[nt_idx({i}, {nm}_n, {line})] {opstr}= {v};"));
+                        match self.soa_of(&ty).map(|f| f.to_vec()) {
+                            // a whole element under SoA is scattered into the field arrays
+                            Some(fields) => {
+                                let k = self.fresh("s");
+                                self.line(&format!("{{ int64_t {k} = nt_idx({i}, {nm}_n, {line}); {} {k}v = {v};", c_ty(self.m, ty.elem().unwrap())));
+                                for (f, _) in &fields { self.line(&format!("    {nm}_{f}_p[{k}] {opstr}= {k}v.{f};")); }
+                                self.line("}");
+                            }
+                            None => self.line(&format!("{nm}_p[nt_idx({i}, {nm}_n, {line})] {opstr}= {v};")),
+                        }
                     }
                     LValue::Field(id, fi) => {
                         let nm = self.local_name(*id);
@@ -269,10 +335,14 @@ static void nt_println_f64(double v) {
                     }
                     LValue::IndexField(id, idx, fi, line) => {
                         let nm = self.local_name(*id);
+                        let ty = self.f.unwrap().locals[*id].ty.clone();
                         let i = self.expr(idx).scalar();
-                        let elem = self.f.unwrap().locals[*id].ty.elem().unwrap().clone();
-                        let f = self.field_name(elem, *fi);
-                        self.line(&format!("{nm}_p[nt_idx({i}, {nm}_n, {line})].{f} {opstr}= {v};"));
+                        let f = self.field_name(ty.elem().unwrap().clone(), *fi);
+                        if self.soa_of(&ty).is_some() {
+                            self.line(&format!("{nm}_{f}_p[nt_idx({i}, {nm}_n, {line})] {opstr}= {v};"));
+                        } else {
+                            self.line(&format!("{nm}_p[nt_idx({i}, {nm}_n, {line})].{f} {opstr}= {v};"));
+                        }
                     }
                 }
             }
@@ -352,11 +422,8 @@ static void nt_println_f64(double v) {
             ExprKind::Byte(v) => s(format!("((uint8_t){v})")),
             ExprKind::Local(id) => {
                 let nm = self.local_name(*id);
-                if self.f.unwrap().locals[*id].ty.is_arrayish() {
-                    CVal::Arr(format!("{nm}_p"), format!("{nm}_n"))
-                } else {
-                    s(nm)
-                }
+                let ty = self.f.unwrap().locals[*id].ty.clone();
+                if ty.is_arrayish() { self.arr_val(&nm, &ty) } else { s(nm) }
             }
             ExprKind::Binary(op, a, b) => {
                 let av = self.expr(a).scalar();
@@ -370,12 +437,30 @@ static void nt_println_f64(double v) {
             }
             ExprKind::Index(id, idx) => {
                 let nm = self.local_name(*id);
+                let ty = self.f.unwrap().locals[*id].ty.clone();
                 let i = self.expr(idx).scalar();
-                s(format!("{nm}_p[nt_idx({i}, {nm}_n, {})]", e.line))
+                match self.soa_of(&ty).map(|f| f.to_vec()) {
+                    // a whole element under SoA is gathered from the field arrays
+                    Some(fields) => {
+                        let k = self.fresh("g");
+                        let parts: Vec<String> = fields.iter().map(|(f, _)| format!(".{f} = {nm}_{f}_p[{k}]")).collect();
+                        s(format!("({{ int64_t {k} = nt_idx({i}, {nm}_n, {}); ({}){{{}}}; }})", e.line, c_ty(self.m, ty.elem().unwrap()), parts.join(", ")))
+                    }
+                    None => s(format!("{nm}_p[nt_idx({i}, {nm}_n, {})]", e.line)),
+                }
             }
             ExprKind::Len(id) => s(format!("{}_n", self.local_name(*id))),
             ExprKind::Field(base, fi) => {
                 let f = self.field_name(base.ty.clone(), *fi);
+                // `xs[i].f` under SoA is one load from that field's array, not a gather
+                if let ExprKind::Index(id, idx) = &base.kind {
+                    let ty = self.f.unwrap().locals[*id].ty.clone();
+                    if self.soa_of(&ty).is_some() {
+                        let nm = self.local_name(*id);
+                        let i = self.expr(idx).scalar();
+                        return s(format!("{nm}_{f}_p[nt_idx({i}, {nm}_n, {})]", e.line));
+                    }
+                }
                 let b = self.expr(base).scalar();
                 s(format!("({b}).{f}"))
             }
@@ -386,17 +471,13 @@ static void nt_println_f64(double v) {
             }
             ExprKind::Ref(id, _) => {
                 let nm = self.local_name(*id);
-                CVal::Arr(format!("{nm}_p"), format!("{nm}_n"))
+                let ty = self.f.unwrap().locals[*id].ty.clone();
+                self.arr_val(&nm, &ty)
             }
             ExprKind::Call(fid, args) => {
                 let callee = &self.m.funcs[*fid];
                 let mut parts = Vec::new();
-                for a in args {
-                    match self.expr(a) {
-                        CVal::Scalar(v) => parts.push(v),
-                        CVal::Arr(p, n) => { parts.push(p); parts.push(n); }
-                    }
-                }
+                for a in args { parts.extend(self.expr(a).parts()); }
                 if callee.body.is_none() { s(format!("{}({})", callee.name, parts.join(", "))) }
                 else { s(format!("nt_{}({})", callee.name, parts.join(", "))) }
             }
@@ -467,6 +548,20 @@ static void nt_println_f64(double v) {
                         this.line(&format!("{rc};"));
                     }
                 }))
+            }
+        }
+    }
+
+    /// Allocate the buffers of an array local `nm` of type `ty`, whose `_n` is already declared.
+    fn alloc(&mut self, nm: &str, ty: &Ty) {
+        match self.soa_of(ty).map(|f| f.to_vec()) {
+            Some(fields) => for (f, ft) in &fields {
+                let c = c_ty(self.m, ft);
+                self.line(&format!("{c} *{nm}_{f}_p = nt_alloc({nm}_n, sizeof({c}));"));
+            },
+            None => {
+                let c = c_ty(self.m, ty.elem().unwrap_or(ty));
+                self.line(&format!("{c} *{nm}_p = nt_alloc({nm}_n, sizeof({c}));"));
             }
         }
     }

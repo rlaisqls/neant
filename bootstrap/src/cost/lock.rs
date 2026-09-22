@@ -1,6 +1,7 @@
 //! `costs.lock`: one line per function, sorted by name, written next to the source. It is
 //! generated and committed, so a change in a function's cost is a diff in review.
 
+use crate::ir::Layout;
 use super::analyze::{CostResult, FuncCost, Machine};
 use super::piece::Cost;
 use super::size::{Atom, Poly};
@@ -18,7 +19,7 @@ fn brief_cond(k: &super::piece::Cond, names: &[String]) -> String {
 /// A cost for the report: one piece in full or leading terms; a piecewise cost as its two
 /// least-conditional pieces with abbreviated conditions and a count of the rest. The lockfile
 /// line keeps every piece exactly.
-fn brief(c: &Cost, names: &[String]) -> String {
+pub fn brief(c: &Cost, names: &[String]) -> String {
     match c.single() {
         Some(p) => brief_poly(p, names),
         None => {
@@ -82,6 +83,23 @@ fn gap(moves: &Poly, bound: &Poly, m: &Machine) -> Option<f64> {
     Some(cm / cb)
 }
 
+/// The layout the compiler chose for each struct type, and what decided it. Printed above the
+/// functions, because every line below it is computed under these choices.
+pub fn layout_report(choices: &[super::analyze::LayoutChoice]) -> String {
+    let mut out = String::new();
+    for c in choices {
+        let l = match c.layout { Layout::Aos => "AoS", Layout::Soa => "SoA" };
+        let how = if c.fixed { "  fixed by #[layout]".to_string() }
+            else if c.decided_by.is_empty() { "  the model does not decide: no function's moves differ".to_string() }
+            else {
+                let other = match c.layout { Layout::Aos => "SoA", Layout::Soa => "AoS" };
+                format!("  decided by {}", c.decided_by.iter().map(|(n, mine, theirs)| format!("{n} ({mine}, {other} {theirs})")).collect::<Vec<_>>().join(", "))
+            };
+        out.push_str(&format!("struct {:<9} layout {l}{how}\n", c.name));
+    }
+    out
+}
+
 /// The full report for one function: its line, then any bound, note and suggestion under it.
 /// A piecewise cost is abbreviated here; `costs.lock` holds it in full.
 pub fn report(c: &FuncCost, m: &Machine) -> String {
@@ -133,6 +151,13 @@ pub fn render(source_name: &str, costs: &[FuncCost]) -> String {
 /// Render, keeping from an existing lockfile what a regeneration cannot know: the `measured over`
 /// annotations `neant measure --lock` wrote on declared functions.
 pub fn render_keeping(source_name: &str, costs: &[FuncCost], existing: &str) -> String {
+    render_with(source_name, costs, existing, &[])
+}
+
+/// The lockfile, with the layout of every struct type at its head: a layout is not a detail of
+/// the emitter, it is what every moves line below rests on, so a change of layout must show up
+/// as a change of the lockfile.
+pub fn render_with(source_name: &str, costs: &[FuncCost], existing: &str, layouts: &[super::analyze::LayoutChoice]) -> String {
     let measured: std::collections::HashMap<String, String> = existing.lines()
         .filter_map(|l| {
             let name = l.split_whitespace().next()?.to_string();
@@ -147,6 +172,9 @@ pub fn render_keeping(source_name: &str, costs: &[FuncCost], existing: &str) -> 
     }).collect();
     lines.sort();
     let mut out = format!("# neant costs.lock — generated from {source_name}; do not edit\n");
+    for c in layouts {
+        out.push_str(&format!("layout {:<10} {}{}\n", c.name, match c.layout { Layout::Aos => "aos", Layout::Soa => "soa" }, if c.fixed { "  fixed" } else { "" }));
+    }
     for l in lines { out.push_str(&l); out.push('\n'); }
     out
 }

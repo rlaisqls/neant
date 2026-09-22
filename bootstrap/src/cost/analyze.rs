@@ -101,6 +101,74 @@ pub struct Suggestion {
     pub result: CostResult,
 }
 
+/// Every function's cost, with no rewrites tried: what the layout pass compares.
+pub fn analyze_costs(m: &Module, machine: &Machine) -> Vec<FuncCost> {
+    let mut an = Analyzer { m, machine: *machine, done: vec![None; m.funcs.len()], active: vec![false; m.funcs.len()] };
+    for i in 0..m.funcs.len() { an.func(i); }
+    an.done.into_iter().map(|c| c.unwrap()).collect()
+}
+
+/// What the layout pass decided for one struct type, for the report.
+pub struct LayoutChoice {
+    pub name: String,
+    pub layout: Layout,
+    /// the attribute fixed it; the model was not asked
+    pub fixed: bool,
+    /// functions whose moves differ between the layouts: (name, moves under the choice, under the other)
+    pub decided_by: Vec<(String, String, String)>,
+}
+
+/// **The choice the compiler makes.** For each struct type the program has one layout, and it is
+/// the one under which the program moves fewer bytes. The module is analysed twice per type —
+/// every array of that type as an array of structs, then as one array per field — and the moves
+/// of every function that touches the type are summed at a reference point (this machine, every
+/// size a million). Types are decided in declaration order, each with the others at their current
+/// choice; the `2^k` joint choices are not tried (docs/m4-design.md §9). `#[layout(...)]` fixes a
+/// type and the model is not asked. A tie is AoS, and the report says the model did not decide.
+pub fn choose_layouts(m: &mut Module, machine: &Machine) -> Vec<LayoutChoice> {
+    let mut out = Vec::new();
+    for sid in 0..m.structs.len() {
+        if m.structs[sid].fixed {
+            out.push(LayoutChoice { name: m.structs[sid].name.clone(), layout: m.structs[sid].layout, fixed: true, decided_by: vec![] });
+            continue;
+        }
+        let mut totals = [0f64; 2];
+        let mut costs: [Vec<FuncCost>; 2] = [vec![], vec![]];
+        for (k, l) in [Layout::Aos, Layout::Soa].into_iter().enumerate() {
+            m.structs[sid].layout = l;
+            costs[k] = analyze_costs(m, machine);
+        }
+        // functions that touch this type, and what each moves under the two layouts
+        let mut decided_by: Vec<(String, String, String)> = Vec::new();
+        for (fi, f) in m.funcs.iter().enumerate() {
+            if !f.locals.iter().any(|l| matches!(l.ty.elem(), Some(Ty::Struct(s)) if *s == sid)) { continue; }
+            let at = |c: &FuncCost| -> (f64, String) {
+                match &c.result {
+                    CostResult::Exact { moves, .. } => {
+                        let point = |a: Atom| match a { Atom::B => Some(machine.b_bytes as f64), Atom::M => Some(machine.m_bytes as f64), Atom::Var(_) => Some(1e6), Atom::Log(_) => None };
+                        (moves.eval(&point, machine).unwrap_or(0.0), super::lock::brief(moves, &c.names))
+                    }
+                    CostResult::Unknown { .. } => (0.0, "unknown".into()),
+                }
+            };
+            let (va, sa) = at(&costs[0][fi]);
+            let (vs, ss) = at(&costs[1][fi]);
+            totals[0] += va;
+            totals[1] += vs;
+            if sa != ss { decided_by.push((f.name.clone(), sa, ss)); }
+        }
+        // strictly fewer bytes wins; a tie, or no difference at all, is AoS
+        let soa_wins = totals[1] < totals[0] * 0.999;
+        let layout = if soa_wins { Layout::Soa } else { Layout::Aos };
+        m.structs[sid].layout = layout;
+        let decided_by = decided_by.into_iter()
+            .map(|(n, a, s)| if soa_wins { (n, s, a) } else { (n, a, s) })
+            .collect();
+        out.push(LayoutChoice { name: m.structs[sid].name.clone(), layout, fixed: false, decided_by });
+    }
+    out
+}
+
 pub fn analyze(m: &Module, machine: &Machine) -> Vec<FuncCost> {
     let mut an = Analyzer { m, machine: *machine, done: vec![None; m.funcs.len()], active: vec![false; m.funcs.len()] };
     for i in 0..m.funcs.len() {
@@ -359,6 +427,11 @@ struct Site {
     stride: i128,
     /// which field, when the site is one field of a struct element
     field: Option<usize>,
+    /// where this site's addresses start inside the array. Zero under AoS; under SoA the field
+    /// arrays are modelled as laid end to end, so a field's base is the size of the fields before
+    /// it. The ranges of two fields are then disjoint, and every rule about ranges — footprint,
+    /// residue, disjointness — holds without a special case.
+    base: Poly,
     path: Vec<usize>,
     /// the `if` branches this site sits in, outermost first: sites on different sides of one
     /// `if` are alternatives, and their moves combine by max, not sum
@@ -595,7 +668,7 @@ impl<'a, 'b, 'c> Fa<'a, 'b, 'c> {
             if negative { lo = lo.add(&b); hi = hi.add(&a); } else { lo = lo.add(&a); hi = hi.add(&b); }
         }
         let st = Rat::int(site.stride);
-        Some((lo.scale(st), hi.scale(st).add(&Poly::constant(site.es))))
+        Some((lo.scale(st).add(&site.base), hi.scale(st).add(&Poly::constant(site.es)).add(&site.base)))
     }
 
     /// The function's footprint over its parameters, and the condition under which all of it is
@@ -607,7 +680,7 @@ impl<'a, 'b, 'c> Fa<'a, 'b, 'c> {
         let mut all_exact = true;
         for site in &self.sites {
             let root = self.local_root.get(&site.arr).copied().unwrap_or(site.arr);
-            let whole = |r: LocalId| (Poly::zero(), self.local_size.get(&r).cloned().unwrap_or_else(Poly::zero).scale(Rat::int(site.es)));
+            let whole = |r: LocalId| (Poly::zero(), self.local_size.get(&r).cloned().unwrap_or_else(Poly::zero).scale(Rat::int(self.elem_bytes(r))));
             let Some(pi) = self.f.params.iter().position(|&p| p == root) else {
                 // an internal array: competes for the cache, invisible to the caller
                 let (_, h) = whole(root);
@@ -618,8 +691,16 @@ impl<'a, 'b, 'c> Fa<'a, 'b, 'c> {
             match feet.get_mut(&pi) {
                 None => { feet.insert(pi, (lo, hi, exact)); }
                 Some(e) => {
-                    // two ranges on one parameter: exact only if identical, else the whole array
-                    if !(exact && e.2 && e.0 == lo && e.1 == hi) { let (l, h) = whole(root); *e = (l, h, false); }
+                    // two ranges on one parameter: the same range twice is one, two disjoint
+                    // field arrays under SoA are the span from the first to the last, and
+                    // anything else falls back to the whole array
+                    if exact && e.2 && e.0 == lo && e.1 == hi {}
+                    else if exact && e.2 && (super::piece::dominates(&lo, &e.1) || super::piece::dominates(&e.0, &hi)) {
+                        let (nlo, nhi) = (if super::piece::dominates(&e.0, &lo) { lo.clone() } else { e.0.clone() },
+                                          if super::piece::dominates(&hi, &e.1) { hi.clone() } else { e.1.clone() });
+                        *e = (nlo, nhi, true);
+                    }
+                    else { let (l, h) = whole(root); *e = (l, h, false); }
                 }
             }
         }
@@ -947,6 +1028,28 @@ impl<'a, 'b, 'c> Fa<'a, 'b, 'c> {
     fn elem_bytes(&self, l: LocalId) -> i128 {
         self.f.locals[l].ty.elem().map_or(8, |t| self.an.m.size_of(t))
     }
+    /// The fields of `l`'s element type when that type is a struct laid out one array per field.
+    fn soa_fields(&self, l: LocalId) -> Option<&'a [(String, Ty)]> {
+        match self.f.locals[l].ty.elem() {
+            Some(Ty::Struct(i)) if self.an.m.structs[*i].layout == Layout::Soa => Some(&self.an.m.structs[*i].fields),
+            _ => None,
+        }
+    }
+    /// How far the address moves per unit of the index: the field's own bytes under SoA, the
+    /// whole element under AoS. This one number is what a layout decides.
+    fn stride_bytes(&self, l: LocalId, field: Option<usize>) -> i128 {
+        match (self.soa_fields(l), field) {
+            (Some(fs), Some(fi)) => fs[fi].1.elem_bytes(),
+            _ => self.elem_bytes(l),
+        }
+    }
+    /// Where a field's array starts in the modelled address space of `l`.
+    fn soa_base(&self, l: LocalId, field: Option<usize>) -> Poly {
+        let (Some(fs), Some(fi)) = (self.soa_fields(l), field) else { return Poly::zero() };
+        let n = self.local_size.get(&l).cloned().unwrap_or_else(Poly::zero);
+        let before: i128 = fs[..fi].iter().map(|(_, t)| t.elem_bytes()).sum();
+        n.scale(Rat::int(before))
+    }
     /// What a site on `l` touches: one field's bytes, or the whole element.
     fn touch_bytes(&self, l: LocalId, field: Option<usize>) -> i128 {
         match (self.f.locals[l].ty.elem(), field) {
@@ -965,22 +1068,32 @@ impl<'a, 'b, 'c> Fa<'a, 'b, 'c> {
     /// whole element could ever prefer that layout.
     fn access(&mut self, arr: LocalId, idx: &Expr, field: Option<usize>) {
         if self.replay { return; }
+        // a whole element under SoA is a gather: one site per field array
+        if field.is_none() {
+            if let Some(n) = self.soa_fields(arr).map(|f| f.len()) {
+                for fi in 0..n { self.access(arr, idx, Some(fi)); }
+                return;
+            }
+        }
         let es = self.touch_bytes(arr, field);
-        let stride = self.elem_bytes(arr);
+        let stride = self.stride_bytes(arr, field);
+        let base = self.soa_base(arr, field);
+        let soa = self.soa_fields(arr).is_some();
         let aff = self.affine(idx);
         let path: Vec<usize> = self.loops.iter().map(|l| l.id).collect();
         let root = self.local_root.get(&arr).copied().unwrap_or(arr);
         if let Some(prev) = self.sites.iter_mut().find(|s| {
-            let sroot = s.arr;
-            sroot == arr && s.stride == stride && s.path == path && s.branch == self.branch
+            s.arr == arr && s.stride == stride && s.path == path && s.branch == self.branch
                 && s.aff.is_some() && s.aff == aff
+                // under SoA two fields are two arrays and never one site
+                && (!soa || s.field == field)
         }) {
             let _ = root;
             // the same element: the span the two fields cover together, which is the element
             if prev.field != field { prev.es = stride; }
             return;
         }
-        self.sites.push(Site { arr, aff, es, stride, field, path, branch: self.branch.clone() });
+        self.sites.push(Site { arr, aff, es, stride, field, base, path, branch: self.branch.clone() });
     }
 
     /// Lines touched by every access site over its loop nest, times B, added to moves. Level by

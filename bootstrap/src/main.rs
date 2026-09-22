@@ -86,6 +86,8 @@ fn main() {
         eprintln!("{e}");
         process::exit(1);
     }
+    // the layout of every struct array, chosen before anything is costed or emitted
+    let layouts = cost::analyze::choose_layouts(&mut module, &machine);
     let opts = emit_c::Options { checked };
     // `#[cost]` is checked on every command: a broken bound is a build error
     if cmd != "cost" {
@@ -99,6 +101,7 @@ fn main() {
     match cmd {
         "check" => {}
         "cost" => {
+            print!("{}", cost::lock::layout_report(&layouts));
             let mut costs = cost::analyze(&module, &machine);
             if use_iolb { iolb_bounds(&module, &mut costs, &machine); }
             for c in &costs {
@@ -114,7 +117,7 @@ fn main() {
             let costs = cost::analyze(&module, &machine);
             let path = file.parent().unwrap_or(Path::new(".")).join("costs.lock");
             let existing = std::fs::read_to_string(&path).unwrap_or_default();
-            let rendered = cost::lock::render_keeping(&file.file_name().unwrap().to_string_lossy(), &costs, &existing);
+            let rendered = cost::lock::render_with(&file.file_name().unwrap().to_string_lossy(), &costs, &existing, &layouts);
             if lock_check {
                 let old = std::fs::read_to_string(&path).unwrap_or_default();
                 let d = cost::lock::diff(&old, &rendered);
