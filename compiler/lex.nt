@@ -102,7 +102,13 @@ fn lex(src: &[u8], n: i64, toks: &mut [Token]) -> i64 {
             let quote = src[i + 1];
             let start = i + 2;
             let mut j = start;
-            while j < n && src[j] != quote { j += 1; }
+            // a backslash takes the next byte with it, so `b'\''` ends at the third quote and not
+            // the second. The escape is still not *decoded* inside `b"..."` (design §2) — but the
+            // span has to end in the right place either way
+            while j < n && src[j] != quote {
+                if src[j] == b'\\' { j += 1; };
+                j += 1;
+            }
             if quote == b'\'' {
                 let ival = if j - start == 2 && src[start] == b'\\' { escape(src[start + 1]) } else { src[start] as i64 };
                 toks[count] = Token { kind: 3, start: start, len: j - start, ival: ival };
@@ -114,7 +120,10 @@ fn lex(src: &[u8], n: i64, toks: &mut [Token]) -> i64 {
         } else if c == b'"' {
             let start = i + 1;
             let mut j = start;
-            while j < n && src[j] != b'"' { j += 1; }
+            while j < n && src[j] != b'"' {
+                if src[j] == b'\\' { j += 1; };
+                j += 1;
+            }
             toks[count] = Token { kind: 5, start: start, len: j - start, ival: 0 };
             count += 1;
             i = j + 1;

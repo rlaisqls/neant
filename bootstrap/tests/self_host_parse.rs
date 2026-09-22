@@ -53,6 +53,10 @@ fn dump_node(nodes: &[Node], n: i64) {
         dump_node(nodes, nodes[n].d);
     } else if k == 111 {
         dump_node(nodes, nodes[n].b);
+    } else if k == 112 || k == 70 {
+        dump_list(nodes, nodes[n].b);
+    } else if k == 113 || k == 114 {
+        dump_node(nodes, nodes[n].b);
     }
 }
 
@@ -71,8 +75,8 @@ fn main() {
     let mut toks = [Token { kind: 0, start: 0, len: 0, ival: 0 }; 65536];
     let n_toks = lex(&buf, n, &mut toks);
     let mut nodes = [Node { kind: 0, a: 0, b: 0, c: 0, d: 0, ival: 0, next: 0 }; 65536];
-    let mut st = [0, 0, 0];
-    let first = parse_program(&toks, n_toks, &mut st, &mut nodes);
+    let mut st = [0, 0, 0, 0, 0];
+    let first = parse_program(&buf, &toks, n_toks, &mut st, &mut nodes);
     if st[2] != 0 {
         println(-1);
     } else {

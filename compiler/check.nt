@@ -7,7 +7,7 @@
 // Out of this slice (design §1): size variables, chain desugaring, moves/uniqueness/layout, and
 // building a typed IR — every one of them feeds a stage that does not exist self-hosted yet.
 //
-// Type kinds:  0 i64  1 f64  2 bool  3 u8  4 unit  5 array  6 slice
+// Type kinds:  0 i64  1 f64  2 bool  3 u8  4 unit  5 array  6 slice  7 struct (`elem` indexes `strs`)
 // The five scalars are interned first, so their indices are 0..4 and a scalar comparison is an
 // integer comparison.
 //
@@ -15,10 +15,18 @@
 //   cst[0] next free type   cst[1] symbol table length   cst[2] error flag
 //   cst[3] signature count  cst[4] next free param type  cst[5] loop depth
 //   cst[6] the current function's return type
+//   cst[7] struct count      cst[8] next free field
+//   cst[9] the node the check failed at, or −1 — set once, by the innermost frame to see the
+//          error flag go up, so it names the smallest expression or statement that is wrong
+//   cst[10] the item — function or struct — being read when it failed, which is where the
+//          failures that happen outside an expression (a signature, a field's type) land
 
 struct Ty { kind: i64, elem: i64, mutable: i64 }
 struct Sym { name: i64, ty: i64, mutable: i64 }
 struct Sig { name: i64, params: i64, n_params: i64, ret: i64 }
+// a struct type: its name token, and a run of fields in the flat `flds` table
+struct Str { name: i64, fields: i64, n_fields: i64 }
+struct Fld { name: i64, ty: i64 }
 
 // ---- types ----
 
@@ -61,6 +69,9 @@ fn same_ty(types: &[Ty], a: i64, b: i64) -> bool {
     if types[a].kind == 5 || types[a].kind == 6 {
         return same_ty(types, types[a].elem, types[b].elem);
     }
+    // two struct types are the same when they name the same struct; `elem` is its table index,
+    // not another type, so this is an integer comparison and not the recursion above
+    if types[a].kind == 7 { return types[a].elem == types[b].elem; }
     false
 }
 
@@ -125,27 +136,82 @@ fn declare(syms: &mut [Sym], cst: &mut [i64], name: i64, ty: i64, mutable: i64) 
     cst[1] = i + 1;
 }
 
+// the struct a name token names, or −1
+fn struct_find(src: &[u8], toks: &[Token], strs: &[Str], cst: &[i64], name: i64) -> i64 {
+    let mut i = 0;
+    let mut found = -1;
+    while i < cst[7] {
+        if found < 0 && name_eq(src, toks, strs[i].name, name) { found = i; }
+        i += 1;
+    }
+    found
+}
+
+// the field of struct `si` with this name, as an index into `flds`, or −1
+fn field_find(src: &[u8], toks: &[Token], strs: &[Str], flds: &[Fld], si: i64, name: i64) -> i64 {
+    let mut i = 0;
+    let mut found = -1;
+    while i < strs[si].n_fields {
+        if found < 0 && name_eq(src, toks, flds[strs[si].fields + i].name, name) { found = strs[si].fields + i; }
+        i += 1;
+    }
+    found
+}
+
+// every `struct` first, so a parameter or a field may name one. Fields are scalars, as they are in
+// the Rust checker — no struct holds another, so nothing here depends on collection order.
+fn collect_structs(src: &[u8], toks: &[Token], nodes: &[Node], types: &mut [Ty], strs: &mut [Str],
+                   flds: &mut [Fld], cst: &mut [i64], first: i64) {
+    let mut f = first;
+    while cst[2] == 0 && f >= 0 {
+        cst[10] = f;
+        if nodes[f].kind == 112 {
+            let si = cst[7];
+            strs[si].name = nodes[f].a;
+            strs[si].fields = cst[8];
+            let mut nf = 0;
+            let mut fd = nodes[f].b;
+            while cst[2] == 0 && fd >= 0 {
+                let t = nodes[fd].b;
+                let sc = if nodes[t].kind == 100 { scalar_named(src, toks, nodes[t].a) } else { -1 };
+                if sc < 0 { cst[2] = 1; };
+                flds[cst[8]].name = nodes[fd].a;
+                flds[cst[8]].ty = sc;
+                cst[8] = cst[8] + 1;
+                nf += 1;
+                fd = nodes[fd].next;
+            }
+            if nf == 0 { cst[2] = 1; };
+            strs[si].n_fields = nf;
+            cst[7] = si + 1;
+        }
+        f = nodes[f].next;
+    }
+}
+
 // ---- type expressions ----
 
-fn resolve_ty(src: &[u8], toks: &[Token], nodes: &[Node], types: &mut [Ty], cst: &mut [i64], n: i64) -> i64 {
+fn resolve_ty(src: &[u8], toks: &[Token], nodes: &[Node], types: &mut [Ty], strs: &[Str], cst: &mut [i64], n: i64) -> i64 {
     if n < 0 { return 4; }
     let k = nodes[n].kind;
     if k == 100 {
         let s = scalar_named(src, toks, nodes[n].a);
-        if s < 0 { cst[2] = 1; return -1; }
-        return s;
+        if s >= 0 { return s; }
+        let si = struct_find(src, toks, strs, cst, nodes[n].a);
+        if si < 0 { cst[2] = 1; return -1; }
+        return new_ty(types, cst, 7, si, 0);
     }
     if k == 101 { return 4; }
     if k == 104 {
-        let e = resolve_ty(src, toks, nodes, types, cst, nodes[n].a);
+        let e = resolve_ty(src, toks, nodes, types, strs, cst, nodes[n].a);
         return new_ty(types, cst, 5, e, 0);
     }
     if k == 102 {
-        let e = resolve_ty(src, toks, nodes, types, cst, nodes[n].a);
+        let e = resolve_ty(src, toks, nodes, types, strs, cst, nodes[n].a);
         return new_ty(types, cst, 5, e, 0);
     }
     if k == 103 {
-        let e = resolve_ty(src, toks, nodes, types, cst, nodes[n].a);
+        let e = resolve_ty(src, toks, nodes, types, strs, cst, nodes[n].a);
         return new_ty(types, cst, 6, e, nodes[n].ival);
     }
     cst[2] = 1;
@@ -157,14 +223,19 @@ fn resolve_ty(src: &[u8], toks: &[Token], nodes: &[Node], types: &mut [Ty], cst:
 // every expression's type is recorded in `ntys`, indexed by node — the table a next stage would
 // read, and what the type dump prints. The rules are in `check_expr_inner`; this only records.
 fn check_expr(src: &[u8], toks: &[Token], nodes: &[Node], types: &mut [Ty], syms: &mut [Sym],
-              sigs: &[Sig], ptys: &[i64], ntys: &mut [i64], cst: &mut [i64], n: i64) -> i64 {
-    let t = check_expr_inner(src, toks, nodes, types, syms, sigs, ptys, ntys, cst, n);
+              sigs: &[Sig], ptys: &[i64], strs: &[Str], flds: &[Fld], ntys: &mut [i64], cst: &mut [i64], n: i64) -> i64 {
+    let before = cst[2];
+    let t = check_expr_inner(src, toks, nodes, types, syms, sigs, ptys, strs, flds, ntys, cst, n);
     if n >= 0 { ntys[n] = t; }
+    // the innermost expression that failed: the recursion unwinds through here, and only the
+    // deepest frame sees the flag go from clear to set. `cst[2]` alone says a program is wrong
+    // without saying where, which is unusable on a file the size of the compiler's own source.
+    if cst[2] != 0 && before == 0 && cst[9] < 0 { cst[9] = n; }
     t
 }
 
 fn check_expr_inner(src: &[u8], toks: &[Token], nodes: &[Node], types: &mut [Ty], syms: &mut [Sym],
-              sigs: &[Sig], ptys: &[i64], ntys: &mut [i64], cst: &mut [i64], n: i64) -> i64 {
+              sigs: &[Sig], ptys: &[i64], strs: &[Str], flds: &[Fld], ntys: &mut [i64], cst: &mut [i64], n: i64) -> i64 {
     if cst[2] != 0 || n < 0 { return -1; }
     let k = nodes[n].kind;
     if k == 60 { return 0; }
@@ -178,8 +249,8 @@ fn check_expr_inner(src: &[u8], toks: &[Token], nodes: &[Node], types: &mut [Ty]
         return syms[s].ty;
     }
     if k == 66 {
-        let a = check_expr(src, toks, nodes, types, syms, sigs, ptys, ntys, cst, nodes[n].a);
-        let b = check_expr(src, toks, nodes, types, syms, sigs, ptys, ntys, cst, nodes[n].b);
+        let a = check_expr(src, toks, nodes, types, syms, sigs, ptys, strs, flds, ntys, cst, nodes[n].a);
+        let b = check_expr(src, toks, nodes, types, syms, sigs, ptys, strs, flds, ntys, cst, nodes[n].b);
         if cst[2] != 0 { return -1; }
         if !same_ty(types, a, b) { cst[2] = 1; return -1; }
         let op = nodes[n].ival;
@@ -197,7 +268,7 @@ fn check_expr_inner(src: &[u8], toks: &[Token], nodes: &[Node], types: &mut [Ty]
         return 2;
     }
     if k == 67 {
-        let a = check_expr(src, toks, nodes, types, syms, sigs, ptys, ntys, cst, nodes[n].a);
+        let a = check_expr(src, toks, nodes, types, syms, sigs, ptys, strs, flds, ntys, cst, nodes[n].a);
         if cst[2] != 0 { return -1; }
         if nodes[n].ival == 0 {
             if !is_numeric(types, a) { cst[2] = 1; return -1; }
@@ -209,19 +280,47 @@ fn check_expr_inner(src: &[u8], toks: &[Token], nodes: &[Node], types: &mut [Ty]
     if k == 68 {
         // the Rust checker indexes a variable, not an arbitrary expression
         if nodes[nodes[n].a].kind != 65 { cst[2] = 1; return -1; }
-        let base = check_expr(src, toks, nodes, types, syms, sigs, ptys, ntys, cst, nodes[n].a);
-        let idx = check_expr(src, toks, nodes, types, syms, sigs, ptys, ntys, cst, nodes[n].b);
+        let base = check_expr(src, toks, nodes, types, syms, sigs, ptys, strs, flds, ntys, cst, nodes[n].a);
+        let idx = check_expr(src, toks, nodes, types, syms, sigs, ptys, strs, flds, ntys, cst, nodes[n].b);
         if cst[2] != 0 { return -1; }
         if !is_arrayish(types, base) { cst[2] = 1; return -1; }
         if idx != 0 { cst[2] = 1; return -1; }
         return types[base].elem;
     }
     if k == 69 {
-        // a field access needs a struct type, and this slice has none
-        cst[2] = 1;
-        return -1;
+        let base = check_expr(src, toks, nodes, types, syms, sigs, ptys, strs, flds, ntys, cst, nodes[n].a);
+        if cst[2] != 0 { return -1; }
+        if base < 0 || types[base].kind != 7 { cst[2] = 1; return -1; }
+        let f = field_find(src, toks, strs, flds, types[base].elem, nodes[n].b);
+        if f < 0 { cst[2] = 1; return -1; }
+        return flds[f].ty;
     }
-    if k == 71 { return check_call(src, toks, nodes, types, syms, sigs, ptys, ntys, cst, n); }
+    if k == 70 {
+        let si = struct_find(src, toks, strs, cst, nodes[n].a);
+        if si < 0 { cst[2] = 1; return -1; }
+        // every field exactly once, in any order. Naming a field of this struct and counting the
+        // initialisers is not enough — `P { x: 1, x: 2 }` passes both and never gives `y` — so a
+        // repeat is caught directly, by scanning the initialisers already read.
+        let mut seen = 0;
+        let mut fi = nodes[n].b;
+        while cst[2] == 0 && fi >= 0 {
+            let f = field_find(src, toks, strs, flds, si, nodes[fi].a);
+            if f < 0 { cst[2] = 1; return -1; }
+            let mut prev = nodes[n].b;
+            while prev != fi {
+                if name_eq(src, toks, nodes[prev].a, nodes[fi].a) { cst[2] = 1; return -1; }
+                prev = nodes[prev].next;
+            }
+            let v = check_expr(src, toks, nodes, types, syms, sigs, ptys, strs, flds, ntys, cst, nodes[fi].b);
+            if cst[2] != 0 { return -1; }
+            if !same_ty(types, flds[f].ty, v) { cst[2] = 1; return -1; }
+            seen += 1;
+            fi = nodes[fi].next;
+        }
+        if seen != strs[si].n_fields { cst[2] = 1; return -1; }
+        return new_ty(types, cst, 7, si, 0);
+    }
+    if k == 71 { return check_call(src, toks, nodes, types, syms, sigs, ptys, strs, flds, ntys, cst, n); }
     if k == 73 {
         if nodes[nodes[n].a].kind != 65 { cst[2] = 1; return -1; }
         let s = sym_find(src, toks, syms, cst, nodes[nodes[n].a].a);
@@ -237,35 +336,35 @@ fn check_expr_inner(src: &[u8], toks: &[Token], nodes: &[Node], types: &mut [Ty]
         return new_ty(types, cst, 6, types[t].elem, m);
     }
     if k == 74 {
-        let a = check_expr(src, toks, nodes, types, syms, sigs, ptys, ntys, cst, nodes[n].a);
-        let t = resolve_ty(src, toks, nodes, types, cst, nodes[n].b);
+        let a = check_expr(src, toks, nodes, types, syms, sigs, ptys, strs, flds, ntys, cst, nodes[n].a);
+        let t = resolve_ty(src, toks, nodes, types, strs, cst, nodes[n].b);
         if cst[2] != 0 { return -1; }
         if !is_numeric(types, a) || !is_numeric(types, t) { cst[2] = 1; return -1; }
         return t;
     }
     if k == 75 {
-        let c = check_expr(src, toks, nodes, types, syms, sigs, ptys, ntys, cst, nodes[n].a);
+        let c = check_expr(src, toks, nodes, types, syms, sigs, ptys, strs, flds, ntys, cst, nodes[n].a);
         if cst[2] == 0 && c != 2 { cst[2] = 1; return -1; }
-        let t = check_block(src, toks, nodes, types, syms, sigs, ptys, ntys, cst, nodes[n].b);
+        let t = check_block(src, toks, nodes, types, syms, sigs, ptys, strs, flds, ntys, cst, nodes[n].b);
         if nodes[n].c < 0 {
             if cst[2] == 0 && t != 4 { cst[2] = 1; return -1; }
             return 4;
         }
-        let e = check_block(src, toks, nodes, types, syms, sigs, ptys, ntys, cst, nodes[n].c);
+        let e = check_block(src, toks, nodes, types, syms, sigs, ptys, strs, flds, ntys, cst, nodes[n].c);
         if cst[2] != 0 { return -1; }
         if !same_ty(types, t, e) { cst[2] = 1; return -1; }
         return t;
     }
-    if k == 76 { return check_block(src, toks, nodes, types, syms, sigs, ptys, ntys, cst, n); }
+    if k == 76 { return check_block(src, toks, nodes, types, syms, sigs, ptys, strs, flds, ntys, cst, n); }
     cst[2] = 1;
     -1
 }
 
 fn check_call(src: &[u8], toks: &[Token], nodes: &[Node], types: &mut [Ty], syms: &mut [Sym],
-              sigs: &[Sig], ptys: &[i64], ntys: &mut [i64], cst: &mut [i64], n: i64) -> i64 {
+              sigs: &[Sig], ptys: &[i64], strs: &[Str], flds: &[Fld], ntys: &mut [i64], cst: &mut [i64], n: i64) -> i64 {
     let name = nodes[n].a;
     if name_is_println(src, toks, name) {
-        let a = check_expr(src, toks, nodes, types, syms, sigs, ptys, ntys, cst, nodes[n].b);
+        let a = check_expr(src, toks, nodes, types, syms, sigs, ptys, strs, flds, ntys, cst, nodes[n].b);
         if cst[2] != 0 { return -1; }
         if nodes[n].b < 0 || nodes[nodes[n].b].next >= 0 { cst[2] = 1; return -1; }
         if !is_scalar(types, a) { cst[2] = 1; return -1; }
@@ -276,8 +375,8 @@ fn check_call(src: &[u8], toks: &[Token], nodes: &[Node], types: &mut [Ty], syms
         if first < 0 { cst[2] = 1; return -1; }
         let second = nodes[first].next;
         if second < 0 || nodes[second].next >= 0 { cst[2] = 1; return -1; }
-        let a = check_expr(src, toks, nodes, types, syms, sigs, ptys, ntys, cst, first);
-        let b = check_expr(src, toks, nodes, types, syms, sigs, ptys, ntys, cst, second);
+        let a = check_expr(src, toks, nodes, types, syms, sigs, ptys, strs, flds, ntys, cst, first);
+        let b = check_expr(src, toks, nodes, types, syms, sigs, ptys, strs, flds, ntys, cst, second);
         if cst[2] != 0 { return -1; }
         if !same_ty(types, a, b) || !is_numeric(types, a) { cst[2] = 1; return -1; }
         return a;
@@ -293,7 +392,7 @@ fn check_call(src: &[u8], toks: &[Token], nodes: &[Node], types: &mut [Ty], syms
     let mut arg = nodes[n].b;
     let mut k = 0;
     while cst[2] == 0 && arg >= 0 {
-        let at = check_expr(src, toks, nodes, types, syms, sigs, ptys, ntys, cst, arg);
+        let at = check_expr(src, toks, nodes, types, syms, sigs, ptys, strs, flds, ntys, cst, arg);
         if cst[2] == 0 {
             if k >= sigs[si].n_params {
                 cst[2] = 1;
@@ -322,17 +421,17 @@ fn check_call(src: &[u8], toks: &[Token], nodes: &[Node], types: &mut [Ty], syms
 
 // a block's own scope is the symbol table's length: entering saves it, leaving restores it
 fn check_block(src: &[u8], toks: &[Token], nodes: &[Node], types: &mut [Ty], syms: &mut [Sym],
-               sigs: &[Sig], ptys: &[i64], ntys: &mut [i64], cst: &mut [i64], n: i64) -> i64 {
+               sigs: &[Sig], ptys: &[i64], strs: &[Str], flds: &[Fld], ntys: &mut [i64], cst: &mut [i64], n: i64) -> i64 {
     if cst[2] != 0 || n < 0 { return -1; }
     let saved = cst[1];
     let mut s = nodes[n].a;
     while cst[2] == 0 && s >= 0 {
-        check_stmt(src, toks, nodes, types, syms, sigs, ptys, ntys, cst, s);
+        check_stmt(src, toks, nodes, types, syms, sigs, ptys, strs, flds, ntys, cst, s);
         s = nodes[s].next;
     }
     let mut t = 4;
     if nodes[n].b >= 0 {
-        t = check_expr(src, toks, nodes, types, syms, sigs, ptys, ntys, cst, nodes[n].b);
+        t = check_expr(src, toks, nodes, types, syms, sigs, ptys, strs, flds, ntys, cst, nodes[n].b);
     }
     cst[1] = saved;
     // recorded here rather than in `check_expr`'s wrapper: a function body, a loop body and an
@@ -342,15 +441,22 @@ fn check_block(src: &[u8], toks: &[Token], nodes: &[Node], types: &mut [Ty], sym
 }
 
 fn check_stmt(src: &[u8], toks: &[Token], nodes: &[Node], types: &mut [Ty], syms: &mut [Sym],
-              sigs: &[Sig], ptys: &[i64], ntys: &mut [i64], cst: &mut [i64], n: i64) {
+              sigs: &[Sig], ptys: &[i64], strs: &[Str], flds: &[Fld], ntys: &mut [i64], cst: &mut [i64], n: i64) {
+    let before = cst[2];
+    check_stmt_inner(src, toks, nodes, types, syms, sigs, ptys, strs, flds, ntys, cst, n);
+    if cst[2] != 0 && before == 0 && cst[9] < 0 { cst[9] = n; }
+}
+
+fn check_stmt_inner(src: &[u8], toks: &[Token], nodes: &[Node], types: &mut [Ty], syms: &mut [Sym],
+              sigs: &[Sig], ptys: &[i64], strs: &[Str], flds: &[Fld], ntys: &mut [i64], cst: &mut [i64], n: i64) {
     if cst[2] != 0 || n < 0 { return; }
     let k = nodes[n].kind;
     if k == 90 {
-        let t = check_expr(src, toks, nodes, types, syms, sigs, ptys, ntys, cst, nodes[n].c);
+        let t = check_expr(src, toks, nodes, types, syms, sigs, ptys, strs, flds, ntys, cst, nodes[n].c);
         if cst[2] != 0 { return; }
         if t == 4 { cst[2] = 1; return; }
         if nodes[n].b >= 0 {
-            let d = resolve_ty(src, toks, nodes, types, cst, nodes[n].b);
+            let d = resolve_ty(src, toks, nodes, types, strs, cst, nodes[n].b);
             if cst[2] != 0 { return; }
             if !same_ty(types, d, t) { cst[2] = 1; return; }
         }
@@ -365,7 +471,7 @@ fn check_stmt(src: &[u8], toks: &[Token], nodes: &[Node], types: &mut [Ty], syms
             if s < 0 { cst[2] = 1; return; }
             if syms[s].mutable == 0 { cst[2] = 1; return; }
             if is_arrayish(types, syms[s].ty) { cst[2] = 1; return; }
-            let v = check_expr(src, toks, nodes, types, syms, sigs, ptys, ntys, cst, nodes[n].b);
+            let v = check_expr(src, toks, nodes, types, syms, sigs, ptys, strs, flds, ntys, cst, nodes[n].b);
             if cst[2] != 0 { return; }
             if !same_ty(types, syms[s].ty, v) { cst[2] = 1; }
             if nodes[n].ival >= 0 && !is_numeric(types, syms[s].ty) { cst[2] = 1; }
@@ -380,39 +486,66 @@ fn check_stmt(src: &[u8], toks: &[Token], nodes: &[Node], types: &mut [Ty], syms
             // writing needs an owned `let mut` array or a `&mut [T]`
             if types[bt].kind == 5 && syms[s].mutable == 0 { cst[2] = 1; return; }
             if types[bt].kind == 6 && types[bt].mutable == 0 { cst[2] = 1; return; }
-            let it = check_expr(src, toks, nodes, types, syms, sigs, ptys, ntys, cst, nodes[tgt].b);
+            let it = check_expr(src, toks, nodes, types, syms, sigs, ptys, strs, flds, ntys, cst, nodes[tgt].b);
             if cst[2] == 0 && it != 0 { cst[2] = 1; return; }
-            let v = check_expr(src, toks, nodes, types, syms, sigs, ptys, ntys, cst, nodes[n].b);
+            let v = check_expr(src, toks, nodes, types, syms, sigs, ptys, strs, flds, ntys, cst, nodes[n].b);
             if cst[2] != 0 { return; }
             if !same_ty(types, types[bt].elem, v) { cst[2] = 1; }
+            return;
+        }
+        if tk == 69 {
+            // writing a field needs the *place* to be writable: a `let mut` struct, or an element
+            // of a writable array. Checking the base as an expression would not say which.
+            let b0 = nodes[tgt].a;
+            if nodes[b0].kind == 65 {
+                let s = sym_find(src, toks, syms, cst, nodes[b0].a);
+                if s < 0 { cst[2] = 1; return; }
+                if syms[s].mutable == 0 { cst[2] = 1; return; }
+            } else if nodes[b0].kind == 68 {
+                if nodes[nodes[b0].a].kind != 65 { cst[2] = 1; return; }
+                let s = sym_find(src, toks, syms, cst, nodes[nodes[b0].a].a);
+                if s < 0 { cst[2] = 1; return; }
+                let bt = syms[s].ty;
+                if !is_arrayish(types, bt) { cst[2] = 1; return; }
+                if types[bt].kind == 5 && syms[s].mutable == 0 { cst[2] = 1; return; }
+                if types[bt].kind == 6 && types[bt].mutable == 0 { cst[2] = 1; return; }
+            } else {
+                cst[2] = 1;
+                return;
+            }
+            let ft = check_expr(src, toks, nodes, types, syms, sigs, ptys, strs, flds, ntys, cst, tgt);
+            let v = check_expr(src, toks, nodes, types, syms, sigs, ptys, strs, flds, ntys, cst, nodes[n].b);
+            if cst[2] != 0 { return; }
+            if !same_ty(types, ft, v) { cst[2] = 1; return; }
+            if nodes[n].ival >= 0 && !is_numeric(types, ft) { cst[2] = 1; }
             return;
         }
         cst[2] = 1;
         return;
     }
     if k == 92 {
-        let a = check_expr(src, toks, nodes, types, syms, sigs, ptys, ntys, cst, nodes[n].b);
-        let b = check_expr(src, toks, nodes, types, syms, sigs, ptys, ntys, cst, nodes[n].c);
+        let a = check_expr(src, toks, nodes, types, syms, sigs, ptys, strs, flds, ntys, cst, nodes[n].b);
+        let b = check_expr(src, toks, nodes, types, syms, sigs, ptys, strs, flds, ntys, cst, nodes[n].c);
         if cst[2] != 0 { return; }
         if a != 0 || b != 0 { cst[2] = 1; return; }
         let saved = cst[1];
         declare(syms, cst, nodes[n].a, 0, 0);
         cst[5] = cst[5] + 1;
-        let t = check_block(src, toks, nodes, types, syms, sigs, ptys, ntys, cst, nodes[n].d);
+        let t = check_block(src, toks, nodes, types, syms, sigs, ptys, strs, flds, ntys, cst, nodes[n].d);
         cst[5] = cst[5] - 1;
         cst[1] = saved;
         if cst[2] == 0 && t != 4 { cst[2] = 1; }
         return;
     }
     if k == 93 {
-        let c = check_expr(src, toks, nodes, types, syms, sigs, ptys, ntys, cst, nodes[n].a);
+        let c = check_expr(src, toks, nodes, types, syms, sigs, ptys, strs, flds, ntys, cst, nodes[n].a);
         if cst[2] == 0 && c != 2 { cst[2] = 1; return; }
         if nodes[n].b >= 0 {
-            let m = check_expr(src, toks, nodes, types, syms, sigs, ptys, ntys, cst, nodes[n].b);
+            let m = check_expr(src, toks, nodes, types, syms, sigs, ptys, strs, flds, ntys, cst, nodes[n].b);
             if cst[2] == 0 && m != 0 { cst[2] = 1; return; }
         }
         cst[5] = cst[5] + 1;
-        let t = check_block(src, toks, nodes, types, syms, sigs, ptys, ntys, cst, nodes[n].c);
+        let t = check_block(src, toks, nodes, types, syms, sigs, ptys, strs, flds, ntys, cst, nodes[n].c);
         cst[5] = cst[5] - 1;
         if cst[2] == 0 && t != 4 { cst[2] = 1; }
         return;
@@ -422,7 +555,7 @@ fn check_stmt(src: &[u8], toks: &[Token], nodes: &[Node], types: &mut [Ty], syms
         return;
     }
     if k == 95 {
-        let t = check_expr(src, toks, nodes, types, syms, sigs, ptys, ntys, cst, nodes[n].a);
+        let t = check_expr(src, toks, nodes, types, syms, sigs, ptys, strs, flds, ntys, cst, nodes[n].a);
         if cst[2] == 0 && is_arrayish(types, t) { cst[2] = 1; }
         return;
     }
@@ -431,7 +564,7 @@ fn check_stmt(src: &[u8], toks: &[Token], nodes: &[Node], types: &mut [Ty], syms
             if cst[6] != 4 { cst[2] = 1; }
             return;
         }
-        let t = check_expr(src, toks, nodes, types, syms, sigs, ptys, ntys, cst, nodes[n].a);
+        let t = check_expr(src, toks, nodes, types, syms, sigs, ptys, strs, flds, ntys, cst, nodes[n].a);
         if cst[2] == 0 && !same_ty(types, t, cst[6]) { cst[2] = 1; }
         return;
     }
@@ -442,30 +575,35 @@ fn check_stmt(src: &[u8], toks: &[Token], nodes: &[Node], types: &mut [Ty], syms
 
 // every signature first, so a call may name a function declared later
 fn collect_sigs(src: &[u8], toks: &[Token], nodes: &[Node], types: &mut [Ty], sigs: &mut [Sig],
-                ptys: &mut [i64], cst: &mut [i64], first: i64) {
+                ptys: &mut [i64], strs: &[Str], cst: &mut [i64], first: i64) {
     let mut f = first;
     while cst[2] == 0 && f >= 0 {
-        let si = cst[3];
-        sigs[si].name = nodes[f].a;
-        sigs[si].params = cst[4];
-        let mut np = 0;
-        let mut p = nodes[f].b;
-        while cst[2] == 0 && p >= 0 {
-            let t = resolve_ty(src, toks, nodes, types, cst, nodes[p].b);
-            ptys[cst[4]] = t;
-            cst[4] = cst[4] + 1;
-            np += 1;
-            p = nodes[p].next;
+        // the item list interleaves functions and structs in source order, so this skips what
+        // `collect_structs` already read
+        cst[10] = f;
+        if nodes[f].kind == 110 {
+            let si = cst[3];
+            sigs[si].name = nodes[f].a;
+            sigs[si].params = cst[4];
+            let mut np = 0;
+            let mut p = nodes[f].b;
+            while cst[2] == 0 && p >= 0 {
+                let t = resolve_ty(src, toks, nodes, types, strs, cst, nodes[p].b);
+                ptys[cst[4]] = t;
+                cst[4] = cst[4] + 1;
+                np += 1;
+                p = nodes[p].next;
+            }
+            sigs[si].n_params = np;
+            sigs[si].ret = resolve_ty(src, toks, nodes, types, strs, cst, nodes[f].c);
+            cst[3] = si + 1;
         }
-        sigs[si].n_params = np;
-        sigs[si].ret = resolve_ty(src, toks, nodes, types, cst, nodes[f].c);
-        cst[3] = si + 1;
         f = nodes[f].next;
     }
 }
 
 fn check_func(src: &[u8], toks: &[Token], nodes: &[Node], types: &mut [Ty], syms: &mut [Sym],
-              sigs: &[Sig], ptys: &[i64], ntys: &mut [i64], cst: &mut [i64], f: i64, si: i64) {
+              sigs: &[Sig], ptys: &[i64], strs: &[Str], flds: &[Fld], ntys: &mut [i64], cst: &mut [i64], f: i64, si: i64) {
     if cst[2] != 0 { return; }
     let saved = cst[1];
     let mut p = nodes[f].b;
@@ -477,7 +615,7 @@ fn check_func(src: &[u8], toks: &[Token], nodes: &[Node], types: &mut [Ty], syms
     }
     cst[6] = sigs[si].ret;
     let body = nodes[f].d;
-    let t = check_block(src, toks, nodes, types, syms, sigs, ptys, ntys, cst, body);
+    let t = check_block(src, toks, nodes, types, syms, sigs, ptys, strs, flds, ntys, cst, body);
     if cst[2] == 0 {
         if nodes[body].b >= 0 {
             // the body's value is its tail: it must be what the signature says
@@ -502,14 +640,20 @@ fn ends_in_return(nodes: &[Node], body: i64) -> bool {
 
 // returns 0 when the program checks, 1 when it does not
 fn check_program(src: &[u8], toks: &[Token], nodes: &[Node], types: &mut [Ty], syms: &mut [Sym],
-                 sigs: &mut [Sig], ptys: &mut [i64], ntys: &mut [i64], cst: &mut [i64], first: i64) -> i64 {
+                 sigs: &mut [Sig], ptys: &mut [i64], strs: &mut [Str], flds: &mut [Fld],
+                 ntys: &mut [i64], cst: &mut [i64], first: i64) -> i64 {
+    cst[9] = -1;
     intern_scalars(types, cst);
-    collect_sigs(src, toks, nodes, types, sigs, ptys, cst, first);
+    collect_structs(src, toks, nodes, types, strs, flds, cst, first);
+    collect_sigs(src, toks, nodes, types, sigs, ptys, strs, cst, first);
     let mut f = first;
     let mut si = 0;
     while cst[2] == 0 && f >= 0 {
-        check_func(src, toks, nodes, types, syms, sigs, ptys, ntys, cst, f, si);
-        si += 1;
+        cst[10] = f;
+        if nodes[f].kind == 110 {
+            check_func(src, toks, nodes, types, syms, sigs, ptys, strs, flds, ntys, cst, f, si);
+            si += 1;
+        }
         f = nodes[f].next;
     }
     cst[2]

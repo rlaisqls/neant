@@ -307,7 +307,25 @@ representation. `bootstrap/rt.c` gained `write_file` for it, whose first signatu
 length argument because a neant view passes as two C arguments — the same convention mismatch that
 motivated writing the shim in the first place. Locals are emitted by their source spelling, so
 same-block shadowing fails in `cc` rather than silently; fixing it is the next thing the checker
-should record (design §3). Not designed yet: the cost calculus, and the fixpoint itself.
+should record (design §3).
+
+**The slice now covers structs, and the front end reads its own source**, written up in
+[self-hosting-structs.md](self-hosting-structs.md). Every stage stopped at its first `struct` — the
+arena pattern means every stage opens with one — so structs went in across parser, checker and
+emitter at once: a pre-scan laying a marker per `struct <Ident>` name (the one-pass parser's answer
+to telling `S { … }` from a block), type kind 7 over a flat struct/field table, and C compound
+literals with designated initialisers. `tests/golden/structval.nt` goes through the whole chain and
+prints what `neant run` prints. Two findings worth the name: the self-hosted lexer had, since the
+day it was written, read past an **escaped quote** — `b'\''`, which `compiler/lex.nt` itself
+contains and no golden program does, so the lexer's corpus is now the goldens *and* `compiler/*.nt`;
+and `P { x: 1, x: 2 }` type-checked, because "every initialiser names a field, and the count
+matches" forbids neither a repeat nor the omission that goes with it.
+
+**The frontier is a test now.** `the_self_hosted_front_end_checks_its_own_source` concatenates
+`lex.nt + parse.nt + check.nt` — ~1500 lines — and the self-hosted lexer, parser and checker parse
+and type-check it. `emit.nt` is deliberately outside: it stops at its first `s.len()`. Arrays,
+slices, `.len()`, array literals and `[e; n]` are what remain between here and the whole compiler
+reading itself. Not designed yet: the cost calculus, and the fixpoint itself.
 
 ## M7 — the constant factor
 

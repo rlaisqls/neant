@@ -300,11 +300,24 @@ fn main() {
 mod parsedump {
     use crate::ast::*;
 
+    /// Top-level items in source order, which the self-hosted parser chains the same way: the
+    /// Rust `Program` splits them into two lists, so they are interleaved back by line.
     pub fn program(p: &Program) -> Result<Vec<i32>, String> {
-        if !p.structs.is_empty() { return Err("a `struct` definition".into()); }
+        let mut items: Vec<(u32, &dyn Fn(&mut Vec<i32>) -> Result<(), String>)> = Vec::new();
+        let fs: Vec<_> = p.funcs.iter().map(|f| (f.line, move |o: &mut Vec<i32>| func(f, o))).collect();
+        let ss: Vec<_> = p.structs.iter().map(|d| (d.line, move |o: &mut Vec<i32>| strukt(d, o))).collect();
+        for (l, f) in &fs { items.push((*l, f)); }
+        for (l, f) in &ss { items.push((*l, f)); }
+        items.sort_by_key(|(l, _)| *l);
         let mut out = Vec::new();
-        for f in &p.funcs { func(f, &mut out)?; }
+        for (_, f) in items { f(&mut out)?; }
         Ok(out)
+    }
+    fn strukt(d: &StructDef, o: &mut Vec<i32>) -> Result<(), String> {
+        if d.layout.is_some() { return Err("a `#[layout(...)]` attribute".into()); }
+        o.push(112);
+        for (_, t, _, _) in &d.fields { o.push(113); ty(t, o)?; }
+        Ok(())
     }
     fn func(f: &Func, o: &mut Vec<i32>) -> Result<(), String> {
         if f.body.is_none() { return Err("an `extern fn`".into()); }
@@ -372,7 +385,11 @@ mod parsedump {
                 Ok(())
             }
             ExprKind::Block(b) => block(b, o),
-            ExprKind::StructLit(..) => Err("a struct literal".into()),
+            ExprKind::StructLit(_, fields) => {
+                o.push(70);
+                for (_, v) in fields { o.push(114); expr(v, o)?; }
+                Ok(())
+            }
             ExprKind::MethodCall(..) => Err("a method call or chain".into()),
             ExprKind::ArrayLit(_) => Err("an array literal".into()),
             ExprKind::ArrayRepeat(..) => Err("an `[e; n]` array".into()),

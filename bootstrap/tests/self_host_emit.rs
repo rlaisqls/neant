@@ -28,24 +28,26 @@ fn main() {{
     let mut toks = [Token {{ kind: 0, start: 0, len: 0, ival: 0 }}; 65536];
     let n_toks = lex(&buf, n, &mut toks);
     let mut nodes = [Node {{ kind: 0, a: 0, b: 0, c: 0, d: 0, ival: 0, next: 0 }}; 65536];
-    let mut st = [0, 0, 0];
-    let first = parse_program(&toks, n_toks, &mut st, &mut nodes);
+    let mut st = [0, 0, 0, 0, 0];
+    let first = parse_program(&buf, &toks, n_toks, &mut st, &mut nodes);
     if st[2] != 0 {{
         println(-2);
     }} else {{
         let mut types = [Ty {{ kind: 0, elem: 0, mutable: 0 }}; 4096];
         let mut syms = [Sym {{ name: 0, ty: 0, mutable: 0 }}; 4096];
         let mut sigs = [Sig {{ name: 0, params: 0, n_params: 0, ret: 0 }}; 1024];
+        let mut strs = [Str {{ name: 0, fields: 0, n_fields: 0 }}; 1024];
+        let mut flds = [Fld {{ name: 0, ty: 0 }}; 4096];
         let mut ptys = [0; 4096];
         let mut ntys = [-1; 65536];
-        let mut cst = [0, 0, 0, 0, 0, 0, 0];
-        let bad = check_program(&buf, &toks, &nodes, &mut types, &mut syms, &mut sigs, &mut ptys, &mut ntys, &mut cst, first);
+        let mut cst = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+        let bad = check_program(&buf, &toks, &nodes, &mut types, &mut syms, &mut sigs, &mut ptys, &mut strs, &mut flds, &mut ntys, &mut cst, first);
         if bad != 0 {{
             println(-1);
         }} else {{
             let mut out = [b'\0'; 262144];
             let mut est = [0, 0];
-            let len = emit_program(&mut out, &mut est, &buf, &toks, &nodes, &types, &ntys, &sigs, &ptys, first);
+            let len = emit_program(&mut out, &mut est, &buf, &toks, &nodes, &types, &strs, &flds, &ntys, &sigs, &ptys, first);
             println(write_file(&outpath, &out, len));
         }}
     }}
@@ -68,7 +70,7 @@ fn self_hosted_emit_runs_the_same() {
         .collect();
     files.sort();
 
-    let (mut compared, mut failures) = (0, Vec::new());
+    let (mut compared, mut failures) = (Vec::new(), Vec::new());
     for f in &files {
         // only what the self-hosted chain can read, and only programs that check: a rejected
         // program has no output to compare
@@ -102,7 +104,7 @@ fn self_hosted_emit_runs_the_same() {
             continue;
         }
 
-        compared += 1;
+        compared.push(name.clone());
         let want = Command::new(neant()).arg("run").arg(f).output().unwrap();
         let got = Command::new(&bin).output().unwrap();
         if want.stdout != got.stdout {
@@ -111,9 +113,13 @@ fn self_hosted_emit_runs_the_same() {
         }
     }
     if failures.is_empty() { let _ = std::fs::remove_dir_all(&dir); }
-    assert!(compared >= 5, "only {compared} programs made it through the self-hosted chain; the slice changed");
+    assert!(compared.len() >= 5, "only {} programs made it through the self-hosted chain; the slice changed", compared.len());
+    // a skip is otherwise silent — a program that stops parsing is simply not compared — so the
+    // one golden that exercises structs is named here rather than left to the count
+    assert!(compared.iter().any(|n| n == "structval.nt"),
+        "structval.nt did not reach the comparison; structs fell out of the slice. compared: {compared:?}");
     if !failures.is_empty() {
-        panic!("{} of {compared} programs differ (artifacts kept in {}):\n\n{}",
-            failures.len(), dir.display(), failures.join("\n"));
+        panic!("{} of {} programs differ (artifacts kept in {}):\n\n{}",
+            failures.len(), compared.len(), dir.display(), failures.join("\n"));
     }
 }

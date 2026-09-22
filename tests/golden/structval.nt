@@ -1,0 +1,40 @@
+// structs by value: a literal, a field read, a field written, a struct passed and returned.
+// `structs.nt` is the array-of-structs case; this one never puts a struct in an array, which is
+// what keeps it inside the self-hosted compiler's slice (tests/self_host_emit.rs).
+struct Point { x: i64, y: i64 }
+
+struct Mixed { n: i64, w: f64, on: bool }
+
+fn shift(p: Point, dx: i64, dy: i64) -> Point {
+    Point { x: p.x + dx, y: p.y + dy }
+}
+
+fn manhattan(p: Point) -> i64 {
+    let ax = if p.x < 0 { 0 - p.x } else { p.x };
+    let ay = if p.y < 0 { 0 - p.y } else { p.y };
+    ax + ay
+}
+
+fn main() {
+    let a = Point { x: 3, y: -4 };
+    println(manhattan(a));
+
+    let b = shift(a, -3, 4);
+    println(b.x);
+    println(b.y);
+
+    // the fields may be written in any order
+    let c = Point { y: 10, x: 20 };
+    println(c.x + c.y);
+
+    let mut d = Point { x: 1, y: 2 };
+    d.x = 7;
+    d.y += 5;
+    println(d.x * d.y);
+
+    let m = Mixed { n: 2, w: 0.5, on: true };
+    if m.on {
+        println(m.w * 4.0);
+        println(m.n);
+    }
+}

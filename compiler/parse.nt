@@ -16,17 +16,20 @@
 //   69 Field  73 Ref  74 Cast  75 If  76 Block
 //   90 Let  91 Assign  92 For  93 While  94 Break  95 ExprStmt  96 Return
 //   100 TyNamed  101 TyUnit  102 TyArray  103 TySlice  104 TyOwned
-//   110 Func  111 Param
-// Out of this slice, by design §6: StructLit(70), MethodCall/chains(72), ArrayLit(77),
-// ArrayRepeat(78), Lambda(79), Comprehension(80), `extern`, attributes, `struct` definitions.
+//   110 Func  111 Param  112 StructDef  113 FieldDef  114 FieldInit  70 StructLit
+//   115 a struct-name marker, laid down before parsing and never part of the tree
+// Out of this slice, by design §6: MethodCall/chains(72), ArrayLit(77), ArrayRepeat(78),
+// Lambda(79), Comprehension(80), `extern` and attributes. Structs were added afterwards, the
+// first widening of the slice (docs/self-hosting-structs.md).
 //
 // BinOp: 0 Add 1 Sub 2 Mul 3 Div 4 Rem 5 Eq 6 Ne 7 Lt 8 Le 9 Gt 10 Ge 11 And 12 Or
 // UnOp:  0 Neg 1 Not
 //
 // `st` is the parser's whole mutable state, the one-element-array idiom `tests/golden/parse.nt`
 // already uses, widened: st[0] = the token position, st[1] = the next free node, st[2] = 1 once a
-// parse has failed. Every function returns −1 immediately once st[2] is set, so one error stops
-// the parse the way parse.rs's `?` does, without unwinding.
+// parse has failed, st[3] = how many struct-name markers were laid down, st[4] = the depth of
+// `if`/`while`/`for` heads currently open. Every function returns −1 immediately once st[2] is
+// set, so one error stops the parse the way parse.rs's `?` does, without unwinding.
 
 struct Node { kind: i64, a: i64, b: i64, c: i64, d: i64, ival: i64, next: i64 }
 
@@ -73,9 +76,34 @@ fn alloc(nodes: &mut [Node], st: &mut [i64], kind: i64) -> i64 {
     i
 }
 
+// two identifier tokens spell the same name: their spans hold the same bytes
+fn tok_text_eq(src: &[u8], toks: &[Token], a: i64, b: i64) -> bool {
+    if a < 0 || b < 0 { return false; }
+    if toks[a].len != toks[b].len { return false; }
+    let mut i = 0;
+    let mut ok = true;
+    while i < toks[a].len {
+        if src[toks[a].start + i] != src[toks[b].start + i] { ok = false; }
+        i += 1;
+    }
+    ok
+}
+
+// is this identifier token the name of a struct? compared against the markers `parse_program`
+// laid down for every `struct <Ident>` in the file (node kind 115, never part of the tree)
+fn is_struct_name(src: &[u8], toks: &[Token], nodes: &[Node], st: &[i64], t: i64) -> bool {
+    let mut i = 0;
+    let mut found = false;
+    while i < st[3] {
+        if nodes[i].kind == 115 && tok_text_eq(src, toks, nodes[i].a, t) { found = true; }
+        i += 1;
+    }
+    found
+}
+
 // ---- types ----
 
-fn type_expr(toks: &[Token], n_toks: i64, st: &mut [i64], nodes: &mut [Node]) -> i64 {
+fn type_expr(src: &[u8], toks: &[Token], n_toks: i64, st: &mut [i64], nodes: &mut [Node]) -> i64 {
     if st[2] != 0 { return -1; }
     let k = toks[st[0]].kind;
     if k == 0 {
@@ -91,14 +119,14 @@ fn type_expr(toks: &[Token], n_toks: i64, st: &mut [i64], nodes: &mut [Node]) ->
     }
     if k == 25 {
         bump(st);
-        let elem = type_expr(toks, n_toks, st, nodes);
+        let elem = type_expr(src, toks, n_toks, st, nodes);
         if eat(toks, st, 26) {
             let n = alloc(nodes, st, 104);
             nodes[n].a = elem;
             return n;
         }
         expect(toks, st, 30);
-        let count = expr(toks, n_toks, st, nodes);
+        let count = expr(src, toks, n_toks, st, nodes);
         expect(toks, st, 26);
         let n = alloc(nodes, st, 102);
         nodes[n].a = elem;
@@ -109,7 +137,7 @@ fn type_expr(toks: &[Token], n_toks: i64, st: &mut [i64], nodes: &mut [Node]) ->
         bump(st);
         let m = eat(toks, st, 8);
         expect(toks, st, 25);
-        let elem = type_expr(toks, n_toks, st, nodes);
+        let elem = type_expr(src, toks, n_toks, st, nodes);
         expect(toks, st, 26);
         let n = alloc(nodes, st, 103);
         nodes[n].a = elem;
@@ -122,15 +150,15 @@ fn type_expr(toks: &[Token], n_toks: i64, st: &mut [i64], nodes: &mut [Node]) ->
 
 // ---- expressions, one function per precedence level (no function values to parameterise with) ----
 
-fn expr(toks: &[Token], n_toks: i64, st: &mut [i64], nodes: &mut [Node]) -> i64 {
-    or_level(toks, n_toks, st, nodes)
+fn expr(src: &[u8], toks: &[Token], n_toks: i64, st: &mut [i64], nodes: &mut [Node]) -> i64 {
+    or_level(src, toks, n_toks, st, nodes)
 }
 
-fn or_level(toks: &[Token], n_toks: i64, st: &mut [i64], nodes: &mut [Node]) -> i64 {
-    let mut lhs = and_level(toks, n_toks, st, nodes);
+fn or_level(src: &[u8], toks: &[Token], n_toks: i64, st: &mut [i64], nodes: &mut [Node]) -> i64 {
+    let mut lhs = and_level(src, toks, n_toks, st, nodes);
     while st[2] == 0 && toks[st[0]].kind == 54 {
         bump(st);
-        let rhs = and_level(toks, n_toks, st, nodes);
+        let rhs = and_level(src, toks, n_toks, st, nodes);
         let n = alloc(nodes, st, 66);
         nodes[n].a = lhs;
         nodes[n].b = rhs;
@@ -140,11 +168,11 @@ fn or_level(toks: &[Token], n_toks: i64, st: &mut [i64], nodes: &mut [Node]) -> 
     lhs
 }
 
-fn and_level(toks: &[Token], n_toks: i64, st: &mut [i64], nodes: &mut [Node]) -> i64 {
-    let mut lhs = cmp_level(toks, n_toks, st, nodes);
+fn and_level(src: &[u8], toks: &[Token], n_toks: i64, st: &mut [i64], nodes: &mut [Node]) -> i64 {
+    let mut lhs = cmp_level(src, toks, n_toks, st, nodes);
     while st[2] == 0 && toks[st[0]].kind == 52 {
         bump(st);
-        let rhs = cmp_level(toks, n_toks, st, nodes);
+        let rhs = cmp_level(src, toks, n_toks, st, nodes);
         let n = alloc(nodes, st, 66);
         nodes[n].a = lhs;
         nodes[n].b = rhs;
@@ -155,15 +183,15 @@ fn and_level(toks: &[Token], n_toks: i64, st: &mut [i64], nodes: &mut [Node]) ->
 }
 
 // comparisons do not chain, exactly as parse.rs has it
-fn cmp_level(toks: &[Token], n_toks: i64, st: &mut [i64], nodes: &mut [Node]) -> i64 {
-    let lhs = add_level(toks, n_toks, st, nodes);
+fn cmp_level(src: &[u8], toks: &[Token], n_toks: i64, st: &mut [i64], nodes: &mut [Node]) -> i64 {
+    let lhs = add_level(src, toks, n_toks, st, nodes);
     if st[2] != 0 { return -1; }
     let k = toks[st[0]].kind;
     let op = if k == 36 { 5 } else if k == 37 { 6 } else if k == 38 { 7 }
         else if k == 39 { 8 } else if k == 40 { 9 } else if k == 41 { 10 } else { -1 };
     if op < 0 { return lhs; }
     bump(st);
-    let rhs = add_level(toks, n_toks, st, nodes);
+    let rhs = add_level(src, toks, n_toks, st, nodes);
     let n = alloc(nodes, st, 66);
     nodes[n].a = lhs;
     nodes[n].b = rhs;
@@ -171,12 +199,12 @@ fn cmp_level(toks: &[Token], n_toks: i64, st: &mut [i64], nodes: &mut [Node]) ->
     n
 }
 
-fn add_level(toks: &[Token], n_toks: i64, st: &mut [i64], nodes: &mut [Node]) -> i64 {
-    let mut lhs = mul_level(toks, n_toks, st, nodes);
+fn add_level(src: &[u8], toks: &[Token], n_toks: i64, st: &mut [i64], nodes: &mut [Node]) -> i64 {
+    let mut lhs = mul_level(src, toks, n_toks, st, nodes);
     while st[2] == 0 && (toks[st[0]].kind == 42 || toks[st[0]].kind == 43) {
         let op = if toks[st[0]].kind == 42 { 0 } else { 1 };
         bump(st);
-        let rhs = mul_level(toks, n_toks, st, nodes);
+        let rhs = mul_level(src, toks, n_toks, st, nodes);
         let n = alloc(nodes, st, 66);
         nodes[n].a = lhs;
         nodes[n].b = rhs;
@@ -186,13 +214,13 @@ fn add_level(toks: &[Token], n_toks: i64, st: &mut [i64], nodes: &mut [Node]) ->
     lhs
 }
 
-fn mul_level(toks: &[Token], n_toks: i64, st: &mut [i64], nodes: &mut [Node]) -> i64 {
-    let mut lhs = cast_level(toks, n_toks, st, nodes);
+fn mul_level(src: &[u8], toks: &[Token], n_toks: i64, st: &mut [i64], nodes: &mut [Node]) -> i64 {
+    let mut lhs = cast_level(src, toks, n_toks, st, nodes);
     while st[2] == 0 && (toks[st[0]].kind == 44 || toks[st[0]].kind == 45 || toks[st[0]].kind == 46) {
         let k = toks[st[0]].kind;
         let op = if k == 44 { 2 } else if k == 45 { 3 } else { 4 };
         bump(st);
-        let rhs = cast_level(toks, n_toks, st, nodes);
+        let rhs = cast_level(src, toks, n_toks, st, nodes);
         let n = alloc(nodes, st, 66);
         nodes[n].a = lhs;
         nodes[n].b = rhs;
@@ -202,11 +230,11 @@ fn mul_level(toks: &[Token], n_toks: i64, st: &mut [i64], nodes: &mut [Node]) ->
     lhs
 }
 
-fn cast_level(toks: &[Token], n_toks: i64, st: &mut [i64], nodes: &mut [Node]) -> i64 {
-    let mut e = unary_level(toks, n_toks, st, nodes);
+fn cast_level(src: &[u8], toks: &[Token], n_toks: i64, st: &mut [i64], nodes: &mut [Node]) -> i64 {
+    let mut e = unary_level(src, toks, n_toks, st, nodes);
     while st[2] == 0 && toks[st[0]].kind == 16 {
         bump(st);
-        let ty = type_expr(toks, n_toks, st, nodes);
+        let ty = type_expr(src, toks, n_toks, st, nodes);
         let n = alloc(nodes, st, 74);
         nodes[n].a = e;
         nodes[n].b = ty;
@@ -215,12 +243,12 @@ fn cast_level(toks: &[Token], n_toks: i64, st: &mut [i64], nodes: &mut [Node]) -
     e
 }
 
-fn unary_level(toks: &[Token], n_toks: i64, st: &mut [i64], nodes: &mut [Node]) -> i64 {
+fn unary_level(src: &[u8], toks: &[Token], n_toks: i64, st: &mut [i64], nodes: &mut [Node]) -> i64 {
     if st[2] != 0 { return -1; }
     let k = toks[st[0]].kind;
     if k == 43 {
         bump(st);
-        let e = unary_level(toks, n_toks, st, nodes);
+        let e = unary_level(src, toks, n_toks, st, nodes);
         let n = alloc(nodes, st, 67);
         nodes[n].a = e;
         nodes[n].ival = 0;
@@ -228,7 +256,7 @@ fn unary_level(toks: &[Token], n_toks: i64, st: &mut [i64], nodes: &mut [Node]) 
     }
     if k == 55 {
         bump(st);
-        let e = unary_level(toks, n_toks, st, nodes);
+        let e = unary_level(src, toks, n_toks, st, nodes);
         let n = alloc(nodes, st, 67);
         nodes[n].a = e;
         nodes[n].ival = 1;
@@ -237,23 +265,23 @@ fn unary_level(toks: &[Token], n_toks: i64, st: &mut [i64], nodes: &mut [Node]) 
     if k == 51 {
         bump(st);
         let m = eat(toks, st, 8);
-        let e = unary_level(toks, n_toks, st, nodes);
+        let e = unary_level(src, toks, n_toks, st, nodes);
         let n = alloc(nodes, st, 73);
         nodes[n].a = e;
         nodes[n].ival = if m { 1 } else { 0 };
         return n;
     }
-    postfix_level(toks, n_toks, st, nodes)
+    postfix_level(src, toks, n_toks, st, nodes)
 }
 
-fn postfix_level(toks: &[Token], n_toks: i64, st: &mut [i64], nodes: &mut [Node]) -> i64 {
-    let mut e = primary(toks, n_toks, st, nodes);
+fn postfix_level(src: &[u8], toks: &[Token], n_toks: i64, st: &mut [i64], nodes: &mut [Node]) -> i64 {
+    let mut e = primary(src, toks, n_toks, st, nodes);
     let mut going = true;
     while st[2] == 0 && going {
         let k = toks[st[0]].kind;
         if k == 25 {
             bump(st);
-            let idx = expr(toks, n_toks, st, nodes);
+            let idx = expr(src, toks, n_toks, st, nodes);
             expect(toks, st, 26);
             let n = alloc(nodes, st, 68);
             nodes[n].a = e;
@@ -279,7 +307,7 @@ fn postfix_level(toks: &[Token], n_toks: i64, st: &mut [i64], nodes: &mut [Node]
     e
 }
 
-fn primary(toks: &[Token], n_toks: i64, st: &mut [i64], nodes: &mut [Node]) -> i64 {
+fn primary(src: &[u8], toks: &[Token], n_toks: i64, st: &mut [i64], nodes: &mut [Node]) -> i64 {
     if st[2] != 0 { return -1; }
     let k = toks[st[0]].kind;
     if k == 1 {
@@ -315,13 +343,35 @@ fn primary(toks: &[Token], n_toks: i64, st: &mut [i64], nodes: &mut [Node]) -> i
     }
     if k == 0 {
         let t = bump(st);
+        if toks[st[0]].kind == 27 && st[4] == 0 && is_struct_name(src, toks, nodes, st, t) {
+            bump(st);
+            let n = alloc(nodes, st, 70);
+            nodes[n].a = t;
+            let mut last = -1;
+            while st[2] == 0 && toks[st[0]].kind != 28 {
+                let fname = expect(toks, st, 0);
+                expect(toks, st, 31);
+                let fi = alloc(nodes, st, 114);
+                nodes[fi].a = fname;
+                // a field's value is an ordinary expression: `S { f: if c { 1 } else { 2 } }` is fine
+                let saved = st[4];
+                st[4] = 0;
+                nodes[fi].b = expr(src, toks, n_toks, st, nodes);
+                st[4] = saved;
+                if last < 0 { nodes[n].b = fi; } else { nodes[last].next = fi; }
+                last = fi;
+                if !eat(toks, st, 29) { break; }
+            }
+            expect(toks, st, 28);
+            return n;
+        }
         if toks[st[0]].kind == 23 {
             bump(st);
             let n = alloc(nodes, st, 71);
             nodes[n].a = t;
             let mut last = -1;
             while st[2] == 0 && toks[st[0]].kind != 24 {
-                let arg = expr(toks, n_toks, st, nodes);
+                let arg = expr(src, toks, n_toks, st, nodes);
                 if last < 0 { nodes[n].b = arg; } else { nodes[last].next = arg; }
                 last = arg;
                 if !eat(toks, st, 29) { break; }
@@ -335,32 +385,36 @@ fn primary(toks: &[Token], n_toks: i64, st: &mut [i64], nodes: &mut [Node]) -> i
     }
     if k == 23 {
         bump(st);
-        let e = expr(toks, n_toks, st, nodes);
+        let e = expr(src, toks, n_toks, st, nodes);
         expect(toks, st, 24);
         return e;
     }
     if k == 9 {
         bump(st);
-        let cond = expr(toks, n_toks, st, nodes);
-        let then = block(toks, n_toks, st, nodes);
+        // inside a condition `S {` opens the body, it is not a struct literal — parse.rs keeps the
+        // same counter for the same reason
+        st[4] = st[4] + 1;
+        let cond = expr(src, toks, n_toks, st, nodes);
+        st[4] = st[4] - 1;
+        let then = block(src, toks, n_toks, st, nodes);
         let n = alloc(nodes, st, 75);
         nodes[n].a = cond;
         nodes[n].b = then;
         if eat(toks, st, 10) {
             if toks[st[0]].kind == 9 {
                 // `else if` is an else block whose value is the inner if, as parse.rs has it
-                let inner = primary(toks, n_toks, st, nodes);
+                let inner = primary(src, toks, n_toks, st, nodes);
                 let b = alloc(nodes, st, 76);
                 nodes[b].b = inner;
                 nodes[n].c = b;
             } else {
-                nodes[n].c = block(toks, n_toks, st, nodes);
+                nodes[n].c = block(src, toks, n_toks, st, nodes);
             }
         }
         return n;
     }
     if k == 27 {
-        return block(toks, n_toks, st, nodes);
+        return block(src, toks, n_toks, st, nodes);
     }
     st[2] = 1;
     -1
@@ -369,7 +423,7 @@ fn primary(toks: &[Token], n_toks: i64, st: &mut [i64], nodes: &mut [Node]) -> i
 // ---- statements ----
 
 // a block: `{ stmt* tail? }` — `a` is the first statement, chained by `next`; `b` is the tail
-fn block(toks: &[Token], n_toks: i64, st: &mut [i64], nodes: &mut [Node]) -> i64 {
+fn block(src: &[u8], toks: &[Token], n_toks: i64, st: &mut [i64], nodes: &mut [Node]) -> i64 {
     if st[2] != 0 { return -1; }
     expect(toks, st, 27);
     let n = alloc(nodes, st, 76);
@@ -380,7 +434,7 @@ fn block(toks: &[Token], n_toks: i64, st: &mut [i64], nodes: &mut [Node]) -> i64
         if k == 28 || k == 57 {
             going = false;
         } else {
-            let s = item(toks, n_toks, st, nodes);
+            let s = item(src, toks, n_toks, st, nodes);
             if st[2] == 0 {
                 if nodes[s].kind == 95 && toks[st[0]].kind == 28 && nodes[s].ival == 1 {
                     // an expression with no `;` before the closing brace is the block's value
@@ -399,7 +453,7 @@ fn block(toks: &[Token], n_toks: i64, st: &mut [i64], nodes: &mut [Node]) -> i64
 
 // one statement, or an expression statement — `ival` is 1 on an ExprStmt that had no `;`, which
 // `block` reads to tell a tail expression from a statement
-fn item(toks: &[Token], n_toks: i64, st: &mut [i64], nodes: &mut [Node]) -> i64 {
+fn item(src: &[u8], toks: &[Token], n_toks: i64, st: &mut [i64], nodes: &mut [Node]) -> i64 {
     if st[2] != 0 { return -1; }
     let k = toks[st[0]].kind;
     if k == 7 {
@@ -409,9 +463,9 @@ fn item(toks: &[Token], n_toks: i64, st: &mut [i64], nodes: &mut [Node]) -> i64 
         let n = alloc(nodes, st, 90);
         nodes[n].a = name;
         nodes[n].ival = if m { 1 } else { 0 };
-        if eat(toks, st, 31) { nodes[n].b = type_expr(toks, n_toks, st, nodes); }
+        if eat(toks, st, 31) { nodes[n].b = type_expr(src, toks, n_toks, st, nodes); }
         expect(toks, st, 35);
-        nodes[n].c = expr(toks, n_toks, st, nodes);
+        nodes[n].c = expr(src, toks, n_toks, st, nodes);
         expect(toks, st, 30);
         return n;
     }
@@ -421,18 +475,22 @@ fn item(toks: &[Token], n_toks: i64, st: &mut [i64], nodes: &mut [Node]) -> i64 
         expect(toks, st, 12);
         let n = alloc(nodes, st, 92);
         nodes[n].a = var;
-        nodes[n].b = expr(toks, n_toks, st, nodes);
+        st[4] = st[4] + 1;
+        nodes[n].b = expr(src, toks, n_toks, st, nodes);
         expect(toks, st, 34);
-        nodes[n].c = expr(toks, n_toks, st, nodes);
-        nodes[n].d = block(toks, n_toks, st, nodes);
+        nodes[n].c = expr(src, toks, n_toks, st, nodes);
+        st[4] = st[4] - 1;
+        nodes[n].d = block(src, toks, n_toks, st, nodes);
         return n;
     }
     if k == 17 {
         bump(st);
         let n = alloc(nodes, st, 93);
-        nodes[n].a = expr(toks, n_toks, st, nodes);
-        if eat(toks, st, 19) { nodes[n].b = expr(toks, n_toks, st, nodes); }
-        nodes[n].c = block(toks, n_toks, st, nodes);
+        st[4] = st[4] + 1;
+        nodes[n].a = expr(src, toks, n_toks, st, nodes);
+        if eat(toks, st, 19) { nodes[n].b = expr(src, toks, n_toks, st, nodes); }
+        st[4] = st[4] - 1;
+        nodes[n].c = block(src, toks, n_toks, st, nodes);
         return n;
     }
     if k == 18 {
@@ -443,11 +501,11 @@ fn item(toks: &[Token], n_toks: i64, st: &mut [i64], nodes: &mut [Node]) -> i64 
     if k == 13 {
         bump(st);
         let n = alloc(nodes, st, 96);
-        if toks[st[0]].kind != 30 { nodes[n].a = expr(toks, n_toks, st, nodes); }
+        if toks[st[0]].kind != 30 { nodes[n].a = expr(src, toks, n_toks, st, nodes); }
         expect(toks, st, 30);
         return n;
     }
-    let e = expr(toks, n_toks, st, nodes);
+    let e = expr(src, toks, n_toks, st, nodes);
     if st[2] != 0 { return -1; }
     let a = toks[st[0]].kind;
     let op = if a == 35 { -1 } else if a == 47 { 0 } else if a == 48 { 1 }
@@ -456,7 +514,7 @@ fn item(toks: &[Token], n_toks: i64, st: &mut [i64], nodes: &mut [Node]) -> i64 
         bump(st);
         let n = alloc(nodes, st, 91);
         nodes[n].a = e;
-        nodes[n].b = expr(toks, n_toks, st, nodes);
+        nodes[n].b = expr(src, toks, n_toks, st, nodes);
         nodes[n].ival = op;
         expect(toks, st, 30);
         return n;
@@ -485,7 +543,7 @@ fn item(toks: &[Token], n_toks: i64, st: &mut [i64], nodes: &mut [Node]) -> i64 
 
 // `fn name(p: T, …) -> T { … }` — `a` is the name token, `b` the first Param (chained by `next`),
 // `c` the return type (−1 when `()` was written or omitted), `d` the body block
-fn func(toks: &[Token], n_toks: i64, st: &mut [i64], nodes: &mut [Node]) -> i64 {
+fn func(src: &[u8], toks: &[Token], n_toks: i64, st: &mut [i64], nodes: &mut [Node]) -> i64 {
     if st[2] != 0 { return -1; }
     expect(toks, st, 6);
     let name = expect(toks, st, 0);
@@ -498,24 +556,63 @@ fn func(toks: &[Token], n_toks: i64, st: &mut [i64], nodes: &mut [Node]) -> i64 
         expect(toks, st, 31);
         let p = alloc(nodes, st, 111);
         nodes[p].a = pname;
-        nodes[p].b = type_expr(toks, n_toks, st, nodes);
+        nodes[p].b = type_expr(src, toks, n_toks, st, nodes);
         if last < 0 { nodes[n].b = p; } else { nodes[last].next = p; }
         last = p;
         if !eat(toks, st, 29) { break; }
     }
     expect(toks, st, 24);
-    if eat(toks, st, 32) { nodes[n].c = type_expr(toks, n_toks, st, nodes); }
-    nodes[n].d = block(toks, n_toks, st, nodes);
+    if eat(toks, st, 32) { nodes[n].c = type_expr(src, toks, n_toks, st, nodes); }
+    nodes[n].d = block(src, toks, n_toks, st, nodes);
     n
 }
 
 // every `fn` in the file, chained by `next`; returns the first, or −1 (st[2] says whether that is
 // an empty program or a parse error)
-fn parse_program(toks: &[Token], n_toks: i64, st: &mut [i64], nodes: &mut [Node]) -> i64 {
+// `struct S { f: T, … }` — `a` is the name token, `b` the first FieldDef (chained by `next`)
+fn struct_def(src: &[u8], toks: &[Token], n_toks: i64, st: &mut [i64], nodes: &mut [Node]) -> i64 {
+    expect(toks, st, 22);
+    let name = expect(toks, st, 0);
+    let n = alloc(nodes, st, 112);
+    nodes[n].a = name;
+    expect(toks, st, 27);
+    let mut last = -1;
+    while st[2] == 0 && toks[st[0]].kind != 28 {
+        let fname = expect(toks, st, 0);
+        expect(toks, st, 31);
+        let f = alloc(nodes, st, 113);
+        nodes[f].a = fname;
+        nodes[f].b = type_expr(src, toks, n_toks, st, nodes);
+        if last < 0 { nodes[n].b = f; } else { nodes[last].next = f; }
+        last = f;
+        if !eat(toks, st, 29) { break; }
+    }
+    expect(toks, st, 28);
+    n
+}
+
+// every top-level item — a `fn` or a `struct` — chained by `next`, in source order
+fn parse_program(src: &[u8], toks: &[Token], n_toks: i64, st: &mut [i64], nodes: &mut [Node]) -> i64 {
+    // the struct names, first: `S {` is a struct literal only when `S` is one, which is how
+    // `S { … }` is told apart from a block, and needs the whole file scanned before parsing
+    let mut i = 0;
+    while i + 1 < n_toks {
+        if toks[i].kind == 22 && toks[i + 1].kind == 0 {
+            nodes[st[1]].kind = 115;
+            nodes[st[1]].a = i + 1;
+            st[1] = st[1] + 1;
+            st[3] = st[3] + 1;
+        }
+        i += 1;
+    }
     let mut first = -1;
     let mut last = -1;
     while st[2] == 0 && toks[st[0]].kind != 57 {
-        let f = func(toks, n_toks, st, nodes);
+        let f = if toks[st[0]].kind == 22 {
+            struct_def(src, toks, n_toks, st, nodes)
+        } else {
+            func(src, toks, n_toks, st, nodes)
+        };
         if st[2] == 0 {
             if last < 0 { first = f; } else { nodes[last].next = f; }
             last = f;
