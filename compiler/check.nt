@@ -530,6 +530,17 @@ fn check_expr_inner(src: &[u8], toks: &[Token], nodes: &mut [Node], types: &mut 
         if count == 0 { cst[2] = 1; return -1; }
         return new_ty_sized(types, cst, 5, t, 0, 1000000 + count);
     }
+    // **An allocation with no fill**, which nothing in the language denotes: `[e; n]` builds *and*
+    // fills, and an array-valued comprehension writes every element itself, so a rewrite that used
+    // `[0; n]` would pay for the array twice (design §26). `ival` carries the element type, which
+    // the rewrite knows and the node cannot otherwise say.
+    if k == 82 {
+        let c = check_expr(src, toks, nodes, types, syms, sigs, ptys, strs, flds, ntys, cst, nodes[n].a);
+        if cst[2] != 0 { return -1; }
+        if c != 0 { cst[2] = 1; return -1; }
+        return new_ty_sized(types, cst, 5, nodes[n].ival, 0,
+                            size_atom(src, toks, nodes, types, syms, cst, nodes[n].a));
+    }
     if k == 78 {
         let e = check_expr(src, toks, nodes, types, syms, sigs, ptys, strs, flds, ntys, cst, nodes[n].a);
         let c = check_expr(src, toks, nodes, types, syms, sigs, ptys, strs, flds, ntys, cst, nodes[n].b);
@@ -670,6 +681,7 @@ fn has_assign(nodes: &[Node], n: i64) -> bool {
     if k == 66 || k == 68 || k == 78 {
         return has_assign(nodes, nodes[n].a) || has_assign(nodes, nodes[n].b);
     }
+    if k == 82 { return has_assign(nodes, nodes[n].a); }
     if k == 67 || k == 73 || k == 74 || k == 95 || k == 96 || k == 69 || k == 72 || k == 79 {
         if k == 79 { return has_assign(nodes, nodes[n].b); }
         return has_assign(nodes, nodes[n].a);
@@ -1071,6 +1083,73 @@ fn check_chain(src: &[u8], toks: &[Token], nodes: &mut [Node], types: &mut [Ty],
     check_block(src, toks, nodes, types, syms, sigs, ptys, strs, flds, ntys, cst, n)
 }
 
+// `let ys = [e for x in xs];` → `let ys = <alloc xs.len()>;` followed by
+// `for i in 0..xs.len() { let x = xs[i]; ys[i] = e; }`. A *filtered* comprehension has no length
+// the compiler can state and is refused, which is what `err_filtered_let.nt` tests.
+fn comp_let(src: &[u8], toks: &[Token], nodes: &mut [Node], types: &mut [Ty], syms: &mut [Sym],
+            sigs: &[Sig], ptys: &[i64], strs: &[Str], flds: &[Fld], ntys: &mut [i64],
+            cst: &mut [i64], n: i64) {
+    let comp = nodes[n].c;
+    if nodes[comp].d >= 0 { cst[2] = 1; return; }
+    let srcn = nodes[comp].c;
+    if nodes[srcn].kind != 65 { cst[2] = 1; return; }
+    let sname = nodes[srcn].a;
+    let ss = sym_find(src, toks, syms, cst, sname);
+    if ss < 0 || !is_arrayish(types, syms[ss].ty) { cst[2] = 1; return; }
+    let elem = types[syms[ss].ty].elem;
+    // the element type the comprehension produces, with its variable bound
+    let saved = cst[1];
+    declare(syms, cst, nodes[comp].b, elem, 0, 0 - 1);
+    let et = check_expr(src, toks, nodes, types, syms, sigs, ptys, strs, flds, ntys, cst, nodes[comp].a);
+    cst[1] = saved;
+    if cst[2] != 0 { return; }
+    if !is_scalar(types, et) { cst[2] = 1; return; }
+
+    let sv = mk_var(nodes, cst, sname);
+    let hi = nnew(nodes, cst, 72);
+    nodes[hi].a = sv;
+    let alloc = nnew(nodes, cst, 82);
+    nodes[alloc].a = hi;
+    nodes[alloc].ival = et;
+
+    let iv = nfresh(cst);
+    let lo = nlit(nodes, cst, 60, 0);
+    let sv2 = mk_var(nodes, cst, sname);
+    let hi2 = nnew(nodes, cst, 72);
+    nodes[hi2].a = sv2;
+    let body = nnew(nodes, cst, 76);
+    let fo = nnew(nodes, cst, 92);
+    nodes[fo].a = iv;
+    nodes[fo].b = lo;
+    nodes[fo].c = hi2;
+    nodes[fo].d = body;
+
+    let sv3 = mk_var(nodes, cst, sname);
+    let iv2 = mk_var(nodes, cst, iv);
+    let ix = nnew(nodes, cst, 68);
+    nodes[ix].a = sv3;
+    nodes[ix].b = iv2;
+    let l1 = mk_let(nodes, cst, nodes[comp].b, ix, 0);
+    let yv = mk_var(nodes, cst, nodes[n].a);
+    let iv3 = mk_var(nodes, cst, iv);
+    let tix = nnew(nodes, cst, 68);
+    nodes[tix].a = yv;
+    nodes[tix].b = iv3;
+    // **the fill is a build, not a store site**: `analyze.rs` charges a comprehension the bytes of
+    // the array it streams and no line term, the same way it charges `[e; n]`, so the write here
+    // must not be counted a second time as a site. The mark rides on the index node's `ival`, which
+    // an index otherwise never uses.
+    nodes[tix].ival = 1;
+    nodes[l1].next = mk_assign(nodes, cst, tix, nodes[comp].a, 0 - 1);
+    nodes[body].a = l1;
+
+    // the `let` keeps its place and the loop follows it, so the target is in scope for the fill
+    nodes[n].c = alloc;
+    nodes[n].ival = 1;
+    nodes[fo].next = nodes[n].next;
+    nodes[n].next = fo;
+}
+
 fn check_call(src: &[u8], toks: &[Token], nodes: &mut [Node], types: &mut [Ty], syms: &mut [Sym],
               sigs: &[Sig], ptys: &[i64], strs: &[Str], flds: &[Fld], ntys: &mut [i64], cst: &mut [i64], n: i64) -> i64 {
     let name = nodes[n].a;
@@ -1185,6 +1264,15 @@ fn check_stmt_inner(src: &[u8], toks: &[Token], nodes: &mut [Node], types: &mut 
     if cst[2] != 0 || n < 0 { return; }
     let k = nodes[n].kind;
     if k == 90 {
+        // **`let ys = [e for x in xs];` is two statements, not one.** Every other chain became a
+        // block expression written over its own node and the emitter never had to know; this one
+        // allocates, and `emit`'s array-`let` path takes only a brace list, a repeat or a byte
+        // string. So the rewrite happens here, at the statement, and puts a fill loop after the
+        // `let` (design §26).
+        if nodes[n].c >= 0 && nodes[nodes[n].c].kind == 80 {
+            comp_let(src, toks, nodes, types, syms, sigs, ptys, strs, flds, ntys, cst, n);
+            if cst[2] != 0 { return; }
+        };
         let t = check_expr(src, toks, nodes, types, syms, sigs, ptys, strs, flds, ntys, cst, nodes[n].c);
         if cst[2] != 0 { return; }
         if t == 4 { cst[2] = 1; return; }

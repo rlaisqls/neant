@@ -663,6 +663,17 @@ fn w_stmt(src: &[u8], toks: &[Token], nodes: &[Node], types: &[Ty], ntys: &[i64]
     if k == 90 {
         let init = nodes[n].c;
         let ik = nodes[init].kind;
+        if ik == 82 {
+            // **an allocation costs nothing**: the fill is the loop the rewrite put after this
+            // statement, and it is charged there like any other loop (design §26)
+            let sz = val_of(src, toks, nodes, facs, terms, pols, pst, env, wst, nodes[init].a);
+            if sz < 0 {
+                wst[1] = 1;
+                return pol_zero(facs, terms, pols, pst);
+            }
+            env_add(env, wst, nodes[n].a, -1, sz);
+            return pol_zero(facs, terms, pols, pst);
+        }
         if ik == 78 {
             // `[e; n]`: the element and the length are evaluated, then the fill costs one per
             // element — which is where a `let` first puts a size variable into the work
@@ -3128,6 +3139,21 @@ fn m_stmt(src: &[u8], toks: &[Token], nodes: &[Node], types: &[Ty], strs: &[Str]
     let k = nodes[n].kind;
     if k == 90 {
         let init = nodes[n].c;
+        if nodes[init].kind == 82 {
+            // **an allocation is charged for the fill that follows it**, as a build: the array's
+            // bytes stream, with no line term, which is what `analyze.rs` charges a comprehension
+            // and what `[e; n]` costs. The store in the fill loop is marked so it is not a site as
+            // well (design §26).
+            let len = val_of(src, toks, nodes, facs, terms, pols, pst, env, wst, nodes[init].a);
+            let es0 = elem_bytes(types, strs, flds, ntys[init]);
+            if len < 0 || es0 < 0 {
+                wst[1] = 1;
+                return ck_zero(facs, terms, pols, pst, budget, cnds, pcs, cks, wst);
+            }
+            env_add(env, wst, nodes[n].a, -1, len);
+            let bytes0 = pol_scale(facs, terms, pols, pst, len, es0, 1);
+            return ck_one(facs, terms, pols, pst, budget, cnds, pcs, cks, wst, bytes0);
+        }
         if nodes[init].kind == 77 || nodes[init].kind == 78 || nodes[init].kind == 64 {
             // building an array streams every byte of it, and leaves it **not** resident — which
             // the instrumentation says plainly and no amount of reasoning had
@@ -3183,6 +3209,9 @@ fn m_stmt(src: &[u8], toks: &[Token], nodes: &[Node], types: &[Ty], strs: &[Str]
         let tgt = nodes[n].a;
         if nodes[tgt].kind == 68 {
             let i = m_expr(src, toks, nodes, types, strs, flds, ntys, sigs, ptys, fm, ffoot, facs, terms, pols, pst, env, cof, sites, cks, cnds, pcs, budget, resid, rargs, subst, slay, wst, nodes[tgt].b);
+            // a comprehension's fill is charged at its allocation, as a build; counting the store
+            // here as well would pay for the array twice
+            if nodes[tgt].ival == 1 { return acc; }
             let sp = site_add(src, toks, nodes, types, strs, flds, ntys, sigs, ptys, fm, ffoot, facs, terms, pols, pst, env, cof, sites, cks, cnds, pcs, budget, resid, rargs, subst, slay, wst, nodes[tgt].a, nodes[tgt].b, -1);
             acc = ck_add(facs, terms, pols, pst, budget, cnds, pcs, cks, wst, acc, i);
             acc = ck_add(facs, terms, pols, pst, budget, cnds, pcs, cks, wst, acc, sp);

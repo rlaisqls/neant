@@ -601,6 +601,31 @@ fn emit_let_array(out: &mut [u8], est: &mut [i64], src: &[u8], toks: &[Token], n
         emit_b(out, est, b';');
         return;
     }
+    if nodes[init].kind == 82 {
+        // an allocation with nothing written into it: the fill is the statement after this one
+        // (design §26), which is the whole difference between `16·n` and `24·n` of traffic
+        let nm = b"int64_t ";
+        emit_bytes(out, est, &nm);
+        emit_arr_name(out, est, src, toks, name, b'n');
+        let eq2 = b" = ";
+        emit_bytes(out, est, &eq2);
+        emit_expr(out, est, src, toks, nodes, types, strs, flds, slay, sigs, ntys, nodes[init].a);
+        let semi = b"; ";
+        emit_bytes(out, est, &semi);
+        emit_type(out, est, src, toks, types, strs, t);
+        let star2 = b" *";
+        emit_bytes(out, est, &star2);
+        emit_arr_name(out, est, src, toks, name, b'p');
+        let al2 = b" = nt_alloc(";
+        emit_bytes(out, est, &al2);
+        emit_arr_name(out, est, src, toks, name, b'n');
+        let sz2 = b", sizeof(";
+        emit_bytes(out, est, &sz2);
+        emit_type(out, est, src, toks, types, strs, t);
+        let cl2 = b"));";
+        emit_bytes(out, est, &cl2);
+        return;
+    }
     if nodes[init].kind != 77 && nodes[init].kind != 78 && nodes[init].kind != 64 {
         // anything else — a call returning an array, a chain — is outside the slice. Saying so
         // costs one flag and is the difference between a refusal and a C file that looks fine

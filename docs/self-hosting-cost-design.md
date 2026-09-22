@@ -1810,3 +1810,31 @@ taught about rather than kept ignorant of.
    separately so it is not mistaken for part of this.
 
 `chains.nt` lands on (1) and (2). `owned.nt` needs (3) as well.
+
+### Built: `chains.nt` is in the slice
+
+Every chain form the corpus writes is reproduced. **work 95, moves 95, bound 107, footprint 108**,
+all exact, and `chains.nt` goes through the whole self-hosted pipeline and prints what `neant run`
+prints — thirteen chains in one `main`, including `zip`, `enumerate`, `fold`, both comprehension
+forms and every terminal.
+
+The array-valued comprehension needed the two things §26 predicted — an allocation with no fill, and
+a *statement-level* rewrite because the emitter's array-`let` path takes only literal shapes — and
+one it did not.
+
+**A comprehension's fill is a build, not a store.** With the allocation free and the fill loop's
+`ys[i] = e` counted as an ordinary site, `moves` came out `16·n + 2·B` against the Rust's
+`16·n + B` — one line term too many. `analyze.rs` charges a comprehension the bytes of the array it
+streams and *no* line term, exactly as it charges `[e; n]`; the write is part of building the array,
+not a walk over one. So the allocation carries the cost and the store is marked to contribute no
+site, or the array is paid for twice.
+
+That is the fourth thing a field means two of in this tree — after a synthetic local, a synthetic
+literal and a builtin's name, an index node's otherwise-unused `ival` now says "this store is a
+fill". Four is more than this design should carry comfortably, and the next one should be a reason
+to give the tree a proper discriminant rather than another sentinel.
+
+**What is left of the corpus.** `owned.nt` alone, and not for its comprehension: `fn doubled(xs:
+&[f64]) -> [f64]` is an **owned array return**, which this checker rejects independently of anything
+chains do. It is declared out of the parser's slice so the three comparisons keep agreeing, and it
+is the last golden outside.

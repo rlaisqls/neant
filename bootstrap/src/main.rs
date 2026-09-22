@@ -329,6 +329,9 @@ mod parsedump {
             if !matches!(f.ret, TypeExpr::Unit) { ty(&f.ret, o)?; }
             return Ok(());
         }
+        // an owned array *returned* is out of the slice: the self-hosted checker rejects
+        // `-> [T]`, comprehension or not, and `owned.nt` is the only golden that does it
+        if matches!(f.ret, TypeExpr::Owned(_)) { return Err("an owned array return".into()); }
         o.push(110);
         for p in &f.params { o.push(111); ty(&p.ty, o)?; }
         if !matches!(f.ret, TypeExpr::Unit) { ty(&f.ret, o)?; }
@@ -408,7 +411,8 @@ mod parsedump {
             // The slice is declared by *stage*, not by "method call", so that the three comparisons
             // agree: a stage the checker cannot rewrite is not in the parser's slice either.
             ExprKind::MethodCall(_, m, _)
-                if !matches!(m.as_str(), "iter" | "map" | "filter" | "sum" | "count") =>
+                if !matches!(m.as_str(), "iter" | "map" | "filter" | "zip" | "enumerate"
+                                       | "sum" | "count" | "max" | "min" | "any" | "all" | "fold") =>
                 Err(format!("a `.{m}()` chain stage")),
             ExprKind::MethodCall(recv, _, args) => {
                 o.push(81);
@@ -431,8 +435,13 @@ mod parsedump {
                 for _ in ps { o.push(111); }
                 expr(body, o)
             }
-            // the parser reads a comprehension; the checker does not rewrite one yet
-            ExprKind::Comprehension { .. } => Err("a comprehension".into()),
+            ExprKind::Comprehension { elem, var: _, source, cond } => {
+                o.push(80);
+                expr(elem, o)?;
+                expr(source, o)?;
+                if let Some(c) = cond { expr(c, o)?; }
+                Ok(())
+            }
         }
     }
 }
