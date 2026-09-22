@@ -407,6 +407,22 @@ static void nt_println_f64(double v) {
                 self.indent -= 1;
                 self.line("}");
             }
+            Stmt::ParFor { var, end, body, acc, op } => {
+                let i = self.local_name(*var);
+                let e = self.expr(end).scalar();
+                let hi = self.fresh("end");
+                let accnm = self.local_name(*acc);
+                let opstr = match op { ParOp::Add => "+", ParOp::Or => "||", ParOp::And => "&&" };
+                // OpenMP's canonical loop form allows exactly one declarator in the init-clause,
+                // so the end bound is hoisted out, unlike the sequential `for`'s `i = 0, end = e`
+                self.line(&format!("int64_t {hi} = {e};"));
+                self.line(&format!("#pragma omp parallel for reduction({opstr}:{accnm})"));
+                self.line(&format!("for (int64_t {i} = 0; {i} < {hi}; {i}++) {{"));
+                self.indent += 1;
+                self.block_body(body, Target::Discard);
+                self.indent -= 1;
+                self.line("}");
+            }
             Stmt::While { cond, body, .. } => {
                 let c = self.expr(cond).scalar();
                 self.line(&format!("while ({c}) {{"));

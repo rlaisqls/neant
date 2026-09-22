@@ -108,7 +108,7 @@ fn main() {
             if use_iolb { iolb_bounds(&module, &mut costs, &machine); }
             for c in &costs {
                 print!("{}", cost::lock::report(c, &machine));
-                if let (Some(ev), cost::CostResult::Exact { work, moves }) = (&eval, &c.result) {
+                if let (Some(ev), cost::CostResult::Exact { work, moves, .. }) = (&eval, &c.result) {
                     if let Some((w, m)) = evaluate(c, work, moves, ev, &machine) {
                         println!("{:<16}   at {ev}: work {w:.0}  moves {m:.0} bytes", "");
                     }
@@ -231,7 +231,7 @@ fn main() {
                     }
                 } else {
                     match &fc.result {
-                        cost::CostResult::Exact { work, moves } => evaluate(fc, work, moves, &ev.join(","), &machine).map_or(String::new(), |(w, m)| format!("{:.3e} / {:.3e}", w * m_repeat as f64, m * m_repeat as f64)),
+                        cost::CostResult::Exact { work, moves, .. } => evaluate(fc, work, moves, &ev.join(","), &machine).map_or(String::new(), |(w, m)| format!("{:.3e} / {:.3e}", w * m_repeat as f64, m * m_repeat as f64)),
                         _ => String::new(),
                     }
                 };
@@ -272,8 +272,11 @@ fn cc(c: &str, out: &Path, src: &Path) -> Result<(), String> {
     let cfile = out.with_extension("c");
     std::fs::write(&cfile, c).map_err(|e| format!("{}: {e}", cfile.display()))?;
     let cc = std::env::var("CC").unwrap_or_else(|_| "cc".to_string());
-    let status = Command::new(&cc)
-        .args(["-O2", "-std=gnu11", "-Wall", "-Wno-unused-variable", "-Wno-unused-but-set-variable", "-Wno-unused-value", "-Wno-unused-function"])
+    let mut cmd = Command::new(&cc);
+    cmd.args(["-O2", "-std=gnu11", "-Wall", "-Wno-unused-variable", "-Wno-unused-but-set-variable", "-Wno-unused-value", "-Wno-unused-function"]);
+    // only a module with a `.par()` chain needs it — no new dependency for one that has none
+    if c.contains("#pragma omp") { cmd.arg("-fopenmp"); }
+    let status = cmd
         .arg("-o").arg(out)
         .arg(&cfile)
         .arg("-lm")

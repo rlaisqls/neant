@@ -1,0 +1,10 @@
+// span, structurally: O(1) for the map stage plus O(log n) for the reduction tree, never O(n) —
+// m5-span-design.md exit test 2.
+fn total(xs: &[f64]) -> f64 {
+    xs.iter().par().map(|x| x * x).sum()
+}
+
+fn main() {
+    let xs = [1.0, 2.0, 3.0];
+    println(total(&xs));
+}

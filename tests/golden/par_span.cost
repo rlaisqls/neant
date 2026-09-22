@@ -1,0 +1,6 @@
+total            work 5·xs.len()                   moves 8·xs.len() + B               exact
+                 span log xs.len() + 5             T ≤ work/P + O(span)
+                 lower bound      moves 8·xs.len()                   (footprint, every distinct element crosses once)   gap 1× at M = 2 MiB, B = 64
+                 footprint        xs: [0, 8·xs.len())   resident after if 8·xs.len() < M
+main             work 21                           moves B + 48                       exact, io
+                 span log 3 + 11                   T ≤ work/P + O(span)

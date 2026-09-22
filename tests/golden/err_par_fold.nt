@@ -1,0 +1,4 @@
+fn main() {
+    let xs = [1, 2, 3];
+    println(xs.iter().par().fold(0, |a, x| a + x));
+}

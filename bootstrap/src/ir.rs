@@ -193,12 +193,23 @@ pub enum Stmt {
     /// `ys = xs;` — index into the function's `reassigns`
     Reassign(usize),
     For { var: LocalId, start: Expr, end: Expr, body: Block },
+    /// A `.par()` chain's loop (m5-span-design.md): `0..end`, `acc` combined with `op` — moves,
+    /// footprint and residue cost it exactly as the same chain's sequential `For` would (the
+    /// bytes touched do not change); only work's `Σ_v` becomes span's `O(log end)`, and emission
+    /// adds `#pragma omp parallel for reduction(op:acc)`.
+    ParFor { var: LocalId, end: Expr, body: Block, acc: LocalId, op: ParOp },
     /// `decreasing` is the programmer's measure, when the compiler needs one.
     While { cond: Expr, decreasing: Option<Expr>, body: Block, line: u32 },
     Break,
     Expr(Expr),
     Return(Option<Expr>),
 }
+
+/// A `.par()` chain's combine, restricted to the terminals with a clean identity element
+/// (m5-span-design.md §1 — `max`/`min`'s "first element seen wins" has no OpenMP-native identity
+/// and is deferred, not implemented as a silent approximation).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ParOp { Add, Or, And }
 
 #[derive(Debug, Clone)]
 pub enum LValue {

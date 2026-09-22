@@ -1,0 +1,10 @@
+// a `.par()` chain's terminal must combine associatively: sum, count, any, all (max/min deferred,
+// m5-span-design.md §1). Each is checked against the sequential result it would give.
+fn main() {
+    let xs = [1, 2, 3, 4, 5, 6];
+    println(xs.iter().par().map(|x| x * x).sum());
+    println(xs.iter().par().filter(|x| x % 2 == 0).count());
+    println(xs.iter().par().map(|x| x > 0).all());
+    println(xs.iter().par().map(|x| x < 0).any());
+    println(xs.par().sum());
+}

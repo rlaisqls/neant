@@ -223,15 +223,29 @@ rather than minting one that merely agrees with it. Goldens `reassign_named_size
 `reassign_len_size`, `err_reassign_mutable_size`; the measurement kernels rewritten to the natural
 `let n = @N@;` form, same predictions and outputs as before.
 
-**Next: span**, designed in [m5-span-design.md](m5-span-design.md), not yet built. `.par()` on a
-chain whose terminal combines associatively (fusion's existing closure-purity check is the
-soundness argument parallel execution needs, for free); span as a third cost alongside work and
-moves, `O(log n)` for a parallel reduction against work's `O(n)`; `P` as a third machine parameter;
-OpenMP emission. The design names its own likely failure before measuring it: `T ≤ W/P + O(S)` has
-no memory-bandwidth term, and M1 already found `sum`/`dot` bandwidth-bound — the exit test compares
-a compute-bound and a memory-bound `.par()` kernel's wall-clock scaling across `P`, and if the
-memory-bound one flattens while `work/P` keeps predicting improvement, the honest fix is a second,
-`moves/BW` term and a roofline bound, decided by the machine rather than assumed here.
+**Span, structurally built**, designed in [m5-span-design.md](m5-span-design.md). `.par()` on a
+chain whose terminal combines associatively — `sum`, `count`, `any`, `all` (`max`/`min` deferred:
+their "first element seen wins" has no OpenMP-native identity, refused rather than approximated;
+`fold` refused, its closure not known associative); `.par()` must come first, right after the
+source, since fusion's existing closure-purity check (`in_closure` forbids assignment) is already
+the soundness argument parallel execution needs. `span: Cost` mirrors `work` through every site
+that composes it (sequential add, `if`'s max, a call's substitution) except a `.par()` loop's own
+leaving, which is one iteration's cost plus `O(log n)` for the reduction tree instead of `Σ_v`; not
+threaded through self-recursion, which falls back to `work` (a safe over-approximation). `P` joins
+`M`/`B` as a machine parameter (`-P`, defaults to `available_parallelism()`). Emission: `#pragma omp
+parallel for reduction(op:acc)`, the loop's own end bound hoisted out of the init-clause first
+(OpenMP's canonical form allows one declarator, unlike the sequential `for`'s `i = 0, end = e`);
+`-fopenmp` added only to a build whose C actually contains `#pragma omp` — confirmed by `ldd`, a
+program with no `.par()` links no `libgomp`. The report gets a `span ... T ≤ work/P + O(span)` line
+only when span differs from work, so every existing golden is unchanged (exit test 1) and the
+structural shape (`O(log n)`, composed correctly across a call) is checked directly in the report
+(exit test 2, goldens `par`, `par_span`, `err_par_max`, `err_par_fold`, `err_par_order`). **Not yet
+done: the wall-clock measurement** (exit tests 3–4) — the design names its own likely failure before
+measuring it: `T ≤ W/P + O(S)` has no memory-bandwidth term, and M1 already found `sum`/`dot`
+bandwidth-bound, so a compute-bound and a memory-bound `.par()` kernel's wall-clock scaling across
+`P` needs to be compared on the pinned cluster before this is trusted; if the memory-bound one
+flattens while `work/P` keeps predicting improvement, the honest fix is a second, `moves/BW` term
+and a roofline bound, decided by the machine rather than assumed here.
 
 ## Self-hosting
 

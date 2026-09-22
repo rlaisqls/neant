@@ -920,6 +920,10 @@ impl<'a> Ctx<'a> {
         };
         let mut all: Vec<Stage> = std::mem::take(&mut pre_stages);
         let mut zip_src: Option<LocalId> = None;
+        // a `.par()` chain runs its map/filter stages independently per element and combines the
+        // terminal in a reduction tree (m5-span-design.md); it may appear once, before any stage
+        // that would need to see another element's result
+        let mut par = false;
         for (name, args, line, col) in stages {
             let lam = |k: usize| -> Result<(&Vec<String>, &ast::Expr)> {
                 match args.get(k).map(|a| &a.kind) {
@@ -929,6 +933,11 @@ impl<'a> Ctx<'a> {
             };
             match name {
                 "iter" => { if !args.is_empty() { return err(line, col, "`.iter()` takes no arguments"); } }
+                "par" => {
+                    if !args.is_empty() { return err(line, col, "`.par()` takes no arguments"); }
+                    if par || !all.is_empty() { return err(line, col, "`.par()` must come first, directly after the source"); }
+                    par = true;
+                }
                 "map" => { let (ps, b) = lam(0)?; all.push(Stage::Map(ps.clone(), b)); }
                 "filter" => { let (ps, b) = lam(0)?; all.push(Stage::Filter(ps.clone(), b)); }
                 "enumerate" => all.push(Stage::Enumerate),
@@ -943,7 +952,7 @@ impl<'a> Ctx<'a> {
                     }
                     zip_src = Some(o);
                 }
-                other => return err(line, col, format!("unknown chain stage `.{other}()`; stages are iter, map, filter, zip, enumerate; terminals are sum, count, fold, max, min, any, all")),
+                other => return err(line, col, format!("unknown chain stage `.{other}()`; stages are iter, par, map, filter, zip, enumerate; terminals are sum, count, fold, max, min, any, all")),
             }
         }
 
@@ -1054,6 +1063,21 @@ impl<'a> Ctx<'a> {
         if !term_args.is_empty() && term_name != "fold" {
             return err(tline, tcol, format!("`.{term_name}()` takes no arguments"));
         }
+        // `.par()`'s terminal must combine associatively with a clean identity: sum/count (+, 0),
+        // any/all (||, false / &&, true). max/min's "first element seen wins" has none — deferred,
+        // not approximated (m5-span-design.md §1); fold's closure is not known associative at all.
+        let par_op = if par {
+            match term_name {
+                "sum" | "count" => Some(ParOp::Add),
+                "any" => Some(ParOp::Or),
+                "all" => Some(ParOp::And),
+                "max" | "min" => return err(tline, tcol, format!("`.par()...{term_name}()` is not built yet: `.{term_name}()` has no combine identity `.par()` can start from")),
+                "fold" => return err(tline, tcol, "a parallel chain's terminal must combine elements associatively (sum, count, max, min, any, all); `fold`'s closure is not known to, since it can do anything"),
+                _ => unreachable!(),
+            }
+        } else {
+            None
+        };
         // assemble: filters nest the remainder in `if`
         let mut inner: Vec<Stmt> = std::mem::take(&mut body_stmts);
         inner.extend(update);
@@ -1066,7 +1090,11 @@ impl<'a> Ctx<'a> {
         let acc_ty = self.locals[acc].ty.clone();
         let mut stmts = vec![Stmt::Let(acc, init)];
         stmts.extend(std::mem::take(&mut self.pending_lets));
-        stmts.push(Stmt::For { var: i, start: Expr { kind: ExprKind::Int(0), ty: Ty::I64, line }, end: len, body: Block { stmts: inner, tail: None, ty: Ty::Unit } });
+        let body = Block { stmts: inner, tail: None, ty: Ty::Unit };
+        stmts.push(match par_op {
+            Some(op) => Stmt::ParFor { var: i, end: len, body, acc, op },
+            None => Stmt::For { var: i, start: Expr { kind: ExprKind::Int(0), ty: Ty::I64, line }, end: len, body },
+        });
         Ok(Expr { kind: ExprKind::Block(Block { stmts, tail: Some(Box::new(self.local_expr(acc, line))), ty: acc_ty.clone() }), ty: acc_ty, line })
     }
 
@@ -1121,6 +1149,7 @@ fn last_uses_stmt(s: &Stmt, reassigns: &[Reassign], into: &mut HashMap<LocalId, 
         Stmt::Assign(lv, _, v) => { last_uses_lvalue(lv, v.line, reassigns, into); last_uses_expr(v, reassigns, into); }
         Stmt::Reassign(idx) => { let r = &reassigns[*idx]; mark(r.src, r.line, into); }
         Stmt::For { start, end, body, .. } => { last_uses_expr(start, reassigns, into); last_uses_expr(end, reassigns, into); last_uses(body, reassigns, into); }
+        Stmt::ParFor { end, body, .. } => { last_uses_expr(end, reassigns, into); last_uses(body, reassigns, into); }
         Stmt::While { cond, decreasing, body, .. } => {
             last_uses_expr(cond, reassigns, into);
             if let Some(d) = decreasing { last_uses_expr(d, reassigns, into); }

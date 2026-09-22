@@ -106,6 +106,13 @@ pub fn layout_report(choices: &[super::analyze::LayoutChoice]) -> String {
 pub fn report(c: &FuncCost, m: &Machine) -> String {
     let mut out = pretty_line(c);
     out.push('\n');
+    // span only differs from work where a `.par()` chain runs — nothing else changes the report
+    // (m5-span-design.md exit test 1)
+    if let CostResult::Exact { work, span, .. } = &c.result {
+        if span != work {
+            out.push_str(&format!("{:<16} span {:<28} T ≤ work/P + O(span)\n", "", brief(span, &c.names)));
+        }
+    }
     for b in &c.bounds {
         let g = match &c.result {
             CostResult::Exact { moves, .. } => gap_text(&gaps(moves, &b.moves, m, &c.names), &format!(" at M = {}, B = {}", human(m.m_bytes), m.b_bytes)),
@@ -133,7 +140,7 @@ pub fn report(c: &FuncCost, m: &Machine) -> String {
     }
     for s in &c.suggestions {
         match &s.result {
-            CostResult::Exact { work, moves } => {
+            CostResult::Exact { work, moves, .. } => {
                 // the gap is against the function's own bound: the rewrite does not change what is computed
                 let g = c.bounds.first().map_or(String::new(), |b| gap_text(&gaps(moves, &b.moves, m, &c.names), ""));
                 out.push_str(&format!(
@@ -191,7 +198,7 @@ pub fn line(c: &FuncCost) -> String {
         return format!("{:<16} work ≤ {:<26} moves ≤ {:<26} {ok}{fx}{sizes}", c.name, w.display(&c.names).to_string(), mv.display(&c.names).to_string());
     }
     match &c.result {
-        CostResult::Exact { work, moves } => format!(
+        CostResult::Exact { work, moves, .. } => format!(
             "{:<16} work {:<28} moves {:<28} {}{fx}",
             c.name, work.display(&c.names).to_string(), moves.display(&c.names).to_string(), c.tier
         ),
@@ -210,14 +217,14 @@ pub fn pretty_line(c: &FuncCost) -> String {
     if c.declared.work.is_some() && c.declared.moves.is_some() {
         let mut s = line(c);
         if c.tier != "declared" {
-            if let CostResult::Exact { work, moves } = &c.result {
+            if let CostResult::Exact { work, moves, .. } = &c.result {
                 s.push_str(&format!("\n{:<16} inferred         work {:<28} moves {:<28} {}", "", brief(work, &c.names), brief(moves, &c.names), if c.violations.is_empty() { "within the declaration" } else { "outside the declaration" }));
             }
         }
         return s;
     }
     match &c.result {
-        CostResult::Exact { work, moves } => {
+        CostResult::Exact { work, moves, .. } => {
             let mut s = format!("{:<16} work {:<28} moves {:<28} {}{fx}", c.name, brief(work, &c.names), brief_poly(moves.pieces.iter().min_by_key(|p| p.conds.len()).map(|p| &p.poly).unwrap_or(&Poly::zero()), &c.names), c.tier);
             if moves.single().is_none() {
                 let mut ps: Vec<&super::piece::Piece> = moves.pieces.iter().collect();

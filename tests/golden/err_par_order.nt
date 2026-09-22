@@ -1,0 +1,4 @@
+fn main() {
+    let xs = [1, 2, 3];
+    println(xs.iter().map(|x| x * 2).par().sum());
+}

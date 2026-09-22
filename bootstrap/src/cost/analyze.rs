@@ -30,7 +30,7 @@ pub struct Machine {
 
 #[derive(Debug, Clone)]
 pub enum CostResult {
-    Exact { work: Cost, moves: Cost },
+    Exact { work: Cost, moves: Cost, span: Cost },
     Unknown { reason: String, line: u32 },
 }
 
@@ -189,7 +189,7 @@ pub fn analyze(m: &Module, machine: &Machine) -> Vec<FuncCost> {
         let choice = tile_choice(&mut an, f);
         let t = choice.as_ref().map_or_else(|| rewrite::tile_side(machine.m_bytes, 8), |c| c.t);
         if let Some(c) = &choice {
-            sugg.push(Suggestion { label: format!("tile T < {}", c.side), flag: format!("{}:tile={}", f.name, c.t), result: CostResult::Exact { work: c.work.clone(), moves: c.moves.clone() } });
+            sugg.push(Suggestion { label: format!("tile T < {}", c.side), flag: format!("{}:tile={}", f.name, c.t), result: CostResult::Exact { work: c.work.clone(), moves: c.moves.clone(), span: c.work.clone() } });
         }
         if let Some(g) = rewrite::tile(f, t) {
             let r = Fa::new(&mut an, &g, None).run().result;
@@ -240,7 +240,7 @@ fn tile_choice(an: &mut Analyzer, f: &Func) -> Option<TileChoice> {
     let (g, tv) = rewrite::tile_sym(f)?;
     let tvar = g.params.iter().position(|&p| p == tv)?;
     let c = Fa::new(an, &g, None).run();
-    let CostResult::Exact { work, moves } = &c.result else { return None };
+    let CostResult::Exact { work, moves, .. } = &c.result else { return None };
     if std::env::var("NEANT_DEBUG_TILE").is_ok() { eprint!("{}", super::lock::report(&c, &machine)); }
     // the reference point: this machine, every size a million — tiling is for large sizes
     let point = |t: Option<f64>| move |a: Atom| match a { Atom::B => Some(machine.b_bytes as f64), Atom::M => Some(machine.m_bytes as f64), Atom::P => Some(machine.p_cores as f64), Atom::Var(v) if v == tvar => t, Atom::Var(_) => Some(1e6), Atom::Log(_) => None };
@@ -513,7 +513,12 @@ struct Fa<'a, 'b, 'c> {
     /// left, its frame is summed over the loop atom into the frame below
     work: Cost,
     moves: Cost,
-    saved: Vec<(Cost, Cost)>,
+    /// the critical path: equal to `work` everywhere by sequential composition (mirrored at every
+    /// site that adds to `work`), except a `.par()` loop's own reduction depth
+    /// (m5-span-design.md §3); never threaded through self-recursion (`solve_recurrence` has no
+    /// span of its own, so a recursive function's span falls back to its work, conservatively).
+    span: Cost,
+    saved: Vec<(Cost, Cost, Cost)>,
     /// the `if` branches currently open, for tagging access sites
     branch: Vec<(usize, bool)>,
     next_if: usize,
@@ -539,7 +544,7 @@ impl<'a, 'b, 'c> Fa<'a, 'b, 'c> {
         let mut fa = Fa {
             an, f, names: param_names(f), sites: vec![], loop_recs: vec![], bounds: vec![], images: HashMap::new(), result_size: None, last_result: None, scalar_alias: HashMap::new(), alias_scopes: vec![], notes: vec![], io: false, self_fid, rec_calls: vec![],
             local_size: HashMap::new(), local_affine: HashMap::new(), initial: HashMap::new(), at_entry: false,
-            loops: vec![], work: Cost::zero(), moves: Cost::zero(), saved: vec![], branch: vec![], next_if: 0,
+            loops: vec![], work: Cost::zero(), moves: Cost::zero(), span: Cost::zero(), saved: vec![], branch: vec![], next_if: 0,
             local_root: HashMap::new(), resident: vec![], call_moves: Cost::zero(), saved_calls: vec![], replay: false, has_call: vec![], rests_on: vec![],
         };
         for (i, &p) in f.params.iter().enumerate() {
@@ -580,7 +585,7 @@ impl<'a, 'b, 'c> Fa<'a, 'b, 'c> {
         let Some(body) = &self.f.body else {
             let effects: Vec<&'static str> = self.f.uses.iter().filter_map(|u| match u.as_str() { "io" => Some("io"), "unbounded" => Some("unbounded"), _ => None }).collect();
             let result = match (&declared.work, &declared.moves) {
-                (Some(w), Some(m)) => CostResult::Exact { work: Cost::poly(w.clone()), moves: Cost::poly(m.clone()) },
+                (Some(w), Some(m)) => CostResult::Exact { work: Cost::poly(w.clone()), moves: Cost::poly(m.clone()), span: Cost::poly(w.clone()) },
                 _ if effects.contains(&"unbounded") => CostResult::Unknown { reason: "declared unbounded".into(), line: self.f.line },
                 _ => CostResult::Unknown { reason: "an extern needs `#[cost(work_at_most = …, moves_at_most = …)]` or `uses unbounded`".into(), line: self.f.line },
             };
@@ -603,12 +608,15 @@ impl<'a, 'b, 'c> Fa<'a, 'b, 'c> {
                 let m = self.machine();
                 self.work.prune_at(&m);
                 self.moves.prune_at(&m);
+                self.span.prune_at(&m);
                 if self.rec_calls.is_empty() {
-                    CostResult::Exact { work: self.work.clone(), moves: self.moves.clone() }
+                    CostResult::Exact { work: self.work.clone(), moves: self.moves.clone(), span: self.span.clone() }
                 } else {
                     tier = "recurrence";
                     match self.solve_recurrence() {
-                        Ok((work, moves)) => CostResult::Exact { work, moves },
+                        // span is not threaded through self-recursion (docs/m5-span-design.md
+                        // does not attempt it); work stands in, always a safe over-approximation
+                        Ok((work, moves)) => CostResult::Exact { span: work.clone(), work, moves },
                         Err(reason) => CostResult::Unknown { reason, line: self.rec_calls[0].2 },
                     }
                 }
@@ -624,7 +632,7 @@ impl<'a, 'b, 'c> Fa<'a, 'b, 'c> {
             let Some(asserted) = asserted else { continue };
             let line = line_of(&format!("{which}_at_most"));
             match &result {
-                CostResult::Exact { work, moves } => {
+                CostResult::Exact { work, moves, .. } => {
                     let inferred = if which == "work" { work } else { moves };
                     if declared.sizes.is_empty() {
                         for piece in &inferred.pieces {
@@ -875,7 +883,7 @@ impl<'a, 'b, 'c> Fa<'a, 'b, 'c> {
     }
     /// Cost of the current point, charged once; the enclosing loops sum it when they are left.
     fn add_work(&mut self, p: Poly) {
-        if !self.replay { self.work = self.work.add_poly(&p); }
+        if !self.replay { self.work = self.work.add_poly(&p); self.span = self.span.add_poly(&p); }
     }
     /// A fresh size atom for a loop variable.
     fn new_atom(&mut self, name: &str) -> usize {
@@ -890,19 +898,19 @@ impl<'a, 'b, 'c> Fa<'a, 'b, 'c> {
         self.push_frame();
     }
     fn push_frame(&mut self) {
-        self.saved.push((std::mem::replace(&mut self.work, Cost::zero()), std::mem::replace(&mut self.moves, Cost::zero())));
+        self.saved.push((std::mem::replace(&mut self.work, Cost::zero()), std::mem::replace(&mut self.moves, Cost::zero()), std::mem::replace(&mut self.span, Cost::zero())));
         self.saved_calls.push(std::mem::replace(&mut self.call_moves, Cost::zero()));
         self.has_call.push(false);
     }
     /// Pop a frame (an `if` branch): its calls count once, into the frame below.
-    fn pop_frame(&mut self) -> (Cost, Cost) {
-        let (pw, pm) = self.saved.pop().unwrap();
+    fn pop_frame(&mut self) -> (Cost, Cost, Cost) {
+        let (pw, pm, psp) = self.saved.pop().unwrap();
         let pc = self.saved_calls.pop().unwrap();
         let had = self.has_call.pop().unwrap_or(false);
         if let Some(h) = self.has_call.last_mut() { *h |= had; }
         let calls = std::mem::replace(&mut self.call_moves, pc);
         self.call_moves = self.call_moves.add(&calls);
-        (std::mem::replace(&mut self.work, pw), std::mem::replace(&mut self.moves, pm))
+        (std::mem::replace(&mut self.work, pw), std::mem::replace(&mut self.moves, pm), std::mem::replace(&mut self.span, psp))
     }
     /// Leave a loop. The body frame is summed over the loop variable. Calls in the body are costed
     /// twice: as walked (cold, the first iteration) and again with the residue the first iteration
@@ -910,14 +918,17 @@ impl<'a, 'b, 'c> Fa<'a, 'b, 'c> {
     /// pays once.
     fn leave_loop(&mut self, body: &Block) -> Result<(), Fail> {
         let lp = self.loops.pop().unwrap();
-        let (pw, pm) = self.saved.pop().unwrap();
+        let (pw, pm, psp) = self.saved.pop().unwrap();
         let pc = self.saved_calls.pop().unwrap();
         let had_call = self.has_call.pop().unwrap_or(false);
         let cold_calls = std::mem::replace(&mut self.call_moves, pc);
         let (w, m) = (std::mem::replace(&mut self.work, pw), std::mem::replace(&mut self.moves, pm));
+        let sp = std::mem::replace(&mut self.span, psp);
         let rec = self.loop_recs[lp.id].clone();
         self.work = self.work.add(&rec.sum_cost(&w));
         self.moves = self.moves.add(&rec.sum_cost(&m));
+        // an ordinary loop is sequential: its span sums the same way work does
+        self.span = self.span.add(&rec.sum_cost(&sp));
         if had_call {
             let first = match rec.atom { Some(a) => cold_calls.subst(a, &rec.lo), None => cold_calls.clone() };
             let warm = if self.numeric(&rec.trip).is_some_and(|t| t <= 1.0) { Cost::zero() } else {
@@ -927,12 +938,13 @@ impl<'a, 'b, 'c> Fa<'a, 'b, 'c> {
                 self.push_frame();
                 let r = self.block(body);
                 // keep only the recounted call moves; everything else returns to what it was
-                let (pw, pm) = self.saved.pop().unwrap();
+                let (pw, pm, psp) = self.saved.pop().unwrap();
                 let pc = self.saved_calls.pop().unwrap();
                 self.has_call.pop();
                 let warm_body = std::mem::replace(&mut self.call_moves, pc);
                 self.work = pw;
                 self.moves = pm;
+                self.span = psp;
                 self.replay = outer_replay;
                 self.loops.pop();
                 r?;
@@ -941,6 +953,31 @@ impl<'a, 'b, 'c> Fa<'a, 'b, 'c> {
                 match rec.atom { Some(a) => warm_body.sum_over(a, &rest_lo, rec.step, &rest_trip), None => warm_body.mul_poly(&rest_trip) }
             };
             self.call_moves = self.call_moves.add(&first).add(&warm);
+            if let Some(h) = self.has_call.last_mut() { *h = true; }
+        }
+        Ok(())
+    }
+    /// Leave a `.par()` loop (m5-span-design.md §3). Work and moves sum over the trip count
+    /// exactly as `leave_loop` would — parallelism changes nothing about what is computed or what
+    /// bytes move. Span does not: it is one iteration's own cost (never trip-many copies) plus the
+    /// reduction tree's own depth, `⌈log₂ trip⌉`. Calls inside the body are costed cold at every
+    /// iteration, with no warm-residue discount — simpler than `leave_loop`'s, and conservative in
+    /// the safe direction; this design does not attempt the residue argument for a parallel loop.
+    fn leave_par_loop(&mut self, _body: &Block, trip: &Poly) -> Result<(), Fail> {
+        let lp = self.loops.pop().unwrap();
+        let (pw, pm, psp) = self.saved.pop().unwrap();
+        let pc = self.saved_calls.pop().unwrap();
+        let had_call = self.has_call.pop().unwrap_or(false);
+        let cold_calls = std::mem::replace(&mut self.call_moves, pc);
+        let (w, m) = (std::mem::replace(&mut self.work, pw), std::mem::replace(&mut self.moves, pm));
+        self.span = psp;
+        let rec = self.loop_recs[lp.id].clone();
+        self.work = self.work.add(&rec.sum_cost(&w));
+        self.moves = self.moves.add(&rec.sum_cost(&m));
+        let depth = Cost::poly(Poly::atom(Atom::Log(Box::new(trip.clone()))));
+        self.span = self.span.add(&w.add(&depth));
+        if had_call {
+            self.call_moves = self.call_moves.add(&cold_calls.mul_poly(trip));
             if let Some(h) = self.has_call.last_mut() { *h = true; }
         }
         Ok(())
@@ -1629,6 +1666,21 @@ impl<'a, 'b, 'c> Fa<'a, 'b, 'c> {
                 r?;
                 self.leave_loop(body)
             }
+            Stmt::ParFor { var, end, body, acc, op } => {
+                let _ = (acc, op); // the combine's own work is inside `body`, walked normally
+                self.expr(end)?;
+                let Some(hi) = self.size_of(end, Dir::Upper) else {
+                    return Err(Fail::Unknown("a `.par()` chain's length is not a size expression".into(), end.line));
+                };
+                let mut trip = hi;
+                if let Some(c) = trip.as_const() { if c.n < 0 { trip = Poly::zero(); } }
+                let atom = self.new_atom(&self.f.locals[*var].name.clone());
+                self.enter_loop(Loop { id: 0, var: Some(*var), atom: Some(atom), trip: trip.clone(), lo: Poly::zero(), step: 1, offset: Some(Affine::constant(Poly::zero())) });
+                self.add_work_n(2);
+                let r = self.block(body);
+                r?;
+                self.leave_par_loop(body, &trip)
+            }
             Stmt::Break => Ok(()),
             Stmt::While { cond, decreasing, body, line } => {
                 self.expr(cond)?;
@@ -1744,7 +1796,9 @@ impl<'a, 'b, 'c> Fa<'a, 'b, 'c> {
                         // m changes by k·delta, so it decreases by −k·delta
                         acc = acc.add(k.mul(Rat::int(delta)).neg());
                     }
-                    Stmt::Assign(LValue::Var(_) | LValue::Index(..) | LValue::Field(..) | LValue::IndexField(..), _, _) | Stmt::Let(..) | Stmt::LetArray(..) | Stmt::LetRepeat(..) | Stmt::LetBuild { .. } | Stmt::Reassign(..) => {}
+                    // a `.par()` chain's body cannot assign to anything outside it (its closures
+                    // are already checked pure), so it can never touch the measure either
+                    Stmt::Assign(LValue::Var(_) | LValue::Index(..) | LValue::Field(..) | LValue::IndexField(..), _, _) | Stmt::Let(..) | Stmt::LetArray(..) | Stmt::LetRepeat(..) | Stmt::LetBuild { .. } | Stmt::Reassign(..) | Stmt::ParFor { .. } => {}
                     Stmt::Expr(Expr { kind: ExprKind::If(_, t, e), .. }) => {
                         let bt = block(t, coef, f)?;
                         let be = match e { Some(e) => block(e, coef, f)?, None => Some(Rat::zero()) };
@@ -1845,18 +1899,19 @@ impl<'a, 'b, 'c> Fa<'a, 'b, 'c> {
                 self.branch.push((if_id, true));
                 self.push_frame();
                 self.block(t)?;
-                let (wt, mt) = self.pop_frame();
+                let (wt, mt, spt) = self.pop_frame();
                 self.branch.pop();
                 let then_calls: Vec<_> = self.rec_calls.drain(before..).collect();
                 let then_init = std::mem::replace(&mut self.initial, entry_init);
                 self.branch.push((if_id, false));
                 self.push_frame();
                 if let Some(b) = els { self.block(b)?; }
-                let (we, me) = self.pop_frame();
+                let (we, me, spe) = self.pop_frame();
                 self.branch.pop();
                 // the two branches are alternatives: the cost is the larger, not the sum
                 self.work = self.work.add(&wt.max(&we));
                 self.moves = self.moves.add(&mt.max(&me));
+                self.span = self.span.add(&spt.max(&spe));
                 // a local defined differently on the two sides may hold either value after
                 for (l, tv) in then_init {
                     let merged = match (tv, self.initial.get(&l).cloned().flatten()) {
@@ -1895,11 +1950,14 @@ impl<'a, 'b, 'c> Fa<'a, 'b, 'c> {
                 // a declared callee is seen through its declaration only: its bounds, no footprint
                 // and no residue — what a caller could know without the body
                 let declared_only = callee.declared.work.is_some() && callee.declared.moves.is_some();
-                let (mut w, mut mv) = if declared_only {
-                    (Cost::poly(callee.declared.work.clone().unwrap()), Cost::poly(callee.declared.moves.clone().unwrap()))
+                // a declared callee has no span of its own (no `span_at_most` yet): its work
+                // stands in, which is always a safe over-approximation (span ≤ work)
+                let (mut w, mut mv, mut sp) = if declared_only {
+                    let w = Cost::poly(callee.declared.work.clone().unwrap());
+                    (w.clone(), Cost::poly(callee.declared.moves.clone().unwrap()), w)
                 } else {
                     match &callee.result {
-                        CostResult::Exact { work, moves } => (work.clone(), moves.clone()),
+                        CostResult::Exact { work, moves, span } => (work.clone(), moves.clone(), span.clone()),
                         CostResult::Unknown { reason, .. } => {
                             let reason = if reason.starts_with("calls `") { reason.clone() }
                                 else { format!("calls `{}`, whose cost is unknown ({reason})", callee.name) };
@@ -1932,7 +1990,7 @@ impl<'a, 'b, 'c> Fa<'a, 'b, 'c> {
                     match by {
                         Some(b) => map.push((i, b)),
                         None => {
-                            let used = w.mentions(i) || mv.mentions(i) || callee.footprint.iter().any(|f| f.param == i || f.lo.mentions(i) || f.hi.mentions(i));
+                            let used = w.mentions(i) || mv.mentions(i) || sp.mentions(i) || callee.footprint.iter().any(|f| f.param == i || f.lo.mentions(i) || f.hi.mentions(i));
                             if used {
                                 return Err(Fail::Unknown(
                                     format!("argument {} to `{}` is not a size expression, and `{}`'s cost depends on it", i + 1, callee.name, callee.name),
@@ -1944,6 +2002,7 @@ impl<'a, 'b, 'c> Fa<'a, 'b, 'c> {
                 }
                 w = w.subst_many(&map);
                 mv = mv.subst_many(&map);
+                sp = sp.subst_many(&map);
                 self.last_result = callee.result_size.as_ref().map(|p| p.subst_many(&map));
                 // the callee's footprint in this function's arrays (none is known of a declared callee)
                 let feet: Vec<(LocalId, Poly, Poly, bool)> = callee.footprint.iter().filter(|_| !declared_only).filter_map(|f| {
@@ -1986,7 +2045,7 @@ impl<'a, 'b, 'c> Fa<'a, 'b, 'c> {
                     let cond = Cond { ws: cond.ws.subst_many(&map), fits: true };
                     for (root, lo, hi, exact) in feet { if exact { self.resident.push(Res { root, lo, hi, conds: vec![cond.clone()] }); } }
                 }
-                if !self.replay { self.work = self.work.add(&w); }
+                if !self.replay { self.work = self.work.add(&w); self.span = self.span.add(&sp); }
                 self.call_moves = self.call_moves.add(&mv);
                 if let Some(h) = self.has_call.last_mut() { *h = true; }
                 Ok(())
