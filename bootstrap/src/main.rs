@@ -135,7 +135,7 @@ fn main() {
             Some(name) => {
                 let Some(f) = module.funcs.iter().find(|f| f.name == *name) else { eprintln!("no function `{name}`"); process::exit(2); };
                 match cost::scop::export(&module, f) {
-                    Ok(c) => print!("{c}"),
+                    Ok((c, assumptions)) => { print!("{c}"); for a in assumptions { eprintln!("assumes {a}"); } }
                     Err(e) => { eprintln!("{}: `{name}` is not a SCoP: {e}", file.display()); process::exit(1); }
                 }
             }
@@ -300,7 +300,7 @@ fn iolb_bounds(module: &ir::Module, costs: &mut [cost::FuncCost], machine: &cost
     let dir = std::env::temp_dir().join(format!("neant-iolb-{}", process::id()));
     let _ = std::fs::create_dir_all(&dir);
     for (f, c) in module.funcs.iter().zip(costs.iter_mut()) {
-        let src = match cost::scop::export(module, f) {
+        let (src, assumptions) = match cost::scop::export(module, f) {
             Ok(s) => s,
             Err(e) => { if !c.bounds.is_empty() { c.notes.push(format!("IOLB not asked: {e}")); } continue; }
         };
@@ -310,7 +310,8 @@ fn iolb_bounds(module: &ir::Module, costs: &mut [cost::FuncCost], machine: &cost
                 // one (the gap of a rewrite is measured against the first). IOLB does not always
                 // see through a tiled nest, where the catalogue's contraction bound stands.
                 let line = c.bounds.first().map_or(f.line, |b| b.line);
-                c.bounds.push(cost::bounds::Bound { kind: "whole function".into(), citation: "IOLB, Olivry et al. 2020".into(), moves: p, line, cold: false });
+                let kind = if assumptions.is_empty() { "whole function".to_string() } else { format!("whole function, untiled, if {}", assumptions.join(" and ")) };
+                c.bounds.push(cost::bounds::Bound { kind, citation: "IOLB, Olivry et al. 2020".into(), moves: p, line, cold: false });
                 cost::bounds::strongest_first(&mut c.bounds, &machine);
             }
             Err(e) => c.notes.push(format!("IOLB gave no bound: {e}")),

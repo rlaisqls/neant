@@ -12,11 +12,15 @@ use std::fmt::Write;
 use crate::ast::BinOp;
 use crate::ir::*;
 
-pub fn export(m: &Module, f: &Func) -> Result<String, String> {
+/// The exported C, and the assumptions under which it is the same computation as `f`: untiling
+/// runs the inner loop over `0..n` rather than `0..T·(n/T)`, because a floor in a loop bound
+/// makes IOLB's search run for hours, so the bound holds when `T | n`.
+pub fn export(m: &Module, f: &Func) -> Result<(String, Vec<String>), String> {
     let body = f.body.as_ref().ok_or("an extern has no body to export")?;
-    let mut ex = Ex { m, f, dims: HashMap::new(), loop_vars: vec![], loop_ids: vec![], consts: HashMap::new(), out: String::new(), indent: 1 };
+    let mut ex = Ex { m, f, dims: HashMap::new(), loop_vars: vec![], loop_ids: vec![], consts: HashMap::new(), outer: HashMap::new(), inner: HashMap::new(), out: String::new(), indent: 1 };
     // first pass: how each array parameter is indexed, to choose its shape
     ex.scan_block(body)?;
+    ex.find_tiles(body);
     // signature: scalars, then the sizes the export introduces, then the arrays (VLA parameters
     // may only mention what precedes them)
     let mut scalars: Vec<String> = Vec::new();
@@ -48,7 +52,10 @@ pub fn export(m: &Module, f: &Func) -> Result<String, String> {
     ex.block(body)?;
     out.push_str(&ex.out);
     out.push_str("#pragma endscop\n}\n");
-    Ok(out)
+    let mut assumptions: Vec<String> = ex.outer.values().map(|(t, n)| format!("{t} | {}", ex.expr(n).trim_matches(|c| c == '(' || c == ')'))).collect();
+    assumptions.sort();
+    assumptions.dedup();
+    Ok((out, assumptions))
 }
 
 fn c_ty(t: &Ty) -> &'static str {
@@ -66,6 +73,13 @@ struct Ex<'a> {
     /// immutable scalars bound to a literal, written as the literal: a tile side `let t = 64`
     /// must be a constant for the loop bounds to be affine
     consts: HashMap<LocalId, String>,
+    /// **Untiling.** A lower bound is a property of the computation, not of the loop order, and
+    /// IOLB does not see through a tiled nest. A tile-outer loop `for ii in 0..n/T` whose variable
+    /// appears only in the bounds of one inner loop `for i in ii·T..ii·T+T` is dropped, and the
+    /// inner loop runs `0..T·(n/T)` — the same iterations, in one loop. `outer[ii] = (T, n)`;
+    /// `inner[i] = ii`.
+    outer: HashMap<LocalId, (String, Expr)>,
+    inner: HashMap<LocalId, LocalId>,
     out: String,
     indent: usize,
 }
@@ -146,6 +160,76 @@ impl<'a> Ex<'a> {
         }
     }
 
+    // ---- untiling ----
+    fn find_tiles(&mut self, b: &Block) {
+        let mut cands: Vec<(LocalId, String, Expr)> = Vec::new();
+        self.tile_outer_loops(b, &mut cands);
+        for (ii, t, n) in cands {
+            // exactly one inner loop `ii·t .. ii·t + t`, and no other use of ii anywhere
+            let mut inners: Vec<LocalId> = Vec::new();
+            let mut other_uses = 0usize;
+            self.tile_inner_loops(b, ii, &t, &mut inners, &mut other_uses);
+            if inners.len() == 1 && other_uses == 0 {
+                self.inner.insert(inners[0], ii);
+                self.outer.insert(ii, (t, n));
+            }
+        }
+    }
+    /// loops `for ii in 0..n/T` with `T` a literal or a constant
+    fn tile_outer_loops(&self, b: &Block, out: &mut Vec<(LocalId, String, Expr)>) {
+        for st in &b.stmts {
+            if let Stmt::For { var, start, end, body } = st {
+                if matches!(start.kind, ExprKind::Int(0)) {
+                    if let ExprKind::Binary(BinOp::Div, n, t) = &end.kind {
+                        if let Some(t) = self.literal(t) { out.push((*var, t, (**n).clone())); }
+                    }
+                }
+                self.tile_outer_loops(body, out);
+            }
+        }
+    }
+    fn literal(&self, e: &Expr) -> Option<String> {
+        match &e.kind { ExprKind::Int(v) => Some(v.to_string()), ExprKind::Local(l) => self.consts.get(l).cloned(), _ => None }
+    }
+    /// inner loops `for i in ii·T .. ii·T + T` (or `.. min(ii·T + T, n)`), and every other mention of ii
+    fn tile_inner_loops(&self, b: &Block, ii: LocalId, t: &str, inners: &mut Vec<LocalId>, other: &mut usize) {
+        for st in &b.stmts {
+            match st {
+                Stmt::For { var, start, end, body } => {
+                    let is_start = self.is_mul(start, ii, t);
+                    let end = if let ExprKind::MinMax(true, a, _) = &end.kind { a } else { end };
+                    let is_end = matches!(&end.kind, ExprKind::Binary(BinOp::Add, a, tt) if self.is_mul(a, ii, t) && self.literal(tt).as_deref() == Some(t));
+                    if is_start && is_end { inners.push(*var); } else { *other += self.mentions(start, ii) as usize + self.mentions(end, ii) as usize; }
+                    self.tile_inner_loops(body, ii, t, inners, other);
+                }
+                Stmt::Let(_, e) | Stmt::Expr(e) => *other += self.mentions(e, ii) as usize,
+                Stmt::Assign(lv, _, e) => { *other += self.mentions(e, ii) as usize; if let LValue::Index(_, i, _) = lv { *other += self.mentions(i, ii) as usize; } }
+                _ => *other += 1,
+            }
+        }
+        if let Some(tail) = &b.tail { *other += self.mentions(tail, ii) as usize; }
+    }
+    fn is_mul(&self, e: &Expr, ii: LocalId, t: &str) -> bool {
+        if let ExprKind::Binary(BinOp::Mul, a, b) = &e.kind {
+            for (x, y) in [(a, b), (b, a)] {
+                if matches!(x.kind, ExprKind::Local(l) if l == ii) && self.literal(y).as_deref() == Some(t) { return true; }
+            }
+        }
+        false
+    }
+    fn mentions(&self, e: &Expr, v: LocalId) -> bool {
+        match &e.kind {
+            ExprKind::Local(l) => *l == v,
+            ExprKind::Binary(_, a, b) | ExprKind::MinMax(_, a, b) => self.mentions(a, v) || self.mentions(b, v),
+            ExprKind::Unary(_, a) | ExprKind::Cast(a, _) | ExprKind::Println(a) => self.mentions(a, v),
+            ExprKind::Index(_, i) => self.mentions(i, v),
+            ExprKind::Call(_, args) => args.iter().any(|a| self.mentions(a, v)),
+            ExprKind::If(c, t, e2) => self.mentions(c, v) || t.tail.as_ref().is_some_and(|x| self.mentions(x, v)) || e2.as_ref().and_then(|b| b.tail.as_ref()).is_some_and(|x| self.mentions(x, v)),
+            ExprKind::Block(b) => b.tail.as_ref().is_some_and(|x| self.mentions(x, v)),
+            _ => false,
+        }
+    }
+
     // ---- emission ----
     fn block(&mut self, b: &Block) -> Result<(), String> {
         for s in &b.stmts { self.stmt(s)?; }
@@ -164,8 +248,19 @@ impl<'a> Ex<'a> {
                 self.line(&format!("{target} {o}= {v};"));
                 Ok(())
             }
+            Stmt::For { var, .. } if self.outer.contains_key(var) => {
+                // the tile-outer loop: its body runs once, the inner loop covers the range
+                let Stmt::For { body, .. } = s else { unreachable!() };
+                self.loop_vars.push(*var);
+                let r = self.block(body);
+                self.loop_vars.pop();
+                r
+            }
             Stmt::For { var, start, end, body } => {
-                let (lo, hi) = (self.expr(start), self.expr(end));
+                let (lo, hi) = match self.inner.get(var).and_then(|ii| self.outer.get(ii)) {
+                    Some((_, n)) => ("0".to_string(), self.expr(n)),
+                    None => (self.expr(start), self.expr(end)),
+                };
                 let v = self.name(*var);
                 self.line(&format!("for (long {v} = {lo}; {v} < {hi}; {v}++) {{"));
                 self.indent += 1;
