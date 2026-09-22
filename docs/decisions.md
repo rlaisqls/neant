@@ -4,6 +4,29 @@ Design decisions with the reasoning that produced them, so the reasoning is not 
 code is. Newest first. A decision is recorded when it was argued over, when it rejected
 alternatives worth remembering, or when a future reader would otherwise ask "why on earth".
 
+## 7 — `T ≤ work/P + O(span)` is missing a term, on the machine's own evidence
+
+**Decided 2026-09-22, after `tests/kernels/par_sweep.py` measured a compute-bound and a
+memory-bound `.par()` chain across `P` on five same-type cores (experiments.md, M5).**
+
+m5-span-design.md §6 named the risk before building anything: the classical work-span bound has no
+memory-bandwidth term, and M1 had already found `sum`/`dot` bandwidth-bound on one core. The
+question was whether that stayed true across several cores sharing one path to memory, or whether
+enough parallel slack absorbed it. Measured: a compute-bound `.par()` chain holds 84% efficiency at
+`P = 5`; a memory-bound one (`.par().sum()`) holds 97%, then breaks — 75% at `P = 4`, 61% at
+`P = 5`, speedup barely moving from `P = 4` to `P = 5` while compute keeps climbing. The model
+predicts the same curve for both, because `work/P + span` has nothing in it that could tell a
+compute-bound chain from a memory-bound one.
+
+**Accepted:** the bound needs a second term, `moves/BW` for some aggregate bandwidth `BW`, taken as
+a `max` with `work/P` — a roofline, the same shape the fit test already uses `max` for elsewhere in
+this calculus, not a new kind of machinery. **Not decided:** what `BW` is, or how it is measured —
+five points on five cores show the shape breaking, not enough to fit a constant. Also not settled:
+the mixed-cluster case. A supplementary run across this machine's two core types (X925 and A725, a
+big.LITTLE split) in the same session showed a real loss from adding the slower cluster late — a
+genuine effect, but a scheduling question (OpenMP's static split assumes same-speed cores) distinct
+from the bandwidth question this decision is about, and left open.
+
 ## 6 — Improving on the tools' logic where the compiler knows more, not where they know more
 
 **Decided 2026-09-22, after the question whether IOLB and IOUB should be reimplemented.**

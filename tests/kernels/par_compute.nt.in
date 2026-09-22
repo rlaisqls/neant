@@ -1,0 +1,18 @@
+// a `.par()` chain whose per-element work (a degree-16 Horner polynomial, ~32 flops) dominates
+// its moves (one 8-byte read): compute-bound, work/P is expected to predict wall-clock scaling
+// with P (m5-span-design.md exit test 3).
+fn compute(xs: &[f64]) -> f64 {
+    xs.iter().par().map(|x| ((((((((((((((((x*1.0000001+0.0000001)*1.0000001+0.0000001)*1.0000001+0.0000001)*1.0000001+0.0000001)*1.0000001+0.0000001)*1.0000001+0.0000001)*1.0000001+0.0000001)*1.0000001+0.0000001)*1.0000001+0.0000001)*1.0000001+0.0000001)*1.0000001+0.0000001)*1.0000001+0.0000001)*1.0000001+0.0000001)*1.0000001+0.0000001)*1.0000001+0.0000001)*1.0000001+0.0000001)).sum()
+}
+
+fn main() {
+    let mut xs = [0.0; @N@];
+    for i in 0..@N@ {
+        xs[i] = (i % 1000) as f64;
+    }
+    let mut t = 0.0;
+    for r in 0..@R@ {
+        t += compute(&xs);
+    }
+    println(t);
+}

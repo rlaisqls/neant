@@ -478,3 +478,57 @@ reassignment from the build-and-sum cost the two kernels share:
   (`size_of_local`), goldens `reassign_named_size`, `reassign_len_size`,
   `err_reassign_mutable_size`.
 
+## M5 — does `T ≤ W/P + O(S)` hold, and does it fail the way §6 predicted?
+
+**Question.** `.par()`'s bound has no memory-bandwidth term (m5-span-design.md §6): `P` cores are
+assumed to divide `work` freely, with only the reduction's `O(log n)` span left over. A
+compute-bound `.par()` chain should scale close to `P`; a memory-bound one — cores sharing one
+path to memory — should scale worse, and by how much worse is exactly what the bound cannot see.
+
+**Setup.** `tests/kernels/par_compute.nt.in` (a degree-16 Horner polynomial per element, work
+dominating) and `par_memory.nt.in` (`.par().sum()`, moves dominating): `n = 20\,000\,000` `f64`
+(160 MiB, past L3), each `.par()` call repeated (40× compute, 150× memory, chosen so `P=1` runs a
+second or two) over one array built once. `tests/kernels/par_sweep.py` times the whole binary,
+best of 5, `taskset` to `P` of the cores `5,6,7,8,9` — the big cluster's X925 cores, same type on
+purpose: OpenMP's static schedule splits the loop into equal iteration counts per thread, and a
+slower core in the mix becomes a straggler the model does not represent either, which would
+confound the one question this experiment asks.
+
+| `P` | compute speedup | compute efficiency | memory speedup | memory efficiency | predicted speedup (either kernel) |
+|---:|---:|---:|---:|---:|---:|
+| 1 | 1.00 | 100% | 1.00 | 100% | 1.00 |
+| 2 | 1.88 | 94% | 1.93 | 97% | 1.99 |
+| 3 | 2.67 | 89% | 2.69 | 90% | 2.98 |
+| 4 | 3.48 | 87% | 2.98 | 75% | 3.95 |
+| 5 | 4.21 | 84% | 3.03 | 61% | 4.92 |
+
+Reproduced twice; the two runs agree to within a few percent at every `P`. The "predicted" column
+is `neant cost --eval` at each `P`, normalised to `P=1` — indistinguishable between the two
+kernels, because `work/P + span` has nothing in it that could tell them apart.
+
+**Findings.**
+
+- **The predicted failure is the measured one.** Compute tracks the model closely — 84% efficiency
+  at `P=5`, falling slowly, the shape a straggler-free static schedule with some fixed overhead
+  produces. Memory does not: it tracks compute almost exactly through `P=2`–`3` (efficiency 97%,
+  90%), then breaks away — 75% at `P=4`, 61% at `P=5`, and the *raw* speedup barely moves from
+  `P=4` (2.98×) to `P=5` (3.03×) while compute is still climbing (3.48× → 4.21×). Four and five
+  cores are pulling on one memory path faster than it can be fed; the model, which has no notion
+  of a memory path, cannot see this coming and predicts the same curve for both.
+- **This is `sum`'s M1 finding at a second layer.** M1 found `sum`/`dot` bandwidth-bound on *one*
+  core (experiments.md §M1 §3). This asks the next question — bandwidth-bound against how many
+  cores — and the answer is: not many, on this machine. The flattening starts by `P=4` of the ten
+  big cores this machine has.
+- **The fix `T ≤ W/P + O(S)` needs is the one §6 named, not a smaller version of it.** A second
+  term, `moves/BW` for some aggregate bandwidth `BW`, would predict compute's curve (`moves` small,
+  the `work/P` term wins the `max`) and predict memory's flattening (`moves/BW` becomes the binding
+  term once `P·(bytes/element/iteration)` exceeds what `BW` delivers) — a roofline, not a straight
+  line. `BW` itself was not fit here; this experiment answers *whether* the model needs it, not yet
+  *what number* goes in it.
+- **What this experiment does not settle.** Five points on five same-type cores is enough to show
+  the shape breaking, not enough to fit a bandwidth constant with any confidence, and this machine's
+  other five big cores (a second X925 cluster, `15`–`19`) and its `A725` cluster were kept out on
+  purpose (§ Setup) — a mixed-cluster sweep run during this same session showed real speedup loss
+  from adding slower cores late, a genuine effect but a different question than this one. Fitting
+  `BW` and re-including the rest of the machine are open, not attempted here.
+

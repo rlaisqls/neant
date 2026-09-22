@@ -239,13 +239,19 @@ parallel for reduction(op:acc)`, the loop's own end bound hoisted out of the ini
 program with no `.par()` links no `libgomp`. The report gets a `span ... T ≤ work/P + O(span)` line
 only when span differs from work, so every existing golden is unchanged (exit test 1) and the
 structural shape (`O(log n)`, composed correctly across a call) is checked directly in the report
-(exit test 2, goldens `par`, `par_span`, `err_par_max`, `err_par_fold`, `err_par_order`). **Not yet
-done: the wall-clock measurement** (exit tests 3–4) — the design names its own likely failure before
-measuring it: `T ≤ W/P + O(S)` has no memory-bandwidth term, and M1 already found `sum`/`dot`
-bandwidth-bound, so a compute-bound and a memory-bound `.par()` kernel's wall-clock scaling across
-`P` needs to be compared on the pinned cluster before this is trusted; if the memory-bound one
-flattens while `work/P` keeps predicting improvement, the honest fix is a second, `moves/BW` term
-and a roofline bound, decided by the machine rather than assumed here.
+(exit test 2, goldens `par`, `par_span`, `err_par_max`, `err_par_fold`, `err_par_order`).
+
+**Measured, exit tests 3–4 decided against the bound as it stands** (docs/experiments.md M5,
+decisions §7; `tests/kernels/par_compute.nt.in`, `par_memory.nt.in`, `par_sweep.py`, wall-clock on
+five same-type big cores). A compute-bound `.par()` chain holds 84% efficiency at `P = 5`; a
+memory-bound one (`.par().sum()`) holds 97% through `P = 3`, then breaks — 61% at `P = 5`, speedup
+barely moving `P = 4 → 5` while compute keeps climbing — and the model predicts the identical curve
+for both, having nothing in it that could tell them apart. **`T ≤ work/P + O(span)` needs a second,
+`moves/BW` term taken as a `max` with the first, a roofline** — decided, not yet built: `BW` itself
+was not fit, and this machine's mixed-cluster case (adding the slower `A725` cores late loses real
+speedup, a scheduling confound OpenMP's static split does not handle, a different question) was
+kept out of the measurement on purpose. Next: fit `BW`, or move on and record the bound as
+qualified rather than exact.
 
 ## Self-hosting
 

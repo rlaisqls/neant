@@ -1,0 +1,18 @@
+// a `.par()` sum: the same shape as par_compute, but with no per-element work to speak of — moves
+// dominates. M1 already found `sum` bandwidth-bound on one core; this asks whether work/P still
+// predicts wall-clock scaling with P once P cores share one path to memory (exit test 4).
+fn memsum(xs: &[f64]) -> f64 {
+    xs.iter().par().sum()
+}
+
+fn main() {
+    let mut xs = [0.0; @N@];
+    for i in 0..@N@ {
+        xs[i] = (i % 1000) as f64;
+    }
+    let mut t = 0.0;
+    for r in 0..@R@ {
+        t += memsum(&xs);
+    }
+    println(t);
+}

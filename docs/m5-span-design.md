@@ -125,6 +125,12 @@ gets the same command line as today, and no new runtime dependency (`libgomp`) i
 
 ## 6. The thing most likely to be wrong, named before it is measured
 
+**Measured 2026-09-22 (docs/experiments.md M5, decisions §7): it was wrong, the way predicted.**
+Compute-bound held 84% efficiency at `P = 5`; memory-bound (`.par().sum()`) held 97% through
+`P = 3` and then broke — 61% at `P = 5`, barely moving from `P = 4`. The bound needs the second,
+`moves/BW` term below; `BW` itself is not fit yet. The rest of this section is kept as written,
+since it argues for running the test rather than for its result.
+
 `T ≤ W/P + O(S)` is the classical work-span bound, and it is a **pure compute** model: it has no
 term for the fact that `P` cores share one path to memory. M1 already established that several of
 this project's own kernels — `sum`, `dot` — are bandwidth-bound, not compute-bound: doubling the
@@ -156,14 +162,13 @@ neither scales as predicted, the compute term itself is wrong and `P` is reconsi
    * x).sum()`: predicted span `O(1) + O(log n)` at several `n`, checked structurally (the
    reported polynomial has a `Log` atom at the right coefficient) — this is an assertion about the
    compiler's arithmetic, not yet about the machine.
-3. **Wall-clock scaling, a compute-bound kernel.** A `.par()` chain whose closure does real
-   arithmetic per element (enough that work dominates moves by the model's own numbers), timed at
-   `P = 1, 2, 4, 8` on the pinned big cluster (`taskset -c 5-9` and `15-19` give ten cores;
-   `OMP_NUM_THREADS` set per run). Exit: wall-clock tracks `work/P + O(log n)` within a stated
-   factor, the same tolerance discipline as every other measured claim in this file.
-4. **Wall-clock scaling, a memory-bound kernel.** The same sweep on `.par()` `sum`. Exit: whatever
-   the machine says (§6) — this test's job is to produce the number that decides §6, not to pass
-   or fail a predetermined bar.
+3. **Wall-clock scaling, a compute-bound kernel — passed.** `par_compute.nt.in`, `P = 1..5` on five
+   same-type big cores: 84% efficiency at `P = 5`, tracking `work/P` closely (docs/experiments.md
+   M5).
+4. **Wall-clock scaling, a memory-bound kernel — decided §6 against the bound.** `par_memory.nt.in`
+   (`.par().sum()`), same sweep: 61% efficiency at `P = 5`, breaking away from compute's curve by
+   `P = 4`. This test's job was to produce the number that decided §6, not to pass or fail a
+   predetermined bar, and it did (decisions §7).
 5. **The associativity refusal.** `.par()` before `.fold(...)` is rejected with the line and the
    reason; every associative terminal (`sum`, `count`, `max`, `min`, `any`, `all`) accepted.
 
