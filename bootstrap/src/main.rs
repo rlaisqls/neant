@@ -285,6 +285,10 @@ fn cc(c: &str, out: &Path, src: &Path) -> Result<(), String> {
     cmd.args(["-O2", "-std=gnu11", "-Wall", "-Wno-unused-variable", "-Wno-unused-but-set-variable", "-Wno-unused-value", "-Wno-unused-function"]);
     // only a module with a `.par()` chain needs it — no new dependency for one that has none
     if c.contains("#pragma omp") { cmd.arg("-fopenmp"); }
+    // the self-hosting I/O bridge (docs/self-hosting-design.md §2): a fixed convention, not a
+    // flag — bootstrap/rt.c is linked in whenever the generated C actually calls into it
+    let rt_c = Path::new(env!("CARGO_MANIFEST_DIR")).join("rt.c");
+    if c.contains("read_file(") && rt_c.exists() { cmd.arg(&rt_c); }
     let status = cmd
         .arg("-o").arg(out)
         .arg(&cfile)
