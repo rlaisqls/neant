@@ -439,3 +439,38 @@ interesting one.
   where each positive term of `q` is a budget the terms of `p` consume from monomials that cover
   them. `64·s.len() − 64` dominates `s.len()` only through it. The arithmetic is `f64` here because
   it is `f64` there, and this has to agree rather than merely be right.
+
+## 14. Calls, and what is already in the cache
+
+24 of the 38 declined `moves` columns are functions that call something. The reason they are
+declined is one line in `analyze.rs`:
+
+```rust
+// credit: what the callee reads that is already resident here pays nothing
+```
+
+`repeat.nt`'s `main` builds one array and calls `total` over it **three times**, and pays for the
+traversal **once** — after the first call the array is in `M` and the rest is free. Adding the
+callees' costs would be wrong by 16 000, which is the whole answer.
+
+So a call needs three things the slice does not have:
+
+- **A signature footprint.** Per array parameter, the byte range the callee touches. For a whole
+  walk that is `[0, elem·len)`, which is all this slice will compute: a callee whose sites do not
+  cover an array it receives makes the call unknown.
+- **A resident set.** What the caller knows is in `M` at this point. It is set *only by a call* —
+  `analyze.rs` clears it and refills it from the callee's footprints — so building an array does
+  not make it resident, which is why `repeat.nt`'s first call still pays.
+- **Credit.** The callee's moves, substituted into the caller's atoms, minus the footprint of every
+  argument already resident.
+
+Residency is conditional: the callee leaves its footprint resident only if it fits in `M`. Where
+the sizes are concrete — which is every `main` in the corpus — that condition is decided and
+nothing forks. Where they are symbolic it forks, and a second, independent fork is unknown (§13).
+
+### Not in this slice
+
+The Rust's credit compares *ranges* with `dominates` in both directions, so a callee reading
+`[0, n/2)` of an array the caller left resident over `[0, n)` gets partial credit. Here a footprint
+is the whole array or nothing, and a partial overlap makes the call unknown. `saxpy` and `stencil`
+are where that will first bite.
