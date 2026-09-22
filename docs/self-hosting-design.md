@@ -42,6 +42,12 @@ in and out of the process at all.
 
 ## 2. The one real gap: `extern fn` cannot do file I/O yet
 
+**Done (commit 604f0ab).** `bootstrap/rt.c`'s `read_file`, `cc()`'s fixed linking convention, and
+`extern fn read_file(path: &[u8], buf: &mut [u8]) -> i64 uses io, unbounded;` all work as designed
+below — verified by hand (correct content and byte count; `-1` on a missing path; `-1`, not a
+silent truncation, on a buffer too small). Not yet in the golden suite, which assumes
+CWD-independent absolute paths and has no fixture file to point at yet.
+
 Two independent problems, checked in `types.rs` and `emit_c.rs`:
 
 - **An `extern` cannot return an owned array.** `check_func`'s owned-array-size inference (`if let
