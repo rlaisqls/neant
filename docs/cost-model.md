@@ -162,6 +162,10 @@ refused, with a sentence, on anything else.
   innermost variable times a row length) is copied transposed before the nest, and the inner
   loop reads the copy along a row. The copy costs a transpose and `8·nk·nj` bytes of memory.
 
+A tiled nest's `N` is counted on its rectangular hull — `(n+T−1)/T` tiles of `T` — so the bound
+printed for a rewritten function is over by `(1+T/n)³`. The suggestion lines take the gap against
+the original function's bound, which is exact.
+
 What the two buy is a matter of the regime. In the symbolic report, where nothing is assumed to
 fit, transposing turns `B·n³` into `8·n³` — a factor of `B/8`. In a concrete program where the
 column of `b` is a known number of lines that fits `M`, the naive walk already shares each line

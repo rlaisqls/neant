@@ -113,6 +113,12 @@ cost after applying.
 **Exit:** the matmul report in the README is real output on real code, and the `[apply]` rewrites
 are verified in the M1 experiment harness to move the measured misses the way the model says.
 
+**Status: passed, 2026-09-22.** Chains and comprehensions desugar to single loops (fusion by
+construction); the product is recognised, bounded and gapped; `--apply matmul:tile` removed 53×
+of the measured traffic against 39× predicted and beat the hand-tiled kernel by 1.75×;
+`--apply matmul:transpose` removed 15% against a predicted nothing. Record in
+[experiments.md](experiments.md).
+
 ### M3 — The dial: nobody is silent
 
 Take the language from "the exact subset" to "a language", and make sure every function still

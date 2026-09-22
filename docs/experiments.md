@@ -110,3 +110,62 @@ transition that matters — reuse or not — once it counts everyone in the loop
 are off by a stable factor that depends on the pattern and on how the counter works, in the
 direction the plan reserved for measurement. M1's exit criterion is met, on the second version
 of the rule set, and the two rules it forced are the experiment's real product.
+
+## M2 — do the compiler's rewrites move the machine the way the model says?
+
+**Claim under test.** `neant cost` offers two rewrites on a recognised matrix product, each
+costed by running the calculus on the rewritten IR. If applying a rewrite does not change the
+measured refills the way its costed suggestion says, the suggestions are decoration.
+
+**Method.** As M1: the naive kernel `tests/kernels/matmul_naive.nt.in`, sizes `64·(odd)`, one
+X925 core, `l2d_cache_refill × 64`, minimum of three runs — built three ways: as written, with
+`--apply matmul:tile` (the compiler chose `T = 256` from `M = 2 MiB`), and with
+`--apply matmul:transpose`. Every rewritten binary printed the same checksum as the original.
+The naive row is from the M1 sweep on the same day.
+
+### Result
+
+| n = 1984 | predicted bytes | measured bytes | measured ÷ naive |
+|---|---:|---:|---:|
+| naive | 6.27e10 | 7.01e10 | 1 |
+| `--apply matmul:tile` | 1.59e9 | 1.33e9 | **1/53** |
+| `--apply matmul:transpose` | 6.28e10 | 6.00e10 | 1/1.17 |
+| hand-written 64×64 tiles (M1) | 2.20e9 | 2.33e9 | 1/30 |
+
+Predicted ÷ measured over the upper half of the sweep: tile 1.54, 1.18, 1.19; transpose 1.14,
+1.07, 1.05. The model said tiling would remove 39× of the traffic; it removed 53×. The model
+said transposing would remove nothing at this size — the column walk already shares each line
+across eight consecutive `j` — and it removed 15%.
+
+Distance to the Hong–Kung bound at this size: naive 1453×, tiled 37× predicted and 31× measured.
+
+### Findings
+
+1. **The costed suggestion is a prediction, and it held.** Both rewrites landed within 1.4× of
+   their predicted effect, in the predicted direction, with the predicted ranking. The report's
+   `[--apply]` lines are computed, not looked up, and this is the evidence that computing them
+   was worth it.
+2. **The compiler's tile beat the hand-written one by 1.75×.** `T` was chosen as the largest
+   power of two with three tiles strictly inside `M`; the hand kernel used 64 because that is
+   what one writes. A number derived from the machine did better than a number from habit, which
+   is the argument for deriving it.
+3. **Transposing bought 15% the model did not see.** In the ideal-cache model a column whose
+   lines fit `M` costs the same as a row; on the core, a row is a stream the prefetcher runs
+   ahead of and a column is not. The prefetcher is on the list of things the model does not
+   see, and here is its size.
+4. **Under tiling, the bound is counted on the hull.** The tiled nest's trip counts are
+   `(n+T−1)/T` tiles of `T`, so `N` is counted as `(n+T−1)³` and the bound printed for the
+   rewritten function is over by `(1+T/n)³` — 1.44× at `n = 1984`. The suggestion lines in the
+   report therefore give the gap against the *original* function's bound, which is exact; the
+   `--apply` path reports the inflated one. A precise count needs the calculus to know that a
+   `min`-bounded tile loop and its `ceil` count multiply back to `n`, which it does not yet.
+5. **The predicted slope of the tiled cost is wrong in a way that does not matter.** 2.50
+   against 3.04 measured over 1216–1984: the `ceil` in the tile count makes the predicted
+   polynomial step rather than grow, and over one octave that reads as a shallower slope. The
+   ratio converges (1.54 → 1.19) as `n` grows past a few tiles.
+
+### Verdict
+
+M2's exit criterion is met: the report in the README is the compiler's output on the code in
+the README, and the two rewrites it offers move the measured refills as their costed lines say —
+one of them better than a person did by hand.
