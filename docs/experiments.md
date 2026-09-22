@@ -535,3 +535,70 @@ between the two kernels because `work/P + span` has nothing in it that could tel
   more monotonic version of the same gap). Fitting
   `BW` and re-including the rest of the machine are open, not attempted here.
 
+
+## The compiler's cost model, on the compiler — and the machine's answer
+
+The self-hosted cost reporter (`compiler/costdump.nt`, compiled by the self-hosted compiler) was
+pointed at `compiler/*.nt` itself. It reports `work` for 31 of the 91 functions and `moves` for 28,
+in **20 ms**, and one line stood out:
+
+```
+emit_bytes    work 8·s.len() + 1    moves B·s.len() + s.len() + 2·B
+```
+
+A whole cache line *per byte copied*. The cause is visible in the source:
+
+```neant
+fn emit_bytes(out: &mut [u8], est: &mut [i64], s: &[u8]) {
+    let mut i = 0;
+    while i < s.len() {
+        out[est[0]] = s[i];        // the index is a *load*, not the loop variable
+        est[0] = est[0] + 1;
+        i += 1;
+    }
+}
+```
+
+`est` is the one-element array the language forces mutable state into — there are no globals — so
+the write's index is an array read, the model cannot follow it, and the rule for an index it cannot
+follow is "a whole line or more" (`analyze.rs`'s `access`, and the same rule in `compiler/cost.nt`).
+
+Rewritten to index by the loop variable, `out[start + i] = s[i]`, the report becomes
+`work 5·s.len() + 4`, `moves 2·s.len() + 3·B` — **32× less traffic predicted**.
+
+### What the machine said
+
+100 self-compiles of the compiler's own source (110 KB in, 183 KB of C out), `taskset -c 5`,
+`perf stat -r 3`:
+
+| | `l2d_cache_refill` | wall clock |
+|---|---|---|
+| before | 12,195,570 ±0.29% | 3.003 ±0.039 s |
+| after | 12,116,281 ±0.11% | 3.029 ±0.013 s |
+
+**0.65% fewer refills. No wall-clock change** — the second run's "after" was marginally slower, and
+an earlier, shorter measurement that appeared to show a 10% win did not survive repetition. It was
+noise, and is recorded here because it was believed for about five minutes.
+
+### Why, and what it says about the model
+
+The emitted C is `out_p[nt_idx(est_p[nt_idx(0, …)], …)] = s_p[…]`, and `out_p` is `uint8_t *` —
+character types are exempt from strict aliasing, so gcc **must** reload `est_p[0]` after every
+store. The cursor really is re-read each iteration. But `est_p[0]` is a single word that never
+leaves L1, and `out_p[…]` walked the buffer contiguously whatever the model believed.
+
+So the model's estimate was an over-estimate by 32×, in the direction it deliberately rounds:
+every assumption rounds up, and "an index I cannot follow scatters" is sound as a bound and wrong
+as a description whenever the index happens to be a cursor. **What the rewrite improved was the
+report, not the program.**
+
+The change is kept — a cost report that is true beats one that is merely sound, and the idiom will
+hide a cursor from this analysis every time it is used — but it is kept with this measurement
+attached, not as a performance fix.
+
+### The loop that produced it
+
+This is the first time in the project that the language's own cost model was applied to its own
+compiler, produced a specific claim, and had that claim checked against hardware. The claim was
+wrong, the reason is understood, and the reason is a property of the model rather than of the port.
+That is the loop working.

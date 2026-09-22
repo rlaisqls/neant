@@ -16,24 +16,40 @@ fn emit_b(out: &mut [u8], est: &mut [i64], b: u8) {
     est[0] = est[0] + 1;
 }
 
+// The cursor is hoisted into a local and the write indexed by the loop variable, on the cost
+// model's own advice — and the machine then said the advice was worth nothing. Both halves are
+// worth keeping (docs/experiments.md, "the compiler's cost model, on the compiler").
+//
+// Written as `out[est[0]] = s[i]`, this loop's index is a *load* from the state array, so the
+// model cannot see that it advances by one and charges a whole cache line per byte:
+// `B·s.len() + s.len() + 2·B`. Written this way it charges `2·s.len() + 3·B` — 32× less. The
+// measurement: **0.65% fewer L2 refills and no change in wall clock**, because the access was
+// contiguous all along and the model's caution was an over-estimate, not a description. What
+// improved was the report, not the program.
+//
+// It is kept because a cost report that is true beats one that is merely sound, and because the
+// one-element-array idiom the language forces on mutable state (there are no globals) will hide a
+// cursor from this analysis every time it is used this way.
 fn emit_bytes(out: &mut [u8], est: &mut [i64], s: &[u8]) {
+    let start = est[0];
     let mut i = 0;
     while i < s.len() {
-        out[est[0]] = s[i];
-        est[0] = est[0] + 1;
+        out[start + i] = s[i];
         i += 1;
     }
+    est[0] = start + s.len();
 }
 
 // a token's own source bytes: an identifier's spelling, a float literal's digits — C spells both
 // the same way, which is why no literal was ever parsed into a value
 fn emit_span(out: &mut [u8], est: &mut [i64], src: &[u8], toks: &[Token], t: i64) {
+    let start = est[0];
     let mut i = 0;
     while i < toks[t].len {
-        out[est[0]] = src[toks[t].start + i];
-        est[0] = est[0] + 1;
+        out[start + i] = src[toks[t].start + i];
         i += 1;
     }
+    est[0] = start + toks[t].len;
 }
 
 // the same, without `_` separators: neant takes `1_000`, C does not

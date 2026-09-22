@@ -112,6 +112,30 @@ fn self_hosted_work_agrees_with_bootstrap() {
     let nt = dir.join("cost_driver.nt");
     std::fs::write(&nt, format!("{stages}\n{}", driver())).unwrap();
 
+    // The reporter is **compiled by the self-hosted compiler**, from the committed seed, rather
+    // than interpreted. Two things follow. It is some fifteen times faster, which is what makes a
+    // corpus-wide comparison affordable at all. And it puts the cost pass inside the fixpoint:
+    // the cost calculus now survives being compiled by the compiler it is part of, which nothing
+    // tested before — `compiler/main.nt` is a filter with no argv, so the cost pass could not be
+    // a mode of the compiler binary and had to be a second one.
+    let cc = std::env::var("CC").unwrap_or_else(|_| "cc".into());
+    let seed = dir.join("seed");
+    let built = Command::new(&cc).args(["-O1", "-std=gnu11", "-w", "-o"]).arg(&seed)
+        .arg(repo("bootstrap/neant.c")).arg(repo("bootstrap/rt.c")).output().unwrap();
+    assert!(built.status.success(), "cc rejected the committed seed:\n{}",
+        String::from_utf8_lossy(&built.stderr));
+    let emitted = Command::new(&seed).stdin(std::fs::File::open(&nt).unwrap()).output().unwrap();
+    assert!(emitted.status.success(),
+        "the self-hosted compiler could not compile the cost pass (exit {:?}: 2 parser, 3 checker, \
+         4 emitter, 5 size)", emitted.status.code());
+    let reporter_c = dir.join("reporter.c");
+    std::fs::write(&reporter_c, &emitted.stdout).unwrap();
+    let reporter = dir.join("reporter");
+    let built = Command::new(&cc).args(["-O1", "-std=gnu11", "-w", "-o"]).arg(&reporter)
+        .arg(&reporter_c).arg(repo("bootstrap/rt.c")).output().unwrap();
+    assert!(built.status.success(), "cc rejected the C the self-hosted compiler wrote for the \
+        cost pass ({}):\n{}", reporter_c.display(), String::from_utf8_lossy(&built.stderr));
+
     let mut files: Vec<PathBuf> = std::fs::read_dir(repo("tests/golden")).unwrap()
         .filter_map(|e| e.ok().map(|e| e.path()))
         .filter(|p| p.extension().is_some_and(|x| x == "nt"))
@@ -130,9 +154,9 @@ fn self_hosted_work_agrees_with_bootstrap() {
             &Command::new(neant()).arg("cost").arg(f).output().unwrap().stdout).into_owned();
         let want = rust_report(&report);
         let want_moves = rust_moves(&report);
-        let run = Command::new(neant()).arg("run").arg(&nt)
+        let run = Command::new(&reporter)
             .stdin(std::fs::File::open(f).unwrap()).output().unwrap();
-        assert!(run.status.success(), "the self-hosted cost driver failed on {name}:\n{}",
+        assert!(run.status.success(), "the self-hosted cost reporter failed on {name}:\n{}",
             String::from_utf8_lossy(&run.stderr));
         let out = String::from_utf8_lossy(&run.stdout);
         let mut lines = out.lines();
