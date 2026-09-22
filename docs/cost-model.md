@@ -1,6 +1,6 @@
 # The cost model, as implemented
 
-What `neant cost` computes, rule by rule. `stage0/src/cost/analyze.rs` implements exactly this;
+What `neant cost` computes, rule by rule. `bootstrap/src/cost/analyze.rs` implements exactly this;
 when the two disagree the code is wrong. The plan for what this grows into is in
 [plan.md](plan.md); this file is only what stands today.
 

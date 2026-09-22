@@ -10,7 +10,7 @@ against n over the sizes past the cache. --dry prints predictions only and needs
 import argparse, math, os, re, subprocess, sys, tempfile, pathlib
 
 HERE = pathlib.Path(__file__).resolve().parent
-NEANT = HERE / "../../stage0/target/release/neant"
+NEANT = HERE / "../../bootstrap/target/release/neant"
 LINE = 64
 EVENT = "l2d_cache_refill"
 
@@ -76,7 +76,7 @@ def main():
     ap.add_argument("kernels", nargs="*")
     a = ap.parse_args()
     if not NEANT.exists():
-        sys.exit("build the compiler first: cargo build --release in stage0/")
+        sys.exit("build the compiler first: cargo build --release in bootstrap/")
     kernels = a.kernels or list(SWEEP)
     work = tempfile.mkdtemp(prefix="neant-sweep-")
     for k in kernels:

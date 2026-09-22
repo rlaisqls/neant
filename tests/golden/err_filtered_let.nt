@@ -1,0 +1,5 @@
+fn main() {
+    let xs = [1, 2, 3];
+    let ys = [x for x in xs if x > 1];
+    println(ys.len());
+}

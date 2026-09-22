@@ -1,0 +1,38 @@
+// iterator chains and comprehensions: every one of these is a single loop
+fn positives(xs: &[f64]) -> f64 {
+    [x * x for x in xs if x > 0.0].sum()
+}
+
+fn dot(a: &[f64], b: &[f64]) -> f64 {
+    a.iter().zip(b).map(|x, y| x * y).sum()
+}
+
+fn weighted(xs: &[f64]) -> f64 {
+    xs.iter().enumerate().map(|i, x| i as f64 * x).sum()
+}
+
+fn main() {
+    let xs = [3.0, -1.0, 4.0, -1.0, 5.0];
+    println(positives(&xs));
+    println(xs.iter().sum());
+    println(xs.iter().map(|x| x * 2.0).sum());
+    println(xs.iter().filter(|x| x < 0.0).count());
+    println(xs.iter().max());
+    println(xs.iter().min());
+    println(xs.iter().map(|x| x > 0.0).all());
+    println(xs.iter().map(|x| x > 4.0).any());
+    println(xs.iter().fold(1.0, |acc, x| acc * x));
+    let ys = [1.0, 2.0, 3.0, 4.0, 5.0];
+    println(dot(&xs, &ys));
+    println(weighted(&ys));
+    let sq = [x * x for x in ys];
+    println(sq.len());
+    println(sq[4]);
+    let n = 10;
+    let idx = [k for k in sq];
+    println(idx.iter().count());
+    println(min(3, 7));
+    println(max(2.5, -1.0));
+    println([x for x in ys if x > 2.0].count());
+    println(min(n, ys.len()));
+}

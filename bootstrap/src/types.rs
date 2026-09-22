@@ -29,7 +29,7 @@ pub fn check(prog: &ast::Program) -> Result<Module> {
         }
         let ret = resolve_type(&f.ret, f.line, f.col)?;
         if ret.is_arrayish() {
-            return err(f.line, f.col, "functions return scalars or `()` in stage 0; write into an `&mut [T]` parameter");
+            return err(f.line, f.col, "functions return scalars or `()` for now; write into an `&mut [T]` parameter");
         }
         sigs.insert(f.name.clone(), (i, ptys, ret));
     }
@@ -64,14 +64,14 @@ fn resolve_type(t: &ast::TypeExpr, line: u32, col: u32) -> Result<Ty> {
         ast::TypeExpr::Slice(elem, m) => {
             let e = resolve_type(elem, line, col)?;
             if !e.is_scalar() {
-                return err(line, col, "element type of a slice must be scalar in stage 0");
+                return err(line, col, "element type of a slice must be scalar for now");
             }
             Ty::Slice(Box::new(e), *m, Size::Const(-1))
         }
         ast::TypeExpr::Array(elem, n) => {
             let e = resolve_type(elem, line, col)?;
             if !e.is_scalar() {
-                return err(line, col, "element type of an array must be scalar in stage 0");
+                return err(line, col, "element type of an array must be scalar for now");
             }
             match n.kind {
                 ast::ExprKind::Int(k) if k >= 0 => Ty::Array(Box::new(e), Size::Const(k)),
@@ -88,11 +88,16 @@ struct Ctx<'a> {
     sizes: Vec<SizeInfo>,
     ret: Ty,
     in_loop: usize,
+    /// inside a closure body: assignment is an error, so a chain stage is pure and fusion is safe
+    in_closure: usize,
+    fresh: usize,
+    /// extra `let`s a terminal needs before its loop (`seen` for max/min)
+    pending_lets: Vec<Stmt>,
 }
 
 fn check_func(f: &ast::Func, sigs: &HashMap<String, (FuncId, Vec<Ty>, Ty)>) -> Result<Func> {
     let (_, ptys, ret) = &sigs[&f.name];
-    let mut cx = Ctx { sigs, locals: vec![], scopes: vec![HashMap::new()], sizes: vec![], ret: ret.clone(), in_loop: 0 };
+    let mut cx = Ctx { sigs, locals: vec![], scopes: vec![HashMap::new()], sizes: vec![], ret: ret.clone(), in_loop: 0, in_closure: 0, fresh: 0, pending_lets: vec![] };
     let mut params = Vec::new();
     for (p, ty) in f.params.iter().zip(ptys) {
         // a slice parameter's size is its own variable, named after the parameter
@@ -145,7 +150,7 @@ impl<'a> Ctx<'a> {
                 || err(e.line, e.col, format!("unknown variable `{n}`")),
                 Ok,
             ),
-            _ => err(e.line, e.col, format!("{what} must be a variable in stage 0")),
+            _ => err(e.line, e.col, format!("{what} must be a variable for now")),
         }
     }
 
@@ -165,7 +170,7 @@ impl<'a> Ctx<'a> {
             None => Ty::Unit,
         };
         if ty.is_arrayish() {
-            return err(b.line, b.col, "a block cannot have an array value in stage 0");
+            return err(b.line, b.col, "a block cannot have an array value for now");
         }
         Ok(Block { stmts, tail, ty })
     }
@@ -199,6 +204,33 @@ impl<'a> Ctx<'a> {
                         self.check_declared(&declared, &ty, *line, *col)?;
                         let id = self.declare(name, ty, *mutable);
                         Ok(Stmt::LetArray(id, out))
+                    }
+                    ast::ExprKind::Comprehension { elem, var, source, cond } => {
+                        if cond.is_some() {
+                            return err(init.line, init.col, "the length of a filtered comprehension depends on the data; reduce it (`.sum()`, `.count()`, ...) or drop the `if`");
+                        }
+                        let src = self.local_by_expr(source, "the source of a comprehension")?;
+                        if !self.locals[src].ty.is_arrayish() {
+                            return err(source.line, source.col, format!("iterating over a `{}`", self.locals[src].ty));
+                        }
+                        let src_elem = self.locals[src].ty.elem().unwrap().clone();
+                        let len = Expr { kind: ExprKind::Len(src), ty: Ty::I64, line: init.line };
+                        // body: { let var = src[k]; elem }
+                        self.scopes.push(HashMap::new());
+                        let k = self.fresh_local("k", Ty::I64, false);
+                        let x = self.declare(var, src_elem.clone(), false);
+                        let load = Expr { kind: ExprKind::Index(src, Box::new(Expr { kind: ExprKind::Local(k), ty: Ty::I64, line: init.line })), ty: src_elem, line: init.line };
+                        let ce = self.expr(elem)?;
+                        if !ce.ty.is_scalar() {
+                            return err(elem.line, elem.col, "comprehension elements must be scalar");
+                        }
+                        self.scopes.pop();
+                        let body = Block { stmts: vec![Stmt::Let(x, load)], tail: Some(Box::new(ce.clone())), ty: ce.ty.clone() };
+                        let size = match self.locals[src].ty.size() { Some(sz) => sz.clone(), None => Size::Const(-1) };
+                        let ty = Ty::Array(Box::new(ce.ty.clone()), size);
+                        self.check_declared(&declared, &ty, *line, *col)?;
+                        let id = self.declare(name, ty, *mutable);
+                        Ok(Stmt::LetBuild { id, len, var: k, body })
                     }
                     ast::ExprKind::ArrayRepeat(e, n) => {
                         let ce = self.expr(e)?;
@@ -244,6 +276,9 @@ impl<'a> Ctx<'a> {
                 }
             }
             ast::Stmt::Assign { target, op, value, line, col } => {
+                if self.in_closure > 0 {
+                    return err(*line, *col, "a closure in a chain cannot assign; it must be a pure function of its arguments");
+                }
                 let val = self.expr(value)?;
                 let (lv, tty) = match &target.kind {
                     ast::ExprKind::Var(n) => {
@@ -402,6 +437,18 @@ impl<'a> Ctx<'a> {
                 };
                 mk(ExprKind::Index(id, Box::new(ci)), elem)
             }
+            ast::ExprKind::Call(name, args) if name == "min" || name == "max" => {
+                if args.len() != 2 {
+                    return err(e.line, e.col, format!("`{name}` takes two arguments"));
+                }
+                let a = self.expr(&args[0])?;
+                let b = self.expr(&args[1])?;
+                if a.ty != b.ty || !a.ty.is_numeric() {
+                    return err(e.line, e.col, format!("`{name}` of `{}` and `{}`", a.ty, b.ty));
+                }
+                let ty = a.ty.clone();
+                mk(ExprKind::MinMax(name == "min", Box::new(a), Box::new(b)), ty)
+            }
             ast::ExprKind::Call(name, args) => {
                 if name == "println" {
                     if args.len() != 1 {
@@ -435,18 +482,20 @@ impl<'a> Ctx<'a> {
                 mk(ExprKind::Call(fid, cargs), ret)
             }
             ast::ExprKind::MethodCall(recv, name, args) => {
-                if name != "len" {
-                    return err(e.line, e.col, format!("unknown method `.{name}()`; only `.len()` exists in stage 0"));
+                if name == "len" {
+                    if !args.is_empty() {
+                        return err(e.line, e.col, "`.len()` takes no arguments");
+                    }
+                    let id = self.local_by_expr(recv, "the receiver of `.len()`")?;
+                    if !self.locals[id].ty.is_arrayish() {
+                        return err(e.line, e.col, format!("`.len()` on `{}`", self.locals[id].ty));
+                    }
+                    return mk(ExprKind::Len(id), Ty::I64);
                 }
-                if !args.is_empty() {
-                    return err(e.line, e.col, "`.len()` takes no arguments");
-                }
-                let id = self.local_by_expr(recv, "the receiver of `.len()`")?;
-                if !self.locals[id].ty.is_arrayish() {
-                    return err(e.line, e.col, format!("`.len()` on `{}`", self.locals[id].ty));
-                }
-                mk(ExprKind::Len(id), Ty::I64)
+                self.chain(e)
             }
+            ast::ExprKind::Lambda(..) => err(e.line, e.col, "a closure can only be the argument of a chain stage (`map`, `filter`, `fold`, ...)"),
+            ast::ExprKind::Comprehension { .. } => err(e.line, e.col, "a comprehension either initialises a `let` or is reduced: `[..].sum()`"),
             ast::ExprKind::Ref(inner, mutable) => {
                 let id = self.local_by_expr(inner, "the operand of `&`")?;
                 let l = &self.locals[id];
@@ -507,8 +556,226 @@ impl<'a> Ctx<'a> {
                 mk(ExprKind::Block(cb), ty)
             }
             ast::ExprKind::ArrayLit(_) | ast::ExprKind::ArrayRepeat(..) => {
-                err(e.line, e.col, "an array literal can only initialise a `let` in stage 0")
+                err(e.line, e.col, "an array literal can only initialise a `let` for now")
             }
         }
     }
+
+    fn next_fresh(&mut self) -> usize { self.fresh += 1; self.fresh }
+
+    /// A compiler-made local; the `#` keeps it out of the user's namespace.
+    fn fresh_local(&mut self, base: &str, ty: Ty, mutable: bool) -> LocalId {
+        let n = self.next_fresh();
+        self.declare(&format!("{base}#{n}"), ty, mutable)
+    }
+
+    fn local_expr(&self, id: LocalId, line: u32) -> Expr {
+        Expr { kind: ExprKind::Local(id), ty: self.locals[id].ty.clone(), line }
+    }
+
+    /// An iterator chain, reduced. `xs.iter().map(|x| ..).filter(|x| ..).sum()` and the
+    /// comprehension form `[e for x in xs if c].sum()` become one loop over the source with
+    /// the stages inlined into its body — fusion by construction, there is no other form.
+    fn chain(&mut self, e: &ast::Expr) -> Result<Expr> {
+        // flatten: receiver ← stage ← stage ← terminal
+        let mut stages: Vec<(&str, &Vec<ast::Expr>, u32, u32)> = Vec::new();
+        let mut cur = e;
+        while let ast::ExprKind::MethodCall(recv, name, args) = &cur.kind {
+            stages.push((name.as_str(), args, cur.line, cur.col));
+            cur = recv;
+        }
+        stages.reverse();
+        let (source_expr, mut pre_stages): (&ast::Expr, Vec<Stage>) = match &cur.kind {
+            ast::ExprKind::Comprehension { elem, var, source, cond } => {
+                let mut st = Vec::new();
+                if let Some(c) = cond { st.push(Stage::Filter(vec![var.clone()], c)); }
+                st.push(Stage::Map(vec![var.clone()], elem));
+                (source, st)
+            }
+            _ => (cur, vec![]),
+        };
+        let src = self.local_by_expr(source_expr, "the source of a chain")?;
+        if !self.locals[src].ty.is_arrayish() {
+            return err(source_expr.line, source_expr.col, format!("iterating over a `{}`", self.locals[src].ty));
+        }
+        let Some((term_name, term_args, tline, tcol)) = stages.pop() else {
+            return err(e.line, e.col, "a chain needs a terminal");
+        };
+        let mut all: Vec<Stage> = std::mem::take(&mut pre_stages);
+        let mut zip_src: Option<LocalId> = None;
+        for (name, args, line, col) in stages {
+            let lam = |k: usize| -> Result<(&Vec<String>, &ast::Expr)> {
+                match args.get(k).map(|a| &a.kind) {
+                    Some(ast::ExprKind::Lambda(ps, body)) => Ok((ps, body)),
+                    _ => err(line, col, format!("`.{name}()` takes a closure")),
+                }
+            };
+            match name {
+                "iter" => { if !args.is_empty() { return err(line, col, "`.iter()` takes no arguments"); } }
+                "map" => { let (ps, b) = lam(0)?; all.push(Stage::Map(ps.clone(), b)); }
+                "filter" => { let (ps, b) = lam(0)?; all.push(Stage::Filter(ps.clone(), b)); }
+                "enumerate" => all.push(Stage::Enumerate),
+                "zip" => {
+                    if zip_src.is_some() || !all.is_empty() {
+                        return err(line, col, "`.zip()` must come first, directly after the source");
+                    }
+                    let Some(other) = args.first() else { return err(line, col, "`.zip()` takes the other array") };
+                    let o = self.local_by_expr(other, "the argument of `.zip()`")?;
+                    if !self.locals[o].ty.is_arrayish() {
+                        return err(other.line, other.col, format!("zipping with a `{}`", self.locals[o].ty));
+                    }
+                    zip_src = Some(o);
+                }
+                other => return err(line, col, format!("unknown chain stage `.{other}()`; stages are iter, map, filter, zip, enumerate; terminals are sum, count, fold, max, min, any, all")),
+            }
+        }
+
+        // the loop
+        self.scopes.push(HashMap::new());
+        let line = e.line;
+        let elem_ty = self.locals[src].ty.elem().unwrap().clone();
+        let i = self.fresh_local("i", Ty::I64, false);
+        let len = match zip_src {
+            None => Expr { kind: ExprKind::Len(src), ty: Ty::I64, line },
+            Some(o) => Expr { kind: ExprKind::MinMax(true, Box::new(Expr { kind: ExprKind::Len(src), ty: Ty::I64, line }), Box::new(Expr { kind: ExprKind::Len(o), ty: Ty::I64, line })), ty: Ty::I64, line },
+        };
+        let idx = |this: &Self, l: LocalId| Expr { kind: ExprKind::Index(l, Box::new(this.local_expr(i, line))), ty: this.locals[l].ty.elem().unwrap().clone(), line };
+        // current values flowing through the stages, as locals
+        let mut body_stmts: Vec<Stmt> = Vec::new();
+        let x0 = self.fresh_local("x", elem_ty.clone(), false);
+        body_stmts.push(Stmt::Let(x0, idx(self, src)));
+        let mut vals: Vec<LocalId> = vec![x0];
+        if let Some(o) = zip_src {
+            let oty = self.locals[o].ty.elem().unwrap().clone();
+            let y0 = self.fresh_local("y", oty, false);
+            body_stmts.push(Stmt::Let(y0, idx(self, o)));
+            vals.push(y0);
+        }
+        // filters wrap everything after them; collect (stmts-so-far, condition) breakpoints
+        let mut guards: Vec<(Vec<Stmt>, Expr)> = Vec::new();
+        for st in &all {
+            match st {
+                Stage::Enumerate => {
+                    let k = self.fresh_local("k", Ty::I64, false);
+                    body_stmts.push(Stmt::Let(k, self.local_expr(i, line)));
+                    vals.insert(0, k);
+                }
+                Stage::Map(ps, body) => {
+                    let (binds, v) = self.apply_closure(ps, body, &vals, line)?;
+                    body_stmts.extend(binds);
+                    if v.ty == Ty::Unit || v.ty.is_arrayish() {
+                        return err(body.line, body.col, format!("a `map` closure must produce a scalar, found `{}`", v.ty));
+                    }
+                    let nv = self.fresh_local("v", v.ty.clone(), false);
+                    body_stmts.push(Stmt::Let(nv, v));
+                    vals = vec![nv];
+                }
+                Stage::Filter(ps, body) => {
+                    let (binds, c) = self.apply_closure(ps, body, &vals, line)?;
+                    body_stmts.extend(binds);
+                    if c.ty != Ty::Bool {
+                        return err(body.line, body.col, format!("a `filter` closure must produce `bool`, found `{}`", c.ty));
+                    }
+                    guards.push((std::mem::take(&mut body_stmts), c));
+                }
+            }
+        }
+        // the terminal
+        let cur_ty = if vals.len() == 1 { self.locals[vals[0]].ty.clone() } else { Ty::Unit };
+        let (acc, init, update): (LocalId, Expr, Vec<Stmt>) = match term_name {
+            "sum" => {
+                if vals.len() != 1 || !cur_ty.is_numeric() { return err(tline, tcol, format!("`.sum()` needs one numeric value per element, found `{cur_ty}`")); }
+                let acc = self.fresh_local("acc", cur_ty.clone(), true);
+                let zero = if cur_ty == Ty::F64 { ExprKind::Float(0.0) } else { ExprKind::Int(0) };
+                (acc, Expr { kind: zero, ty: cur_ty.clone(), line }, vec![Stmt::Assign(LValue::Var(acc), Some(BinOp::Add), self.local_expr(vals[0], line))])
+            }
+            "count" => {
+                let acc = self.fresh_local("acc", Ty::I64, true);
+                (acc, Expr { kind: ExprKind::Int(0), ty: Ty::I64, line }, vec![Stmt::Assign(LValue::Var(acc), Some(BinOp::Add), Expr { kind: ExprKind::Int(1), ty: Ty::I64, line })])
+            }
+            "max" | "min" => {
+                if vals.len() != 1 || !cur_ty.is_numeric() { return err(tline, tcol, format!("`.{term_name}()` needs one numeric value per element, found `{cur_ty}`")); }
+                let acc = self.fresh_local("acc", cur_ty.clone(), true);
+                let seen = self.fresh_local("seen", Ty::Bool, true);
+                let zero = if cur_ty == Ty::F64 { ExprKind::Float(0.0) } else { ExprKind::Int(0) };
+                let cmp = if term_name == "max" { BinOp::Gt } else { BinOp::Lt };
+                let better = Expr { kind: ExprKind::Binary(cmp, Box::new(self.local_expr(vals[0], line)), Box::new(self.local_expr(acc, line))), ty: Ty::Bool, line };
+                let notseen = Expr { kind: ExprKind::Unary(UnOp::Not, Box::new(self.local_expr(seen, line))), ty: Ty::Bool, line };
+                let cond = Expr { kind: ExprKind::Binary(BinOp::Or, Box::new(notseen), Box::new(better)), ty: Ty::Bool, line };
+                let then = Block { stmts: vec![
+                    Stmt::Assign(LValue::Var(acc), None, self.local_expr(vals[0], line)),
+                    Stmt::Assign(LValue::Var(seen), None, Expr { kind: ExprKind::Bool(true), ty: Ty::Bool, line }),
+                ], tail: None, ty: Ty::Unit };
+                let upd = Stmt::Expr(Expr { kind: ExprKind::If(Box::new(cond), then, None), ty: Ty::Unit, line });
+                // `seen` is declared here so it is initialised before the loop, alongside acc
+                self.pending_lets.push(Stmt::Let(seen, Expr { kind: ExprKind::Bool(false), ty: Ty::Bool, line }));
+                (acc, Expr { kind: zero, ty: cur_ty.clone(), line }, vec![upd])
+            }
+            "any" | "all" => {
+                if vals.len() != 1 || cur_ty != Ty::Bool { return err(tline, tcol, format!("`.{term_name}()` needs one `bool` per element; use `.map(|x| ..)` or a closure argument")); }
+                let acc = self.fresh_local("acc", Ty::Bool, true);
+                let (init, op) = if term_name == "any" { (false, BinOp::Or) } else { (true, BinOp::And) };
+                let upd = Stmt::Assign(LValue::Var(acc), None, Expr { kind: ExprKind::Binary(op, Box::new(self.local_expr(acc, line)), Box::new(self.local_expr(vals[0], line))), ty: Ty::Bool, line });
+                (acc, Expr { kind: ExprKind::Bool(init), ty: Ty::Bool, line }, vec![upd])
+            }
+            "fold" => {
+                let Some(init_e) = term_args.first() else { return err(tline, tcol, "`.fold(init, |acc, x| ..)`") };
+                let init = self.expr(init_e)?;
+                if !init.ty.is_scalar() { return err(init_e.line, init_e.col, "a fold accumulator must be scalar"); }
+                let acc = self.fresh_local("acc", init.ty.clone(), true);
+                let Some(ast::ExprKind::Lambda(ps, body)) = term_args.get(1).map(|a| &a.kind) else { return err(tline, tcol, "`.fold(init, |acc, x| ..)`") };
+                let mut args = vec![acc];
+                args.extend(vals.iter().copied());
+                let (binds, v) = self.apply_closure(ps, body, &args, line)?;
+                if v.ty != init.ty { return err(body.line, body.col, format!("the fold closure returns `{}` but the accumulator is `{}`", v.ty, init.ty)); }
+                let mut upd = binds;
+                upd.push(Stmt::Assign(LValue::Var(acc), None, v));
+                (acc, init, upd)
+            }
+            other => return err(tline, tcol, format!("unknown chain terminal `.{other}()`; terminals are sum, count, fold, max, min, any, all")),
+        };
+        if !term_args.is_empty() && term_name != "fold" {
+            return err(tline, tcol, format!("`.{term_name}()` takes no arguments"));
+        }
+        // assemble: filters nest the remainder in `if`
+        let mut inner: Vec<Stmt> = std::mem::take(&mut body_stmts);
+        inner.extend(update);
+        for (before, cond) in guards.into_iter().rev() {
+            let then = Block { stmts: inner, tail: None, ty: Ty::Unit };
+            inner = before;
+            inner.push(Stmt::Expr(Expr { kind: ExprKind::If(Box::new(cond), then, None), ty: Ty::Unit, line }));
+        }
+        self.scopes.pop();
+        let acc_ty = self.locals[acc].ty.clone();
+        let mut stmts = vec![Stmt::Let(acc, init)];
+        stmts.extend(std::mem::take(&mut self.pending_lets));
+        stmts.push(Stmt::For { var: i, start: Expr { kind: ExprKind::Int(0), ty: Ty::I64, line }, end: len, body: Block { stmts: inner, tail: None, ty: Ty::Unit } });
+        Ok(Expr { kind: ExprKind::Block(Block { stmts, tail: Some(Box::new(self.local_expr(acc, line))), ty: acc_ty.clone() }), ty: acc_ty, line })
+    }
+
+    /// Bind a closure's parameters to the current values and check its body in that scope.
+    /// Returns the `let`s that bind the parameters and the body expression.
+    fn apply_closure(&mut self, params: &[String], body: &ast::Expr, vals: &[LocalId], line: u32) -> Result<(Vec<Stmt>, Expr)> {
+        if params.len() != vals.len() {
+            return err(body.line, body.col, format!("closure takes {} argument(s) but {} value(s) flow into it", params.len(), vals.len()));
+        }
+        self.scopes.push(HashMap::new());
+        let mut binds = Vec::new();
+        for (p, &v) in params.iter().zip(vals) {
+            let ty = self.locals[v].ty.clone();
+            let id = self.declare(p, ty, false);
+            binds.push(Stmt::Let(id, self.local_expr(v, line)));
+        }
+        self.in_closure += 1;
+        let r = self.expr(body);
+        self.in_closure -= 1;
+        self.scopes.pop();
+        Ok((binds, r?))
+    }
+}
+
+enum Stage<'a> {
+    Map(Vec<String>, &'a ast::Expr),
+    Filter(Vec<String>, &'a ast::Expr),
+    Enumerate,
 }

@@ -1,4 +1,4 @@
-//! neant stage 0.
+//! neant, the bootstrap compiler.
 //!
 //!   neant build f.nt [-o out] [--unchecked]   compile to a binary via the C compiler
 //!   neant run   f.nt [--unchecked] [-- args]  build to a temp file and run it

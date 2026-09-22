@@ -14,7 +14,7 @@ pub enum Tok {
     Eq, EqEq, Ne, Lt, Le, Gt, Ge,
     Plus, Minus, Star, Slash, Percent,
     PlusEq, MinusEq, StarEq, SlashEq,
-    Amp, AmpAmp, PipePipe, Bang,
+    Amp, AmpAmp, Pipe, PipePipe, Bang,
     Eof,
 }
 
@@ -120,7 +120,7 @@ pub fn lex(src: &str) -> Result<Vec<Token>> {
                     '{' => Tok::LBrace, '}' => Tok::RBrace, ',' => Tok::Comma, ';' => Tok::Semi,
                     ':' => Tok::Colon, '.' => Tok::Dot, '=' => Tok::Eq, '<' => Tok::Lt, '>' => Tok::Gt,
                     '+' => Tok::Plus, '-' => Tok::Minus, '*' => Tok::Star, '/' => Tok::Slash,
-                    '%' => Tok::Percent, '&' => Tok::Amp, '!' => Tok::Bang,
+                    '%' => Tok::Percent, '&' => Tok::Amp, '!' => Tok::Bang, '|' => Tok::Pipe,
                     _ => return err(l, cl, format!("unexpected character `{c}`")),
                 };
                 (t, 1)

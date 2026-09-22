@@ -38,7 +38,7 @@ impl Ty {
     pub fn size(&self) -> Option<&Size> {
         match self { Ty::Array(_, s) | Ty::Slice(_, _, s) => Some(s), _ => None }
     }
-    /// Same shape, ignoring sizes: sizes are tracked, not enforced, in stage 0.
+    /// Same shape, ignoring sizes: sizes are tracked, not enforced, for now.
     pub fn same_shape(&self, other: &Ty) -> bool {
         match (self, other) {
             (Ty::Array(a, _), Ty::Array(b, _)) => a.same_shape(b),
@@ -107,6 +107,9 @@ pub enum Stmt {
     LetRepeat(LocalId, Expr, Expr),
     /// `let xs = [a, b, c]`
     LetArray(LocalId, Vec<Expr>),
+    /// `let ys = [e for x in xs]`: an array of `len` elements, element `k` computed by `body`
+    /// with `var` bound to `k`. One pass, no intermediate.
+    LetBuild { id: LocalId, len: Expr, var: LocalId, body: Block },
     Assign(LValue, Option<crate::ast::BinOp>, Expr),
     For { var: LocalId, start: Expr, end: Expr, body: Block },
     Expr(Expr),
@@ -141,6 +144,8 @@ pub enum ExprKind {
     /// A view of a local array or a reborrow of a local slice.
     Ref(LocalId, bool),
     Cast(Box<Expr>, Ty),
+    /// `min(a, b)` / `max(a, b)`
+    MinMax(bool, Box<Expr>, Box<Expr>),
     If(Box<Expr>, Block, Option<Block>),
     Block(Block),
 }

@@ -77,6 +77,10 @@ pub enum ExprKind {
     ArrayLit(Vec<Expr>),
     /// `[e; n]`
     ArrayRepeat(Box<Expr>, Box<Expr>),
+    /// `|a, b| body` — only ever an argument of a chain stage
+    Lambda(Vec<String>, Box<Expr>),
+    /// `[elem for var in source if cond]`
+    Comprehension { elem: Box<Expr>, var: String, source: Box<Expr>, cond: Option<Box<Expr>> },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

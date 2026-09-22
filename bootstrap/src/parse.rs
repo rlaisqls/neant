@@ -307,6 +307,15 @@ impl Parser {
                     return err(l, c, "empty array literal has no element type");
                 }
                 let first = self.expr()?;
+                if self.at(&Tok::For) {
+                    self.next();
+                    let (var, _, _) = self.ident("comprehension variable")?;
+                    self.expect(Tok::In, "`in`")?;
+                    let source = self.expr()?;
+                    let cond = if self.eat(&Tok::If) { Some(Box::new(self.expr()?)) } else { None };
+                    self.expect(Tok::RBracket, "`]`")?;
+                    return mk(ExprKind::Comprehension { elem: Box::new(first), var, source: Box::new(source), cond });
+                }
                 if self.eat(&Tok::Semi) {
                     let n = self.expr()?;
                     self.expect(Tok::RBracket, "`]`")?;
@@ -340,6 +349,18 @@ impl Parser {
                 let b = self.block()?;
                 mk(ExprKind::Block(b))
             }
+            Tok::Pipe => {
+                self.next();
+                let mut params = Vec::new();
+                while !self.at(&Tok::Pipe) {
+                    let (p, _, _) = self.ident("closure parameter")?;
+                    params.push(p);
+                    if !self.eat(&Tok::Comma) { break; }
+                }
+                self.expect(Tok::Pipe, "`|`")?;
+                let body = self.expr()?;
+                mk(ExprKind::Lambda(params, Box::new(body)))
+            }
             t => err(l, c, format!("expected an expression, found {}", describe(&t))),
         }
     }
@@ -362,7 +383,7 @@ fn describe(t: &Tok) -> String {
                 Tok::Le => "<=", Tok::Gt => ">", Tok::Ge => ">=", Tok::Plus => "+", Tok::Minus => "-",
                 Tok::Star => "*", Tok::Slash => "/", Tok::Percent => "%", Tok::PlusEq => "+=",
                 Tok::MinusEq => "-=", Tok::StarEq => "*=", Tok::SlashEq => "/=", Tok::Amp => "&",
-                Tok::AmpAmp => "&&", Tok::PipePipe => "||", Tok::Bang => "!",
+                Tok::AmpAmp => "&&", Tok::Pipe => "|", Tok::PipePipe => "||", Tok::Bang => "!",
                 _ => "?",
             };
             format!("`{s}`")

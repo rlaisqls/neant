@@ -1,5 +1,5 @@
 /target
-/stage0/target
+/bootstrap/target
 *.o
 /tests/golden/*.bin
 /tests/golden/*.c

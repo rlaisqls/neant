@@ -57,7 +57,7 @@ impl<'a> Analyzer<'a> {
         if self.done[fid].is_none() {
             let f = &self.m.funcs[fid];
             if self.active[fid] {
-                // a cycle: recursion is a recurrence, which stage 0 does not solve yet (M3)
+                // a cycle: recursion is a recurrence, which is not solved yet (M3)
                 self.done[fid] = Some(FuncCost {
                     name: f.name.clone(),
                     names: param_names(f),
@@ -245,6 +245,9 @@ impl<'a, 'b> Fa<'a, 'b> {
             }
             ExprKind::Len(l) => self.local_size.get(l).cloned(),
             ExprKind::Cast(inner, Ty::I64) => self.size_of(inner, bound),
+            // min is bounded above by either argument, max below by either: the first that is a size
+            ExprKind::MinMax(true, a, b) if bound == Bound::Upper => self.size_of(a, bound).or_else(|| self.size_of(b, bound)),
+            ExprKind::MinMax(false, a, b) if bound == Bound::Lower => self.size_of(a, bound).or_else(|| self.size_of(b, bound)),
             ExprKind::Binary(BinOp::Add, a, b) => Some(self.size_of(a, bound)?.add(&self.size_of(b, bound)?)),
             ExprKind::Binary(BinOp::Sub, a, b) => Some(self.size_of(a, bound)?.sub(&self.size_of(b, flip(bound))?)),
             ExprKind::Binary(BinOp::Mul, a, b) => {
@@ -275,6 +278,8 @@ impl<'a, 'b> Fa<'a, 'b> {
             }
             ExprKind::Len(l) => self.local_size.get(l).map(|p| Affine::constant(p.clone())),
             ExprKind::Cast(inner, Ty::I64) => self.affine(inner),
+            // `min(ii*T + T, n)` as a loop end: the tile bound, the rectangular hull of the rest
+            ExprKind::MinMax(true, a, _) => self.affine(a),
             ExprKind::Binary(BinOp::Div, a, b) => {
                 let pb = self.affine(b)?;
                 if !pb.is_const() { return None; }
@@ -413,6 +418,21 @@ impl<'a, 'b> Fa<'a, 'b> {
                 }
                 Ok(())
             }
+            Stmt::LetBuild { id, len, var, body } => {
+                self.expr(len)?;
+                let Some(size) = self.size_of(len, Bound::Upper) else {
+                    return Err(Fail::Unknown(format!("the length of `{}` is not a size expression", self.f.locals[*id].name), len.line));
+                };
+                let es = self.elem_bytes(*id);
+                self.stream(&size, es);
+                self.local_size.insert(*id, size.clone());
+                self.loop_recs.push(LoopRec { var: Some(*var), trip: size.clone() });
+                self.loops.push(Loop { id: self.loop_recs.len() - 1, var: Some(*var), trip: size.clone(), start: Poly::zero(), end: size, offset: Some(Affine::constant(Poly::zero())) });
+                self.add_work_n(2);
+                let r = self.block(body);
+                self.loops.pop();
+                r
+            }
             Stmt::LetRepeat(id, e, n) => {
                 self.expr(e)?;
                 self.expr(n)?;
@@ -479,7 +499,7 @@ impl<'a, 'b> Fa<'a, 'b> {
         match &e.kind {
             ExprKind::Int(_) | ExprKind::Float(_) | ExprKind::Bool(_) | ExprKind::Local(_) | ExprKind::Ref(..) => Ok(()),
             ExprKind::Len(_) => { self.add_work_n(1); Ok(()) }
-            ExprKind::Binary(_, a, b) => { self.expr(a)?; self.expr(b)?; self.add_work_n(1); Ok(()) }
+            ExprKind::Binary(_, a, b) | ExprKind::MinMax(_, a, b) => { self.expr(a)?; self.expr(b)?; self.add_work_n(1); Ok(()) }
             ExprKind::Unary(_, a) | ExprKind::Cast(a, _) => { self.expr(a)?; self.add_work_n(1); Ok(()) }
             ExprKind::Println(a) => { self.expr(a)?; self.add_work_n(1); Ok(()) }
             ExprKind::Index(arr, idx) => {
