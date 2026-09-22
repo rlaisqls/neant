@@ -11,6 +11,6 @@ fn main() {
     for i in 0..y.len() {
         println(y[i]);
     }
-    saxpy(-1.0, &y, &mut y);
+    saxpy(-1.0, &x, &mut y);
     println(y[3]);
 }

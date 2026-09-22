@@ -94,11 +94,14 @@ struct Ctx<'a> {
     fresh: usize,
     /// extra `let`s a terminal needs before its loop (`seen` for max/min)
     pending_lets: Vec<Stmt>,
+    /// the array a view local looks into. A parameter's root is itself: callers keep parameters
+    /// disjoint, so two parameters never share a root inside a function.
+    root: HashMap<LocalId, LocalId>,
 }
 
 fn check_func(f: &ast::Func, sigs: &HashMap<String, (FuncId, Vec<Ty>, Ty)>) -> Result<Func> {
     let (_, ptys, ret) = &sigs[&f.name];
-    let mut cx = Ctx { sigs, locals: vec![], scopes: vec![HashMap::new()], sizes: vec![], ret: ret.clone(), in_loop: 0, in_closure: 0, fresh: 0, pending_lets: vec![] };
+    let mut cx = Ctx { sigs, locals: vec![], scopes: vec![HashMap::new()], sizes: vec![], ret: ret.clone(), in_loop: 0, in_closure: 0, fresh: 0, pending_lets: vec![], root: HashMap::new() };
     let mut params = Vec::new();
     for (p, ty) in f.params.iter().zip(ptys) {
         // a slice parameter's size is its own variable, named after the parameter
@@ -279,6 +282,9 @@ impl<'a> Ctx<'a> {
                         }
                         self.check_declared(&declared, &ce.ty, *line, *col)?;
                         let id = self.declare(name, ce.ty.clone(), *mutable);
+                        if let ExprKind::Ref(src, _) | ExprKind::Local(src) = &ce.kind {
+                            if ce.ty.is_arrayish() { let r = self.root_of(*src); self.root.insert(id, r); }
+                        }
                         Ok(Stmt::Let(id, ce))
                     }
                 }
@@ -503,6 +509,27 @@ impl<'a> Ctx<'a> {
                     return err(e.line, e.col, format!("`{name}` takes {} argument(s), {} given", ptys.len(), args.len()));
                 }
                 let mut cargs = Vec::new();
+                // views into one array may not be passed twice if either is mutable: the callee's
+                // parameters are emitted as `restrict`, and the cost model counts them as disjoint
+                let mut roots: Vec<(LocalId, bool, usize)> = Vec::new();
+                for (k, a) in args.iter().enumerate() {
+                    // the view this argument is, if it is one: `&x`, `&mut x`, or a view local `v`
+                    let (target, explicit_mut) = match &a.kind {
+                        ast::ExprKind::Ref(inner, m) => (&**inner, Some(*m)),
+                        ast::ExprKind::Var(_) => (a, None),
+                        _ => continue,
+                    };
+                    let Some(id) = (match &target.kind { ast::ExprKind::Var(n) => self.lookup(n), _ => None }) else { continue };
+                    if !self.locals[id].ty.is_arrayish() { continue; }
+                    let mutable = explicit_mut.unwrap_or(matches!(self.locals[id].ty, Ty::Slice(_, true, _)));
+                    let r = self.root_of(id);
+                    if let Some((_, _, k2)) = roots.iter().find(|(r2, m2, _)| *r2 == r && (mutable || *m2)) {
+                        return err(a.line, a.col, format!(
+                            "arguments {} and {} are both views of `{}` and one is `&mut`; a function's parameters must not overlap",
+                            k2 + 1, k + 1, self.locals[r].name));
+                    }
+                    roots.push((r, mutable, k));
+                }
                 for (a, pty) in args.iter().zip(&ptys) {
                     let ca = self.expr(a)?;
                     let ok = match (&ca.ty, pty) {
@@ -598,6 +625,12 @@ impl<'a> Ctx<'a> {
     }
 
     fn next_fresh(&mut self) -> usize { self.fresh += 1; self.fresh }
+
+    fn root_of(&self, id: LocalId) -> LocalId {
+        let mut r = id;
+        while let Some(&next) = self.root.get(&r) { if next == r { break; } r = next; }
+        r
+    }
 
     /// A compiler-made local; the `#` keeps it out of the user's namespace.
     fn fresh_local(&mut self, base: &str, ty: Ty, mutable: bool) -> LocalId {

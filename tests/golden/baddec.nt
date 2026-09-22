@@ -1,0 +1,12 @@
+// terminates (s is never negative), but the compiler cannot show the measure decreases
+fn f(n: i64) -> i64 {
+    let mut i = n;
+    let mut s = 0;
+    while i > 0 decreasing i {
+        s += i;
+        if s < 0 { i += 1; }
+        i -= 1;
+    }
+    s
+}
+fn main() { println(f(5)); }

@@ -222,8 +222,11 @@ struct Fa<'a, 'b, 'c> {
     local_size: HashMap<LocalId, Poly>,
     /// value of every immutable i64 local that is an affine expression
     local_affine: HashMap<LocalId, Affine>,
-    /// the value a mutable i64 local was last assigned, as a size, for `while` trip counts
-    initial: HashMap<LocalId, Poly>,
+    /// every value a mutable i64 local may hold here, as sizes, by the definitions that reach
+    /// this point: one after a straight-line assignment, several after an `if` that assigns in
+    /// both branches, none (`None`) after a loop that assigns it. Structured control flow makes
+    /// this a walk rather than a fixpoint.
+    initial: HashMap<LocalId, Option<Vec<Poly>>>,
     /// while set, `size_of` reads a mutable local as that entry value: for a `decreasing` measure
     at_entry: bool,
     loops: Vec<Loop>,
@@ -437,7 +440,7 @@ impl<'a, 'b, 'c> Fa<'a, 'b, 'c> {
                 if let Some(lp) = self.loops.iter().find(|lp| lp.var == Some(*l)) {
                     return Some(if bound == Dir::Upper { lp.end.clone() } else { lp.start.clone() });
                 }
-                if self.at_entry && self.f.locals[*l].mutable { return self.initial.get(l).cloned(); }
+                if self.at_entry && self.f.locals[*l].mutable { return self.entry_value(*l); }
                 let a = self.local_affine.get(l)?;
                 if !a.is_const() { return None; }
                 Some(a.konst.clone())
@@ -641,7 +644,8 @@ impl<'a, 'b, 'c> Fa<'a, 'b, 'c> {
                 } else if l.ty == Ty::I64 && !l.mutable {
                     if let Some(a) = self.affine(e) { self.local_affine.insert(*id, a); }
                 } else if l.ty == Ty::I64 {
-                    match self.size_of(e, Dir::Upper) { Some(p) => { self.initial.insert(*id, p); } None => { self.initial.remove(id); } }
+                    let v = self.size_of(e, Dir::Upper).map(|p| vec![p]);
+                    self.initial.insert(*id, v);
                 }
                 Ok(())
             }
@@ -684,11 +688,13 @@ impl<'a, 'b, 'c> Fa<'a, 'b, 'c> {
             Stmt::Assign(lv, op, e) => {
                 self.recognise(s);
                 self.expr(e)?;
-                if let (LValue::Var(v), None) = (lv, op) {
+                if let LValue::Var(v) = lv {
                     if self.f.locals[*v].ty == Ty::I64 {
-                        match self.size_of(e, Dir::Upper) { Some(p) if self.loops.is_empty() => { self.initial.insert(*v, p); } _ => { self.initial.remove(v); } }
+                        // inside a loop the value at the loop's next iteration is not this one
+                        let val = if op.is_none() && self.loops.is_empty() { self.size_of(e, Dir::Upper).map(|p| vec![p]) } else { None };
+                        self.initial.insert(*v, val);
                     }
-                } else if let LValue::Var(v) = lv { self.initial.remove(v); }
+                }
                 match lv {
                     // a register: only the operation of `op=` costs
                     LValue::Var(_) => self.add_work_n(if op.is_some() { 1 } else { 0 }),
@@ -742,9 +748,21 @@ impl<'a, 'b, 'c> Fa<'a, 'b, 'c> {
                         let Some(v) = v else {
                             return Err(Fail::Unknown("the `decreasing` measure is not a size expression — it reads memory or a value the compiler cannot follow — so this loop has no static bound; `neant measure` can fit one".into(), m.line));
                         };
+                        // the promise is checked: along every path through the body that comes
+                        // back to the condition, the measure must go down by at least one
+                        match self.min_decrease(m, body) {
+                            Some(d) if d >= Rat::one() => {}
+                            Some(d) => return Err(Fail::Unknown(format!(
+                                "the `decreasing` measure is not shown to decrease: there is a path through the body along which it changes by {}",
+                                if d.is_zero() { "0".to_string() } else { format!("{}{}", if d.n < 0 { "+" } else { "−" }, Rat::new(d.n.abs(), d.d).to_f64()) }), m.line)),
+                            None => return Err(Fail::Unknown("the `decreasing` measure is not shown to decrease: the body changes one of its variables in a way the compiler cannot follow".into(), m.line)),
+                        }
                         Some((v, None))
                     }
-                    None => self.induction_trip(cond, body),
+                    None => match self.induction_trip(cond, body) {
+                        Ok(t) => Some(t),
+                        Err(why) => return Err(Fail::Unknown(why, *line)),
+                    },
                 };
                 let Some((trip, ind)) = found else {
                     return Err(Fail::Unknown("`while` has no measure the compiler can find; write `while cond decreasing <expr>` with an `i64` that goes down by at least one every iteration".into(), *line));
@@ -766,30 +784,126 @@ impl<'a, 'b, 'c> Fa<'a, 'b, 'c> {
         }
     }
 
+    /// The one value a mutable local holds on entry to a loop, when exactly one definition reaches
+    /// it. Several definitions need `max` in the cost algebra to give a bound; until then they
+    /// are "not a size".
+    fn entry_value(&self, l: LocalId) -> Option<Poly> {
+        match self.initial.get(&l) {
+            Some(Some(vs)) if vs.len() == 1 => Some(vs[0].clone()),
+            _ => None,
+        }
+    }
+
+    /// The least amount the measure `m` decreases along any path through `body` that reaches the
+    /// end of the body (a path that leaves by `break` or `return` need not decrease it). `m` is
+    /// read as an affine form in the locals; an assignment `x += c` to a local with coefficient
+    /// `k` in `m` changes `m` by `k·c`. A nested loop that only ever decreases `m` contributes
+    /// nothing (it may run zero times); one that can increase it, or any update the affine
+    /// reading cannot follow, is `None`.
+    fn min_decrease(&self, m: &Expr, body: &Block) -> Option<Rat> {
+        // coefficients of the locals in m
+        let mut coef: HashMap<LocalId, Rat> = HashMap::new();
+        fn collect(e: &Expr, sign: Rat, coef: &mut HashMap<LocalId, Rat>) -> bool {
+            match &e.kind {
+                ExprKind::Local(l) => { let c = coef.entry(*l).or_insert(Rat::zero()); *c = c.add(sign); true }
+                ExprKind::Int(_) | ExprKind::Len(_) => true,
+                ExprKind::Binary(BinOp::Add, a, b) => collect(a, sign, coef) && collect(b, sign, coef),
+                ExprKind::Binary(BinOp::Sub, a, b) => collect(a, sign, coef) && collect(b, sign.neg(), coef),
+                ExprKind::Binary(BinOp::Mul, a, b) => {
+                    match (&a.kind, &b.kind) {
+                        (ExprKind::Int(k), _) => collect(b, sign.mul(Rat::int(*k as i128)), coef),
+                        (_, ExprKind::Int(k)) => collect(a, sign.mul(Rat::int(*k as i128)), coef),
+                        _ => false,
+                    }
+                }
+                ExprKind::Cast(a, Ty::I64) => collect(a, sign, coef),
+                _ => false,
+            }
+        }
+        if !collect(m, Rat::one(), &mut coef) { return None; }
+        let coef = &coef;
+        // Some(Some(d)): the path falls through decreasing m by at least d; Some(None): every
+        // path leaves the loop; None: cannot follow
+        fn block(b: &Block, coef: &HashMap<LocalId, Rat>, f: &Func) -> Option<Option<Rat>> {
+            let mut acc = Rat::zero();
+            // an `if` in tail position is a statement to this analysis
+            let tail_stmt = b.tail.as_ref().map(|t| Stmt::Expr((**t).clone()));
+            for s in b.stmts.iter().chain(tail_stmt.iter()) {
+                match s {
+                    Stmt::Break | Stmt::Return(_) => return Some(None),
+                    Stmt::Assign(LValue::Var(v), op, e) if coef.get(v).is_some_and(|k| !k.is_zero()) => {
+                        let k = coef[v];
+                        // the change to v: op= c, or v = v ± c
+                        let delta: Option<i128> = match (op, &e.kind) {
+                            (Some(BinOp::Add), ExprKind::Int(c)) => Some(*c as i128),
+                            (Some(BinOp::Sub), ExprKind::Int(c)) => Some(-(*c as i128)),
+                            (None, ExprKind::Binary(BinOp::Add, a, c)) if matches!(a.kind, ExprKind::Local(l) if l == *v) => if let ExprKind::Int(c) = c.kind { Some(c as i128) } else { None },
+                            (None, ExprKind::Binary(BinOp::Sub, a, c)) if matches!(a.kind, ExprKind::Local(l) if l == *v) => if let ExprKind::Int(c) = c.kind { Some(-(c as i128)) } else { None },
+                            _ => None,
+                        };
+                        let delta = delta?;
+                        // m changes by k·delta, so it decreases by −k·delta
+                        acc = acc.add(k.mul(Rat::int(delta)).neg());
+                    }
+                    Stmt::Assign(LValue::Var(_), _, _) | Stmt::Assign(LValue::Index(..), _, _) | Stmt::Let(..) | Stmt::LetArray(..) | Stmt::LetRepeat(..) | Stmt::LetBuild { .. } => {}
+                    Stmt::Expr(Expr { kind: ExprKind::If(_, t, e), .. }) => {
+                        let bt = block(t, coef, f)?;
+                        let be = match e { Some(e) => block(e, coef, f)?, None => Some(Rat::zero()) };
+                        match (bt, be) {
+                            (None, None) => return Some(None),
+                            (Some(a), None) | (None, Some(a)) => acc = acc.add(a),
+                            (Some(a), Some(b)) => acc = acc.add(if a < b { a } else { b }),
+                        }
+                    }
+                    Stmt::Expr(_) => {}
+                    Stmt::For { body, .. } | Stmt::While { body, .. } => {
+                        // a nested loop may run zero times: it helps only if it never hurts
+                        match block(body, coef, f) {
+                            Some(Some(d)) if d >= Rat::zero() => {}
+                            Some(None) => {}
+                            _ => return None,
+                        }
+                    }
+                }
+            }
+            Some(Some(acc))
+        }
+        match block(body, coef, self.f)? {
+            Some(d) => Some(d),
+            None => Some(Rat::int(1_000_000)), // every path leaves: the loop runs once
+        }
+    }
+
     /// `while i < e { … i += c … }` runs at most `(e − i₀)/c` times when `i` is a mutable local
     /// stepped by the constant `c` exactly once in the body and nowhere else, `e` is a size
     /// expression, and `i₀` — the last assignment to `i` before the loop — is one too.
     /// `i > e` with `i -= c` is the mirror. Anything else is not an induction variable.
-    fn induction_trip(&self, cond: &Expr, body: &Block) -> Option<(Poly, Option<(LocalId, Poly)>)> {
-        let ExprKind::Binary(op, l, r) = &cond.kind else { return None };
+    fn induction_trip(&self, cond: &Expr, body: &Block) -> Result<(Poly, Option<(LocalId, Poly)>), String> {
+        let ask = "`while` has no measure the compiler can find; write `while cond decreasing <expr>` with an `i64` that goes down by at least one every iteration".to_string();
+        let ExprKind::Binary(op, l, r) = &cond.kind else { return Err(ask) };
         // normalise to (var, bound, ascending)
         let (var, bound, asc) = match (&l.kind, &r.kind, op) {
             (ExprKind::Local(v), _, BinOp::Lt | BinOp::Le | BinOp::Ne) => (*v, &**r, true),
             (_, ExprKind::Local(v), BinOp::Gt | BinOp::Ge) => (*v, &**l, true),
             (ExprKind::Local(v), _, BinOp::Gt | BinOp::Ge) => (*v, &**r, false),
             (_, ExprKind::Local(v), BinOp::Lt | BinOp::Le) => (*v, &**l, false),
-            _ => return None,
+            _ => return Err(ask),
         };
-        if !self.f.locals[var].mutable || self.f.locals[var].ty != Ty::I64 { return None; }
-        let step = single_step(body, var)?;
-        if (asc && step <= 0) || (!asc && step >= 0) { return None; }
-        if assigns(body, |l| l != var && bound_mentions(bound, l)) { return None; }
-        let e = self.size_of(bound, if asc { Dir::Upper } else { Dir::Lower })?;
-        let i0 = self.initial.get(&var)?.clone();
+        let name = &self.f.locals[var].name;
+        if !self.f.locals[var].mutable || self.f.locals[var].ty != Ty::I64 { return Err(ask); }
+        let Some(step) = single_step(body, var) else { return Err(format!("`{name}` is compared in the `while` condition but is not stepped by a constant exactly once in the body; {ask}")) };
+        if (asc && step <= 0) || (!asc && step >= 0) { return Err(format!("`{name}` steps away from its bound; {ask}")); }
+        if assigns(body, |l| l != var && bound_mentions(bound, l)) { return Err(format!("the bound of `{name}` is assigned inside the body; {ask}")); }
+        let Some(e) = self.size_of(bound, if asc { Dir::Upper } else { Dir::Lower }) else { return Err(format!("the bound of `{name}` is not a size expression; {ask}")) };
+        let i0 = match self.initial.get(&var) {
+            Some(Some(vs)) if vs.len() == 1 => vs[0].clone(),
+            Some(Some(vs)) => return Err(format!("`{name}` may hold any of {} values on entry, one per path that defines it; a single value is needed until `max` is in the cost algebra", vs.len())),
+            _ => return Err(format!("`{name}` is assigned inside a loop before this one, so its entry value is not known")),
+        };
         let span = if asc { e.sub(&i0) } else { i0.sub(&e) };
         // the variable steps by |step| per iteration: indices in it move by step·elem bytes,
         // which the stride rule sees through the loop variable's coefficient
-        Some((span.scale(Rat::new(1, step.abs() as i128)), Some((var, i0))))
+        Ok((span.scale(Rat::new(1, step.abs() as i128)), Some((var, i0))))
     }
 
     fn expr(&mut self, e: &Expr) -> Result<(), Fail> {
@@ -813,9 +927,19 @@ impl<'a, 'b, 'c> Fa<'a, 'b, 'c> {
                 // for recursive call sites, which are counted along the heavier path only, or a
                 // binary search would read as two calls per level and come out linear
                 let before = self.rec_calls.len();
+                let entry_init = self.initial.clone();
                 self.block(t)?;
                 let then_calls: Vec<_> = self.rec_calls.drain(before..).collect();
+                let then_init = std::mem::replace(&mut self.initial, entry_init);
                 if let Some(b) = els { self.block(b)?; }
+                // a local defined differently on the two sides may hold either value after
+                for (l, tv) in then_init {
+                    let merged = match (tv, self.initial.get(&l).cloned().flatten()) {
+                        (Some(mut a), Some(b)) => { for p in b { if !a.contains(&p) { a.push(p); } } Some(a) }
+                        _ => None,
+                    };
+                    self.initial.insert(l, merged);
+                }
                 let else_n = self.rec_calls.len() - before;
                 if then_calls.len() > else_n {
                     self.rec_calls.truncate(before);
@@ -932,7 +1056,8 @@ fn single_step(body: &Block, var: LocalId) -> Option<i64> {
     let mut found: Option<i64> = None;
     let mut count = 0;
     fn walk(b: &Block, var: LocalId, found: &mut Option<i64>, count: &mut usize, nested: bool) {
-        for s in &b.stmts {
+        let tail_stmt = b.tail.as_ref().map(|t| Stmt::Expr((**t).clone()));
+        for s in b.stmts.iter().chain(tail_stmt.iter()) {
             match s {
                 Stmt::Assign(LValue::Var(v), op, e) if *v == var => {
                     *count += if nested { 2 } else { 1 };
@@ -960,7 +1085,8 @@ fn single_step(body: &Block, var: LocalId) -> Option<i64> {
 
 fn assigns(body: &Block, mut pred: impl FnMut(LocalId) -> bool) -> bool {
     fn walk(b: &Block, pred: &mut dyn FnMut(LocalId) -> bool) -> bool {
-        b.stmts.iter().any(|s| match s {
+        let tail_stmt = b.tail.as_ref().map(|t| Stmt::Expr((**t).clone()));
+        b.stmts.iter().chain(tail_stmt.iter()).any(|s| match s {
             Stmt::Assign(LValue::Var(v), _, _) => pred(*v),
             Stmt::For { body, .. } | Stmt::While { body, .. } => walk(body, pred),
             Stmt::Expr(Expr { kind: ExprKind::If(_, t, e), .. }) => walk(t, pred) || e.as_ref().is_some_and(|e| walk(e, pred)),

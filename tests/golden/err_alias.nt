@@ -1,0 +1,8 @@
+fn shift(src: &[i64], dst: &mut [i64]) {
+    for i in 1..src.len() { dst[i] = src[i - 1]; }
+}
+fn main() {
+    let mut xs = [1, 2, 3];
+    let v = &xs;
+    shift(v, &mut xs);
+}
