@@ -133,47 +133,77 @@ fn self_hosted_emit_runs_the_same() {
     }
 }
 
-/// The fixpoint's other half. `self_host_check.rs` shows the self-hosted front end *reads* all
-/// four stages; this one shows the self-hosted emitter **writes** them: the same ~2000 lines go
-/// through the whole self-hosted chain, out as C, and `cc` compiles that C to an object file
-/// without a diagnostic.
+
+/// **The fixpoint.** Everything above compares the self-hosted compiler against the Rust one.
+/// This compares it against *itself*, which is the only test that says the thing is a compiler
+/// rather than a program that agrees with one.
 ///
-/// It stops at `-c`, on purpose. Linking needs `main`, and `main` lives in a driver that opens
-/// with `extern fn read_file(…)` — `extern` is still outside the parser's slice, so the compiler
-/// cannot yet read the few lines that make it a program. That is the whole remaining gap, and
-/// this test is where it will be closed.
+/// 1. `stage1` is the four stages plus the driver that makes them a program — neant source, run
+///    by the Rust compiler's interpreter.
+/// 2. `stage1` reads its own source and writes `stage2.c`; `cc` compiles that with `rt.c` into a
+///    native binary.
+/// 3. `stage2` reads the same source and writes C again.
+///
+/// **That C must be byte-identical to `stage2.c`.** A compiler that has reached its fixpoint emits
+/// itself; one that has not — because it is compiled differently from how it compiles, or because
+/// some construct survives one pass and not the next — does not. Nothing about the Rust compiler
+/// is in the comparison: it built stage2 and then stepped out.
+///
+/// It also grew out of a weaker test that stopped at `cc -c`, because `main` lived in a driver and
+/// `extern fn` was outside the slice. It is not outside any more.
 #[test]
-fn the_self_hosted_emitter_emits_its_own_source() {
+fn the_self_hosted_compiler_reaches_its_fixpoint() {
     let names = ["compiler/lex.nt", "compiler/parse.nt", "compiler/check.nt", "compiler/emit.nt"];
     let stages = names.map(|p| std::fs::read_to_string(repo(p)).unwrap()).join("\n");
-    let dir = std::env::temp_dir().join(format!("neant-self-host-selfemit-{}", std::process::id()));
-    let src_dir = dir.join("src");
-    std::fs::create_dir_all(&src_dir).unwrap();
+    let dir = std::env::temp_dir().join(format!("neant-fixpoint-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
 
-    let subject = src_dir.join("compiler.nt");
-    std::fs::write(&subject, &stages).unwrap();
-    let c_out = dir.join("compiler.c");
-    let nt = dir.join("selfemit_driver.nt");
     // the arenas are sized for the compiler's own source, not for a golden
-    let big = driver(&subject.to_string_lossy(), &c_out.to_string_lossy())
-        .replace("[b'\\0'; 65536]", "[b'\\0'; 262144]")
-        .replace("; 65536]", "; 262144]")
-        .replace("; 4096]", "; 16384]");
-    std::fs::write(&nt, format!("{stages}\n{big}")).unwrap();
+    let big = |d: String| d.replace("[b'\\0'; 65536]", "[b'\\0'; 262144]")
+        .replace("; 65536]", "; 262144]").replace("; 4096]", "; 16384]");
 
-    let run = Command::new(neant()).arg("run").arg(&nt).output().unwrap();
-    assert!(run.status.success(), "the self-hosted compiler failed on its own source:\n{}",
+    // stage1: reads `input.nt`, writes `emitted.c`. Its own source is what it will be given.
+    let input = dir.join("input.nt");
+    let emitted = dir.join("emitted.c");
+    let stage1 = dir.join("stage1.nt");
+    let stage1_src = format!("{stages}\n{}",
+        big(driver(&input.to_string_lossy(), &emitted.to_string_lossy())));
+    std::fs::write(&stage1, &stage1_src).unwrap();
+
+    // stage1 compiles stage1, under the Rust compiler
+    let stage2_c = dir.join("stage2.c");
+    let bootstrap_driver = dir.join("bootstrap.nt");
+    std::fs::write(&bootstrap_driver, format!("{stages}\n{}",
+        big(driver(&stage1.to_string_lossy(), &stage2_c.to_string_lossy())))).unwrap();
+    let run = Command::new(neant()).arg("run").arg(&bootstrap_driver).output().unwrap();
+    assert!(run.status.success(), "stage1 failed on its own source:\n{}",
         String::from_utf8_lossy(&run.stderr));
     let wrote: i64 = String::from_utf8_lossy(&run.stdout).trim().parse().unwrap_or(-9);
-    assert!(wrote > 0, "the self-hosted compiler emitted nothing for its own source (code {wrote}): \
-        -2 is the parser, -1 the checker");
+    assert!(wrote > 0, "stage1 emitted nothing for its own source (code {wrote}; \
+        -2 parser, -1 checker, -3 emitter)");
 
-    let obj = dir.join("compiler.o");
+    // stage2: the same compiler, native
+    let stage2 = dir.join("stage2");
     let cc = std::env::var("CC").unwrap_or_else(|_| "cc".into());
-    let built = Command::new(&cc).args(["-c", "-O0", "-std=gnu11", "-w", "-o"])
-        .arg(&obj).arg(&c_out).output().unwrap();
-    assert!(built.status.success(),
-        "cc rejected the C the self-hosted compiler wrote for its own source ({}):\n{}",
-        c_out.display(), String::from_utf8_lossy(&built.stderr));
+    let built = Command::new(&cc).args(["-O1", "-std=gnu11", "-w", "-o"]).arg(&stage2)
+        .arg(&stage2_c).arg(repo("bootstrap/rt.c")).output().unwrap();
+    assert!(built.status.success(), "cc rejected stage2.c ({}):\n{}",
+        stage2_c.display(), String::from_utf8_lossy(&built.stderr));
+
+    // stage2 compiles stage1 — the same input stage1 was just given
+    std::fs::copy(&stage1, &input).unwrap();
+    let out = Command::new(&stage2).output().unwrap();
+    assert!(out.status.success(), "stage2 failed on stage1's source:\n{}",
+        String::from_utf8_lossy(&out.stderr));
+    let wrote2: i64 = String::from_utf8_lossy(&out.stdout).trim().parse().unwrap_or(-9);
+    assert!(wrote2 > 0, "stage2 emitted nothing for stage1's source (code {wrote2})");
+
+    let a = std::fs::read(&stage2_c).unwrap();
+    let b = std::fs::read(&emitted).unwrap();
+    assert_eq!(a.len(), b.len(),
+        "stage2 emitted {} bytes where stage1 emitted {} — the compiler does not reach its \
+         fixpoint (artifacts in {})", b.len(), a.len(), dir.display());
+    assert!(a == b, "stage2's output differs from stage1's although the lengths match \
+        (artifacts in {})", dir.display());
     let _ = std::fs::remove_dir_all(&dir);
 }

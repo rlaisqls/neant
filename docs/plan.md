@@ -332,12 +332,23 @@ lines), and `the_self_hosted_emitter_emits_its_own_source` runs the whole chain 
 160 KB of C, and `cc` compiles it — 92 functions, no diagnostic. End-to-end behavioural comparison
 went from 7 golden programs to 18.
 
-The remaining gap is `extern fn`. The stages are not a program without a driver, and every driver
-opens with `extern fn read_file(…)`, which the parser still rejects — so the test stops at `cc -c`
-rather than linking and running. That, and then running the self-compiled compiler against itself,
-is the fixpoint. Also found: **size atoms are not only the cost model's** — whole-array
+`extern fn` and brace-list array literals closed the last gap, so a driver is in the slice too and
+the stages are a program. **The fixpoint is reached**, written up in
+[self-hosting-fixpoint.md](self-hosting-fixpoint.md): stage1 (the stages plus a driver, interpreted
+by the Rust compiler) compiles its own source to `stage2.c`; `cc` builds that with `rt.c`; and
+stage2 compiles the same source to **byte-identical C**, in 42 ms where the interpreted pass takes
+about ninety seconds. `the_self_hosted_compiler_reaches_its_fixpoint` is the test, and it is the
+only one here with no Rust compiler in the comparison. 36 golden programs also go through the whole
+self-hosted chain with output identical to `neant run`.
+
+What the fixpoint is *of* matters as much: a front end and a C backend, not the compiler the plan
+describes. **The cost calculus is not in it at all** — no `work`, `moves`, `span`, regimes or
+`costs.lock` — nor are M5's moves and uniqueness (the emitter takes the safe branch and copies),
+M4's layout, chains, closures or comprehensions. Seed two exists as a build artifact; checking it
+in from a committed source file rather than a concatenation a test performs is the next piece of
+bookkeeping. Also found along the way: **size atoms are not only the cost model's** — whole-array
 reassignment cannot be type-checked without them, which the checker design had said the opposite
-of. Not designed yet: the cost calculus.
+of.
 
 ## M7 — the constant factor
 
