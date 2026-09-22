@@ -592,7 +592,7 @@ fn walks_anything(ffoot: &[i64], sigs: &[Sig], si: i64) -> bool {
     let mut p = 0;
     let mut any = false;
     while p < sigs[si].n_params {
-        if ffoot[(si * 16 + p) * 4] != 0 { any = true; }
+        if ffoot[(si * 16 + p) * 8] != 0 { any = true; }
         p += 1;
     }
     any
@@ -1356,10 +1356,10 @@ fn foot_flags(src: &[u8], toks: &[Token], nodes: &[Node], sites: &[Site], ffoot:
             lo = 0;
             hi = whole;
         };
-        ffoot[(si * 16 + i) * 4] = walks;
-        ffoot[(si * 16 + i) * 4 + 1] = lo;
-        ffoot[(si * 16 + i) * 4 + 2] = hi;
-        ffoot[(si * 16 + i) * 4 + 3] = exact;
+        ffoot[(si * 16 + i) * 8] = walks;
+        ffoot[(si * 16 + i) * 8 + 1] = lo;
+        ffoot[(si * 16 + i) * 8 + 2] = hi;
+        ffoot[(si * 16 + i) * 8 + 3] = exact;
         i += 1;
         p = nodes[p].next;
     }
@@ -1835,7 +1835,8 @@ fn ck_max(facs: &[Fac], terms: &mut [Term], pols: &mut [Pol], pst: &mut [i64], b
 struct Site { arr: i64, idx: i64, inloop: i64, coef: i64, stride: i64, bad: i64, trip: i64, branch: i64,
              novar: i64, field: i64, p0: i64, p1: i64, p2: i64,
              c0: i64, c1: i64, c2: i64, b0: i64, b1: i64, b2: i64, alen: i64, es: i64, base: i64,
-             touch: i64, fldname: i64, tail: i64, pc0: i64, pc1: i64, pc2: i64 }
+             touch: i64, fldname: i64, tail: i64, pc0: i64, pc1: i64, pc2: i64,
+             rlo: i64, rhi: i64 }
 
 // the id of the loop this site sits in at depth `d`, or −1
 fn site_lp(sites: &[Site], s: i64, d: i64) -> i64 {
@@ -2088,6 +2089,82 @@ fn idx_coef_pol(src: &[u8], toks: &[Token], nodes: &[Node], facs: &mut [Fac], te
     0 - 1
 }
 
+// does every coefficient of this polynomial have the same sign as `want`
+fn pol_all_nonneg(pols: &[Pol], terms: &[Term], p: i64) -> bool {
+    let mut i = 0;
+    let mut ok = true;
+    while i < pols[p].n_term {
+        if terms[pols[p].term + i].cn < 0 { ok = false; }
+        i += 1;
+    }
+    ok
+}
+
+// **The byte range one site covers over its loop nest** — `site_range` in `analyze.rs`, with the
+// double count this session removed from it (docs/experiments.md). The index's affine form already
+// carries each loop's start, so a level's own contribution runs from `0` to `(trip − 1)·step` and
+// the sign of its coefficient decides which end it lands on. The constant part is the index with
+// every loop variable set to zero, which `val_of` and a substitution give without a new reader.
+// Written into the site; false when there is no range to be had, and then the parameter's
+// footprint falls back to the whole array and is not exact.
+fn site_range(src: &[u8], toks: &[Token], nodes: &[Node], facs: &mut [Fac], terms: &mut [Term],
+              pols: &mut [Pol], pst: &mut [i64], env: &[Env], sites: &mut [Site], wst: &mut [i64],
+              s: i64, idx: i64) -> bool {
+    let mut konst = val_of(src, toks, nodes, facs, terms, pols, pst, env, wst, idx);
+    if konst < 0 { return false; }
+    // the index at the nest's first iteration: each loop variable at its **own first value**, and
+    // innermost first, because an inner loop's start may name the variable outside it —
+    // `for i in ii*4..ii*4+4` puts `ii` back in when `i` goes out, and only then does `ii` leave.
+    let mut d = sites[s].inloop - 1;
+    while d >= 0 {
+        let id0 = site_lp(sites, s, d);
+        let a = lp_atom(wst, id0);
+        if a >= 0 {
+            let lo0 = lp_lo(wst, id0);
+            if lo0 < 0 { return false; }
+            konst = pol_subst(facs, terms, pols, pst, konst, a, lo0);
+        };
+        d -= 1;
+    }
+    let mut lo = konst;
+    let mut hi = konst;
+    let mut d2 = 0;
+    while d2 < sites[s].inloop {
+        let c = site_coef_pol(sites, s, d2);
+        if c < 0 { return false; }
+        let id = site_lp(sites, s, d2);
+        let one = pol_const(facs, terms, pols, pst, 1);
+        let t1 = pol_sub(facs, terms, pols, pst, lp_trip(wst, id), one);
+        let sp0 = pol_scale(facs, terms, pols, pst, t1, lp_step(wst, id), 1);
+        let span = pol_mul(facs, terms, pols, pst, c, sp0);
+        let v = pol_as_f64(facs, terms, pols, pst, c);
+        let neg = if pst[7] != 0 { v < 0.0 } else {
+            if !pol_all_nonneg(pols, terms, c) { return false; }
+            false
+        };
+        if neg {
+            lo = pol_add(facs, terms, pols, pst, lo, span);
+        } else {
+            hi = pol_add(facs, terms, pols, pst, hi, span);
+        };
+        d2 += 1;
+    }
+    // under SoA a field's own array starts where the fields before it end, and that base is a
+    // length times their sizes — the one place a range needs the array's length
+    let mut basep = pol_zero(facs, terms, pols, pst);
+    if sites[s].base > 0 {
+        if sites[s].alen < 0 { return false; }
+        basep = pol_scale(facs, terms, pols, pst, sites[s].alen, sites[s].base, 1);
+    };
+    let blo = pol_scale(facs, terms, pols, pst, lo, sites[s].stride, 1);
+    let bhi = pol_scale(facs, terms, pols, pst, hi, sites[s].stride, 1);
+    let tb = pol_const(facs, terms, pols, pst, sites[s].touch);
+    let hi2 = pol_add(facs, terms, pols, pst, bhi, tb);
+    sites[s].rlo = pol_add(facs, terms, pols, pst, blo, basep);
+    sites[s].rhi = pol_add(facs, terms, pols, pst, hi2, basep);
+    true
+}
+
 // is this array's element a struct the module has chosen SoA for
 fn is_soa(types: &[Ty], slay: &[i64], t: i64) -> bool {
     if t < 0 { return false; }
@@ -2323,6 +2400,10 @@ fn site_add(src: &[u8], toks: &[Token], nodes: &[Node], types: &[Ty], strs: &[St
         };
         sites[s].c0 = a0;
         sites[s].b0 = wst[14];
+    };
+    if !site_range(src, toks, nodes, facs, terms, pols, pst, env, sites, wst, s, idx) {
+        sites[s].rlo = 0 - 1;
+        sites[s].rhi = 0 - 1;
     };
     wst[10] = s + 1;
 
@@ -2914,8 +2995,8 @@ fn call_moves(src: &[u8], toks: &[Token], nodes: &[Node], types: &[Ty], strs: &[
         let t = ptys[sigs[si].params + p];
         // a walked parameter whose range is not exact forfeits the residue for the whole call, as
         // `signature_footprint`'s `all_exact` does
-        if ffoot[(si * 16 + p) * 4] != 0 && ffoot[(si * 16 + p) * 4 + 3] == 0 { wst[27] = 1; };
-        if ffoot[(si * 16 + p) * 4] == 1 && ffoot[(si * 16 + p) * 4 + 3] == 1
+        if ffoot[(si * 16 + p) * 8] != 0 && ffoot[(si * 16 + p) * 8 + 3] == 0 { wst[27] = 1; };
+        if ffoot[(si * 16 + p) * 8] == 1 && ffoot[(si * 16 + p) * 8 + 3] == 1
             && t >= 0 && inner >= 0 && nodes[inner].kind == 65 {
             let al = arg_len(src, toks, nodes, env, wst, inner);
             if al < 0 {
@@ -2923,9 +3004,9 @@ fn call_moves(src: &[u8], toks: &[Token], nodes: &[Node], types: &[Ty], strs: &[
             } else {
                 resid[64 + newn].root = env_root(src, toks, env, wst, nodes[inner].a);
                 resid[64 + newn].lo = pol_scale(facs, terms, pols, pst, al,
-                                                ffoot[(si * 16 + p) * 4 + 1], 1);
+                                                ffoot[(si * 16 + p) * 8 + 1], 1);
                 resid[64 + newn].hi = pol_scale(facs, terms, pols, pst, al,
-                                                ffoot[(si * 16 + p) * 4 + 2], 1);
+                                                ffoot[(si * 16 + p) * 8 + 2], 1);
                 newn += 1;
             }
         }
@@ -3382,6 +3463,92 @@ fn bound_moves(src: &[u8], toks: &[Token], nodes: &[Node], facs: &mut [Fac], ter
     total
 }
 
+// **A parameter's footprint**: the sites on it, merged. The same range twice is one; two disjoint
+// ranges become the span; anything else is the whole array and not exact — the rule
+// `signature_footprint` uses, now on polynomials rather than on bytes per element, so a walk that
+// does not cover its whole array is stated as what it covers (design §23, retiring §20's
+// approximation). One inexact parameter forfeits the residue for the whole call.
+//
+// Written into `ffoot`, which now holds eight slots per (function, parameter): the walk flag, the
+// old per-element bounds the residency credit still reads, whether the range is exact, and the
+// range itself as two polynomials.
+fn foot_ranges(src: &[u8], toks: &[Token], nodes: &[Node], facs: &mut [Fac], terms: &mut [Term],
+               pols: &mut [Pol], pst: &mut [i64], budget: &mut [f64], sites: &[Site],
+               ffoot: &mut [i64], wst: &mut [i64], f: i64, si: i64) {
+    let mut p = nodes[f].b;
+    let mut i = 0;
+    while p >= 0 && i < 16 {
+        let b = (si * 16 + i) * 8;
+        let mut have = false;
+        let mut walked = false;
+        let mut exact = true;
+        let mut lo = 0 - 1;
+        let mut hi = 0 - 1;
+        let mut whole = 0;
+        let mut k = 0;
+        while k < wst[10] {
+            if name_eq(src, toks, sites[k].arr, nodes[p].a) {
+                walked = true;
+                if sites[k].es > whole { whole = sites[k].es; };
+                if sites[k].rlo < 0 || sites[k].rhi < 0 {
+                    exact = false;
+                } else if !have {
+                    lo = sites[k].rlo;
+                    hi = sites[k].rhi;
+                    have = true;
+                } else if exact {
+                    let same = pol_eq(facs, terms, pols, lo, sites[k].rlo)
+                        && pol_eq(facs, terms, pols, hi, sites[k].rhi);
+                    let after = pol_dominates(facs, terms, pols, pst, budget, sites[k].rlo, hi);
+                    let before = pol_dominates(facs, terms, pols, pst, budget, lo, sites[k].rhi);
+                    if same {
+                    } else if after || before {
+                        if pol_dominates(facs, terms, pols, pst, budget, lo, sites[k].rlo) {
+                            lo = sites[k].rlo;
+                        };
+                        if pol_dominates(facs, terms, pols, pst, budget, sites[k].rhi, hi) {
+                            hi = sites[k].rhi;
+                        };
+                    } else {
+                        exact = false;
+                    };
+                };
+            };
+            k += 1;
+        }
+        if !walked {
+            ffoot[b + 4] = 0 - 1;
+            ffoot[b + 5] = 0 - 1;
+        } else if exact && have {
+            ffoot[b + 4] = lo;
+            ffoot[b + 5] = hi;
+        } else {
+            // the whole array, and not exact
+            let z = pol_zero(facs, terms, pols, pst);
+            let al = foot_len(src, toks, sites, wst, nodes[p].a);
+            ffoot[b + 4] = z;
+            ffoot[b + 5] = if al >= 0 { pol_scale(facs, terms, pols, pst, al, whole, 1) } else { 0 - 1 };
+        };
+        ffoot[b + 6] = if exact && have { 1 } else { 0 };
+        i += 1;
+        p = nodes[p].next;
+    }
+}
+
+// the length of an array a site walked, from the sites themselves — the binding may be out of
+// scope by the time a footprint is stated
+fn foot_len(src: &[u8], toks: &[Token], sites: &[Site], wst: &[i64], name: i64) -> i64 {
+    let mut k = 0;
+    let mut found = 0 - 1;
+    while k < wst[10] {
+        if found < 0 && sites[k].alen >= 0 && name_eq(src, toks, sites[k].arr, name) {
+            found = sites[k].alen;
+        };
+        k += 1;
+    }
+    found
+}
+
 // The moves of a function that calls nothing: its sites, settled by the rule in §11. −1 when this
 // slice cannot say, which a call, a second loop, an array built here or a `moves 0` that was never
 // looked for all produce.
@@ -3492,7 +3659,7 @@ fn choose_layouts(src: &[u8], toks: &[Token], nodes: &[Node], types: &[Ty], strs
     let mut pst = [0, 0, 0, 0, 0, 0, 0, 0];
     let mut env = [Env { name: 0, val: 0, len: 0, root: 0 }; 4096];
     let mut cof = [Cof { name: 0, c: 0 }; 256];
-    let mut sites = [Site { arr: 0, idx: 0, inloop: 0, coef: 0, stride: 0, bad: 0, trip: 0, branch: 0, novar: 0, field: -1, p0: -1, p1: -1, p2: -1, c0: 0, c1: 0, c2: 0, b0: 0, b1: 0, b2: 0, alen: -1, es: 0, base: 0, touch: 0, fldname: -1, tail: 0, pc0: -1, pc1: -1, pc2: -1 }; 4096];
+    let mut sites = [Site { arr: 0, idx: 0, inloop: 0, coef: 0, stride: 0, bad: 0, trip: 0, branch: 0, novar: 0, field: -1, p0: -1, p1: -1, p2: -1, c0: 0, c1: 0, c2: 0, b0: 0, b1: 0, b2: 0, alen: -1, es: 0, base: 0, touch: 0, fldname: -1, tail: 0, pc0: -1, pc1: -1, pc2: -1, rlo: -1, rhi: -1 }; 4096];
     let mut cks = [Ck { pce: 0, n_pce: 0 }; 262144];
     let mut cnds = [Cnd { ws: 0, fits: 0 }; 262144];
     let mut pcs = [Pce { cnd: 0, n_cnd: 0, poly: 0 }; 262144];
@@ -3539,6 +3706,8 @@ fn choose_layouts(src: &[u8], toks: &[Token], nodes: &[Node], types: &[Ty], strs
                                         &mut scratch, &mut subst, slay, &mut lpes, &mut imgs,
                                         &mut sc, &mut wst, f, si);
                         foot_flags(src, toks, nodes, &sites, &mut ffoot, &wst, f, si);
+                        foot_ranges(src, toks, nodes, &mut facs, &mut terms, &mut pols, &mut pst,
+                                    &mut budget, &sites, &mut ffoot, &mut wst, f, si);
                         if pass == 1 && fm[si] >= 0
                             && touches_struct(src, toks, nodes, types, sigs, ptys, sid, f, si) {
                             // the piece whose conditions hold at the reference point, and the

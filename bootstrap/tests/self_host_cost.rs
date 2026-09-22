@@ -39,6 +39,17 @@ fn repo(sub: &str) -> PathBuf {
 /// deliberate divergence should land here and be argued, not absorbed.
 const COPIES_INSTEAD: &[(&str, &str)] = &[];
 
+/// Functions whose **footprint** this pass states more narrowly than `neant cost`: it reports none
+/// where the Rust reports one. A narrowing, not a disagreement — the two never state *different*
+/// footprints, and a missing one only costs a caller a credit it could have had.
+///
+/// `parse`'s `number` is the whole list. Its `while` carries a `decreasing` measure the compiler
+/// cannot follow, so both compilers call its cost unknown; the Rust has still recorded the site on
+/// `pos` by then and this walk has not, because it stops at the loop it cannot bound instead of
+/// walking the body for sites it will not cost. Widening it means collecting sites past a decline,
+/// which is a change to the walk, not to the footprint.
+const FOOTPRINT_NARROWER: &[(&str, &str)] = &[("parse.nt", "number")];
+
 /// The number of functions whose `work` the self-hosted pass reproduces exactly. In the test so
 /// that widening the slice means changing a number someone has to look at.
 const EXACT: usize = 76;
@@ -59,6 +70,12 @@ const EXACT: usize = 76;
 /// `COPIES_INSTEAD` — a footprint is a range now, so a callee that reads two fields of a four-field
 /// particle leaves half the array resident and the next call over the other half pays in full.
 const EXACT_MOVES: usize = 76;
+
+/// The same for the **footprint**: one entry per array parameter and the condition under which the
+/// whole of it is resident on return, whitespace-normalised so the report's column padding is not
+/// part of the comparison. Counted over every function, so one that should state no footprint and
+/// states none counts too.
+const EXACT_FOOT: usize = 89;
 
 /// The same for the **footprint lower bound** — `moves` cannot be less than the distinct bytes a
 /// function's parameter arrays reach. Counted over every function, so a `main` that should have no
@@ -126,6 +143,35 @@ fn rust_moves(out: &str) -> BTreeMap<String, String> {
 /// The `lower bound … (footprint, …)` line of `neant cost`, per function. A function with no such
 /// line is not in the map, and the self-hosted pass must print `none` for it — the half of this
 /// that keeps a bound from being invented.
+/// The `footprint …` line of `neant cost`, per function, in the shape the self-hosted pass prints:
+/// the entries with runs of spaces collapsed, then `| resident <poly>` or `| none`.
+fn rust_foot(out: &str) -> BTreeMap<String, String> {
+    let mut m = BTreeMap::new();
+    let mut cur = String::new();
+    for line in out.lines() {
+        if !line.starts_with(' ') && !line.trim().is_empty() {
+            cur = line.split_whitespace().next().unwrap_or("").to_string();
+            continue;
+        }
+        let t = line.trim();
+        let Some(rest) = t.strip_prefix("footprint") else { continue };
+        let rest = rest.trim();
+        let (entries, res) = match rest.find("  no residue claimed") {
+            Some(i) => (&rest[..i], "| none".to_string()),
+            None => match rest.find("  resident after if ") {
+                Some(i) => {
+                    let c = &rest[i + "  resident after if ".len()..];
+                    (&rest[..i], format!("| resident {}", c.trim_end().trim_end_matches(" < M")))
+                }
+                None => (rest, "| none".to_string()),
+            },
+        };
+        let e = entries.split_whitespace().collect::<Vec<_>>().join(" ");
+        m.insert(cur.clone(), format!("{e} {res}").trim().to_string());
+    }
+    m
+}
+
 fn rust_bounds(out: &str) -> BTreeMap<String, String> {
     let mut m = BTreeMap::new();
     let mut cur = String::new();
@@ -187,6 +233,7 @@ fn self_hosted_work_agrees_with_bootstrap() {
     let (mut exact, mut unknown, mut failures) = (0, 0, Vec::new());
     let mut exact_moves = 0;
     let mut exact_bounds = 0;
+    let mut exact_foot = 0;
     for f in &files {
         // only what the self-hosted compiler can read, and only what checks
         if Command::new(neant()).arg("parsedump").arg(f).output().unwrap().status.code() == Some(2) { continue; }
@@ -198,6 +245,7 @@ fn self_hosted_work_agrees_with_bootstrap() {
         let want = rust_report(&report);
         let want_moves = rust_moves(&report);
         let want_bounds = rust_bounds(&report);
+        let want_foot = rust_foot(&report);
         let run = Command::new(&reporter)
             .stdin(std::fs::File::open(f).unwrap()).output().unwrap();
         assert!(run.status.success(), "the self-hosted cost reporter failed on {name}:\n{}",
@@ -213,6 +261,22 @@ fn self_hosted_work_agrees_with_bootstrap() {
             .filter(|r| r.len() >= 3).map(|r| (r[0], r[2])).collect();
         let got_bounds: BTreeMap<&str, &str> = rows.iter()
             .filter(|r| r.len() >= 4).map(|r| (r[0], r[3])).collect();
+        let got_foot: BTreeMap<&str, &str> = rows.iter()
+            .filter(|r| r.len() >= 5).map(|r| (r[0], r[4])).collect();
+        for (fname, g) in &got_foot {
+            let listed = FOOTPRINT_NARROWER.contains(&(name.as_str(), fname));
+            match (want_foot.get(*fname), *g) {
+                (None, "none") => exact_foot += 1,
+                (None, other) => failures.push(format!("{name} {fname}: `neant cost` states no \
+                    footprint, the self-hosted pass invented [{other}]")),
+                (Some(_), "none") if listed => {}
+                (Some(w), "none") => failures.push(format!("{name} {fname}: `neant cost` states \
+                    footprint [{w}], the self-hosted pass states none and is not listed as narrower")),
+                (Some(w), g) if w == g => exact_foot += 1,
+                (Some(w), g) => failures.push(format!("{name} {fname}: `neant cost` states \
+                    footprint [{w}], the self-hosted pass says [{g}]")),
+            }
+        }
         for (fname, g) in &got_bounds {
             match (want_bounds.get(*fname), *g) {
                 (None, "none") => exact_bounds += 1,
@@ -275,6 +339,8 @@ fn self_hosted_work_agrees_with_bootstrap() {
         {EXACT}; {unknown} more it declines. Widening or narrowing the slice means changing EXACT.");
     assert_eq!(exact_moves, EXACT_MOVES, "the self-hosted pass reproduces {exact_moves} moves \
         columns exactly, not {EXACT_MOVES}.");
+    assert_eq!(exact_foot, EXACT_FOOT, "the self-hosted pass agrees on {exact_foot} footprint \
+        columns, not {EXACT_FOOT}.");
     assert_eq!(exact_bounds, EXACT_BOUNDS, "the self-hosted pass agrees on {exact_bounds} \
         footprint-bound columns, not {EXACT_BOUNDS}.");
 }

@@ -1339,3 +1339,43 @@ of the comparison. The risk is not the printing: it is that footprints feed resi
 getting a range wrong moves a `moves` column that is exact today. **`moves` staying at 76 is the
 test that matters**, and it is a stronger check on this than the new column is — a wrong range that
 happens to print plausibly will still mis-credit a caller.
+
+### Built: 89 footprint columns, and the approximation is gone
+
+**Done.** A fifth column, 89 functions agreeing, and `moves` unmoved at 76 — which was the test that
+mattered, since footprints feed residency credit and a plausible-looking wrong range would have
+shown up there rather than here.
+
+`site_range` replaces §20's whole-array assumption outright. The corpus's shapes that it could not
+have stated before, and now does:
+
+```
+recur    xs: [8·i, 8·i + 8)                     an index that is a parameter, not a loop variable
+recur    xs: [4·hi + 4·lo, 4·hi + 4·lo + 8)     (lo + hi) / 2, coefficients of a half
+parse    pos: [0, 8)                            a constant index, at depth 0
+stencil  dst: [8·n + 8, 8·n² − 8·n − 8)         a two-deep nest that starts at 1
+tri      a: [0, 8·n)                            a tiled nest, through the inner loop's offset
+matmul   a: [0, 8·n²)                           symbolic coefficients
+particles ps: [16·ps.len(), 32·ps.len())        one field of an SoA struct
+```
+
+Two things the build corrected, both about the constant part.
+
+**The index's constant part is the index at the nest's *first iteration*, not at zero.** §23 said
+"every loop variable set to zero", copying `analyze.rs`'s `aff.konst` without noticing that its
+affine form has already absorbed each loop's start into that constant. Here the loop variable's atom
+means the variable's actual value, so the constant is the index with each variable at its own `lo`.
+Setting them to zero gave `stencil` `dst: [0, 8·n² − 16·n − 16)` where the range starts at `8·n + 8`.
+
+**And the substitution has to run innermost first**, because an inner loop's start may name the
+variable outside it: `for i in ii*4..ii*4+4` substitutes `i := 4·ii`, which puts `ii` *back* into
+the expression, and only a later substitution of `ii` takes it out again. Outermost-first leaves a
+loop variable in a footprint a caller is supposed to read — which is exactly the shape of the bug
+this session found in `analyze.rs`, arrived at from the other direction.
+
+**One narrowing, listed by name.** `parse`'s `number` states no footprint where `neant cost` states
+`pos: [0, 8)`. Both compilers call its cost unknown — its `while` carries a `decreasing` measure
+neither can follow — but the Rust has recorded the site on `pos` by the time it gives up and this
+walk has not, because it stops at the loop it cannot bound rather than walking the body for sites it
+will not charge for. Widening it is a change to the walk, not to the footprint, so it is recorded in
+`FOOTPRINT_NARROWER` rather than absorbed into the count.

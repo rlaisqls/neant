@@ -39,7 +39,7 @@ fn main() {
     let mut fb = [-1; 4096];
     let mut sc = [0; 40960];
     let mut wst = [0; 4096];
-    let mut sites = [Site { arr: 0, idx: 0, inloop: 0, coef: 0, stride: 0, bad: 0, trip: 0, branch: 0, novar: 0, field: -1, p0: -1, p1: -1, p2: -1, c0: 0, c1: 0, c2: 0, b0: 0, b1: 0, b2: 0, alen: -1, es: 0, base: 0, touch: 0, fldname: -1, tail: 0, pc0: -1, pc1: -1, pc2: -1 }; 4096];
+    let mut sites = [Site { arr: 0, idx: 0, inloop: 0, coef: 0, stride: 0, bad: 0, trip: 0, branch: 0, novar: 0, field: -1, p0: -1, p1: -1, p2: -1, c0: 0, c1: 0, c2: 0, b0: 0, b1: 0, b2: 0, alen: -1, es: 0, base: 0, touch: 0, fldname: -1, tail: 0, pc0: -1, pc1: -1, pc2: -1, rlo: -1, rhi: -1 }; 4096];
     let mut fm = [-1; 4096];
     let mut cks = [Ck { pce: 0, n_pce: 0 }; 262144];
     let mut cnds = [Cnd { ws: 0, fits: 0 }; 262144];
@@ -77,6 +77,8 @@ fn main() {
                 // after the walk, since it reads the sites the walk recorded; the second pass is
                 // what lets a call to a function declared later find them
                 foot_flags(&buf, &toks, &nodes, &sites, &mut ffoot, &wst, f, si);
+                foot_ranges(&buf, &toks, &nodes, &mut facs, &mut terms, &mut pols, &mut pst,
+                            &mut budget, &sites, &mut ffoot, &mut wst, f, si);
                 si += 1;
             } else if nodes[f].kind == 116 {
                 si += 1;
@@ -183,6 +185,55 @@ fn main() {
                     emit_bytes(&mut out, &mut est, &u);
                 }
             }
+            // the fifth column: the footprint, one entry per array parameter and then the
+            // condition under which the whole of it is resident on return. Whitespace is a single
+            // space everywhere, so the report's column padding is not part of the comparison.
+            emit_b(&mut out, &mut est, b'\t');
+            let mut fp = nodes[f].b;
+            let mut fi2 = 0;
+            let mut n_fp = 0;
+            let mut allx = true;
+            let mut tot = pol_zero(&mut facs, &mut terms, &mut pols, &mut pst);
+            while fp >= 0 && fi2 < 16 {
+                let bb = (si * 16 + fi2) * 8;
+                if ffoot[bb + 4] >= 0 && ffoot[bb + 5] >= 0 {
+                    if n_fp > 0 { emit_b(&mut out, &mut est, b' '); };
+                    emit_span(&mut out, &mut est, &buf, &toks, nodes[fp].a);
+                    let cl = b": [";
+                    emit_bytes(&mut out, &mut est, &cl);
+                    pol_print(&mut out, &mut est, &buf, &toks, &facs, &terms, &pols, &logs,
+                              &pnames, &parr, ffoot[bb + 4], &mut order, 0);
+                    let cm = b", ";
+                    emit_bytes(&mut out, &mut est, &cm);
+                    pol_print(&mut out, &mut est, &buf, &toks, &facs, &terms, &pols, &logs,
+                              &pnames, &parr, ffoot[bb + 5], &mut order, 0);
+                    emit_b(&mut out, &mut est, b')');
+                    if ffoot[bb + 6] == 0 {
+                        let wa = b" (whole array)";
+                        emit_bytes(&mut out, &mut est, &wa);
+                        allx = false;
+                    } else {
+                        let d = pol_sub(&mut facs, &mut terms, &mut pols, &mut pst,
+                                        ffoot[bb + 5], ffoot[bb + 4]);
+                        tot = pol_add(&mut facs, &mut terms, &mut pols, &mut pst, tot, d);
+                    };
+                    n_fp += 1;
+                };
+                fi2 += 1;
+                fp = nodes[fp].next;
+            }
+            if n_fp == 0 {
+                let nn = b"none";
+                emit_bytes(&mut out, &mut est, &nn);
+            } else if allx {
+                let r = b" | resident ";
+                emit_bytes(&mut out, &mut est, &r);
+                pol_print(&mut out, &mut est, &buf, &toks, &facs, &terms, &pols, &logs, &pnames,
+                          &parr, tot, &mut order, 0);
+            } else {
+                let r2 = b" | none";
+                emit_bytes(&mut out, &mut est, &r2);
+            };
             emit_b(&mut out, &mut est, b'\n');
             si += 1;
         } else if nodes[f].kind == 116 {
