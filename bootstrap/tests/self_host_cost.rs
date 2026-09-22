@@ -52,7 +52,7 @@ const FOOTPRINT_NARROWER: &[(&str, &str)] = &[("parse.nt", "number")];
 
 /// The number of functions whose `work` the self-hosted pass reproduces exactly. In the test so
 /// that widening the slice means changing a number someone has to look at.
-const EXACT: usize = 76;
+const EXACT: usize = 81;
 
 /// The same for `moves`, whose slice is narrower: a function that calls anything is unknown,
 /// because a callee's traffic depends on what is already resident — which it now computes, so a
@@ -69,19 +69,19 @@ const EXACT: usize = 76;
 /// **Nothing is declined.** Every `moves` column either matches or is one of the four in
 /// `COPIES_INSTEAD` — a footprint is a range now, so a callee that reads two fields of a four-field
 /// particle leaves half the array resident and the next call over the other half pays in full.
-const EXACT_MOVES: usize = 76;
+const EXACT_MOVES: usize = 81;
 
 /// The same for the **footprint**: one entry per array parameter and the condition under which the
 /// whole of it is resident on return, whitespace-normalised so the report's column padding is not
 /// part of the comparison. Counted over every function, so one that should state no footprint and
 /// states none counts too.
-const EXACT_FOOT: usize = 89;
+const EXACT_FOOT: usize = 94;
 
 /// The same for the **footprint lower bound** — `moves` cannot be less than the distinct bytes a
 /// function's parameter arrays reach. Counted over every function, so a `main` that should have no
 /// bound and gets none counts too: a bound invented where `neant cost` states none is as wrong as
 /// a missing one, and only one of those two shows up as a difference.
-const EXACT_BOUNDS: usize = 90;
+const EXACT_BOUNDS: usize = 95;
 
 
 

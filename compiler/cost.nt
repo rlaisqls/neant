@@ -3549,6 +3549,164 @@ fn foot_len(src: &[u8], toks: &[Token], sites: &[Site], wst: &[i64], name: i64) 
     found
 }
 
+// ---------------------------------------------------------------------------------------------
+// **A declared cost is its own small language** (design §24): `"8 xs.len() + 2 B"`, where
+// juxtaposition is multiplication, `^` raises to a power, `B` and `M` are the machine's own atoms
+// and `xs.len()` is the size of the parameter named. It produces a polynomial, so everything
+// downstream — the dominance check, the report, a caller that takes the declaration instead of an
+// inference — already exists and needs nothing new.
+//
+// `ds` is the reader's state: ds[0] the position, ds[1] the end, ds[2] the error flag.
+
+fn c_space(src: &[u8], ds: &mut [i64]) {
+    while ds[0] < ds[1] && src[ds[0]] == b' ' { ds[0] = ds[0] + 1; }
+}
+
+fn c_is_digit(c: u8) -> bool { c >= b'0' && c <= b'9' }
+fn c_is_alpha(c: u8) -> bool {
+    c >= b'a' && c <= b'z' || c >= b'A' && c <= b'Z' || c == b'_'
+}
+
+// the atom a name stands for: `B`, `M`, or a parameter's size when it is followed by `.len()`
+fn c_atom(src: &[u8], toks: &[Token], nodes: &[Node], ds: &mut [i64], f: i64) -> i64 {
+    let st0 = ds[0];
+    while ds[0] < ds[1] && (c_is_alpha(src[ds[0]]) || c_is_digit(src[ds[0]])) { ds[0] = ds[0] + 1; }
+    let n = ds[0] - st0;
+    if n == 1 && src[st0] == b'B' { return 0; }
+    if n == 1 && src[st0] == b'M' { return 1; }
+    if n == 1 && src[st0] == b'P' { return 2; }
+    // a parameter, which must be spelled with its `.len()`
+    c_space(src, ds);
+    if ds[0] + 6 > ds[1] || src[ds[0]] != b'.' {
+        ds[2] = 1;
+        return 0 - 1;
+    }
+    ds[0] = ds[0] + 6;
+    let mut p = nodes[f].b;
+    let mut i = 0;
+    while p >= 0 {
+        let t = nodes[p].a;
+        if toks[t].len == n {
+            let mut k = 0;
+            let mut same = true;
+            while k < n {
+                if src[toks[t].start + k] != src[st0 + k] { same = false; };
+                k += 1;
+            }
+            if same { return 3 + i; }
+        };
+        i += 1;
+        p = nodes[p].next;
+    }
+    ds[2] = 1;
+    0 - 1
+}
+
+fn c_factor(src: &[u8], toks: &[Token], nodes: &[Node], facs: &mut [Fac], terms: &mut [Term],
+            pols: &mut [Pol], pst: &mut [i64], ds: &mut [i64], f: i64) -> i64 {
+    c_space(src, ds);
+    if ds[0] >= ds[1] { ds[2] = 1; return pol_zero(facs, terms, pols, pst); }
+    let mut base = pol_zero(facs, terms, pols, pst);
+    if c_is_digit(src[ds[0]]) {
+        let mut v = 0;
+        while ds[0] < ds[1] && c_is_digit(src[ds[0]]) {
+            v = v * 10 + ((src[ds[0]] as i64) - 48);
+            ds[0] = ds[0] + 1;
+        }
+        base = pol_const(facs, terms, pols, pst, v);
+    } else if c_is_alpha(src[ds[0]]) {
+        let a = c_atom(src, toks, nodes, ds, f);
+        if ds[2] != 0 { return base; }
+        base = pol_atom(facs, terms, pols, pst, a);
+    } else {
+        ds[2] = 1;
+        return base;
+    };
+    c_space(src, ds);
+    if ds[0] < ds[1] && src[ds[0]] == b'^' {
+        ds[0] = ds[0] + 1;
+        c_space(src, ds);
+        let mut e = 0;
+        while ds[0] < ds[1] && c_is_digit(src[ds[0]]) {
+            e = e * 10 + ((src[ds[0]] as i64) - 48);
+            ds[0] = ds[0] + 1;
+        }
+        base = pol_pow(facs, terms, pols, pst, base, e);
+    };
+    base
+}
+
+// juxtaposition is multiplication: `2 B` is two lines, `8 xs.len()` eight bytes an element
+fn c_term(src: &[u8], toks: &[Token], nodes: &[Node], facs: &mut [Fac], terms: &mut [Term],
+          pols: &mut [Pol], pst: &mut [i64], ds: &mut [i64], f: i64) -> i64 {
+    let mut acc = c_factor(src, toks, nodes, facs, terms, pols, pst, ds, f);
+    let mut going = true;
+    while going && ds[2] == 0 {
+        c_space(src, ds);
+        if ds[0] < ds[1] && (c_is_digit(src[ds[0]]) || c_is_alpha(src[ds[0]])) {
+            let g = c_factor(src, toks, nodes, facs, terms, pols, pst, ds, f);
+            acc = pol_mul(facs, terms, pols, pst, acc, g);
+        } else {
+            going = false;
+        };
+    }
+    acc
+}
+
+fn c_read(src: &[u8], toks: &[Token], nodes: &[Node], facs: &mut [Fac], terms: &mut [Term],
+          pols: &mut [Pol], pst: &mut [i64], ds: &mut [i64], f: i64, t: i64) -> i64 {
+    ds[0] = toks[t].start;
+    ds[1] = toks[t].start + toks[t].len;
+    ds[2] = 0;
+    let mut acc = c_term(src, toks, nodes, facs, terms, pols, pst, ds, f);
+    let mut going = true;
+    while going && ds[2] == 0 {
+        c_space(src, ds);
+        if ds[0] < ds[1] && src[ds[0]] == b'+' {
+            ds[0] = ds[0] + 1;
+            let g = c_term(src, toks, nodes, facs, terms, pols, pst, ds, f);
+            acc = pol_add(facs, terms, pols, pst, acc, g);
+        } else if ds[0] < ds[1] && src[ds[0]] == b'-' {
+            ds[0] = ds[0] + 1;
+            let g = c_term(src, toks, nodes, facs, terms, pols, pst, ds, f);
+            acc = pol_sub(facs, terms, pols, pst, acc, g);
+        } else {
+            going = false;
+        };
+    }
+    c_space(src, ds);
+    if ds[0] != ds[1] { ds[2] = 1; };
+    if ds[2] != 0 { return 0 - 1; }
+    acc
+}
+
+// `≤ `, which a declared column is prefixed with; the sign is two bytes this printer cannot spell
+fn emit_le(out: &mut [u8], est: &mut [i64]) {
+    emit_u(out, est, 226);
+    emit_u(out, est, 137);
+    emit_u(out, est, 164);
+    emit_b(out, est, b' ');
+}
+
+// **A `#[cost]` is a declaration only when it gives both columns** (design §24). With both, the
+// declared polynomials become this function's cost outright — the body is not consulted again and
+// neither is any caller's view of it. With one, it is an assertion about an inference that stands,
+// and this leaves the inference alone.
+fn take_decl(src: &[u8], toks: &[Token], nodes: &[Node], facs: &mut [Fac], terms: &mut [Term],
+             pols: &mut [Pol], pst: &mut [i64], budget: &mut [f64], cnds: &mut [Cnd],
+             pcs: &mut [Pce], cks: &mut [Ck], wst: &mut [i64], ds: &mut [i64], fw: &mut [i64],
+             fm: &mut [i64], f: i64, si: i64) -> i64 {
+    let at = nodes[f].ival;
+    if at < 0 || nodes[at].a < 0 || nodes[at].b < 0 { return 0; }
+    let dw = c_read(src, toks, nodes, facs, terms, pols, pst, ds, f, nodes[at].a);
+    if dw < 0 { return 0; }
+    let dm = c_read(src, toks, nodes, facs, terms, pols, pst, ds, f, nodes[at].b);
+    if dm < 0 { return 0; }
+    fw[si] = dw;
+    fm[si] = ck_one(facs, terms, pols, pst, budget, cnds, pcs, cks, wst, dm);
+    1
+}
+
 // The moves of a function that calls nothing: its sites, settled by the rule in §11. −1 when this
 // slice cannot say, which a call, a second loop, an array built here or a `moves 0` that was never
 // looked for all produce.

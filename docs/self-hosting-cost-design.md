@@ -1455,3 +1455,26 @@ per regime. A bare number with `sizes` is a **budget**, checked numerically at t
 Of these only (2) and (4) are new; (1) is small and (3) is done. Order: the attribute and the
 reader first, since `assert.nt` and `decl_extern.nt` need no chains and would come into the slice
 on those alone.
+
+### Built: the declaration half of `#[cost]`
+
+`#[cost(...)]` parses, and a declaration that gives **both** columns replaces the function's cost
+outright. Three files come into the slice — `assert.nt`, `decl_extern.nt` and `err_assert.nt` —
+and all four columns stay exact: **work 81, moves 81, bound 95, footprint 94**.
+
+The part that turned out to need no code is the one §24 called "the only part that is not
+additive": a caller taking the declaration rather than the inference. The driver already reads
+`fw[si]` and `fm[si]` and asks nothing else, so **writing the declaration into them is the whole
+change** — `decl_extern.nt`'s `total` charges `labs` its declared 4 and 0 without ever having a
+body to look at, which is what a declaration being a claim in its own right means.
+
+The cost expression is its own small language and its reader is small because it produces a
+polynomial: juxtaposition multiplies, `^` raises, `B`, `M` and `P` are the machine's own atoms, and
+a parameter must be spelled with its `.len()`. Everything after that — dominance, printing, a
+caller's view — already existed.
+
+**The assertion half is what remains, and it is a coupling, not a rule.** A `#[cost]` with one
+column is an assertion about an inference that still stands, and `neant check` *rejects* a program
+whose assertion is breached — so a checker verdict depends on the cost pass. `self_host_check.rs`
+runs the checker alone and cannot see one, so `err_assert.nt` is listed in `NEEDS_THE_COST_PASS`
+there. Closing it means giving that driver the cost pass, not giving the checker a new rule.

@@ -37,6 +37,8 @@ fn main() {
     let mut lpes = [Lpe { cnd: 0, n_cnd: 0, lines: 0, contig: 0 }; 65536];
     let mut imgs = [Img { arr: 0, fld: 0, poly: 0 }; 1024];
     let mut fb = [-1; 4096];
+    let mut fdecl = [0; 4096];
+    let mut ds = [0, 0, 0];
     let mut sc = [0; 40960];
     let mut wst = [0; 4096];
     let mut sites = [Site { arr: 0, idx: 0, inloop: 0, coef: 0, stride: 0, bad: 0, trip: 0, branch: 0, novar: 0, field: -1, p0: -1, p1: -1, p2: -1, c0: 0, c1: 0, c2: 0, b0: 0, b1: 0, b2: 0, alen: -1, es: 0, base: 0, touch: 0, fldname: -1, tail: 0, pc0: -1, pc1: -1, pc2: -1, rlo: -1, rhi: -1 }; 4096];
@@ -79,8 +81,19 @@ fn main() {
                 foot_flags(&buf, &toks, &nodes, &sites, &mut ffoot, &wst, f, si);
                 foot_ranges(&buf, &toks, &nodes, &mut facs, &mut terms, &mut pols, &mut pst,
                             &mut budget, &sites, &mut ffoot, &mut wst, f, si);
+                // **A declaration replaces the inference**, and only when it gives both columns
+                // (design §24). Replacing `fw`/`fm` is all it takes for a caller to see the
+                // declaration rather than the body: the call path reads them and asks nothing else.
+                fdecl[si] = take_decl(&buf, &toks, &nodes, &mut facs, &mut terms, &mut pols,
+                                      &mut pst, &mut budget, &mut cnds, &mut pcs, &mut cks,
+                                      &mut wst, &mut ds, &mut fw, &mut fm, f, si);
                 si += 1;
             } else if nodes[f].kind == 116 {
+                // an `extern fn` has no body to infer from, which is the case that shows a
+                // declaration is a claim in its own right — `decl_extern.nt` declares libc's `labs`
+                fdecl[si] = take_decl(&buf, &toks, &nodes, &mut facs, &mut terms, &mut pols,
+                                      &mut pst, &mut budget, &mut cnds, &mut pcs, &mut cks,
+                                      &mut wst, &mut ds, &mut fw, &mut fm, f, si);
                 si += 1;
             }
             f = nodes[f].next;
@@ -108,6 +121,7 @@ fn main() {
                 emit_bytes(&mut out, &mut est, &u);
             } else {
                 let before = est[2];
+                if fdecl[si] != 0 { emit_le(&mut out, &mut est); };
                 pol_print(&mut out, &mut est, &buf, &toks, &facs, &terms, &pols, &logs, &pnames, &parr, fw[si], &mut order, 0);
                 if est[2] != before {
                     est[2] = before;
@@ -121,6 +135,7 @@ fn main() {
                 emit_bytes(&mut out, &mut est, &u);
             } else {
                 let before = est[2];
+                if fdecl[si] != 0 { emit_le(&mut out, &mut est); };
                 let c = fm[si];
                 let mut pi = 0;
                 while pi < cks[c].n_pce {

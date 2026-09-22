@@ -19,6 +19,8 @@
 //   110 Func  111 Param  112 StructDef  113 FieldDef  114 FieldInit  70 StructLit
 //   116 ExternFn (a signature and no body; its `uses` clause is dropped)
 //   115 a struct-name marker, laid down before parsing and never part of the tree
+//   117 CostAttr — `#[cost(…)]`, hung off the item it precedes through that item's `ival`;
+//       `a` the `work_at_most` string token, `b` `moves_at_most`, `c` `sizes`, each −1 when absent
 // Out of this slice, by design §6: MethodCall/chains other than `.len()`,
 // Lambda(79), Comprehension(80), `extern` and attributes. Structs were added afterwards, the
 // first widening of the slice (docs/self-hosting-structs.md).
@@ -666,6 +668,45 @@ fn struct_def(src: &[u8], toks: &[Token], n_toks: i64, st: &mut [i64], nodes: &m
     n
 }
 
+// `#[cost(work_at_most = "…", moves_at_most = "…", sizes = "…")]`, in any order and any subset.
+// A declaration is a claim in its own right, not a summary of an inference — `decl_extern.nt`
+// declares libc's `labs`, which has no body to infer from — so this is read for `extern fn` too.
+fn cost_attr(src: &[u8], toks: &[Token], n_toks: i64, st: &mut [i64], nodes: &mut [Node]) -> i64 {
+    expect(toks, st, 56);
+    expect(toks, st, 25);
+    let name = expect(toks, st, 0);
+    if st[2] == 0 && !tok_text_is(src, toks, name, b'c', b'o', b's', b't') { st[2] = 1; }
+    expect(toks, st, 23);
+    let n = alloc(nodes, st, 117);
+    nodes[n].a = 0 - 1;
+    nodes[n].b = 0 - 1;
+    nodes[n].c = 0 - 1;
+    while st[2] == 0 && toks[st[0]].kind != 24 {
+        let key = expect(toks, st, 0);
+        expect(toks, st, 35);
+        let val = expect(toks, st, 5);
+        if st[2] == 0 {
+            if tok_text_is(src, toks, key, b'w', b'o', b'r', b'k') { nodes[n].a = val; }
+            else if tok_text_is(src, toks, key, b'm', b'o', b'v', b'e') { nodes[n].b = val; }
+            else if tok_text_is(src, toks, key, b's', b'i', b'z', b'e') { nodes[n].c = val; }
+            else { st[2] = 1; };
+        };
+        if !eat(toks, st, 29) { break; }
+    }
+    expect(toks, st, 24);
+    expect(toks, st, 26);
+    n
+}
+
+// the first four bytes of a token's text, which is all that tells `work_at_most`, `moves_at_most`
+// and `sizes` apart — an array literal cannot be an argument, so a whole word to compare with is
+// not available
+fn tok_text_is(src: &[u8], toks: &[Token], t: i64, a: u8, b: u8, c: u8, d: u8) -> bool {
+    if t < 0 || toks[t].len < 4 { return false; }
+    let s0 = toks[t].start;
+    src[s0] == a && src[s0 + 1] == b && src[s0 + 2] == c && src[s0 + 3] == d
+}
+
 // every top-level item — a `fn` or a `struct` — chained by `next`, in source order
 fn parse_program(src: &[u8], toks: &[Token], n_toks: i64, st: &mut [i64], nodes: &mut [Node]) -> i64 {
     // the struct names, first: `S {` is a struct literal only when `S` is one, which is how
@@ -683,6 +724,7 @@ fn parse_program(src: &[u8], toks: &[Token], n_toks: i64, st: &mut [i64], nodes:
     let mut first = -1;
     let mut last = -1;
     while st[2] == 0 && toks[st[0]].kind != 57 {
+        let attr = if toks[st[0]].kind == 56 { cost_attr(src, toks, n_toks, st, nodes) } else { 0 - 1 };
         let f = if toks[st[0]].kind == 22 {
             struct_def(src, toks, n_toks, st, nodes)
         } else if toks[st[0]].kind == 20 {
@@ -691,6 +733,7 @@ fn parse_program(src: &[u8], toks: &[Token], n_toks: i64, st: &mut [i64], nodes:
             func(src, toks, n_toks, st, nodes)
         };
         if st[2] == 0 {
+            nodes[f].ival = attr;
             if last < 0 { first = f; } else { nodes[last].next = f; }
             last = f;
         }

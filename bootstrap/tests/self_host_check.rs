@@ -149,11 +149,16 @@ fn self_hosted_check_agrees_with_bootstrap() {
         if parses.status.code() == Some(2) { continue; }
         let name = f.file_name().unwrap().to_string_lossy().to_string();
         let want_ok = Command::new(neant()).arg("check").arg(f).output().unwrap().status.success();
-        // M5's move and aliasing rules are out of this slice by design (the checker design §1:
-        // moves, uniqueness, roots and layout all feed a stage that is not self-hosted). These
-        // five goldens each test one of them, so `neant check` rejects what the self-hosted
-        // checker accepts. Listed by name rather than filtered by a pattern, so that growing move
-        // checking means deleting names from here.
+        // **A breached `#[cost]` assertion is a check error**, and this driver cannot see one: it
+        // runs the checker alone, and whether an assertion holds is a question for the cost pass.
+        // The declaration half of `#[cost]` is done — a declaration with both columns replaces the
+        // function's cost and its callers take it — and the assertion half is what this waits on.
+        // Listed by name, so closing it means deleting a name.
+        const NEEDS_THE_COST_PASS: &[&str] = &["err_assert.nt"];
+        if NEEDS_THE_COST_PASS.contains(&name.as_str()) {
+            assert!(!want_ok, "{name} is listed as needing the cost pass, but `neant check` accepts it");
+            continue;
+        }
         let got = self_hosted(&dir, &stages, f);
         let verdict = got.lines().next().unwrap_or("");
         // "0" accepted, "1" rejected by the checker, "2" rejected by the parser

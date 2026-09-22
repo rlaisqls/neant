@@ -320,7 +320,9 @@ mod parsedump {
         Ok(())
     }
     fn func(f: &Func, o: &mut Vec<i32>) -> Result<(), String> {
-        if !f.asserts.is_empty() { return Err("a `#[cost(...)]` attribute".into()); }
+        // `#[cost(...)]` is in the slice now: the self-hosted parser reads it into a node hung off
+        // the item through `ival`, which is not a child, so it contributes no kinds to either
+        // side's sequence.
         if f.body.is_none() {
             o.push(116);
             for p in &f.params { o.push(111); ty(&p.ty, o)?; }
