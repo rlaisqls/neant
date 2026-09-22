@@ -37,7 +37,10 @@ fn main() {
     let mut wst = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
     let mut sites = [Site { arr: 0, idx: 0, inloop: 0, coef: 0, stride: 0, bad: 0, trip: 0, branch: 0, novar: 0, field: -1 }; 4096];
     let mut fm = [-1; 4096];
-    let mut cks = [Ck { fits: 0, nofit: 0, ws: 0 }; 65536];
+    let mut cks = [Ck { pce: 0, n_pce: 0 }; 262144];
+    let mut cnds = [Cnd { ws: 0, fits: 0 }; 262144];
+    let mut pcs = [Pce { cnd: 0, n_cnd: 0, poly: 0 }; 262144];
+    let mut subst = [-1; 64];
     let mut ffoot = [0; 65536];
     let mut resid = [Res { root: 0, foot: 0 }; 128];
     let mut slay = [0; 1024];
@@ -65,7 +68,7 @@ fn main() {
         while f >= 0 {
             if nodes[f].kind == 110 {
                 fw[si] = w_func(&buf, &toks, &nodes, &types, &ntys, &sigs, &ptys, &fw, &mut facs, &mut terms, &mut pols, &mut pst, &mut env, &mut wst, &mut scratch, &mut cof, &mut rargs, &mut logs, &mut budget, f, si);
-                fm[si] = m_func(&buf, &toks, &nodes, &types, &strs, &flds, &ntys, &sigs, &ptys, &fm, &ffoot, &mut facs, &mut terms, &mut pols, &mut pst, &mut env, &mut cof, &mut sites, &mut cks, &mut budget, &mut resid, &mut rargs, &mut logs, &mut scratch, &slay, &mut wst, f, si);
+                fm[si] = m_func(&buf, &toks, &nodes, &types, &strs, &flds, &ntys, &sigs, &ptys, &fm, &ffoot, &mut facs, &mut terms, &mut pols, &mut pst, &mut env, &mut cof, &mut sites, &mut cks, &mut cnds, &mut pcs, &mut budget, &mut resid, &mut rargs, &mut logs, &mut scratch, &mut subst, &slay, &mut wst, f, si);
                 // after the walk, since it reads the sites the walk recorded; the second pass is
                 // what lets a call to a function declared later find them
                 foot_flags(&buf, &toks, &nodes, &sites, &mut ffoot, &wst, f, si);
@@ -112,26 +115,43 @@ fn main() {
             } else {
                 let before = est[2];
                 let c = fm[si];
-                pol_print(&mut out, &mut est, &buf, &toks, &facs, &terms, &pols, &logs, &pnames, &parr, cks[c].fits, &mut order, 0);
-                if cks[c].ws >= 0 {
-                    // a forked cost prints both regimes and the condition that tells them apart
-                    let i1 = b" if ";
-                    emit_bytes(&mut out, &mut est, &i1);
-                    pol_print(&mut out, &mut est, &buf, &toks, &facs, &terms, &pols, &logs, &pnames, &parr, cks[c].ws, &mut order, 0);
-                    let lt = b" < M | ";
-                    emit_bytes(&mut out, &mut est, &lt);
-                    pol_print(&mut out, &mut est, &buf, &toks, &facs, &terms, &pols, &logs, &pnames, &parr, cks[c].nofit, &mut order, 0);
-                    emit_bytes(&mut out, &mut est, &i1);
-                    pol_print(&mut out, &mut est, &buf, &toks, &facs, &terms, &pols, &logs, &pnames, &parr, cks[c].ws, &mut order, 0);
-                    // `≥` U+2265, so the two reports compare as strings and not as approximations
-                    // of each other
-                    emit_b(&mut out, &mut est, b' ');
-                    emit_u(&mut out, &mut est, 226);
-                    emit_u(&mut out, &mut est, 137);
-                    emit_u(&mut out, &mut est, 165);
-                    let m2 = b" M";
-                    emit_bytes(&mut out, &mut est, &m2);
-                };
+                let mut pi = 0;
+                while pi < cks[c].n_pce {
+                    if pi > 0 {
+                        let bar = b" | ";
+                        emit_bytes(&mut out, &mut est, &bar);
+                    };
+                    let pp = cks[c].pce + pi;
+                    emit_brief(&mut out, &mut est, &buf, &toks, &mut facs, &mut terms, &mut pols,
+                               &mut pst, &logs, &pnames, &parr, pcs[pp].poly, &mut order, 3);
+                    let mut ci = 0;
+                    while ci < pcs[pp].n_cnd {
+                        // an array literal may only initialise a `let`, so the two words are two
+                        if ci == 0 {
+                            let i1 = b" if ";
+                            emit_bytes(&mut out, &mut est, &i1);
+                        } else {
+                            let i2 = b" and ";
+                            emit_bytes(&mut out, &mut est, &i2);
+                        };
+                        emit_brief(&mut out, &mut est, &buf, &toks, &mut facs, &mut terms, &mut pols,
+                                   &mut pst, &logs, &pnames, &parr, cnds[pcs[pp].cnd + ci].ws,
+                                   &mut order, 1);
+                        if cnds[pcs[pp].cnd + ci].fits == 1 {
+                            let lt = b" < M";
+                            emit_bytes(&mut out, &mut est, &lt);
+                        } else {
+                            emit_b(&mut out, &mut est, b' ');
+                            emit_u(&mut out, &mut est, 226);
+                            emit_u(&mut out, &mut est, 137);
+                            emit_u(&mut out, &mut est, 165);
+                            let m2 = b" M";
+                            emit_bytes(&mut out, &mut est, &m2);
+                        };
+                        ci += 1;
+                    }
+                    pi += 1;
+                }
                 if est[2] != before {
                     est[2] = before;
                     let u = b"[unprintable]";

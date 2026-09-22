@@ -17,39 +17,40 @@
 //   4  the emitter refused — a construct outside the self-hosted slice
 //   5  the input did not fit, or the output did not
 //
-// The arenas are fixed, as every pass in this repo's arenas are: 256 KiB of source, one token
-// and one node per byte of it, and 1 MiB of C out. The compiler's own source is 80 KiB and
-// emits 180 KiB, so this is roughly 3× headroom; a source that does not fit exits 5 rather
-// than writing something short and calling it a success.
+// The arenas are fixed, as every pass in this repo's arenas are: 1 MiB of source, half a million
+// tokens and nodes, and 4 MiB of C out. They were a third of that until the compiler's own source
+// passed 256 KiB and `build.sh` began exiting 5 — the pre-sized-array discipline meeting its own
+// limit, in the one program guaranteed to keep growing. A source that does not fit still exits 5
+// rather than writing something short and calling it a success.
 
 extern fn read_stdin(buf: &mut [u8]) -> i64 uses io, unbounded;
 extern fn write_stdout(buf: &[u8], n: i64) -> i64 uses io, unbounded;
 extern fn quit(code: i64) uses io;
 
 fn main() {
-    let mut buf = [b'\0'; 262144];
+    let mut buf = [b'\0'; 1048576];
     let n = read_stdin(&mut buf);
     if n < 0 {
         quit(5);
     }
 
-    let mut toks = [Token { kind: 0, start: 0, len: 0, ival: 0 }; 262144];
+    let mut toks = [Token { kind: 0, start: 0, len: 0, ival: 0 }; 524288];
     let n_toks = lex(&buf, n, &mut toks);
 
-    let mut nodes = [Node { kind: 0, a: 0, b: 0, c: 0, d: 0, ival: 0, next: 0 }; 262144];
+    let mut nodes = [Node { kind: 0, a: 0, b: 0, c: 0, d: 0, ival: 0, next: 0 }; 524288];
     let mut st = [0, 0, 0, 0, 0];
     let first = parse_program(&buf, &toks, n_toks, &mut st, &mut nodes);
     if st[2] != 0 {
         quit(2);
     }
 
-    let mut types = [Ty { kind: 0, elem: 0, mutable: 0, size: 0 }; 262144];
-    let mut syms = [Sym { name: 0, ty: 0, mutable: 0 }; 262144];
+    let mut types = [Ty { kind: 0, elem: 0, mutable: 0, size: 0 }; 524288];
+    let mut syms = [Sym { name: 0, ty: 0, mutable: 0 }; 524288];
     let mut sigs = [Sig { name: -1, params: 0, n_params: 0, ret: 0, ext: 0 }; 4096];
     let mut strs = [Str { name: 0, fields: 0, n_fields: 0 }; 1024];
     let mut flds = [Fld { name: 0, ty: 0 }; 4096];
     let mut ptys = [0; 16384];
-    let mut ntys = [-1; 262144];
+    let mut ntys = [-1; 524288];
     let mut cst = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
     let bad = check_program(&buf, &toks, &nodes, &mut types, &mut syms, &mut sigs, &mut ptys,
                             &mut strs, &mut flds, &mut ntys, &mut cst, first);
@@ -65,7 +66,7 @@ fn main() {
     choose_layouts(&buf, &toks, &nodes, &types, &strs, &flds, &ntys, &sigs, &ptys, &mut slay,
                    first, cst[7]);
 
-    let mut out = [b'\0'; 1048576];
+    let mut out = [b'\0'; 4194304];
     let mut est = [0, 0, 0];
     let len = emit_program(&mut out, &mut est, &buf, &toks, &nodes, &types, &strs, &flds, &slay,
                            &ntys, &sigs, &ptys, first);

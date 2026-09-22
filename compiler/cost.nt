@@ -1316,79 +1316,247 @@ fn foot_flags(src: &[u8], toks: &[Token], nodes: &[Node], sites: &[Site], ffoot:
     }
 }
 
-// ---- a cost that forks once ----
+// ---- a cost as a list of pieces ----
 //
-// Either a single polynomial (`ws < 0`), or a pair under one condition: `fits` when `ws < M` and
-// `nofit` when `ws ≥ M` (design §13). Two costs combine when they are single, or forked on the
-// same `ws`; two independent conditions are refused, because the piecewise algebra that would
-// handle them is `piece.rs` and none of it earns its place until a second condition does.
+// `piece.rs`'s shape, reproduced rather than narrowed (design §16): a cost is a run of **pieces**,
+// each a run of **conditions** and a polynomial. `§13`'s single fork was enough until `matmul`,
+// whose two pieces carry two *different* conditions — `≈ 8·n² < M` and `≈ B·n + 8·n ≥ M` — which a
+// one-condition cost cannot hold.
+//
+// `add` is a cross product: every piece of one against every piece of the other, conditions
+// unioned, infeasible combinations dropped. `max` is the union. Both prune afterwards, because
+// without it the cross product doubles the piece count at every statement.
 
-struct Ck { fits: i64, nofit: i64, ws: i64 }
+struct Cnd { ws: i64, fits: i64 }
+struct Pce { cnd: i64, n_cnd: i64, poly: i64 }
+struct Ck { pce: i64, n_pce: i64 }
 
-fn ck_one(cks: &mut [Ck], wst: &mut [i64], p: i64) -> i64 {
-    let i = wst[25];
-    cks[i].fits = p;
-    cks[i].nofit = p;
-    cks[i].ws = -1;
-    wst[25] = i + 1;
-    i
+fn cnd_push(cnds: &mut [Cnd], wst: &mut [i64], ws: i64, fits: i64) {
+    cnds[wst[28]].ws = ws;
+    cnds[wst[28]].fits = fits;
+    wst[28] = wst[28] + 1;
 }
 
-fn ck_fork(cks: &mut [Ck], wst: &mut [i64], fits: i64, nofit: i64, ws: i64) -> i64 {
-    let i = wst[25];
-    cks[i].fits = fits;
-    cks[i].nofit = nofit;
-    cks[i].ws = ws;
-    wst[25] = i + 1;
-    i
+fn pce_push(pcs: &mut [Pce], wst: &mut [i64], cnd: i64, n_cnd: i64, poly: i64) {
+    pcs[wst[29]].cnd = cnd;
+    pcs[wst[29]].n_cnd = n_cnd;
+    pcs[wst[29]].poly = poly;
+    wst[29] = wst[29] + 1;
 }
 
-// the condition two costs share, or −2 when they cannot be combined; −1 means neither forks
-fn ck_cond(facs: &[Fac], terms: &[Term], pols: &[Pol], cks: &[Ck], a: i64, b: i64) -> i64 {
-    if cks[a].ws < 0 && cks[b].ws < 0 { return -1; }
-    if cks[a].ws < 0 { return cks[b].ws; }
-    if cks[b].ws < 0 { return cks[a].ws; }
-    if pol_eq(facs, terms, pols, cks[a].ws, cks[b].ws) { return cks[a].ws; }
-    -2
-}
-
-fn ck_add(facs: &[Fac], terms: &mut [Term], pols: &mut [Pol], pst: &mut [i64], cks: &mut [Ck], budget: &mut [f64],
-          wst: &mut [i64], a: i64, b: i64) -> i64 {
-    let c = ck_cond(facs, terms, pols, cks, a, b);
-    if c == 0 - 2 {
-        wst[1] = 1;
-        return a;
+// `ws_a < M` and `ws_b ≥ M` contradict when `ws_b ≤ ws_a`
+fn conds_feasible(facs: &[Fac], terms: &mut [Term], pols: &mut [Pol], pst: &mut [i64],
+                  budget: &mut [f64], cnds: &[Cnd], start: i64, n: i64) -> bool {
+    let mut i = 0;
+    let mut ok = true;
+    while i < n {
+        if cnds[start + i].fits == 1 {
+            let mut j = 0;
+            while j < n {
+                if cnds[start + j].fits == 0
+                    && pol_dominates(facs, terms, pols, pst, budget, cnds[start + i].ws, cnds[start + j].ws) {
+                    ok = false;
+                }
+                j += 1;
+            }
+        }
+        i += 1;
     }
-    if c < 0 {
-        let f = pol_add(facs, terms, pols, pst, cks[a].fits, cks[b].fits);
-        return ck_one(cks, wst, f);
-    }
-    // Both fork on the same working set, which in this slice means both walk the same array. Its
-    // lines are the array's however many sites walk it — `settle_moves` says the same of an arena
-    // — so on the fitting side the footprint is counted **once**, not once per site. `max` is how
-    // that is said here, since a forked site's fitting cost *is* the footprint.
-    let f = pol_max(facs, terms, pols, pst, budget, wst, cks[a].fits, cks[b].fits);
-    let n = pol_add(facs, terms, pols, pst, cks[a].nofit, cks[b].nofit);
-    ck_fork(cks, wst, f, n, c)
+    ok
 }
 
-fn ck_max(facs: &[Fac], terms: &mut [Term], pols: &mut [Pol], pst: &mut [i64], cks: &mut [Ck], budget: &mut [f64],
-          wst: &mut [i64], a: i64, b: i64) -> i64 {
-    let c = ck_cond(facs, terms, pols, cks, a, b);
-    if c == 0 - 2 {
-        wst[1] = 1;
-        return a;
+// the union of two condition runs, written fresh; its length is left in wst[19]
+fn conds_union(facs: &[Fac], terms: &[Term], pols: &[Pol], cnds: &mut [Cnd], wst: &mut [i64],
+               a: i64, na: i64, b: i64, nb: i64) -> i64 {
+    let start = wst[28];
+    let mut i = 0;
+    while i < na {
+        cnd_push(cnds, wst, cnds[a + i].ws, cnds[a + i].fits);
+        i += 1;
     }
-    let f = pol_max(facs, terms, pols, pst, budget, wst, cks[a].fits, cks[b].fits);
-    if c < 0 { return ck_one(cks, wst, f); }
-    let n = pol_max(facs, terms, pols, pst, budget, wst, cks[a].nofit, cks[b].nofit);
-    ck_fork(cks, wst, f, n, c)
+    let mut j = 0;
+    while j < nb {
+        let mut seen = false;
+        let mut k = 0;
+        while k < wst[28] - start {
+            if cnds[start + k].fits == cnds[b + j].fits
+                && pol_eq(facs, terms, pols, cnds[start + k].ws, cnds[b + j].ws) { seen = true; }
+            k += 1;
+        }
+        if !seen { cnd_push(cnds, wst, cnds[b + j].ws, cnds[b + j].fits); };
+        j += 1;
+    }
+    wst[19] = wst[28] - start;
+    start
 }
 
-fn ck_zero(facs: &[Fac], terms: &mut [Term], pols: &mut [Pol], pst: &mut [i64], cks: &mut [Ck],
-           budget: &mut [f64], wst: &mut [i64]) -> i64 {
+// is every condition of `a` also a condition of `b`
+fn conds_subset(facs: &[Fac], terms: &[Term], pols: &[Pol], cnds: &[Cnd],
+                a: i64, na: i64, b: i64, nb: i64) -> bool {
+    let mut i = 0;
+    let mut all = true;
+    while i < na {
+        let mut found = false;
+        let mut j = 0;
+        while j < nb {
+            if cnds[a + i].fits == cnds[b + j].fits
+                && pol_eq(facs, terms, pols, cnds[a + i].ws, cnds[b + j].ws) { found = true; }
+            j += 1;
+        }
+        if !found { all = false; }
+        i += 1;
+    }
+    all
+}
+
+// Close the pieces written at [start, wst[29]) into a cost, dropping any that another piece
+// already covers: a piece whose conditions are implied by another's and whose polynomial that
+// other dominates says nothing new. Without this the cross product grows without bound.
+fn ck_close(facs: &[Fac], terms: &mut [Term], pols: &mut [Pol], pst: &mut [i64],
+            budget: &mut [f64], cnds: &mut [Cnd], pcs: &mut [Pce], cks: &mut [Ck],
+            wst: &mut [i64], start: i64) -> i64 {
+    // **A condition whose truth this machine already knows is not a regime** (`prune_at`): decide
+    // it here rather than carry a fork the report would print. `128 < M` is a fact, not a
+    // question, and `arena.nt`'s `main` read `B + 512 if 128 < M | …` until this was here.
+    let mut d = start;
+    let mut kept = start;
+    while d < wst[29] {
+        let cstart = wst[28];
+        let mut alive = true;
+        let mut ci = 0;
+        while ci < pcs[d].n_cnd {
+            let w = pol_as_f64(facs, terms, pols, pst, cnds[pcs[d].cnd + ci].ws);
+            if pst[7] != 0 {
+                let holds = if w * 64.0 < 2097152.0 { 1 } else { 0 };
+                if holds != cnds[pcs[d].cnd + ci].fits { alive = false; }
+            } else {
+                cnd_push(cnds, wst, cnds[pcs[d].cnd + ci].ws, cnds[pcs[d].cnd + ci].fits);
+            }
+            ci += 1;
+        }
+        if alive {
+            pcs[kept].cnd = cstart;
+            pcs[kept].n_cnd = wst[28] - cstart;
+            pcs[kept].poly = pcs[d].poly;
+            kept += 1;
+        }
+        d += 1;
+    }
+    wst[29] = kept;
+    if kept == start {
+        // every piece was ruled out: the cost is zero rather than nothing
+        let z = pol_zero(facs, terms, pols, pst);
+        pce_push(pcs, wst, 0, 0, z);
+    }
+    let mut write = start;
+    let mut i = start;
+    while i < wst[29] {
+        let mut covered = false;
+        let mut j = start;
+        while j < wst[29] {
+            if j != i && !covered
+                && conds_subset(facs, terms, pols, cnds, pcs[j].cnd, pcs[j].n_cnd, pcs[i].cnd, pcs[i].n_cnd)
+                && pol_dominates(facs, terms, pols, pst, budget, pcs[j].poly, pcs[i].poly)
+                // the same tie-break `prune` uses: a piece is covered when another says at least
+                // as much under no more conditions, and equal pieces are broken by position so
+                // that one of a pair survives rather than both or neither
+                && (pcs[j].n_cnd < pcs[i].n_cnd
+                    || !pol_eq(facs, terms, pols, pcs[j].poly, pcs[i].poly)
+                    || j < i) {
+                covered = true;
+            }
+            j += 1;
+        }
+        if !covered {
+            pcs[write].cnd = pcs[i].cnd;
+            pcs[write].n_cnd = pcs[i].n_cnd;
+            pcs[write].poly = pcs[i].poly;
+            write += 1;
+        }
+        i += 1;
+    }
+    wst[29] = write;
+    let c = wst[25];
+    cks[c].pce = start;
+    cks[c].n_pce = write - start;
+    wst[25] = c + 1;
+    c
+}
+
+fn ck_one(facs: &[Fac], terms: &mut [Term], pols: &mut [Pol], pst: &mut [i64], budget: &mut [f64],
+          cnds: &mut [Cnd], pcs: &mut [Pce], cks: &mut [Ck], wst: &mut [i64], p: i64) -> i64 {
+    let start = wst[29];
+    pce_push(pcs, wst, 0, 0, p);
+    ck_close(facs, terms, pols, pst, budget, cnds, pcs, cks, wst, start)
+}
+
+fn ck_fork(facs: &[Fac], terms: &mut [Term], pols: &mut [Pol], pst: &mut [i64], budget: &mut [f64],
+           cnds: &mut [Cnd], pcs: &mut [Pce], cks: &mut [Ck], wst: &mut [i64],
+           fits: i64, nofit: i64, ws: i64) -> i64 {
+    let start = wst[29];
+    let c1 = wst[28];
+    cnd_push(cnds, wst, ws, 1);
+    pce_push(pcs, wst, c1, 1, fits);
+    let c2 = wst[28];
+    cnd_push(cnds, wst, ws, 0);
+    pce_push(pcs, wst, c2, 1, nofit);
+    ck_close(facs, terms, pols, pst, budget, cnds, pcs, cks, wst, start)
+}
+
+// a cost of one piece with no conditions — the common case, and the only shape several callers
+// know how to take apart
+fn ck_plain(pcs: &[Pce], cks: &[Ck], c: i64) -> bool {
+    cks[c].n_pce == 1 && pcs[cks[c].pce].n_cnd == 0
+}
+
+fn ck_poly(pcs: &[Pce], cks: &[Ck], c: i64) -> i64 {
+    pcs[cks[c].pce].poly
+}
+
+fn ck_zero(facs: &[Fac], terms: &mut [Term], pols: &mut [Pol], pst: &mut [i64], budget: &mut [f64],
+           cnds: &mut [Cnd], pcs: &mut [Pce], cks: &mut [Ck], wst: &mut [i64]) -> i64 {
     let z = pol_zero(facs, terms, pols, pst);
-    ck_one(cks, wst, z)
+    ck_one(facs, terms, pols, pst, budget, cnds, pcs, cks, wst, z)
+}
+
+fn ck_add(facs: &[Fac], terms: &mut [Term], pols: &mut [Pol], pst: &mut [i64], budget: &mut [f64],
+          cnds: &mut [Cnd], pcs: &mut [Pce], cks: &mut [Ck], wst: &mut [i64], a: i64, b: i64) -> i64 {
+    let start = wst[29];
+    let mut i = 0;
+    while i < cks[a].n_pce {
+        let mut j = 0;
+        while j < cks[b].n_pce {
+            let pa = cks[a].pce + i;
+            let pb = cks[b].pce + j;
+            let u = conds_union(facs, terms, pols, cnds, wst, pcs[pa].cnd, pcs[pa].n_cnd,
+                                pcs[pb].cnd, pcs[pb].n_cnd);
+            let nu = wst[19];
+            if conds_feasible(facs, terms, pols, pst, budget, cnds, u, nu) {
+                let sum = pol_add(facs, terms, pols, pst, pcs[pa].poly, pcs[pb].poly);
+                pce_push(pcs, wst, u, nu, sum);
+            }
+            j += 1;
+        }
+        i += 1;
+    }
+    ck_close(facs, terms, pols, pst, budget, cnds, pcs, cks, wst, start)
+}
+
+fn ck_max(facs: &[Fac], terms: &mut [Term], pols: &mut [Pol], pst: &mut [i64], budget: &mut [f64],
+          cnds: &mut [Cnd], pcs: &mut [Pce], cks: &mut [Ck], wst: &mut [i64], a: i64, b: i64) -> i64 {
+    // alternatives: both survive, and `ck_close` drops whichever the other already covers
+    let start = wst[29];
+    let mut i = 0;
+    while i < cks[a].n_pce {
+        pce_push(pcs, wst, pcs[cks[a].pce + i].cnd, pcs[cks[a].pce + i].n_cnd, pcs[cks[a].pce + i].poly);
+        i += 1;
+    }
+    let mut j = 0;
+    while j < cks[b].n_pce {
+        pce_push(pcs, wst, pcs[cks[b].pce + j].cnd, pcs[cks[b].pce + j].n_cnd, pcs[cks[b].pce + j].poly);
+        j += 1;
+    }
+    ck_close(facs, terms, pols, pst, budget, cnds, pcs, cks, wst, start)
 }
 
 // ---- `moves`: cache-line traffic, for a function that calls nothing ----
@@ -1559,19 +1727,19 @@ fn scalar_bytes(types: &[Ty], strs: &[Str], flds: &[Fld], t: i64) -> i64 {
 fn site_add(src: &[u8], toks: &[Token], nodes: &[Node], types: &[Ty], strs: &[Str], flds: &[Fld],
             ntys: &[i64], sigs: &[Sig], ptys: &[i64], fm: &[i64], ffoot: &[i64],
             facs: &mut [Fac], terms: &mut [Term], pols: &mut [Pol],
-            pst: &mut [i64], env: &mut [Env], cof: &mut [Cof], sites: &mut [Site], cks: &mut [Ck], budget: &mut [f64],
-            resid: &mut [Res], rargs: &mut [i64], slay: &[i64], wst: &mut [i64],
+            pst: &mut [i64], env: &mut [Env], cof: &mut [Cof], sites: &mut [Site], cks: &mut [Ck], cnds: &mut [Cnd], pcs: &mut [Pce], budget: &mut [f64],
+            resid: &mut [Res], rargs: &mut [i64], subst: &mut [i64], slay: &[i64], wst: &mut [i64],
             arr: i64, idx: i64, fld: i64) -> i64 {
     // three loops deep is past what the loop state here records
     if wst[11] > 2 {
         wst[1] = 1;
-        return ck_zero(facs, terms, pols, pst, cks, budget, wst);
+        return ck_zero(facs, terms, pols, pst, budget, cnds, pcs, cks, wst);
     }
     let t = ntys[arr];
     let es = elem_bytes(types, strs, flds, t);
     if es < 0 || nodes[arr].kind != 65 {
         wst[1] = 1;
-        return ck_zero(facs, terms, pols, pst, cks, budget, wst);
+        return ck_zero(facs, terms, pols, pst, budget, cnds, pcs, cks, wst);
     }
     // under SoA a field access walks that field's own array, so it steps by the field's size and
     // not the element's — the one split M4 recorded as making AoS cost `24n` and SoA `8n`
@@ -1585,13 +1753,14 @@ fn site_add(src: &[u8], toks: &[Token], nodes: &[Node], types: &[Ty], strs: &[St
             // one, and it is part of what the choice weighs against SoA.
             let e2 = types[t].elem;
             let si2 = types[e2].elem;
-            let mut acc2 = ck_zero(facs, terms, pols, pst, cks, budget, wst);
+            let mut acc2 = ck_zero(facs, terms, pols, pst, budget, cnds, pcs, cks, wst);
             let mut k2 = 0;
             while k2 < strs[si2].n_fields {
                 let one2 = site_add(src, toks, nodes, types, strs, flds, ntys, sigs, ptys, fm,
-                                    ffoot, facs, terms, pols, pst, env, cof, sites, cks, budget,
-                                    resid, rargs, slay, wst, arr, idx, flds[strs[si2].fields + k2].name);
-                acc2 = ck_add(facs, terms, pols, pst, cks, budget, wst, acc2, one2);
+                                    ffoot, facs, terms, pols, pst, env, cof, sites, cks, cnds, pcs,
+                                    budget, resid, rargs, subst, slay, wst, arr, idx,
+                                    flds[strs[si2].fields + k2].name);
+                acc2 = ck_add(facs, terms, pols, pst, budget, cnds, pcs, cks, wst, acc2, one2);
                 k2 += 1;
             }
             return acc2;
@@ -1600,7 +1769,7 @@ fn site_add(src: &[u8], toks: &[Token], nodes: &[Node], types: &[Ty], strs: &[St
         sfld = fld;
         if step < 0 {
             wst[1] = 1;
-            return ck_zero(facs, terms, pols, pst, cks, budget, wst);
+            return ck_zero(facs, terms, pols, pst, budget, cnds, pcs, cks, wst);
         }
     }
     let mut i = 0;
@@ -1613,7 +1782,7 @@ fn site_add(src: &[u8], toks: &[Token], nodes: &[Node], types: &[Ty], strs: &[St
             && name_eq(src, toks, sites[i].arr, nodes[arr].a)
             && expr_same(src, toks, nodes, sites[i].idx, idx)
             && (!soa || name_eq(src, toks, sites[i].field, sfld)) {
-            return ck_zero(facs, terms, pols, pst, cks, budget, wst);
+            return ck_zero(facs, terms, pols, pst, budget, cnds, pcs, cks, wst);
         }
         i += 1;
     }
@@ -1635,7 +1804,7 @@ fn site_add(src: &[u8], toks: &[Token], nodes: &[Node], types: &[Ty], strs: &[St
     // settled here rather than in a pass at the end, so that the moves of an `if`'s two arms can
     // be compared: sites in different arms are *alternatives*, and only one of them happens
     let b = pol_atom(facs, terms, pols, pst, 0);
-    if wst[11] == 0 { return ck_one(cks, wst, b); }
+    if wst[11] == 0 { return ck_one(facs, terms, pols, pst, budget, cnds, pcs, cks, wst, b); }
     let trip = sites[s].trip;
     let cm = if sites[s].coef < 0 { 0 - sites[s].coef } else { sites[s].coef };
     let stride = cm * sites[s].stride;
@@ -1649,7 +1818,7 @@ fn site_add(src: &[u8], toks: &[Token], nodes: &[Node], types: &[Ty], strs: &[St
             + sites[s].coef * idx_coef(src, toks, nodes, wst, wst[34 + 1], wst[30]);
         if wst[14] != 0 {
             wst[1] = 1;
-            return ck_zero(facs, terms, pols, pst, cks, budget, wst);
+            return ck_zero(facs, terms, pols, pst, budget, cnds, pcs, cks, wst);
         }
         let cm0 = if c_out < 0 { 0 - c_out } else { c_out };
         let s_out = cm0 * sites[s].stride;
@@ -1668,7 +1837,7 @@ fn site_add(src: &[u8], toks: &[Token], nodes: &[Node], types: &[Ty], strs: &[St
         let wsv = pol_as_f64(facs, terms, pols, pst, test_lines);
         if pst[7] == 0 || wsv * 64.0 >= 2097152.0 {
             wst[1] = 1;
-            return ck_zero(facs, terms, pols, pst, cks, budget, wst);
+            return ck_zero(facs, terms, pols, pst, budget, cnds, pcs, cks, wst);
         }
         let mut lines = lines_in;
         if s_out >= 64 || c_out == 0 {
@@ -1679,11 +1848,11 @@ fn site_add(src: &[u8], toks: &[Token], nodes: &[Node], types: &[Ty], strs: &[St
             lines = pol_add(facs, terms, pols, pst, lines_in, oslide);
         }
         let mv = pol_mul(facs, terms, pols, pst, lines, b);
-        return ck_one(cks, wst, mv);
+        return ck_one(facs, terms, pols, pst, budget, cnds, pcs, cks, wst, mv);
     }
     if wst[11] == 2 {
         wst[1] = 1;
-        return ck_zero(facs, terms, pols, pst, cks, budget, wst);
+        return ck_zero(facs, terms, pols, pst, budget, cnds, pcs, cks, wst);
     }
     if scattered || stride >= 64 {
         let nofit = pol_mul(facs, terms, pols, pst, trip, b);
@@ -1692,7 +1861,7 @@ fn site_add(src: &[u8], toks: &[Token], nodes: &[Node], types: &[Ty], strs: &[St
         // a line. A strided walk it *can* follow does not fork: that one really does take a line
         // per touch either way.
         let len = arg_len(src, toks, nodes, env, wst, arr);
-        if !scattered || len < 0 { return ck_one(cks, wst, nofit); }
+        if !scattered || len < 0 { return ck_one(facs, terms, pols, pst, budget, cnds, pcs, cks, wst, nofit); }
         // the bound is the **whole array's** bytes, every field of it, however the struct is laid
         // out: once every line of it has been touched nothing more is fetched, and under SoA the
         // field arrays together are still the structure. Using the site's own stride here bounded
@@ -1703,47 +1872,60 @@ fn site_add(src: &[u8], toks: &[Token], nodes: &[Node], types: &[Ty], strs: &[St
         // touches against the array's line count with `B` substituted, and so does this.
         let touched = pol_scale(facs, terms, pols, pst, trip, 64, 1);
         if !pol_dominates(facs, terms, pols, pst, budget, touched, foot) {
-            return ck_one(cks, wst, nofit);
+            return ck_one(facs, terms, pols, pst, budget, cnds, pcs, cks, wst, nofit);
         }
-        return ck_fork(cks, wst, foot, nofit, foot);
+        // **an arena's lines are the arena's, however many sites walk it.** A second scattered site
+        // on the same array adds nothing on the fitting side: the bound is the array, and it has
+        // already been counted. `analyze.rs` calls this `arenas_taken`; §13 had it as a `max` on
+        // the fitting side, which a general piece algebra cannot express because `add` there really
+        // does add. It belongs here, at the site, and not in the arithmetic.
+        let mut taken = false;
+        let mut q = 0;
+        while q < s {
+            if sites[q].inloop != 0 && (sites[q].bad != 0 || sites[q].coef == 0 && sites[q].novar != 0)
+                && name_eq(src, toks, sites[q].arr, sites[s].arr) { taken = true; }
+            q += 1;
+        }
+        let fits = if taken { pol_zero(facs, terms, pols, pst) } else { foot };
+        return ck_fork(facs, terms, pols, pst, budget, cnds, pcs, cks, wst, fits, nofit, foot);
     }
-    if stride == 0 { return ck_one(cks, wst, b); }
+    if stride == 0 { return ck_one(facs, terms, pols, pst, budget, cnds, pcs, cks, wst, b); }
     let mut slide = pol_scale(facs, terms, pols, pst, trip, stride, 1);
     // a walk that covers less than a line still crosses one: `analyze.rs` floors the slide at one
     // line, which is what makes `arrays.nt`'s five-element loop cost `B` and not `40`
     let total = pol_as_int(facs, terms, pols, pst, slide);
     if pst[4] != 0 && total < 64 { slide = b; };
     let one = pol_add(facs, terms, pols, pst, b, slide);
-    ck_one(cks, wst, one)
+    ck_one(facs, terms, pols, pst, budget, cnds, pcs, cks, wst, one)
 }
 
 fn m_expr(src: &[u8], toks: &[Token], nodes: &[Node], types: &[Ty], strs: &[Str], flds: &[Fld],
           ntys: &[i64], sigs: &[Sig], ptys: &[i64], fm: &[i64], ffoot: &[i64],
             facs: &mut [Fac], terms: &mut [Term], pols: &mut [Pol],
-            pst: &mut [i64], env: &mut [Env], cof: &mut [Cof], sites: &mut [Site], cks: &mut [Ck], budget: &mut [f64],
-            resid: &mut [Res], rargs: &mut [i64], slay: &[i64], wst: &mut [i64], n: i64) -> i64 {
-    if n < 0 || wst[1] != 0 { return ck_zero(facs, terms, pols, pst, cks, budget, wst); }
+            pst: &mut [i64], env: &mut [Env], cof: &mut [Cof], sites: &mut [Site], cks: &mut [Ck], cnds: &mut [Cnd], pcs: &mut [Pce], budget: &mut [f64],
+            resid: &mut [Res], rargs: &mut [i64], subst: &mut [i64], slay: &[i64], wst: &mut [i64], n: i64) -> i64 {
+    if n < 0 || wst[1] != 0 { return ck_zero(facs, terms, pols, pst, budget, cnds, pcs, cks, wst); }
     let k = nodes[n].kind;
     if k == 68 {
-        let i = m_expr(src, toks, nodes, types, strs, flds, ntys, sigs, ptys, fm, ffoot, facs, terms, pols, pst, env, cof, sites, cks, budget, resid, rargs, slay, wst, nodes[n].b);
-        let s = site_add(src, toks, nodes, types, strs, flds, ntys, sigs, ptys, fm, ffoot, facs, terms, pols, pst, env, cof, sites, cks, budget, resid, rargs, slay, wst, nodes[n].a, nodes[n].b, -1);
-        return ck_add(facs, terms, pols, pst, cks, budget, wst, i, s);
+        let i = m_expr(src, toks, nodes, types, strs, flds, ntys, sigs, ptys, fm, ffoot, facs, terms, pols, pst, env, cof, sites, cks, cnds, pcs, budget, resid, rargs, subst, slay, wst, nodes[n].b);
+        let s = site_add(src, toks, nodes, types, strs, flds, ntys, sigs, ptys, fm, ffoot, facs, terms, pols, pst, env, cof, sites, cks, cnds, pcs, budget, resid, rargs, subst, slay, wst, nodes[n].a, nodes[n].b, -1);
+        return ck_add(facs, terms, pols, pst, budget, cnds, pcs, cks, wst, i, s);
     }
     if k == 69 {
         let base = nodes[n].a;
         if nodes[base].kind == 68 {
-            let i = m_expr(src, toks, nodes, types, strs, flds, ntys, sigs, ptys, fm, ffoot, facs, terms, pols, pst, env, cof, sites, cks, budget, resid, rargs, slay, wst, nodes[base].b);
-            let s = site_add(src, toks, nodes, types, strs, flds, ntys, sigs, ptys, fm, ffoot, facs, terms, pols, pst, env, cof, sites, cks, budget, resid, rargs, slay, wst, nodes[base].a, nodes[base].b, nodes[n].b);
-            return ck_add(facs, terms, pols, pst, cks, budget, wst, i, s);
+            let i = m_expr(src, toks, nodes, types, strs, flds, ntys, sigs, ptys, fm, ffoot, facs, terms, pols, pst, env, cof, sites, cks, cnds, pcs, budget, resid, rargs, subst, slay, wst, nodes[base].b);
+            let s = site_add(src, toks, nodes, types, strs, flds, ntys, sigs, ptys, fm, ffoot, facs, terms, pols, pst, env, cof, sites, cks, cnds, pcs, budget, resid, rargs, subst, slay, wst, nodes[base].a, nodes[base].b, nodes[n].b);
+            return ck_add(facs, terms, pols, pst, budget, cnds, pcs, cks, wst, i, s);
         }
-        return m_expr(src, toks, nodes, types, strs, flds, ntys, sigs, ptys, fm, ffoot, facs, terms, pols, pst, env, cof, sites, cks, budget, resid, rargs, slay, wst, base);
+        return m_expr(src, toks, nodes, types, strs, flds, ntys, sigs, ptys, fm, ffoot, facs, terms, pols, pst, env, cof, sites, cks, cnds, pcs, budget, resid, rargs, subst, slay, wst, base);
     }
     if k == 71 {
-        let mut acc = ck_zero(facs, terms, pols, pst, cks, budget, wst);
+        let mut acc = ck_zero(facs, terms, pols, pst, budget, cnds, pcs, cks, wst);
         let mut a = nodes[n].b;
         while a >= 0 {
-            let w = m_expr(src, toks, nodes, types, strs, flds, ntys, sigs, ptys, fm, ffoot, facs, terms, pols, pst, env, cof, sites, cks, budget, resid, rargs, slay, wst, a);
-            acc = ck_add(facs, terms, pols, pst, cks, budget, wst, acc, w);
+            let w = m_expr(src, toks, nodes, types, strs, flds, ntys, sigs, ptys, fm, ffoot, facs, terms, pols, pst, env, cof, sites, cks, cnds, pcs, budget, resid, rargs, subst, slay, wst, a);
+            acc = ck_add(facs, terms, pols, pst, budget, cnds, pcs, cks, wst, acc, w);
             a = nodes[a].next;
         }
         // `println`, `min` and `max` touch nothing of their own
@@ -1759,8 +1941,8 @@ fn m_expr(src: &[u8], toks: &[Token], nodes: &[Node], types: &[Ty], strs: &[Str]
         }
         if wst[11] != 0 {
             // a callee that touches nothing has nothing to replay
-            if si >= 0 && si != wst[24] && fm[si] >= 0 && cks[fm[si]].ws < 0
-                && pol_is_zero(pols, cks[fm[si]].fits) && !walks_anything(ffoot, sigs, si) {
+            if si >= 0 && si != wst[24] && fm[si] >= 0 && ck_plain(pcs, cks, fm[si])
+                && pol_is_zero(pols, ck_poly(pcs, cks, fm[si])) && !walks_anything(ffoot, sigs, si) {
                 return acc;
             }
             if si < 0 || fm[si] < 0 || si == wst[24] || wst[13] < 0 {
@@ -1774,21 +1956,21 @@ fn m_expr(src: &[u8], toks: &[Token], nodes: &[Node], types: &[Ty], strs: &[Str]
             // calls `sum` twenty times over a 1.6 MB array and twenty times over a 32 MB one, and
             // pays once for the first and twenty times for the second.
             let cold = call_moves(src, toks, nodes, types, strs, flds, sigs, ptys, fm, ffoot, facs,
-                                  terms, pols, pst, env, cks, budget, resid, rargs, slay, wst, n, si);
+                                  terms, pols, pst, env, cks, cnds, pcs, budget, resid, rargs, subst, slay, wst, n, si);
             if wst[1] != 0 { return acc; }
             let warm = call_moves(src, toks, nodes, types, strs, flds, sigs, ptys, fm, ffoot, facs,
-                                  terms, pols, pst, env, cks, budget, resid, rargs, slay, wst, n, si);
+                                  terms, pols, pst, env, cks, cnds, pcs, budget, resid, rargs, subst, slay, wst, n, si);
             if wst[1] != 0 { return acc; }
             let one = pol_const(facs, terms, pols, pst, 1);
             let rest = pol_sub(facs, terms, pols, pst, wst[13], one);
-            if cks[warm].ws >= 0 || cks[cold].ws >= 0 {
+            if !ck_plain(pcs, cks, warm) || !ck_plain(pcs, cks, cold) {
                 wst[1] = 1;
                 return acc;
             }
-            let laps = pol_mul(facs, terms, pols, pst, cks[warm].fits, rest);
-            let total = pol_add(facs, terms, pols, pst, cks[cold].fits, laps);
-            let ct = ck_one(cks, wst, total);
-            return ck_add(facs, terms, pols, pst, cks, budget, wst, acc, ct);
+            let laps = pol_mul(facs, terms, pols, pst, ck_poly(pcs, cks, warm), rest);
+            let total = pol_add(facs, terms, pols, pst, ck_poly(pcs, cks, cold), laps);
+            let ct = ck_one(facs, terms, pols, pst, budget, cnds, pcs, cks, wst, total);
+            return ck_add(facs, terms, pols, pst, budget, cnds, pcs, cks, wst, acc, ct);
         }
         if si == wst[24] {
             // a self-call: the recurrence is solved once the body is walked, so the call itself
@@ -1817,55 +1999,55 @@ fn m_expr(src: &[u8], toks: &[Token], nodes: &[Node], types: &[Ty], strs: &[Str]
             return acc;
         }
         let cm = call_moves(src, toks, nodes, types, strs, flds, sigs, ptys, fm, ffoot, facs, terms,
-                            pols, pst, env, cks, budget, resid, rargs, slay, wst, n, si);
-        return ck_add(facs, terms, pols, pst, cks, budget, wst, acc, cm);
+                            pols, pst, env, cks, cnds, pcs, budget, resid, rargs, subst, slay, wst, n, si);
+        return ck_add(facs, terms, pols, pst, budget, cnds, pcs, cks, wst, acc, cm);
     }
     if k == 75 {
         // **the two arms are alternatives, so the traffic is the larger and not the sum** — the
         // same rule `work` follows, and the reason `vm.nt`'s dispatch chain costs three lines a
         // lap and not ten. Sites still carry a branch tag, because two reads of one address on
         // opposite sides of an `if` are two sites even though only one of them happens.
-        let c = m_expr(src, toks, nodes, types, strs, flds, ntys, sigs, ptys, fm, ffoot, facs, terms, pols, pst, env, cof, sites, cks, budget, resid, rargs, slay, wst, nodes[n].a);
+        let c = m_expr(src, toks, nodes, types, strs, flds, ntys, sigs, ptys, fm, ffoot, facs, terms, pols, pst, env, cof, sites, cks, cnds, pcs, budget, resid, rargs, subst, slay, wst, nodes[n].a);
         let saved = wst[20];
         wst[21] = wst[21] + 1;
         wst[20] = wst[21] * 2;
         // recursive calls count along the heavier arm only, as they do for `work`: `bsearch` calls
         // itself on each side and only one of them happens
         let before = wst[23];
-        let t = m_block(src, toks, nodes, types, strs, flds, ntys, sigs, ptys, fm, ffoot, facs, terms, pols, pst, env, cof, sites, cks, budget, resid, rargs, slay, wst, nodes[n].b);
+        let t = m_block(src, toks, nodes, types, strs, flds, ntys, sigs, ptys, fm, ffoot, facs, terms, pols, pst, env, cof, sites, cks, cnds, pcs, budget, resid, rargs, subst, slay, wst, nodes[n].b);
         let n_then = wst[23] - before;
         wst[23] = before;
         wst[20] = wst[21] * 2 + 1;
-        let e = m_block(src, toks, nodes, types, strs, flds, ntys, sigs, ptys, fm, ffoot, facs, terms, pols, pst, env, cof, sites, cks, budget, resid, rargs, slay, wst, nodes[n].c);
+        let e = m_block(src, toks, nodes, types, strs, flds, ntys, sigs, ptys, fm, ffoot, facs, terms, pols, pst, env, cof, sites, cks, cnds, pcs, budget, resid, rargs, subst, slay, wst, nodes[n].c);
         let n_else = wst[23] - before;
         wst[23] = before + if n_then > n_else { n_then } else { n_else };
         wst[20] = saved;
-        let m = ck_max(facs, terms, pols, pst, cks, budget, wst, t, e);
-        return ck_add(facs, terms, pols, pst, cks, budget, wst, c, m);
+        let m = ck_max(facs, terms, pols, pst, budget, cnds, pcs, cks, wst, t, e);
+        return ck_add(facs, terms, pols, pst, budget, cnds, pcs, cks, wst, c, m);
     }
     if k == 76 {
-        return m_block(src, toks, nodes, types, strs, flds, ntys, sigs, ptys, fm, ffoot, facs, terms, pols, pst, env, cof, sites, cks, budget, resid, rargs, slay, wst, n);
+        return m_block(src, toks, nodes, types, strs, flds, ntys, sigs, ptys, fm, ffoot, facs, terms, pols, pst, env, cof, sites, cks, cnds, pcs, budget, resid, rargs, subst, slay, wst, n);
     }
     if k == 66 {
-        let a = m_expr(src, toks, nodes, types, strs, flds, ntys, sigs, ptys, fm, ffoot, facs, terms, pols, pst, env, cof, sites, cks, budget, resid, rargs, slay, wst, nodes[n].a);
-        let b = m_expr(src, toks, nodes, types, strs, flds, ntys, sigs, ptys, fm, ffoot, facs, terms, pols, pst, env, cof, sites, cks, budget, resid, rargs, slay, wst, nodes[n].b);
-        return ck_add(facs, terms, pols, pst, cks, budget, wst, a, b);
+        let a = m_expr(src, toks, nodes, types, strs, flds, ntys, sigs, ptys, fm, ffoot, facs, terms, pols, pst, env, cof, sites, cks, cnds, pcs, budget, resid, rargs, subst, slay, wst, nodes[n].a);
+        let b = m_expr(src, toks, nodes, types, strs, flds, ntys, sigs, ptys, fm, ffoot, facs, terms, pols, pst, env, cof, sites, cks, cnds, pcs, budget, resid, rargs, subst, slay, wst, nodes[n].b);
+        return ck_add(facs, terms, pols, pst, budget, cnds, pcs, cks, wst, a, b);
     }
     if k == 67 || k == 74 {
-        return m_expr(src, toks, nodes, types, strs, flds, ntys, sigs, ptys, fm, ffoot, facs, terms, pols, pst, env, cof, sites, cks, budget, resid, rargs, slay, wst, nodes[n].a);
+        return m_expr(src, toks, nodes, types, strs, flds, ntys, sigs, ptys, fm, ffoot, facs, terms, pols, pst, env, cof, sites, cks, cnds, pcs, budget, resid, rargs, subst, slay, wst, nodes[n].a);
     }
     if k == 70 {
-        let mut acc = ck_zero(facs, terms, pols, pst, cks, budget, wst);
+        let mut acc = ck_zero(facs, terms, pols, pst, budget, cnds, pcs, cks, wst);
         let mut fi = nodes[n].b;
         while fi >= 0 {
-            let v = m_expr(src, toks, nodes, types, strs, flds, ntys, sigs, ptys, fm, ffoot, facs, terms, pols, pst, env, cof, sites, cks, budget, resid, rargs, slay, wst, nodes[fi].b);
-            acc = ck_add(facs, terms, pols, pst, cks, budget, wst, acc, v);
+            let v = m_expr(src, toks, nodes, types, strs, flds, ntys, sigs, ptys, fm, ffoot, facs, terms, pols, pst, env, cof, sites, cks, cnds, pcs, budget, resid, rargs, subst, slay, wst, nodes[fi].b);
+            acc = ck_add(facs, terms, pols, pst, budget, cnds, pcs, cks, wst, acc, v);
             fi = nodes[fi].next;
         }
         return acc;
     }
     if k == 77 || k == 78 { wst[1] = 1; };
-    ck_zero(facs, terms, pols, pst, cks, budget, wst)
+    ck_zero(facs, terms, pols, pst, budget, cnds, pcs, cks, wst)
 }
 
 // The callee's moves in the caller's atoms, less the credit, with the resident set replaced by the
@@ -1875,37 +2057,26 @@ fn m_expr(src: &[u8], toks: &[Token], nodes: &[Node], types: &[Ty], strs: &[Str]
 fn call_moves(src: &[u8], toks: &[Token], nodes: &[Node], types: &[Ty], strs: &[Str], flds: &[Fld],
               sigs: &[Sig], ptys: &[i64], fm: &[i64], ffoot: &[i64], facs: &mut [Fac],
               terms: &mut [Term], pols: &mut [Pol], pst: &mut [i64], env: &mut [Env],
-              cks: &mut [Ck], budget: &mut [f64], resid: &mut [Res], rargs: &mut [i64],
-              slay: &[i64], wst: &mut [i64], n: i64, si: i64) -> i64 {
-    // A callee whose own cost forks hands its condition up: the caller adopts it, and `ck_add`
-    // refuses later if the caller already had a different one. Every regime in this corpus reaches
-    // `main` this way — `sum_list`, `stencil` and `is_palindrome` are all piecewise and all called.
+              cks: &mut [Ck], cnds: &mut [Cnd], pcs: &mut [Pce], budget: &mut [f64], resid: &mut [Res], rargs: &mut [i64],
+              subst: &mut [i64], slay: &[i64], wst: &mut [i64], n: i64, si: i64) -> i64 {
+    // A callee's pieces come up with it: each polynomial and each condition is substituted into
+    // the caller's atoms, and `ck_add` sorts out what the combination means. §13's single fork
+    // could not carry a callee that forks on two conditions; a piece list can.
     let c = fm[si];
-    let mut body = cks[c].fits;
-    let mut bodyn = cks[c].nofit;
-    let mut ws = cks[c].ws;
+    let start = wst[29];
     let mut newn = 0;
     wst[27] = 0;
+    let mut credit = pol_zero(facs, terms, pols, pst);
+
+    // first the substitution map: one pass over the parameters, recorded for reuse per piece
     let mut p = 0;
     let mut a = nodes[n].b;
     while p < sigs[si].n_params {
         let inner = if a >= 0 && nodes[a].kind == 73 { nodes[a].a } else { a };
         let v = if a >= 0 { val_of(src, toks, nodes, facs, terms, pols, pst, env, wst, inner) } else { -1 };
         let len = if v >= 0 { v } else { arg_len(src, toks, nodes, env, wst, inner) };
-        if len < 0 {
-            if mono_mentions(facs, terms, pols, body, 3 + p) { wst[1] = 1; }
-            if ws >= 0 && mono_mentions(facs, terms, pols, ws, 3 + p) { wst[1] = 1; }
-        } else {
-            body = pol_subst(facs, terms, pols, pst, body, 3 + p, len);
-            if ws >= 0 {
-                bodyn = pol_subst(facs, terms, pols, pst, bodyn, 3 + p, len);
-                ws = pol_subst(facs, terms, pols, pst, ws, 3 + p, len);
-            };
-        }
+        subst[p] = len;
         let t = ptys[sigs[si].params + p];
-        // Under SoA a callee's footprint is **per field array** — `shift` touches only `.x` and so
-        // leaves only the x-array resident — and this slice's resident set is per array. Rather
-        // than credit a whole element where a third of one was brought in, decline.
         if ffoot[si * 16 + p] != 0 && is_soa(types, slay, t) { wst[1] = 1; };
         if ffoot[si * 16 + p] == 2 { wst[27] = 1; };
         if ffoot[si * 16 + p] == 1 && t >= 0 && inner >= 0 && nodes[inner].kind == 65 {
@@ -1922,7 +2093,7 @@ fn call_moves(src: &[u8], toks: &[Token], nodes: &[Node], types: &[Ty], strs: &[
         if a >= 0 { a = nodes[a].next; };
         p += 1;
     }
-    let mut credit = pol_zero(facs, terms, pols, pst);
+    // every footprint against every resident range
     let mut i = 0;
     while i < newn {
         let mut r = 0;
@@ -1930,8 +2101,6 @@ fn call_moves(src: &[u8], toks: &[Token], nodes: &[Node], types: &[Ty], strs: &[
             if name_eq(src, toks, resid[r].root, resid[64 + i].root) {
                 let bytes = pol_as_int(facs, terms, pols, pst, resid[r].foot);
                 if pst[4] == 0 {
-                    // a symbolic footprint makes the credit conditional, and the caller's own cost
-                    // may already carry a condition; one is all there is
                     wst[1] = 1;
                 } else if bytes < 2097152 {
                     credit = pol_add(facs, terms, pols, pst, credit, resid[r].foot);
@@ -1941,7 +2110,6 @@ fn call_moves(src: &[u8], toks: &[Token], nodes: &[Node], types: &[Ty], strs: &[
         }
         i += 1;
     }
-    // a callee with any inexact footprint leaves nothing behind that a caller may rely on
     if wst[27] != 0 { newn = 0; };
     let mut k = 0;
     while k < newn {
@@ -1950,44 +2118,62 @@ fn call_moves(src: &[u8], toks: &[Token], nodes: &[Node], types: &[Ty], strs: &[
         k += 1;
     }
     wst[26] = newn;
-    let net = pol_sub(facs, terms, pols, pst, body, credit);
-    if ws < 0 { return ck_one(cks, wst, net); }
-    // a condition whose truth this machine already knows is not a regime: decide it here rather
-    // than carry a fork the report would have to print
-    let wsv = pol_as_int(facs, terms, pols, pst, ws);
-    if pst[4] != 0 {
-        if wsv < 2097152 { return ck_one(cks, wst, net); }
-        let netn = pol_sub(facs, terms, pols, pst, bodyn, credit);
-        return ck_one(cks, wst, netn);
+
+    // then each of the callee's pieces, substituted and credited
+    let mut pi = 0;
+    while pi < cks[c].n_pce {
+        let src_p = cks[c].pce + pi;
+        let mut poly = pcs[src_p].poly;
+        let cstart = wst[28];
+        let mut ci = 0;
+        while ci < pcs[src_p].n_cnd {
+            let mut w = cnds[pcs[src_p].cnd + ci].ws;
+            let mut q = 0;
+            while q < sigs[si].n_params {
+                if subst[q] >= 0 { w = pol_subst(facs, terms, pols, pst, w, 3 + q, subst[q]); }
+                else if mono_mentions(facs, terms, pols, w, 3 + q) { wst[1] = 1; };
+                q += 1;
+            }
+            cnd_push(cnds, wst, w, cnds[pcs[src_p].cnd + ci].fits);
+            ci += 1;
+        }
+        let mut q2 = 0;
+        while q2 < sigs[si].n_params {
+            if subst[q2] >= 0 { poly = pol_subst(facs, terms, pols, pst, poly, 3 + q2, subst[q2]); }
+            else if mono_mentions(facs, terms, pols, poly, 3 + q2) { wst[1] = 1; };
+            q2 += 1;
+        }
+        let net = pol_sub(facs, terms, pols, pst, poly, credit);
+        pce_push(pcs, wst, cstart, pcs[src_p].n_cnd, net);
+        pi += 1;
     }
-    let netn = pol_sub(facs, terms, pols, pst, bodyn, credit);
-    ck_fork(cks, wst, net, netn, ws)
+    ck_close(facs, terms, pols, pst, budget, cnds, pcs, cks, wst, start)
 }
 
 fn m_block(src: &[u8], toks: &[Token], nodes: &[Node], types: &[Ty], strs: &[Str], flds: &[Fld],
            ntys: &[i64], sigs: &[Sig], ptys: &[i64], fm: &[i64], ffoot: &[i64],
             facs: &mut [Fac], terms: &mut [Term], pols: &mut [Pol],
-            pst: &mut [i64], env: &mut [Env], cof: &mut [Cof], sites: &mut [Site], cks: &mut [Ck], budget: &mut [f64],
-            resid: &mut [Res], rargs: &mut [i64], slay: &[i64], wst: &mut [i64], n: i64) -> i64 {
-    if n < 0 || wst[1] != 0 { return ck_zero(facs, terms, pols, pst, cks, budget, wst); }
+            pst: &mut [i64], env: &mut [Env], cof: &mut [Cof], sites: &mut [Site], cks: &mut [Ck], cnds: &mut [Cnd], pcs: &mut [Pce], budget: &mut [f64],
+            resid: &mut [Res], rargs: &mut [i64], subst: &mut [i64], slay: &[i64], wst: &mut [i64], n: i64) -> i64 {
+    if n < 0 || wst[1] != 0 { return ck_zero(facs, terms, pols, pst, budget, cnds, pcs, cks, wst); }
     let saved = wst[0];
-    let mut acc = ck_zero(facs, terms, pols, pst, cks, budget, wst);
+    let mut acc = ck_zero(facs, terms, pols, pst, budget, cnds, pcs, cks, wst);
     let mut s = nodes[n].a;
     while s >= 0 && wst[1] == 0 {
-        let w = m_stmt(src, toks, nodes, types, strs, flds, ntys, sigs, ptys, fm, ffoot, facs, terms, pols, pst, env, cof, sites, cks, budget, resid, rargs, slay, wst, s);
-        acc = ck_add(facs, terms, pols, pst, cks, budget, wst, acc, w);
+        let w = m_stmt(src, toks, nodes, types, strs, flds, ntys, sigs, ptys, fm, ffoot, facs, terms, pols, pst, env, cof, sites, cks, cnds, pcs, budget, resid, rargs, subst, slay, wst, s);
+        acc = ck_add(facs, terms, pols, pst, budget, cnds, pcs, cks, wst, acc, w);
         s = nodes[s].next;
     }
-    let t = m_expr(src, toks, nodes, types, strs, flds, ntys, sigs, ptys, fm, ffoot, facs, terms, pols, pst, env, cof, sites, cks, budget, resid, rargs, slay, wst, nodes[n].b);
+    let t = m_expr(src, toks, nodes, types, strs, flds, ntys, sigs, ptys, fm, ffoot, facs, terms, pols, pst, env, cof, sites, cks, cnds, pcs, budget, resid, rargs, subst, slay, wst, nodes[n].b);
     wst[0] = saved;
-    ck_add(facs, terms, pols, pst, cks, budget, wst, acc, t)
+    ck_add(facs, terms, pols, pst, budget, cnds, pcs, cks, wst, acc, t)
 }
 
 fn m_stmt(src: &[u8], toks: &[Token], nodes: &[Node], types: &[Ty], strs: &[Str], flds: &[Fld],
           ntys: &[i64], sigs: &[Sig], ptys: &[i64], fm: &[i64], ffoot: &[i64],
             facs: &mut [Fac], terms: &mut [Term], pols: &mut [Pol],
-            pst: &mut [i64], env: &mut [Env], cof: &mut [Cof], sites: &mut [Site], cks: &mut [Ck], budget: &mut [f64],
-            resid: &mut [Res], rargs: &mut [i64], slay: &[i64], wst: &mut [i64], n: i64) -> i64 {
+            pst: &mut [i64], env: &mut [Env], cof: &mut [Cof], sites: &mut [Site], cks: &mut [Ck], cnds: &mut [Cnd], pcs: &mut [Pce], budget: &mut [f64],
+            resid: &mut [Res], rargs: &mut [i64], subst: &mut [i64], slay: &[i64], wst: &mut [i64], n: i64) -> i64 {
     let k = nodes[n].kind;
     if k == 90 {
         let init = nodes[n].c;
@@ -2012,7 +2198,7 @@ fn m_stmt(src: &[u8], toks: &[Token], nodes: &[Node], types: &[Ty], strs: &[Str]
             }
             if es < 0 || len < 0 {
                 wst[1] = 1;
-                return ck_zero(facs, terms, pols, pst, cks, budget, wst);
+                return ck_zero(facs, terms, pols, pst, budget, cnds, pcs, cks, wst);
             }
             env_add(env, wst, nodes[n].a, -1, len);
             let mut bytes = pol_scale(facs, terms, pols, pst, len, es, 1);
@@ -2022,9 +2208,9 @@ fn m_stmt(src: &[u8], toks: &[Token], nodes: &[Node], types: &[Ty], strs: &[Str]
             if wst[11] != 0 && wst[13] >= 0 {
                 bytes = pol_mul(facs, terms, pols, pst, bytes, wst[13]);
             };
-            return ck_one(cks, wst, bytes);
+            return ck_one(facs, terms, pols, pst, budget, cnds, pcs, cks, wst, bytes);
         }
-        let w = m_expr(src, toks, nodes, types, strs, flds, ntys, sigs, ptys, fm, ffoot, facs, terms, pols, pst, env, cof, sites, cks, budget, resid, rargs, slay, wst, init);
+        let w = m_expr(src, toks, nodes, types, strs, flds, ntys, sigs, ptys, fm, ffoot, facs, terms, pols, pst, env, cof, sites, cks, cnds, pcs, budget, resid, rargs, subst, slay, wst, init);
         // the same environment the work walk keeps, and for the same reason: a `while`'s induction
         // variable needs its entry value, and an array's length is what a loop bound reads
         let t = ntys[init];
@@ -2042,19 +2228,19 @@ fn m_stmt(src: &[u8], toks: &[Token], nodes: &[Node], types: &[Ty], strs: &[Str]
         return w;
     }
     if k == 91 {
-        let mut acc = m_expr(src, toks, nodes, types, strs, flds, ntys, sigs, ptys, fm, ffoot, facs, terms, pols, pst, env, cof, sites, cks, budget, resid, rargs, slay, wst, nodes[n].b);
+        let mut acc = m_expr(src, toks, nodes, types, strs, flds, ntys, sigs, ptys, fm, ffoot, facs, terms, pols, pst, env, cof, sites, cks, cnds, pcs, budget, resid, rargs, subst, slay, wst, nodes[n].b);
         let tgt = nodes[n].a;
         if nodes[tgt].kind == 68 {
-            let i = m_expr(src, toks, nodes, types, strs, flds, ntys, sigs, ptys, fm, ffoot, facs, terms, pols, pst, env, cof, sites, cks, budget, resid, rargs, slay, wst, nodes[tgt].b);
-            let sp = site_add(src, toks, nodes, types, strs, flds, ntys, sigs, ptys, fm, ffoot, facs, terms, pols, pst, env, cof, sites, cks, budget, resid, rargs, slay, wst, nodes[tgt].a, nodes[tgt].b, -1);
-            acc = ck_add(facs, terms, pols, pst, cks, budget, wst, acc, i);
-            acc = ck_add(facs, terms, pols, pst, cks, budget, wst, acc, sp);
+            let i = m_expr(src, toks, nodes, types, strs, flds, ntys, sigs, ptys, fm, ffoot, facs, terms, pols, pst, env, cof, sites, cks, cnds, pcs, budget, resid, rargs, subst, slay, wst, nodes[tgt].b);
+            let sp = site_add(src, toks, nodes, types, strs, flds, ntys, sigs, ptys, fm, ffoot, facs, terms, pols, pst, env, cof, sites, cks, cnds, pcs, budget, resid, rargs, subst, slay, wst, nodes[tgt].a, nodes[tgt].b, -1);
+            acc = ck_add(facs, terms, pols, pst, budget, cnds, pcs, cks, wst, acc, i);
+            acc = ck_add(facs, terms, pols, pst, budget, cnds, pcs, cks, wst, acc, sp);
         } else if nodes[tgt].kind == 69 && nodes[nodes[tgt].a].kind == 68 {
             let b = nodes[tgt].a;
-            let i = m_expr(src, toks, nodes, types, strs, flds, ntys, sigs, ptys, fm, ffoot, facs, terms, pols, pst, env, cof, sites, cks, budget, resid, rargs, slay, wst, nodes[b].b);
-            let sp = site_add(src, toks, nodes, types, strs, flds, ntys, sigs, ptys, fm, ffoot, facs, terms, pols, pst, env, cof, sites, cks, budget, resid, rargs, slay, wst, nodes[b].a, nodes[b].b, nodes[tgt].b);
-            acc = ck_add(facs, terms, pols, pst, cks, budget, wst, acc, i);
-            acc = ck_add(facs, terms, pols, pst, cks, budget, wst, acc, sp);
+            let i = m_expr(src, toks, nodes, types, strs, flds, ntys, sigs, ptys, fm, ffoot, facs, terms, pols, pst, env, cof, sites, cks, cnds, pcs, budget, resid, rargs, subst, slay, wst, nodes[b].b);
+            let sp = site_add(src, toks, nodes, types, strs, flds, ntys, sigs, ptys, fm, ffoot, facs, terms, pols, pst, env, cof, sites, cks, cnds, pcs, budget, resid, rargs, subst, slay, wst, nodes[b].a, nodes[b].b, nodes[tgt].b);
+            acc = ck_add(facs, terms, pols, pst, budget, cnds, pcs, cks, wst, acc, i);
+            acc = ck_add(facs, terms, pols, pst, budget, cnds, pcs, cks, wst, acc, sp);
         } else if nodes[tgt].kind == 65 {
             if ntys[tgt] >= 0 && (types[ntys[tgt]].kind == 5 || types[ntys[tgt]].kind == 6) {
                 // `ys = xs` **copies**, so it streams one array's worth — the same decision the
@@ -2073,8 +2259,8 @@ fn m_stmt(src: &[u8], toks: &[Token], nodes: &[Node], types: &[Ty], strs: &[Str]
                     if wst[11] != 0 && wst[13] >= 0 {
                         bytes = pol_mul(facs, terms, pols, pst, bytes, wst[13]);
                     };
-                    let cb = ck_one(cks, wst, bytes);
-                    acc = ck_add(facs, terms, pols, pst, cks, budget, wst, acc, cb);
+                    let cb = ck_one(facs, terms, pols, pst, budget, cnds, pcs, cks, wst, bytes);
+                    acc = ck_add(facs, terms, pols, pst, budget, cnds, pcs, cks, wst, acc, cb);
                 }
             } else {
                 let e = env_find(src, toks, env, wst, nodes[tgt].a);
@@ -2096,15 +2282,15 @@ fn m_stmt(src: &[u8], toks: &[Token], nodes: &[Node], types: &[Ty], strs: &[Str]
         // lower bound's node. A site's stride against an *outer* loop reads the inner loop's
         // bound — `for i in ii*4 .. ii*4+4` moves `a[i]` by four elements a lap of `ii`.
         wst[11] = depth + 1;
-        let mut acc = ck_zero(facs, terms, pols, pst, cks, budget, wst);
+        let mut acc = ck_zero(facs, terms, pols, pst, budget, cnds, pcs, cks, wst);
         if k == 92 {
-            let a = m_expr(src, toks, nodes, types, strs, flds, ntys, sigs, ptys, fm, ffoot, facs, terms, pols, pst, env, cof, sites, cks, budget, resid, rargs, slay, wst, nodes[n].b);
-            let b = m_expr(src, toks, nodes, types, strs, flds, ntys, sigs, ptys, fm, ffoot, facs, terms, pols, pst, env, cof, sites, cks, budget, resid, rargs, slay, wst, nodes[n].c);
+            let a = m_expr(src, toks, nodes, types, strs, flds, ntys, sigs, ptys, fm, ffoot, facs, terms, pols, pst, env, cof, sites, cks, cnds, pcs, budget, resid, rargs, subst, slay, wst, nodes[n].b);
+            let b = m_expr(src, toks, nodes, types, strs, flds, ntys, sigs, ptys, fm, ffoot, facs, terms, pols, pst, env, cof, sites, cks, cnds, pcs, budget, resid, rargs, subst, slay, wst, nodes[n].c);
             let lo = val_of(src, toks, nodes, facs, terms, pols, pst, env, wst, nodes[n].b);
             let hi = val_of(src, toks, nodes, facs, terms, pols, pst, env, wst, nodes[n].c);
             if lo < 0 || hi < 0 {
                 wst[1] = 1;
-                return ck_zero(facs, terms, pols, pst, cks, budget, wst);
+                return ck_zero(facs, terms, pols, pst, budget, cnds, pcs, cks, wst);
             }
             wst[13] = pol_sub(facs, terms, pols, pst, hi, lo);
             wst[12] = nodes[n].a;
@@ -2120,17 +2306,17 @@ fn m_stmt(src: &[u8], toks: &[Token], nodes: &[Node], types: &[Ty], strs: &[Str]
             wst[2] = atom + 1;
             let av = pol_atom(facs, terms, pols, pst, atom);
             env_add(env, wst, nodes[n].a, av, -1);
-            let body = m_block(src, toks, nodes, types, strs, flds, ntys, sigs, ptys, fm, ffoot, facs, terms, pols, pst, env, cof, sites, cks, budget, resid, rargs, slay, wst, nodes[n].d);
-            acc = ck_add(facs, terms, pols, pst, cks, budget, wst, a, b);
-            acc = ck_add(facs, terms, pols, pst, cks, budget, wst, acc, body);
+            let body = m_block(src, toks, nodes, types, strs, flds, ntys, sigs, ptys, fm, ffoot, facs, terms, pols, pst, env, cof, sites, cks, cnds, pcs, budget, resid, rargs, subst, slay, wst, nodes[n].d);
+            acc = ck_add(facs, terms, pols, pst, budget, cnds, pcs, cks, wst, a, b);
+            acc = ck_add(facs, terms, pols, pst, budget, cnds, pcs, cks, wst, acc, body);
         } else {
             let t = while_trip(src, toks, nodes, facs, terms, pols, pst, env, wst, cof, n);
             if t < 0 {
                 wst[1] = 1;
-                return ck_zero(facs, terms, pols, pst, cks, budget, wst);
+                return ck_zero(facs, terms, pols, pst, budget, cnds, pcs, cks, wst);
             }
-            let a = m_expr(src, toks, nodes, types, strs, flds, ntys, sigs, ptys, fm, ffoot, facs, terms, pols, pst, env, cof, sites, cks, budget, resid, rargs, slay, wst, nodes[n].a);
-            let b = m_expr(src, toks, nodes, types, strs, flds, ntys, sigs, ptys, fm, ffoot, facs, terms, pols, pst, env, cof, sites, cks, budget, resid, rargs, slay, wst, nodes[n].b);
+            let a = m_expr(src, toks, nodes, types, strs, flds, ntys, sigs, ptys, fm, ffoot, facs, terms, pols, pst, env, cof, sites, cks, cnds, pcs, budget, resid, rargs, subst, slay, wst, nodes[n].a);
+            let b = m_expr(src, toks, nodes, types, strs, flds, ntys, sigs, ptys, fm, ffoot, facs, terms, pols, pst, env, cof, sites, cks, cnds, pcs, budget, resid, rargs, subst, slay, wst, nodes[n].b);
             wst[13] = t;
             // a `while` with a measure has no loop variable at all, so nothing in it is known to
             // move contiguously; one with an induction variable has that variable
@@ -2141,9 +2327,9 @@ fn m_stmt(src: &[u8], toks: &[Token], nodes: &[Node], types: &[Ty], strs: &[Str]
                 wst[32 + depth] = t;
                 wst[34 + depth] = -1;
             };
-            let body = m_block(src, toks, nodes, types, strs, flds, ntys, sigs, ptys, fm, ffoot, facs, terms, pols, pst, env, cof, sites, cks, budget, resid, rargs, slay, wst, nodes[n].c);
-            acc = ck_add(facs, terms, pols, pst, cks, budget, wst, a, b);
-            acc = ck_add(facs, terms, pols, pst, cks, budget, wst, acc, body);
+            let body = m_block(src, toks, nodes, types, strs, flds, ntys, sigs, ptys, fm, ffoot, facs, terms, pols, pst, env, cof, sites, cks, cnds, pcs, budget, resid, rargs, subst, slay, wst, nodes[n].c);
+            acc = ck_add(facs, terms, pols, pst, budget, cnds, pcs, cks, wst, a, b);
+            acc = ck_add(facs, terms, pols, pst, budget, cnds, pcs, cks, wst, acc, body);
         }
         wst[0] = saved;
         wst[11] = depth;
@@ -2152,12 +2338,12 @@ fn m_stmt(src: &[u8], toks: &[Token], nodes: &[Node], types: &[Ty], strs: &[Str]
         wst[22] = sbody;
         return acc;
     }
-    if k == 94 { return ck_zero(facs, terms, pols, pst, cks, budget, wst); }
+    if k == 94 { return ck_zero(facs, terms, pols, pst, budget, cnds, pcs, cks, wst); }
     if k == 95 || k == 96 {
-        return m_expr(src, toks, nodes, types, strs, flds, ntys, sigs, ptys, fm, ffoot, facs, terms, pols, pst, env, cof, sites, cks, budget, resid, rargs, slay, wst, nodes[n].a);
+        return m_expr(src, toks, nodes, types, strs, flds, ntys, sigs, ptys, fm, ffoot, facs, terms, pols, pst, env, cof, sites, cks, cnds, pcs, budget, resid, rargs, subst, slay, wst, nodes[n].a);
     }
     wst[1] = 1;
-    ck_zero(facs, terms, pols, pst, cks, budget, wst)
+    ck_zero(facs, terms, pols, pst, budget, cnds, pcs, cks, wst)
 }
 
 // The moves of a function that calls nothing: its sites, settled by the rule in §11. −1 when this
@@ -2167,9 +2353,9 @@ fn m_func(src: &[u8], toks: &[Token], nodes: &[Node], types: &[Ty], strs: &[Str]
           ntys: &[i64], sigs: &[Sig], ptys: &[i64], fm: &[i64], ffoot: &[i64],
           facs: &mut [Fac], terms: &mut [Term],
           pols: &mut [Pol], pst: &mut [i64], env: &mut [Env], cof: &mut [Cof],
-          sites: &mut [Site], cks: &mut [Ck], budget: &mut [f64], resid: &mut [Res],
-          rargs: &mut [i64], logs: &mut [i64], scratch: &mut [i64], slay: &[i64],
-          wst: &mut [i64], f: i64, si: i64) -> i64 {
+          sites: &mut [Site], cks: &mut [Ck], cnds: &mut [Cnd], pcs: &mut [Pce], budget: &mut [f64], resid: &mut [Res],
+          rargs: &mut [i64], logs: &mut [i64], scratch: &mut [i64], subst: &mut [i64],
+          slay: &[i64], wst: &mut [i64], f: i64, si: i64) -> i64 {
     wst[0] = 0;
     wst[1] = 0;
     wst[10] = 0;
@@ -2196,15 +2382,15 @@ fn m_func(src: &[u8], toks: &[Token], nodes: &[Node], types: &[Ty], strs: &[Str]
         p = nodes[p].next;
     }
     wst[23] = 0;
-    let total = m_block(src, toks, nodes, types, strs, flds, ntys, sigs, ptys, fm, ffoot, facs, terms, pols, pst, env, cof, sites, cks, budget, resid, rargs, slay, wst, nodes[f].d);
+    let total = m_block(src, toks, nodes, types, strs, flds, ntys, sigs, ptys, fm, ffoot, facs, terms, pols, pst, env, cof, sites, cks, cnds, pcs, budget, resid, rargs, subst, slay, wst, nodes[f].d);
     if wst[1] != 0 { return -1; }
     if wst[23] == 0 { return total; }
     // the same solver the `work` column uses; a forked body would need the recurrence solved in
     // both regimes, which is a second condition and out
-    if cks[total].ws >= 0 { return -1; }
-    let solved = solve_recurrence(types, sigs, ptys, facs, terms, pols, logs, pst, rargs, scratch, si, cks[total].fits, wst[23]);
+    if !ck_plain(pcs, cks, total) { return -1; }
+    let solved = solve_recurrence(types, sigs, ptys, facs, terms, pols, logs, pst, rargs, scratch, si, ck_poly(pcs, cks, total), wst[23]);
     if solved < 0 { return -1; }
-    ck_one(cks, wst, solved)
+    ck_one(facs, terms, pols, pst, budget, cnds, pcs, cks, wst, solved)
 }
 
 // does this function take or build an array whose element is struct `sid`
@@ -2261,7 +2447,10 @@ fn choose_layouts(src: &[u8], toks: &[Token], nodes: &[Node], types: &[Ty], strs
     let mut env = [Env { name: 0, val: 0, len: 0, root: 0 }; 4096];
     let mut cof = [Cof { name: 0, c: 0 }; 256];
     let mut sites = [Site { arr: 0, idx: 0, inloop: 0, coef: 0, stride: 0, bad: 0, trip: 0, branch: 0, novar: 0, field: -1 }; 4096];
-    let mut cks = [Ck { fits: 0, nofit: 0, ws: 0 }; 262144];
+    let mut cks = [Ck { pce: 0, n_pce: 0 }; 262144];
+    let mut cnds = [Cnd { ws: 0, fits: 0 }; 262144];
+    let mut pcs = [Pce { cnd: 0, n_cnd: 0, poly: 0 }; 262144];
+    let mut subst = [-1; 64];
     let mut budget = [0.0; 4096];
     let mut resid = [Res { root: 0, foot: 0 }; 128];
     let mut rargs = [-1; 64];
@@ -2284,6 +2473,8 @@ fn choose_layouts(src: &[u8], toks: &[Token], nodes: &[Node], types: &[Ty], strs
             pst[2] = 0;
             pst[5] = 0;
             wst[25] = 0;
+            wst[28] = 0;
+            wst[29] = 0;
             // two sub-passes, as the reporter does: a call to a function declared later needs its
             // callee's moves, and without them every caller declines and contributes nothing
             let mut pass = 0;
@@ -2294,21 +2485,16 @@ fn choose_layouts(src: &[u8], toks: &[Token], nodes: &[Node], types: &[Ty], strs
                     if nodes[f].kind == 110 {
                         fm[si] = m_func(src, toks, nodes, types, strs, flds, ntys, sigs, ptys, &fm,
                                         &ffoot, &mut facs, &mut terms, &mut pols, &mut pst, &mut env,
-                                        &mut cof, &mut sites, &mut cks, &mut budget, &mut resid,
-                                        &mut rargs, &mut logs, &mut scratch, slay, &mut wst, f, si);
+                                        &mut cof, &mut sites, &mut cks, &mut cnds, &mut pcs,
+                                        &mut budget, &mut resid, &mut rargs, &mut logs,
+                                        &mut scratch, &mut subst, slay, &mut wst, f, si);
                         foot_flags(src, toks, nodes, &sites, &mut ffoot, &wst, f, si);
                         if pass == 1 && fm[si] >= 0
                             && touches_struct(src, toks, nodes, types, sigs, ptys, sid, f, si) {
-                            // a forked cost is evaluated in the regime that applies at the
-                            // reference point, not always in the fitting one
-                            let mut which_p = cks[fm[si]].fits;
-                            if cks[fm[si]].ws >= 0 {
-                                let wsv = pol_eval(&facs, &terms, &pols, &mut pst, cks[fm[si]].ws,
-                                                   64.0, 2097152.0, 1000000.0);
-                                if pst[6] == 0 && wsv >= 2097152.0 { which_p = cks[fm[si]].nofit; };
-                            };
-                            let v = pol_eval(&facs, &terms, &pols, &mut pst, which_p,
-                                             64.0, 2097152.0, 1000000.0);
+                            // the piece whose conditions hold at the reference point, and the
+                            // largest of them where several do — `Cost::eval`'s own rule
+                            let v = ck_eval(&facs, &terms, &pols, &mut pst, &cnds, &pcs, &cks,
+                                            fm[si], 64.0, 2097152.0, 1000000.0);
                             if pst[6] == 0 {
                                 if which == 0 { total_aos = total_aos + v; }
                                 else { total_soa = total_soa + v; };
@@ -2327,4 +2513,80 @@ fn choose_layouts(src: &[u8], toks: &[Token], nodes: &[Node], types: &[Ty], strs
         slay[sid] = if total_soa < total_aos * 0.999 { 1 } else { 0 };
         sid += 1;
     }
+}
+
+// A cost's value at a point: the largest of the pieces whose conditions hold there, which is what
+// `Cost::eval` does. `pst[6]` is left set when some piece could not be valued at all.
+fn ck_eval(facs: &[Fac], terms: &[Term], pols: &[Pol], pst: &mut [i64], cnds: &[Cnd],
+           pcs: &[Pce], cks: &[Ck], c: i64, b: f64, m: f64, size: f64) -> f64 {
+    let mut best = 0.0;
+    let mut any = false;
+    let mut bad = 0;
+    let mut i = 0;
+    while i < cks[c].n_pce {
+        let p = cks[c].pce + i;
+        let mut holds = true;
+        let mut j = 0;
+        while j < pcs[p].n_cnd {
+            let w = pol_eval(facs, terms, pols, pst, cnds[pcs[p].cnd + j].ws, b, m, size);
+            if pst[6] != 0 { bad = 1; };
+            let fits = if w * b < m { 1 } else { 0 };
+            if fits != cnds[pcs[p].cnd + j].fits { holds = false; }
+            j += 1;
+        }
+        if holds {
+            let v = pol_eval(facs, terms, pols, pst, pcs[p].poly, b, m, size);
+            if pst[6] != 0 { bad = 1; };
+            if !any || v > best { best = v; };
+            any = true;
+        }
+        i += 1;
+    }
+    pst[6] = bad;
+    best
+}
+
+// ---- printing a cost ----
+//
+// `lock.rs`'s `brief`: a polynomial of more than three terms shows its **highest-degree terms**
+// with `≈` in front, and a condition shows its working set's leading term the same way. Nothing is
+// approximated — the cost object is exact and the report is short, which is why `stencil`'s two
+// regimes print the same `≈ 40·n²` while differing below the leading term.
+fn pol_leading(facs: &[Fac], terms: &mut [Term], pols: &mut [Pol], pst: &mut [i64], p: i64) -> i64 {
+    let mut top = 0 - 1;
+    let mut i = 0;
+    while i < pols[p].n_term {
+        let d = mono_degree(facs, terms[pols[p].term + i].fac, terms[pols[p].term + i].n_fac);
+        if d > top { top = d; };
+        i += 1;
+    }
+    let start = pst[1];
+    i = 0;
+    while i < pols[p].n_term {
+        let t = pols[p].term + i;
+        if mono_degree(facs, terms[t].fac, terms[t].n_fac) == top {
+            terms[pst[1]].fac = terms[t].fac;
+            terms[pst[1]].n_fac = terms[t].n_fac;
+            terms[pst[1]].cn = terms[t].cn;
+            terms[pst[1]].cd = terms[t].cd;
+            pst[1] = pst[1] + 1;
+        }
+        i += 1;
+    }
+    pol_close(facs, terms, pols, pst, start)
+}
+
+fn emit_brief(out: &mut [u8], est: &mut [i64], src: &[u8], toks: &[Token], facs: &mut [Fac],
+              terms: &mut [Term], pols: &mut [Pol], pst: &mut [i64], logs: &[i64], pnames: &[i64],
+              parr: &[i64], p: i64, order: &mut [i64], limit: i64) {
+    let mut q = p;
+    if pols[p].n_term > limit {
+        // `\u2248` ASCIIly unspellable, like every other symbol this printer needs
+        emit_u(out, est, 226);
+        emit_u(out, est, 137);
+        emit_u(out, est, 136);
+        emit_b(out, est, b' ');
+        q = pol_leading(facs, terms, pols, pst, p);
+    };
+    pol_print(out, est, src, toks, facs, terms, pols, logs, pnames, parr, q, order, 0);
 }

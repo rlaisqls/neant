@@ -725,3 +725,29 @@ Two things in the polynomial layer had to be right for the arithmetic to come ou
 The nine that remain are `matmul`, `stencil` and `tri.nt`'s `pairs`, whose working sets are
 symbolic and fork on a second condition; the `main`s that call them; and the three `main`s where a
 callee under SoA leaves a **per-field** footprint resident, which this slice tracks per array.
+
+### A cost as a list of pieces
+
+`Ck` is now `piece.rs`'s shape rather than §13's single fork: a cost is a run of **pieces**, each a
+run of **conditions** and a polynomial. `add` is a cross product with infeasible combinations
+dropped, `max` is the union, and both prune. **Behaviour-preserving**: 64 exact, 3 differing, 9
+declined, exactly as before — which is the point, because the ceiling it removes is not reached
+until the level test forks.
+
+Three things the refactor needed that the single fork had hidden:
+
+- **`arenas_taken` belongs at the site, not in the arithmetic.** §13 expressed "an arena's lines
+  are the arena's, however many sites walk it" as a `max` on the fitting side of `add`. A general
+  piece algebra cannot: `add` there really does add. So the second scattered site on an array now
+  contributes **zero** on the fitting side, which is what `analyze.rs` does and what §13 was
+  approximating.
+- **A condition this machine has already decided is not a regime.** `prune_at`: `128 < M` is a
+  fact, and carrying it made `arena.nt`'s `main` read `B + 512 if 128 < M | …`.
+- **The prune's tie-break.** A piece is covered when another says at least as much under no more
+  conditions — and when the two polynomials *differ*, not only when the conditions do. Getting that
+  wrong left both `0` and `B` standing as alternatives, which made every self-recursive function's
+  moves look piecewise and so undecidable.
+
+And the compiler outgrew its own arenas: at 267 KB of source it no longer fitted the 256 KiB input
+buffer, and `build.sh` exited 5. The pre-sized-array discipline meeting its own limit, in the one
+program guaranteed to keep growing.
