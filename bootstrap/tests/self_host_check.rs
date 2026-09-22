@@ -99,13 +99,13 @@ fn main() {{
         println(2);
     }} else {{
         let mut types = [Ty {{ kind: 0, elem: 0, mutable: 0, size: 0 }}; 4096];
-        let mut syms = [Sym {{ name: 0, ty: 0, mutable: 0 }}; 4096];
+        let mut syms = [Sym {{ name: 0, ty: 0, mutable: 0, root: 0 }}; 4096];
         let mut sigs = [Sig {{ name: -1, params: 0, n_params: 0, ret: 0, ext: 0 }}; 1024];
         let mut strs = [Str {{ name: 0, fields: 0, n_fields: 0 }}; 1024];
         let mut flds = [Fld {{ name: 0, ty: 0 }}; 4096];
         let mut ptys = [0; 4096];
         let mut ntys = [-1; 65536];
-        let mut cst = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+        let mut cst = [0; 1024];
         let bad = check_program(&buf, &toks, &nodes, &mut types, &mut syms, &mut sigs, &mut ptys, &mut strs, &mut flds, &mut ntys, &mut cst, first);
         println(bad);
         if bad == 0 {{
@@ -154,12 +154,6 @@ fn self_hosted_check_agrees_with_bootstrap() {
         // five goldens each test one of them, so `neant check` rejects what the self-hosted
         // checker accepts. Listed by name rather than filtered by a pattern, so that growing move
         // checking means deleting names from here.
-        const NO_MOVES_YET: &[&str] = &["err_alias.nt", "err_move_if.nt", "err_move_loop.nt",
-                                        "err_move_use.nt", "err_move_view.nt"];
-        if NO_MOVES_YET.contains(&name.as_str()) {
-            assert!(!want_ok, "{name} is listed as needing move checking, but `neant check` accepts it");
-            continue;
-        }
         let got = self_hosted(&dir, &stages, f);
         let verdict = got.lines().next().unwrap_or("");
         // "0" accepted, "1" rejected by the checker, "2" rejected by the parser

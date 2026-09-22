@@ -115,3 +115,60 @@ is no way to compare *inside* the Rust checker without writing a second one ther
   `&mut [T]` (accepted), an index that is not `i64`, an element type that does not match the
   return type, an undeclared name. Each is a bad form and its fixed form, and the verdict must
   flip; all twenty agree with `neant check`.
+
+## Moves, done — `NO_MOVES_YET` is empty
+
+The five goldens the parity test listed as out of slice are all rejected now, and the list is
+deleted rather than shortened. They are five separate rules, and each turned out small once the
+right identity was chosen for a local.
+
+**A declaration's name token is the identity.** `types.rs` keys `moved` by `LocalId`, which is
+globally unique because `locals` is never popped — the scope stack is a separate structure. This
+checker merges the two: a scope *is* the symbol table's saved length, so symbol indices are reused
+as scopes close and the same index means different locals at different times. A declaration's name
+token is unique by construction and outlives the scope, so that is what the moved set holds.
+
+| rule | golden | how |
+|---|---|---|
+| a moved array may not be used again | `err_move_use` | a use checks the moved set at `sym_find` |
+| moving in a loop moves it again next lap | `err_move_loop` | the symbol table's length at the loop's entry; a source below it was declared outside |
+| a move in either arm is a move after the `if` | `err_move_if` | each arm checked from the same set, the then-arm's held aside, unioned after |
+| a view may not outlive the move and be read | `err_move_view` | a view with the same root whose name appears again later in the item |
+| two arguments must not overlap when one is `&mut` | `err_alias` | roots compared pairwise across the argument list |
+
+**The loop rule is the symbol table's length, and that is exactly `types.rs`'s test.** There it is
+`src < loop_start.last()`, a comparison of `LocalId`s that works because ids are handed out in
+declaration order. Here the same comparison is `sv < cst[13]`, the symbol index against the table's
+length when the loop opened. Only the *innermost* loop matters, as there: anything declared before
+it would be moved again on its next lap whatever encloses it.
+
+**The `if` union needs a stack, not a variable.** Each arm must be checked from the same starting
+set — otherwise a move in the then-arm wrongly rejects a use in the else-arm — so the then-arm's
+moves are held aside and appended afterwards. The holding place has to be a stack: an `if` inside
+the else-arm starts from the same count as the `if` around it, and a single scratch region would
+have it write over the one still being held.
+
+**Two things this states more coarsely than `neant check`, both in the safe direction.**
+
+- A move's *line* is not recorded. `neant check` says "`xs` was moved at line 3"; this checker only
+  ever reports a verdict, and the parity test compares verdicts, so it records the fact alone.
+- "Is a view read after the move" is asked of the **token stream**, not of a checked body.
+  `types.rs` computes every local's last use over the typed `Block` and compares it with the move's
+  line. There is no typed body here to walk, and tokens are in source order by construction, so a
+  name that appears again later in the same item counts as a use. That over-approximates: a *write*
+  to the view counts where `last_uses` counts reads. It is bounded by the next item's name token, so
+  a same-named local in another function cannot be mistaken for this one.
+
+Both are approximations a growing corpus could expose, and both reject more than they should rather
+than less — which is the direction a checker may safely be wrong in.
+
+**What it did not find.** The alias rule was the one change that could have rejected the compiler's
+own source, since `compiler/*.nt` passes views to functions constantly. It does not: the fixpoint
+holds unchanged. That is worth recording as a measurement rather than an absence — a compiler that
+hands two overlapping views to one function would have emitted `restrict` pointers that lie.
+
+**Still out, and it is the one that would pay.** `ys = xs` on an *existing* array is checked but its
+in-place-versus-copy decision is not made: the emitter always copies, which is why four `moves`
+columns differ from `neant cost` by design. Making that decision needs the same "is a view read
+later" scan this now has, plus `Reassign`'s `in_place` flag reaching the emitter — and it would
+close the last recorded divergence between the two compilers.

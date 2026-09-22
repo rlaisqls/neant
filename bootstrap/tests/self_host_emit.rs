@@ -34,13 +34,13 @@ fn main() {{
         println(-2);
     }} else {{
         let mut types = [Ty {{ kind: 0, elem: 0, mutable: 0, size: 0 }}; 4096];
-        let mut syms = [Sym {{ name: 0, ty: 0, mutable: 0 }}; 4096];
+        let mut syms = [Sym {{ name: 0, ty: 0, mutable: 0, root: 0 }}; 4096];
         let mut sigs = [Sig {{ name: -1, params: 0, n_params: 0, ret: 0, ext: 0 }}; 1024];
         let mut strs = [Str {{ name: 0, fields: 0, n_fields: 0 }}; 1024];
         let mut flds = [Fld {{ name: 0, ty: 0 }}; 4096];
         let mut ptys = [0; 4096];
         let mut ntys = [-1; 65536];
-        let mut cst = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+        let mut cst = [0; 1024];
         let bad = check_program(&buf, &toks, &nodes, &mut types, &mut syms, &mut sigs, &mut ptys, &mut strs, &mut flds, &mut ntys, &mut cst, first);
         if bad != 0 {{
             println(-1);
