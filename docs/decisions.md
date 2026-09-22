@@ -4,6 +4,59 @@ Design decisions with the reasoning that produced them, so the reasoning is not 
 code is. Newest first. A decision is recorded when it was argued over, when it rejected
 alternatives worth remembering, or when a future reader would otherwise ask "why on earth".
 
+## 4 — What four reviews changed: composition is an effect, the language's reason is scope, and the boundary is the measure of it
+
+**Decided 2026-09-22, after four written reviews of the tree at M3.**
+
+Accepted, and written into README, plan and this file:
+
+- **Cost composes like an effect, not like a type.** The cache is a shared resource, so what `g`
+  costs after `f` depends on what `f` left resident. The call-site re-analysis of the first
+  calculus (specialisation, inherited loops) was whole-program analysis wearing a signature's
+  clothes, and the symbolic line — the one in the lockfile — was the least predictive one until
+  regimes were added. The fix is structural: a cost object of four parts, `work`, `footprint`
+  (roots and byte ranges), `moves` from a cold cache, and `residue` (what is resident after,
+  bounded by `min(footprint, M)`), composed by one rule — `g`'s moves are reduced by
+  `f.residue ∩ g.footprint` — with loops as the body composed with itself, so the fit test and
+  the slide rules become instances of the rule. Stage A. Its kill condition: if the goldens cannot
+  be reproduced from signatures alone, moves is not a composable quantity, and "cost lives in the
+  signature" is withdrawn in favour of "whole-program analysis tool".
+- **The reason to be a language is scope, not mechanism.** Aliasing is a lint on safe Rust;
+  `repr(Rust)` is known to rustc; position independence is unrelated to cost — all three were
+  withdrawn from the argument. The one mechanism argument that stands is narrower: projections
+  return addresses in Rust (`Index` → `&T`, `Vec<T>` contiguous by definition), so the compiler
+  cannot choose representation without redefining references. The real competitor is the embedded
+  IR (MLIR, Halide, TVM, Triton, Exo), which owns layout without being a general-purpose language.
+  What only a language buys is that the analysis covers everything and the tier of `main` means
+  something.
+- **That reason and its strongest objection are the same fact**: scope ends at the C boundary.
+  Stage C makes the boundary declared (`extern` with a cost), measured (`neant measure` confirms
+  it), and audited (every lockfile line names what it rests on). The share of a program's cost
+  resting on the boundary becomes a number — the size of the language's reason.
+- **Declarations first** (stage B): budgets in real units checked under given `M`, `B` and size
+  bounds, the declaration as the lockfile line and the inference as what is checked against it,
+  callers seeing only callee declarations. Exit test: delete a callee's body, keep its
+  declaration, and the caller still checks. `dyn` inverts: the interface carries the budget.
+- **Coverage is a number and it is low.** M3 corpus, 11 functions: 6 exact, 2 of them by a
+  declared measure, 5 unknown. Kept in the README; re-measured after stage C.
+- **Dates are gone from the plan.** The M0–M3 pace came from a subset cut to be tractable; region
+  inference, cost-driven layout, uniqueness analysis and schedule search are each team-scale
+  problems, and extrapolating the easy part's speed onto them was not honest.
+- **Self-hosting is a goal, not the coverage proof.** The compiler is the program this language is
+  worst at (tree-shaped, string-heavy, `while` over tokens) and so the worst corpus to prove
+  coverage on. It moves after M4 and stays a goal because the author wants it.
+- **Zero-copy persistence leaves the argument** and stays unscheduled.
+
+Not accepted as stated: that the pre-regime symbolic line was "wrong by 8×". It was an upper bound
+under a stated assumption. That the lockfile carried the least predictive bound is accepted, and
+was the reason conditional costs were pulled forward.
+
+The safety-critical / real-time market, where every constraint this language accepts is something
+certification already demands, was proposed early in the design discussion and set aside in favour
+of a general-purpose language judged on its own merits. It is recorded here as the one adoption
+story that was ever plausible, so that if the coverage number after stage C does not move, the
+choice can be revisited with the number in hand.
+
 ## 3 — Exactness first: an exact answer that is finite is always taken; an exponential one is taken until it explodes, and then it says so
 
 **Decided 2026-09-22. Governs everything below and everything after.**

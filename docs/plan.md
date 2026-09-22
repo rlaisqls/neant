@@ -1,325 +1,205 @@
 # Implementation plan
 
 The front door is [../README.md](../README.md). This is the order things get built in, what each
-step has to prove before the next one starts, and what would stop the project.
+step has to prove before the next one starts, and what would stop the project. Dates are not in
+it: the ones an earlier version carried were extrapolated from M0–M3, a subset cut to be
+tractable, onto stages that are each team-scale problems, and that was not honest.
 
-The governing rule: **the cost model is a scientific claim before it is a compiler feature.** It
-says a static number predicts what the hardware does. If that is false, nothing else here matters,
-so the plan front-loads the experiment that could falsify it and puts a kill criterion on it.
+The governing rule: **a claim the compiler makes is a scientific claim before it is a feature.**
+The cost model says a static number predicts what the hardware does; the signature says a
+function's cost can be known without its body; the language says being a language buys scope
+that a DSL cannot. Each is falsifiable, each stage below carries the test that would falsify it,
+and a failed test stops the stage rather than being explained away. M1 was run this way and its
+first rule set failed ([experiments.md](experiments.md)).
 
 ## Decisions taken up front
 
-**Rust first, self-hosted later, two seeds forever.** The compiler will be written in neant. Not
-first, and not by deleting the thing that came before it — the previous language's single worst
-structural problem was the bootstrap: an image that could only be rebuilt by a binary that already
-carried a working one, because the Rust front end had been deleted the moment the self-hosted one
-worked. So:
+**Rust first, self-hosted later, two seeds forever.** The compiler in `bootstrap/` is Rust,
+builds with `cargo build` from a clean checkout, and is never deleted: once a compiler in neant
+exists it becomes seed one and stops growing, and the compiler's own C output, committed as
+`bootstrap/neant.c`, is seed two. The fixpoint from both roads is a CI test. Self-hosting is a
+goal the author holds, not a proof of anything: the compiler is the program this language is worst
+at, and it comes after M4 (decisions §4).
 
-- **The bootstrap compiler is Rust and is never deleted.** It builds with `cargo build` from a clean checkout. Once
-  the self-hosted compiler exists, it stops growing — it only has to compile the subset the
-  compiler is written in — but it stays in the tree and CI builds `compiler/` with it on every
-  commit.
-- **The second seed is the compiler's own C output**, committed as `bootstrap/neant.c`. Because the
-  backend emits C, the self-hosted compiler compiled by itself *is* a C file, and anyone with clang
-  can rebuild the tree from it. This is what the old image should have been: a seed that is
-  readable, diffable, and buildable with a tool everyone already has.
-- **The fixpoint is a test.** `clang bootstrap/neant.c → stage1; stage1 compiler/ → stage2;
-  stage2 compiler/ → stage3; stage2 == stage3`, and separately `bootstrap compiler/ → stage2'` with
-  `stage2' == stage2`. Two independent roads to the same binary, checked in CI.
+**Emit C, do not write a backend.** Cost inference is static and needs no backend; validating it
+needs the program to run on real hardware, and `clang`/`gcc -O2` on generated C is that. Layout,
+fusion, tiling and loop order are decided before the C is written, so the cost model owns what it
+cares about. An own backend is a stage M7 question, as a search space rather than a hand-written
+optimiser (§ M7).
 
-Self-hosting is M6, not M0, for a reason given there. Zero dependencies is a goal, not a rule; a
-parser combinator or an SMT binding in the bootstrap compiler is acceptable if it saves a month.
+**Costs are exact where exactness is finite, and loud where it is not** (decisions §3). No hull
+where a sum is available, no trusted measure that can be checked, no lid on regimes that folds
+silently.
 
-**Emit C, do not write a backend.** Cost inference is a static analysis; it needs no backend at
-all. What it needs is a way to *run* the analysed program on real hardware to check the prediction,
-and `clang -O2` on generated C is that way in a week rather than a quarter. It is also a defensible
-long-term architecture (Nim, Chicken, Futhark's C target): clang owns instruction selection and
-register allocation, this compiler owns everything the cost model cares about — layout, fusion,
-tiling, loop order — because those are decided before the C is written. An own backend is
-reconsidered only if layout control turns out to need it.
+## Done: M0–M3, the analyser
 
-**Source files stay `.nt`.** Same name, same extension.
+**M0** — lexer, parser, checker, typed IR with size variables, C emitter; a dozen programs run.
+**M1** — `work` and `moves` for the exact tier, `costs.lock`, and the experiment: six kernels,
+size sweeps, predicted bytes against `l2d_cache_refill × 64` on one pinned core. Passed on the
+second rule set — the data forced two rules, that access sites compete for the cache and that
+fitting is strictly less than `M`. **M2** — chains and comprehensions desugared to single loops;
+the Hong–Kung bound for contractions, the gap, and `--apply tile|transpose` as costed rewrites:
+tiling removed 53× of measured traffic against 39× predicted and beat the hand-written tile by
+1.75×. **M3** — `while` with inferred or declared measures, `break`, `u8`, solved self-recursion,
+`io` inferred, `#[cost]` by asymptotic dominance, `neant measure`, and a four-program corpus.
+Then the exactness pass: verified measures, reaching definitions, loop sums by Faulhaber, exact
+recurrence constants, and piecewise costs with `if` as max and fit tests that fork.
 
-**Sizes are symbolic, costs are expressions.** A cost is a normalised expression over size
-variables (`n`, `m`, from slice lengths), the two cache parameters (`M` lines of capacity, `B` bytes
-per line) and the usual functions (`log`, `√`). Two costs compare by asymptotic dominance. When the
-normal form would blow up, the function degrades to *measured*; it never fails to get a line.
+What M0–M3 established is an analyser. Everything in it could have been built over a Rust subset
+or as an MLIR dialect. The coverage it reached on ordinary code is the number that governs what
+follows: **6 of 11 functions exact in the M3 corpus, 2 of them only by a declared measure.**
 
-## Milestones
+## Stage A — a composable arrow
 
-Each milestone has an exit criterion that is a test, not a feeling.
+**Claim.** A function's cost can be written in its signature so that a caller never re-analyses
+the body. Today it cannot: rules two and three of the calculus (call-site specialisation,
+inherited loops) re-analyse the callee at every call, because a scalar polynomial cannot say what
+the callee leaves in the cache.
 
-### M0 — A program runs
+**Do.** The cost object becomes four things: `work`; **footprint** — the set of (root, byte
+range) the function touches, expressed in its parameters (the view roots and ranges from the
+exactness pass are already this data structure); **moves** from a cold cache; and **residue** —
+what is resident when it returns, bounded by `min(footprint, M)`, piecewise like the rest.
+Composition is one rule: for `f` then `g`, `g`'s moves are reduced by `f.residue ∩ g.footprint`.
+A loop is its body composed with itself, so the fit test and the two slide rules become instances
+of the rule instead of separate machinery. Regions in M4 become instances too: a region's size is
+its footprint, and "fits a cache level → loaded once whatever the access order" is the residue
+rule.
 
-Lexer, parser, name resolution, a typed IR with size variables attached to every array-typed
-value, and a C emitter. The subset: `i64 f64 bool`, fixed arrays `[T; n]` and slices `&[T]`,
-`let`, arithmetic, `if`, `for i in a..b`, first-order functions, `println` for the harness.
+**Exit.** Rules two and three deleted. Every `.cost` golden reproduced from signatures alone —
+in particular, a call scanning an array twenty times inside a loop costs one scan when the array
+fits, because the residue of iteration `k` covers the footprint of iteration `k+1`. The M1 and M2
+numbers reproduced as a by-product.
 
-`neant build f.nt` produces a binary via clang. No cost anywhere yet.
+**Kill.** If the goldens cannot be reproduced from signatures, moves is not a composable quantity.
+Then "cost lives in the signature" is withdrawn, the README is rewritten around a whole-program
+analysis tool, and M4 is reconsidered from there.
 
-**Exit:** a dozen small programs compile and produce the right output.
+## Stage B — declarations first
 
-### M1 — The exact tier, and the experiment
+**Claim.** A caller can be checked against a callee's declaration alone.
 
-Add iterator chains (`iter map filter sum fold zip`) and comprehensions to the subset. Infer, for
-every function, **work** (primitive operations, symbolic in sizes) and **moves** (bytes across the
-cache boundary, in the I/O model). Print both in the shape the README shows. Write `costs.lock`.
+**Do.** Three changes to `#[cost]`. Budgets: coefficients count, checked as concrete numbers under
+given `M`, `B` and declared size bounds (`moves_at_most = "4096"` with `n ≤ 512`), beside the
+asymptotic check that exists. Ownership: a declaration is the lockfile line, and the inferred cost
+is what gets checked against it — today it is the other way round. Modularity: a caller reads the
+callee's declaration and nothing else, which stage A makes possible. `dyn` inverts with it — an
+interface carries a budget and implementations are checked against it, instead of the call being
+charged the maximum over implementations.
 
-The moves rule set for M1 is deliberately coarse and written down in `docs/cost-model.md` as it is
-built: every array access in a loop nest is classified as *sequential* (`n/B`), *strided* (`n`)
-or *reused-within-cache* (`0` after the first load, when the touched footprint is shown to fit
-`M`); tiling is recognised when a loop nest is split by a constant that the footprint check
-accepts. The polyhedral model is the eventual replacement; it is not needed to run the experiment.
+**Exit.** Delete a callee's body, keep its declaration: the caller's check still passes. One test,
+and it captures what makes separate compilation, binary distribution and interface budgets
+possible.
 
-**Exit, part 1 — golden tests.** `tests/golden/*.nt` each carry the expected `work` and `moves`
-line; they pass.
+## Stage C — the boundary
 
-**Exit, part 2 — the experiment.** Six kernels: `sum`, `dot`, `saxpy`, `transpose`, naive
-`matmul`, tiled `matmul`. For each, over a size sweep from L1-sized to several times L3-sized, on
-one pinned core, compare predicted `moves` against measured `LLC-load-misses × 64` from `perf
-stat`. Two things must hold:
+**Claim.** Scope — the reason this is a language — survives the call into C, as a number rather
+than a hole.
 
-- the **slope** in `n` is right — the model says `n³` for naive matmul and `n³/√M` for tiled, and
-  the measured misses scale the same way;
-- the **ratio** predicted/measured is stable within a factor of ~3 across the sweep for a given
-  kernel. The constant is allowed to be wrong; it is not allowed to drift.
+**Do.** `extern fn` carries a declared cost and effects. `neant measure` confirms the declaration
+on the machine and records the range it was measured on. Every line in `costs.lock` names what it
+rests on: the machine model, an external declaration, a person's assumption (`decreasing`, a
+`#[cost]` on an `extern`). The tier column becomes an auditable chain.
 
-**Kill criterion.** If the model cannot separate naive from tiled matmul in measured misses, or if
-the ratio wanders by an order of magnitude across sizes, the moves model as specified does not
-predict the machine. Stop, and do not build M2 on top of it. Either the rule set is fixed until the
-experiment passes, or the project's central claim is withdrawn.
+**Exit.** A program that calls a C library keeps every non-boundary function exact, and the
+lockfile shows what each line rests on. Then the M3 corpus tier count is taken again — and the
+same for a corpus chosen from the domain where these constraints are assets (control loops,
+kernels, real-time code) — and how far it moved is the measured size of the language's reason to
+exist.
 
-**Status: passed, 2026-09-22, on the second rule set.** Slopes within 0.1 on the five fixed-pattern
-kernels; naive/tiled separated 30× measured against 28× predicted; ratios stable per kernel. The
-first rule set failed on the tiled product and was changed twice — access sites now compete for
-the cache, and fitting is strictly less than `M`. The record, with the numbers and the three
-things the model does not see, is [experiments.md](experiments.md).
+## M4 — views, layout, regions
 
-### M2 — Guaranteed fusion, one lower bound, one gap report
+Stands on stage A. Structs and views (`&xs[i]`, `&p.field` as (collection, index[, field]),
+never an address; projections do not return addresses, which is the one mechanism argument for
+being a language). Compiler-owned representation per type, chosen by the footprint and moves of
+the loops that touch it, reported. Region inference (Tofte–Talpin) for pointer-linked structures,
+with the region's footprint and the residue rule giving the traversal bound. Arrays as values that
+move and return. Layout as a deterministic function of the type definition.
 
-Two things the README promises that M1 does not yet deliver.
+**Exit.** A linked-list and a tree traversal get a bound from the residue rule; switching a struct
+from rows to columns on a benchmark changes measured refills in the direction and magnitude the
+model predicts. **This is the project's first real gate**: the point at which being a language,
+rather than an analyser, has bought something.
 
-**Fusion as a guarantee.** An iterator chain that cannot be fused into a single loop — because a
-stage needs the whole intermediate (`sort`, `reverse`), or because a closure captures a mutable
-that a later stage also touches — is a **type error** naming the stage, not a slower program. The
-compiler proves the fused form has the moves cost it reported.
+## M5 — span and in-place reuse
 
-**The lower-bound catalogue, entry one.** Recognise matrix multiply in the IR (a triple loop nest
-with the characteristic access pattern, or a call to a `matmul` intrinsic), attach the Hong–Kung
-bound `n³/√M`, and compute the gap. Offer the two closing transformations — tiling by `√(M/3)` and
-transposing the column-accessed operand — as rewrites the compiler can apply, and report the new
-cost after applying.
+`span` joins the cost; `T ≤ W/P + O(S)` becomes a statement about a parallel loop. Uniqueness in
+the Perceus style: `ys = xs; ys[3] = 9` is written one way and the cost line says `1` or `n`.
 
-**Exit:** the matmul report in the README is real output on real code, and the `[apply]` rewrites
-are verified in the M1 experiment harness to move the measured misses the way the model says.
+## Self-hosting
 
-**Status: passed, 2026-09-22.** Chains and comprehensions desugar to single loops (fusion by
-construction); the product is recognised, bounded and gapped; `--apply matmul:tile` removed 53×
-of the measured traffic against 39× predicted and beat the hand-tiled kernel by 1.75×;
-`--apply matmul:transpose` removed 15% against a predicted nothing. Record in
-[experiments.md](experiments.md).
+After M4, as a goal. The compiler in neant, the Rust compiler frozen as seed one, `bootstrap/neant.c`
+as seed two, the two-seed fixpoint in CI, and `compiler/costs.lock` as the compiler's own stated
+complexity. Not the coverage proof; the corpus for that is chosen in stage C.
 
-### M3 — The dial: nobody is silent
+## M7 — the constant factor
 
-Take the language from "the exact subset" to "a language", and make sure every function still
-gets a line.
+Prove the asymptote, search the constant. A micro-architectural cost line (what llvm-mca and uiCA
+compute for a block, as default output, applicable because the type system knows what may be
+reassociated); schedules separate from algorithms; search over schedules pruned by the cost model
+and decided by measurement, persisted in `costs.lock`. An own backend is justified here and only
+here — as the search space LLVM does not expose, not as better heuristics.
 
-- **`while`.** Infer the termination measure for induction-variable loops (`i < n` with `i += k`).
-  When inference fails, the error asks for one — `while c decreasing m` — exactly as Rust asks for
-  a lifetime, and only then.
-- **Recursion.** Extract a recurrence from structural recursion on lists and from divide-and-conquer
-  on slices; solve the master-theorem shapes. Anything else is `unbounded`.
-- **`unbounded` and `io` as effects** in the `uses` position. They propagate through calls; a
-  function that calls an unbounded function is unbounded.
-- **The measured tier.** For any function the static analysis leaves unbounded, the compiler can run
-  it over a size sweep, fit `~n^k`, and write that into `costs.lock` marked *measured* with the
-  range it was measured on. A function that falls from *exact* to *measured* is a lockfile diff.
-- **`#[cost(...)]`.** `work_at_most`, `moves_at_most`. Checked by asymptotic dominance; a failure is
-  a build error that shows the inferred cost next to the asserted one.
-- **Higher-order costs.** `map f` costs `n · cost(f)`; costs are parametric in callback costs and
-  instantiated at the call site when `f` is known.
+## Not scheduled
 
-**Exit:** a corpus of ordinary programs — string processing, a small interpreter, a graph search,
-a parser — every function of which has a `costs.lock` line, none of which says nothing, and a
-golden test that each line is the expected *kind* (exact / parametric / recurrence / measured).
+Zero-copy persistence (unrelated to cost; out of the argument); generics beyond what the stages
+need; strings and I/O beyond the harness; compile-time performance of the compiler.
 
-**Status: passed, 2026-09-22.** `while` takes an inferred induction variable or a declared
-`decreasing` measure read at entry; `break`, `u8` and byte strings exist; self-recursion is solved
-(linear, divide-and-conquer, logarithmic; exponential refused; mutual recursion named); `io` is
-inferred; `#[cost]` fails the build by asymptotic dominance; `neant measure` fits `~n^k` under
-perf and writes a `measured` line. The corpus is `tests/golden/{words,vm,bfs,parse}.nt`: every
-function has a line, and the `.cost` goldens lock the kind of each. Higher-order costs did not
-arise — closures are inlined into their chain, and there are no function values yet.
+## Who switches, and why
 
-### M4 — Views, layout, regions
-
-**Before M4 starts** (done 2026-09-22, seven commits): the exactness pass of [decisions.md](decisions.md) §3, in this order —
-the aliasing hole (a shared and a mutable view of one array in one call is accepted and emitted
-with `restrict`; views get a root and a range, disjointness is proved), `decreasing` measures
-verified rather than trusted, reaching definitions for entry values, symbolic summation for
-triangular loops and linear recurrences, exact divide-and-conquer constants, `max` in the cost
-algebra, and conditional costs with feasibility pruning and no silent lid (§2). Three to four
-days. M4's region bound cannot be stated without the last one.
-
-The part of the design that makes the moves model apply to programs with structure in them.
-
-- **Structs and views.** `&xs[i]` and `&p.field` denote (collection, index) or (collection,
-  index, field) and never a location. Nothing in the language observes an address.
-- **Compiler-owned layout.** For each struct type, choose AoS or SoA (later AoSoA, hot/cold
-  splitting) per type, driven by which fields each loop touches and what the moves model says each
-  choice costs. Report the choice.
-- **Region inference.** Tofte–Talpin style: pointer-linked structures (`List`, `Tree`) live in a
-  region the compiler infers from escape behaviour; the region has a known size; a traversal is
-  bounded by `|region| / B` regardless of access order, and by `0` after first touch when the
-  region fits a cache level. `Arena::with_capacity` is the explicit override.
-- **Layout evolution.** Layout is a deterministic function of the type definition, so a
-  position-independent value written by one build reads back under any build of the same
-  definition. Type changes are out of scope until there is a use for them.
-
-**Exit:** a linked-list and a tree traversal get a region-granular moves bound; switching a struct
-from AoS to SoA on a benchmark changes measured misses in the direction and magnitude the model
-predicts.
-
-### M5 — Span, in-place reuse, the editor
-
-- **Span** joins work and moves in every cost; `T ≤ W/P + O(S)` becomes a statement the compiler
-  can make about a `par` loop or a parallel iterator.
-- **In-place reuse.** Uniqueness analysis in the Perceus style: `ys = xs; ys[3] = 9` is written the
-  same way whether it copies or not, and the cost line says `1` or `n` and, in the `n` case, names
-  the line that keeps `xs` alive.
-- **An LSP** that serves the cost line as an inlay hint after the signature, and the M2 gap report
-  as a code action.
-
-### M6 — Self-hosting
-
-Rewrite the compiler in neant. This waits for M4 because a compiler is exactly the kind of program
-the early language is worst at: tree-shaped (the AST needs recursive types and therefore regions),
-string-heavy, hash-map-heavy, and full of `while` loops over tokens. Before M3 it cannot be
-expressed; before M4 it cannot be expressed comfortably. After M4 it is an ordinary program.
-
-The port is of the whole compiler, cost inference included. The Rust cost module written for
-M1–M3 is written a second time here; that is the price of validating the model early instead of
-waiting until the language could express its own analysis, and it is a bounded price — a few
-thousand lines, in a language whose shape is settled by then. The bootstrap compiler is then frozen: it keeps
-whatever it has, gains nothing, and is only ever touched to keep compiling `compiler/`.
-
-Two things fall out of self-hosting *this* language that do not fall out of self-hosting in
-general:
-
-- **The compiler is the M3 corpus.** "Every function gets a line and nobody is silent" is tested on
-  the largest real program in the tree.
-- **`compiler/costs.lock` is the compiler's own complexity, stated.** Which pass is superlinear in
-  the size of the input, which one is `n · d` in nesting depth, which one is measured because it
-  recurses on the AST — a self-hosted compiler usually proves the language works; this one would
-  also state what its own compile time costs and why.
-
-**Exit:** the two-seed fixpoint passes in CI; `compiler/costs.lock` is committed; `bootstrap/` is marked
-frozen in its README.
-
-### M7 — The constant factor
-
-Everything before this is asymptotic: the cost model proves the shape of a function's cost and
-leaves the constant to clang. The constant is where the last 1.2–2× on a hot kernel lives —
-latency chains, vector width, unroll factors, port pressure, prefetch distance — and it is where
-LLVM's heuristics stop and a person with an assembly listing starts. This milestone takes that
-work over, not by writing a better heuristic backend than LLVM (a solo project cannot) but by three
-things this language is unusually placed to do.
-
-**Prove the asymptote, search the constant.**
-
-- **A micro-architectural cost line.** What the matmul report does for moves, done for latency and
-  throughput: `dot` is reported as latency-bound on a 4-cycle FMA chain against a 0.5-cycle
-  throughput bound, with the fix — four independent accumulators — offered as `[apply]`. This is
-  what llvm-mca and uiCA compute for a basic block, made the default output for every function, and
-  made applicable because the type system knows whether the reduction may be reassociated (always
-  for integers; for `f64` only where the region allows `reassoc`).
-- **Schedules, separate from algorithms.** Halide's separation: `schedule matmul for <target> {
-  tile ..; vectorize ..; unroll ..; prefetch ..; }`. The algorithm fixes meaning and asymptotic
-  cost; the schedule moves only the constant, and cannot break either. Hand-tuning stops meaning
-  rewriting the algorithm and hoping.
-- **Search where heuristics stop.** For a hot kernel on a specific machine, enumerate schedules,
-  prune by the cost model (a schedule with worse `moves` is never run), measure the survivors,
-  keep the best, and persist it in `costs.lock` so it is still there tomorrow. This is the shape
-  in which search has actually beaten hand-tuned code — TVM/Ansor over cuDNN, Halide's
-  autoscheduler over hand schedules, CryptOpt over hand-written assembly — and the language makes
-  the search unusually cheap: no aliasing means every reordering is legal without analysis, known
-  sizes mean specialisation is free, and the cost model is the pruning function.
-
-**Where an own backend becomes justified.** Not to write better instruction selection than LLVM by
-hand, but to expose instruction selection and scheduling as a *search space* that LLVM does not
-offer — a backend that need not be good in general because it solves one kernel on one machine
-with time to spare. That is CryptOpt's position and the only one from which a small backend beats
-a large one. It also restores the property the previous language had and this one gave up by
-emitting C: that the bytes that run are bytes the compiler can be asked about.
-
-**Exit:** on a small set of kernels that are already at their moves bound after M2, the searched
-schedule beats `clang -O3` on the same C by a measured margin, the micro line predicted the
-bottleneck the search fixed, and the result survives a rebuild via `costs.lock`.
-
-The micro model is an approximation on out-of-order cores; uiCA's error against hardware is
-nonzero and this one's will be larger. It is therefore used only to prune, never to choose — the
-final choice is always a measurement.
-
-### Not scheduled
-
-Generics beyond what the milestones need; strings and I/O beyond the harness; `dyn` dispatch
-costing; zero-copy persistence as a feature rather than a consequence; compile-time performance of
-the compiler itself.
+Nobody has to, and the plan does not assume anyone will. This is a general-purpose language judged
+on its own merits, chosen knowingly over the two positions with an adoption story: a kernel DSL
+that inherits its host's ecosystem, and the safety-critical / real-time niche where dynamic
+allocation bans, restricted subsets and strange toolchains are what certification already demands
+and worst-case tools are disliked (decisions §4). The reason a language and not an embedded IR is
+scope; the thing that attacks scope is the C boundary; stage C turns that into a number. If, after
+stage C, the exact tier does not move on ordinary code, the honest positions are the two above, and
+the choice is reopened with the number in hand.
 
 ## Layout of the repository
 
 ```
 bootstrap/              everything that builds the compiler from nothing
-  Cargo.toml, src/      the Rust compiler. Seed one. Frozen after M6, never deleted.
-    lex.rs  parse.rs  ast.rs  resolve.rs  types.rs
-    ir.rs               typed IR, every array value carries a size variable
+  Cargo.toml, src/      the Rust compiler. Seed one. Frozen after self-hosting, never deleted.
+    lex.rs  parse.rs  ast.rs  types.rs  ir.rs  emit_c.rs  main.rs
     cost/
       size.rs           symbolic sizes and costs: rational polynomials over atoms, B and M
-      analyze.rs        the work and moves calculi, one walk (docs/cost-model.md is its spec)
-      recur.rs          recurrence extraction and solving           (M3)
-      bounds.rs         the lower-bound catalogue                    (M2)
-      lock.rs           costs.lock read/write/diff
-    emit_c.rs
-    main.rs             neant build | cost | lock | measure | validate
-  neant.c               compiler/ compiled by itself. Seed two. Regenerated at each release. (M6)
-compiler/               the compiler in neant. Empty until M6, then the one that grows.
-  *.nt
-  costs.lock
+      piece.rs          piecewise costs: conditions, max, feasibility
+      analyze.rs        the calculus, one walk (docs/cost-model.md is its spec)
+      bounds.rs         the lower-bound catalogue
+      rewrite.rs        tile and transpose
+      assert.rs         #[cost] parsing and dominance
+      measure.rs        the measured tier
+      lock.rs           costs.lock and the report
+  neant.c               compiler/ compiled by itself. Seed two. (self-hosting)
+compiler/               the compiler in neant. Empty until self-hosting.
 tests/
   golden/               .nt programs with expected output (.out, .exit), rejection (.err), cost report (.cost)
-  kernels/              the M1 experiment: six kernel templates and sweep.py, the perf harness
-  bootstrap.sh          the two-seed fixpoint
+  kernels/              the M1/M2 experiments: kernel templates and sweep.py, the perf harness
 docs/
   plan.md               this file
   cost-model.md         the calculus, as implemented
   experiments.md        what was measured against what prediction, and what it changed
+  decisions.md          decisions with the reasoning that produced them
 ```
 
 ## Validation harness notes
 
-`perf stat -e LLC-loads,LLC-load-misses`, pinned to one core with `taskset`, minimum of several
-runs per size. The development machine is heterogeneous (big.LITTLE); pinning to a big core is not
-optional, and the harness must record which core it ran on. Sizes step by factors of 2 from below
-L1 to well past L3; the slope is fitted on the region past L3 where the I/O model is meant to hold.
+`perf stat -e l2d_cache_refill`, pinned to one core with `taskset`, minimum of several runs per
+size. The development machine is heterogeneous (Cortex-X925 on CPUs 5–9 and 15–19, L2 2 MiB
+private, L3 16 MiB; Cortex-A725 elsewhere); pinning to a big core is not optional, and the harness
+records which core it ran on. Sizes step by factors of two from below L1 to well past L3 and avoid
+powers of two; the slope is fitted on the region past the cache where the I/O model is meant to
+hold. `kernel.perf_event_paranoid` must be 2 or lower.
 
 ## Risks and what is done about them
 
 | risk | mitigation |
 |---|---|
-| The moves model does not predict hardware | The M1 experiment, with a kill criterion, before anything is built on it |
-| Symbolic sizes explode | A small normal form; when it fails, the function degrades to *measured* rather than the compiler failing |
-| Recurrence solving is a research project | Master-theorem shapes only in M3; everything else is `unbounded` and measured |
-| Region inference is a research project | M4, not earlier; the explicit `Arena` is the fallback that always works |
-| "Measured" becomes the tier everyone lives in | The error that accompanies a fall to *measured* says exactly what would bring the function back to *exact*, and `costs.lock` makes the fall visible in review |
-| The generated-C path cannot express a layout the model wants | Discovered in M4, where the own-backend decision is revisited with evidence |
-| Self-hosting recreates the bootstrap trap | Two seeds, both exercised in CI on every commit; the bootstrap compiler is frozen, not deleted; the second seed is C, not an image |
-| Two compilers to maintain | The bootstrap compiler stops growing at M6 and only has to compile `compiler/`; the cost module is written twice, once, and that is the whole overlap |
-
-## Rough shape of the calendar
-
-M0 one to two weeks. M1 three to four, half of it the experiment. M2 three. M3 four to six. M4
-six to eight. M5 four. M6 — the port — six to eight. M7 is open-ended and starts with the micro
-cost line, which is the cheap part. That is roughly a quarter to M3, the point at which the
-language exists and the thesis is either standing or not; two more months to M4; self-hosted
-somewhere around month eight or nine; and the constant factor after that, for as long as it keeps
-paying. Solo pace; the numbers are for ordering, not for promising.
+| moves is not composable (stage A fails) | The kill condition: withdraw the signature claim, reposition as whole-program analysis |
+| the boundary swallows the program (most lines rest on `extern` declarations) | Stage C measures it; if the exact share does not move, the positioning is reopened (§ Who switches) |
+| the moves model does not predict hardware | M1's experiment and kill criterion, passed; re-run at every rule change |
+| symbolic sizes or regimes explode | Exact by default, feasibility pruning, and an explosion is reported, not folded (decisions §3) |
+| region inference and cost-driven layout are research problems | M4 waits for stage A; the explicit `Arena` and an explicit layout attribute are the fallbacks that always work |
+| self-hosting recreates the bootstrap trap | Two seeds, both in CI; the Rust compiler is frozen, not deleted; seed two is C, not an image |
+| the generated-C path cannot express a layout the model wants | Discovered in M4, where the backend decision is revisited with evidence |

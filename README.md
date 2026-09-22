@@ -124,13 +124,44 @@ optimization. `.sum()` means what `+/` meant. The notation is words now.
 
 ## Why this is a language and not a library on Rust or Zig
 
-Neither has a cost semantics. Performance in both is emergent — the reason a program is fast or
-slow lives in LLVM, not in the language, and changes with the compiler version. A cost in a
-signature needs the compiler to know layout, aliasing and effects for the whole program, and one
-`&mut p.x` destroys the first, one raw pointer the second. `repr(Rust)` is unspecified; `Vec`,
-`String` and `Box` hold absolute addresses; making a struct position-independent means leaving the
-native type system for a parallel one (`rkyv`). None of this is a pass that can be added. It is the
-part of the language that decides what a value is.
+Not for the reasons a first draft of this section gave. Aliasing does not need a language: safe
+Rust already has a sound aliasing discipline and hands LLVM `noalias`; forbidding `unsafe` is a
+lint. `repr(Rust)` being unspecified is no obstacle to an analyser that sits on rustc, which knows
+the layout exactly. And position-independent data is a separate feature that has nothing to do
+with cost. Those arguments are withdrawn.
+
+One argument about mechanism survives, narrower than before. The compiler can choose a type's
+representation — split a struct into columns, store a declared `f64` as `f32`, pack bits — only
+if nothing in the program can hold an address into it. In Rust, `Index` returns `&T` and `Vec<T>`
+is *defined* as contiguous `T`: every projection returns an address, so the representation is
+fixed by the type's definition and no pass can change it. Making projections not be addresses
+means redefining what a reference is, and that is a language decision.
+
+But the real alternative is not a library on Rust. It is an **embedded IR with its own value
+world** — MLIR's `tensor` and `memref`, Halide, TVM, Triton, Exo — where values have no
+addresses, layout is an attribute the compiler chooses, and aliasing is absent by construction.
+They got layout ownership without becoming a general-purpose language, and switching to one of
+them costs nothing: the Python and C++ around the kernel stay.
+
+What only a language gets is **scope**. The analysis covers every function, so `costs.lock` is
+total and "nobody is silent" is a statement about the program, not about the 5% of it inside a
+DSL region; `io` and `unbounded` propagate up the whole call graph, so the tier of `main` means
+something. That is the argument, and it is also the argument's strongest objection: scope ends
+where the program calls C. A cost signature on a function that calls `read` or `malloc` rests on
+whatever is assumed about `read` and `malloc`. The answer is not to pretend otherwise but to make
+the boundary a declared, measured and audited thing — an `extern` carries a declared cost, `neant
+measure` confirms it on the machine, and every line in the lockfile says what it rests on: the
+machine model, an external declaration, or a person's assumption. How much of a program's cost
+rests on the boundary is then a number, and that number is the size of this language's reason to
+exist.
+
+A correction to the analogy this document opens with. Correctness composes like a type: `f: A→B`
+and `g: B→C` give `A→C` with no further information. Cost does not, because the cache is a shared
+resource: what `g` costs after `f` depends on what `f` left in the cache. So a cost signature is
+not a type but an **effect**: it must say what a function touches (its footprint) and what it
+leaves resident (its residue), and composition subtracts the overlap. The calculus is being
+rebuilt in that shape (plan, stage A); until it is, the compiler re-analyses a callee at each call
+site, which is not composition but whole-program analysis, and is said so.
 
 ## Where the pieces already exist
 
@@ -150,24 +181,56 @@ not been built.
 
 ## What this is not
 
-`O(·)` does not capture constants. A function can meet its movement bound and still lose 2× to
-a prefetcher, NUMA, or out-of-order effects the model does not see; the model turns "why is this
-slow" from a profiling question into a compositional one and leaves the last factor of two to
-measurement, where it has always been. The ideal-cache assumption (full associativity, optimal
-replacement) is a proven constant-factor approximation of real hardware, and that constant is
-sometimes uncomfortable. Inference will refuse things you know are fine, and ask for measures and
-sizes you find obvious — the same bargain Rust struck with the borrow checker, made for time
-instead of memory. And costing works best where the lower bounds are known; for an algorithm the
-compiler has never seen, it can tell you what yours costs but not what it should.
+**It predicts movement, not time.** `moves` is bytes across one cache boundary in an ideal cache
+of one size `M`. The machine has three levels, a TLB the model does not mention that dominates at
+large strides, set associativity that made one tiled product 75× slower at a stride with a big
+power of two in it, and a transition from "fits" to "does not" that the model puts at one `n` and
+the hardware spreads over an octave. `O(·)` does not capture constants either: a function can meet
+its movement bound and lose 2× to a prefetcher or out-of-order effects. The model turns "why is
+this slow" from a profiling question into a compositional one; it does not answer "will this be
+fast".
+
+**What was verified is shape, not number.** The M1 sweep confirmed slopes and the one transition
+that matters — reuse or not — and calibrated a stable constant per access pattern; the counter it
+was measured against pairs read streams and does not see write streams, so it was never in the
+model's unit. The linear kernels' slopes are near-trivial; the information is in the naive/tiled
+separation and in the two rules the data forced.
+
+**The gap report exists for a dozen computations.** A lower bound is known for the matrix product
+and other contractions, FFT, sorting, permutation, some stencils — the catalogue will hold maybe a
+dozen entries. For anything else the compiler says what yours costs and cannot say what it should.
+
+**The exact tier covers less than the demo suggests.** On the four ordinary programs of the M3
+corpus — string processing, a stack machine, breadth-first search, a recursive-descent parser —
+6 of 11 functions are exact, and 2 of those 6 only because a `decreasing` measure was declared;
+5 are unknown and go to the measured tier, which is a profiler with the boundary written down.
+Dense affine loop nests, where the calculus is at its best, are also where Halide, TVM and the
+polyhedral compilers already are. Whether the exact tier grows past half of ordinary code is the
+open question of the next stages, and the number will be kept in this document.
+
+**M0–M3 built the analyser, not yet the language.** Everything so far could have been an analysis
+over a Rust subset or an MLIR dialect. The bet that this is a language pays, if it pays, when the
+compiler owns representation — stage M4 — and not before. That is the project's first real gate.
+
+The rest is the usual: inference refuses things you know are fine and asks for measures and sizes
+you find obvious, the bargain Rust struck with the borrow checker made for time instead of memory.
 
 ## Status
 
-Nothing is built. This document is the design, and it exists to be argued with before anything is.
+Built and measured, 2026-09-22, in `bootstrap/`: a Rust compiler emitting C for the subset
+described above; `neant cost`, `lock`, `measure`, `--apply`; the calculus with piecewise costs,
+exact loop summation and solved recurrences; the M1 experiment (passed on the second rule set)
+and the M2 rewrite measurement (tile: 53× less traffic, predicted 39×). The corpus tier count
+above is the honest coverage number. Record of the sweeps: [docs/experiments.md](docs/experiments.md);
+the calculus as implemented: [docs/cost-model.md](docs/cost-model.md); decisions with their
+reasons: [docs/decisions.md](docs/decisions.md); what is next and in what order:
+[docs/plan.md](docs/plan.md).
 
-The first thing to build is the smallest possible demonstration of the thesis: a subset with arrays,
-bounded loops and iterator chains; inference of work and moves for that subset; a `costs.lock`;
-and one lower bound (matrix multiply) with its gap report. If that is not convincing on its own,
-nothing downstream of it will be.
+Next is not M4 but three stages that make the cost object compose: signatures that carry a
+footprint and a residue so a callee is never re-analysed (A); declarations first, with budgets in
+real units and callers seeing only the callee's declaration (B); and the boundary as a declared,
+measured, audited thing (C). Each has an exit test and a kill condition, and all three run on the
+subset that exists. M4 stands on A.
 
 This repository previously held a different language of the same name — a k-family array language
 with a self-hosted arm64 JIT and a checker that read the emitted machine code to decide whether a

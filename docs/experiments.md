@@ -111,6 +111,12 @@ are off by a stable factor that depends on the pattern and on how the counter wo
 direction the plan reserved for measurement. M1's exit criterion is met, on the second version
 of the rule set, and the two rules it forced are the experiment's real product.
 
+What this verified, said plainly: the *shape* — slopes, and the one transition between reuse and
+no reuse — and a stable constant per access pattern. It did not verify numbers: the counter pairs
+read streams and does not see write streams, so it was never in the model's unit, and the linear
+kernels' slopes are near-trivial. The information is in the naive/tiled separation and in the two
+rules the data forced.
+
 ## M2 — do the compiler's rewrites move the machine the way the model says?
 
 **Claim under test.** `neant cost` offers two rewrites on a recognised matrix product, each
