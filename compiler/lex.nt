@@ -68,7 +68,7 @@ fn keyword(src: &[u8], start: i64, len: i64) -> i64 {
     };
     if len == 10 {
         if src[start] == b'd' && src[start + 1] == b'e' && src[start + 2] == b'c' && src[start + 3] == b'r' && src[start + 4] == b'e' && src[start + 5] == b'a' && src[start + 6] == b's' && src[start + 7] == b'i' && src[start + 8] == b'n' && src[start + 9] == b'g' { return 19; }
-    };
+    }
     -1
 }
 

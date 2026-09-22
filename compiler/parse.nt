@@ -544,7 +544,13 @@ fn item(src: &[u8], toks: &[Token], n_toks: i64, st: &mut [i64], nodes: &mut [No
         expect(toks, st, 30);
         return n;
     }
-    let e = expr(src, toks, n_toks, st, nodes);
+    // in *statement* position an expression that begins with a block-like form — `if` or `{` —
+    // ends at that block, and an operator on the next line starts a new statement rather than
+    // continuing it. Same rule as parse.rs, for the reason recorded there: without it an
+    // else-less `if` followed by a line starting with `-` is one subtraction, which bit this
+    // file, check.nt and a debug driver before the grammar was fixed.
+    let block_like = k == 9 || k == 27;
+    let e = if block_like { primary(src, toks, n_toks, st, nodes) } else { expr(src, toks, n_toks, st, nodes) };
     if st[2] != 0 { return -1; }
     let a = toks[st[0]].kind;
     let op = if a == 35 { -1 } else if a == 47 { 0 } else if a == 48 { 1 }

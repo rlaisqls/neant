@@ -1,0 +1,38 @@
+// An else-less `if` in statement position ends at its block. Without that rule the `-1` on the
+// next line continues it, and `if c { … }` followed by `-1` is one subtraction between `()` and
+// `i64` — which is what it was, and what needed a stray `;` after the block three separate times
+// while the compiler was being written in itself.
+fn classify(n: i64) -> i64 {
+    if n > 100 {
+        return 2;
+    }
+    -1
+}
+
+fn tally(n: i64) -> i64 {
+    let mut acc = 0;
+    let mut i = 0;
+    while i < n {
+        if i % 3 == 0 {
+            acc += i;
+        }
+        -i + i;
+        i += 1;
+    }
+    // a bare block in statement position ends the same way
+    {
+        acc += 1;
+    }
+    -acc
+}
+
+fn main() {
+    println(classify(200));
+    println(classify(5));
+    println(tally(10));
+    // in *value* position nothing changed: this is still one expression
+    let v = if 1 < 2 { 10 } else { 20 } - 3;
+    println(v);
+    // and a block-like operand in statement position works when it is bracketed
+    println((if 1 < 2 { 4 } else { 5 }) - 1);
+}

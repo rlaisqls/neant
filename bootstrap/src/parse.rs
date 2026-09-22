@@ -256,7 +256,17 @@ impl Parser {
                 Ok(Item::Stmt(Stmt::Break(line, col)))
             }
             _ => {
-                let e = self.expr()?;
+                // Rust's rule, and for Rust's reason: in *statement* position an expression that
+                // begins with a block-like form — `if` or `{` — ends at that block, and a binary
+                // operator on the next line starts a new statement rather than continuing it.
+                // Without this, an else-less `if` followed by a line starting with `-` parses as
+                // one subtraction; that bit three times while self-hosting (compiler/lex.nt,
+                // compiler/check.nt, and a debug driver) and was worked around with a stray `;`
+                // each time. `let x = if c { 1 } else { 2 } + 1;` is unaffected: it is not in
+                // statement position. To use a block-like expression as an operand here, bracket
+                // it — `(if c { 1 } else { 2 }) + 1` — which is what Rust asks for too.
+                let block_like = matches!(self.peek(), Tok::If | Tok::LBrace);
+                let e = if block_like { self.primary()? } else { self.expr()? };
                 let compound = match self.peek() {
                     Tok::Eq => Some(None),
                     Tok::PlusEq => Some(Some(BinOp::Add)),

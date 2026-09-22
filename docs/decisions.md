@@ -4,6 +4,40 @@ Design decisions with the reasoning that produced them, so the reasoning is not 
 code is. Newest first. A decision is recorded when it was argued over, when it rejected
 alternatives worth remembering, or when a future reader would otherwise ask "why on earth".
 
+## 8 — a block-like expression in statement position ends at its block
+
+**Decided 2026-09-23, after the same parse bit three times while writing the compiler in itself.**
+
+```neant
+if n > 100 {
+    return 2;
+}
+-1
+```
+
+read as **one subtraction** — `(if …) - 1`, `-` between `()` and `i64` — rather than a statement
+and then a tail expression. The workaround each time was a stray `;` after the block, and the
+first two occurrences were recorded as "a language question worth treating as more than a
+papercut" (self-hosting-design.md §5, checker design §7). The third was a throwaway driver written
+to debug the second. A thing that catches its author three times catches everyone.
+
+**The rule, which is Rust's:** in *statement* position, an expression that begins with a block-like
+form — `if` or `{` — ends at that block. An operator on the next line begins a new statement. In
+value position nothing changes: `let v = if c { 10 } else { 20 } - 3;` is still one expression,
+because a `let` initialiser is not statement position. To use a block-like expression as an
+operand *in* statement position, bracket it: `(if c { 4 } else { 5 }) - 1`.
+
+**Alternatives rejected.** Requiring `;` after every `if` statement — that is what the workaround
+was, and it makes the common case pay for the rare one. Making an else-less `if` a statement and
+an `if`/`else` an expression — the distinction is invisible at the point of use and would split
+`if` into two constructs. Newline sensitivity — a real option, and the one Go takes, but it makes
+formatting semantic and nothing else in this language is line-sensitive.
+
+**What it cost:** nothing measurable. All 70 goldens passed unchanged, the self-hosted parser took
+the same three lines, and `tests/golden/ifstmt.nt` is the golden that fails without it. The two
+stray `;`s in `compiler/lex.nt` and `compiler/check.nt` are deleted, which is the real proof: the
+self-hosted parser has to have the rule in order to read its own source.
+
 ## 7 — `T ≤ work/P + O(span)` is missing a term, on the machine's own evidence
 
 **Decided 2026-09-22, after `tests/kernels/par_sweep.py` measured a compute-bound and a
