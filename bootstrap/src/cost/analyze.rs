@@ -106,9 +106,9 @@ pub fn analyze(m: &Module, machine: &Machine) -> Vec<FuncCost> {
     for i in 0..m.funcs.len() {
         an.func(i);
     }
-    // a function with a recognised bound gets each rewrite tried on it and costed
+    // a function with reuse to be had — an HBL exponent above one — gets each rewrite tried on it
     for i in 0..m.funcs.len() {
-        if an.done[i].as_ref().is_some_and(|c| c.bounds.is_empty()) { continue; }
+        if an.done[i].as_ref().is_some_and(|c| !c.bounds.iter().any(|b| b.kind.starts_with("HBL"))) { continue; }
         let f = &m.funcs[i];
         let t = rewrite::tile_side(machine.m_bytes, 8);
         let mut sugg = Vec::new();
@@ -183,7 +183,7 @@ fn param_names(f: &Func) -> Vec<String> {
 
 /// An index expression as an affine function of the enclosing loop variables, with
 /// coefficients that are size polynomials.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, PartialEq)]
 struct Affine {
     coeffs: BTreeMap<LocalId, Poly>,
     konst: Poly,
@@ -278,6 +278,14 @@ struct Fa<'a, 'b, 'c> {
     sites: Vec<Site>,
     loop_recs: Vec<LoopRec>,
     bounds: Vec<Bound>,
+    /// per array root, the largest injective image (bytes) any reference to it has: the footprint bound
+    images: HashMap<LocalId, Poly>,
+    /// A scalar that a statement of the enclosing block stores into, or loads from, an array
+    /// element (`c[i·n + j] = acc`): inside that block the scalar *is* that element's running
+    /// value, and a statement using it references the element. Register promotion does not
+    /// change the computation, so the bound over the element's projection holds.
+    scalar_alias: HashMap<LocalId, (LocalId, Expr)>,
+    alias_scopes: Vec<Vec<LocalId>>,
     notes: Vec<String>,
     io: bool,
     /// the function being analysed, when it may call itself
@@ -325,7 +333,7 @@ struct Fa<'a, 'b, 'c> {
 impl<'a, 'b, 'c> Fa<'a, 'b, 'c> {
     fn new(an: &'b mut Analyzer<'a>, f: &'c Func, self_fid: Option<FuncId>) -> Self {
         let mut fa = Fa {
-            an, f, names: param_names(f), sites: vec![], loop_recs: vec![], bounds: vec![], notes: vec![], io: false, self_fid, rec_calls: vec![],
+            an, f, names: param_names(f), sites: vec![], loop_recs: vec![], bounds: vec![], images: HashMap::new(), scalar_alias: HashMap::new(), alias_scopes: vec![], notes: vec![], io: false, self_fid, rec_calls: vec![],
             local_size: HashMap::new(), local_affine: HashMap::new(), initial: HashMap::new(), at_entry: false,
             loops: vec![], work: Cost::zero(), moves: Cost::zero(), saved: vec![], branch: vec![], next_if: 0,
             local_root: HashMap::new(), resident: vec![], call_moves: Cost::zero(), saved_calls: vec![], replay: false, has_call: vec![], rests_on: vec![],
@@ -439,6 +447,15 @@ impl<'a, 'b, 'c> Fa<'a, 'b, 'c> {
             }
         }
         let effects = if self.io { vec!["io"] } else { vec![] };
+        // the footprint bound: distinct elements of parameter arrays, each crossing once from cold
+        let mut foot = Poly::zero();
+        let mut roots: Vec<&LocalId> = self.images.keys().collect();
+        roots.sort();
+        for r in roots { if self.f.params.contains(r) { foot = foot.add(&self.images[r]); } }
+        if !foot.is_zero() {
+            self.bounds.push(Bound { kind: "footprint".into(), citation: "every distinct element crosses once".into(), moves: foot, line: self.f.line, cold: true });
+        }
+        bounds::strongest_first(&mut self.bounds, &m);
         FuncCost { name: self.f.name.clone(), names: self.names, result, bounds: self.bounds, notes: self.notes, suggestions: vec![], effects, violations, tier, footprint, resident, declared, rests_on: self.rests_on }
     }
 
@@ -955,23 +972,80 @@ impl<'a, 'b, 'c> Fa<'a, 'b, 'c> {
         self.moves = self.moves.add(&total.mul_poly(&Poly::atom(Atom::B)));
     }
 
-    /// The catalogue, entry one: is this statement a multiply-accumulate whose two indices form
-    /// a contraction over the enclosing loops? Then the Hong–Kung bound applies to the whole nest.
+    /// The native lower bound for the statement's nest (`bounds.rs`): every array reference in
+    /// the statement as an injective affine map on the loop variables, the HBL exponent over
+    /// them, and the exact iteration count. References that are not injective (`a[i + j]`) or
+    /// not affine leave the statement without an HBL bound; each injective reference still
+    /// records the size of its image for the footprint bound.
     fn recognise(&mut self, s: &Stmt) {
         if self.replay { return; }
+        // the references, reads and writes alike
+        let mut refs: Vec<(LocalId, &Expr)> = Vec::new();
+        match s {
+            Stmt::Assign(lv, _, e) => { if let LValue::Index(a, i, _) = lv { refs.push((*a, i)); } collect_refs(e, &mut refs); }
+            Stmt::Let(_, e) | Stmt::Expr(e) => collect_refs(e, &mut refs),
+            _ => {}
+        }
+        // scalars that stand for an array element
+        let mut scalars: Vec<LocalId> = Vec::new();
+        match s {
+            Stmt::Assign(lv, _, e) => { if let LValue::Var(v) = lv { scalars.push(*v); } collect_scalars(e, &mut scalars); }
+            Stmt::Let(_, e) | Stmt::Expr(e) => collect_scalars(e, &mut scalars),
+            _ => {}
+        }
+        let aliased: Vec<(LocalId, Expr)> = scalars.iter().filter_map(|v| self.scalar_alias.get(v).cloned()).collect();
+        for (arr, idx) in &aliased { refs.push((*arr, idx)); }
+        if refs.is_empty() { return; }
+        let line = match s { Stmt::Assign(_, _, e) | Stmt::Let(_, e) | Stmt::Expr(e) => e.line, _ => 0 };
+        // loop variables in scope with atoms, outermost first
+        let nest: Vec<(LocalId, usize, usize)> = self.loops.iter().enumerate().filter_map(|(k, l)| Some((l.var?, l.atom?, k))).collect();
+        let mut all_injective = true;
+        let mut dim_sets: Vec<u32> = Vec::new();
+        for (arr, idx) in &refs {
+            let Some(aff) = self.affine(idx) else { all_injective = false; continue };
+            let Some(dims) = self.injective_dims(&aff, &nest) else { all_injective = false; continue };
+            let mut mask = 0u32;
+            for d in &dims { if let Some(pos) = nest.iter().position(|(v, _, _)| v == d) { mask |= 1 << pos; } }
+            dim_sets.push(mask);
+            // the image of this reference, for the footprint bound: the count over its own loops
+            // when their bounds mention no other loop
+            if let Some(img) = self.image_size(&dims, &nest) {
+                let root = self.local_root.get(arr).copied().unwrap_or(*arr);
+                let bytes = img.scale(Rat::int(self.elem_bytes(*arr)));
+                let e = self.images.entry(root).or_insert_with(Poly::zero);
+                if bounds_dominates(&bytes, e) { *e = bytes; }
+            }
+        }
+        if all_injective && !dim_sets.is_empty() {
+            // loops no reference mentions are repetition, left out of |I| when nothing inside
+            // depends on them; a loop an inner bound depends on stays in and the LP says so
+            let used: u32 = dim_sets.iter().fold(0, |a, b| a | b);
+            let mut count = Poly::constant(1);
+            let mut in_lp = used;
+            for (pos, (_, atom, k)) in nest.iter().enumerate().rev() {
+                let l = &self.loops[*k];
+                if used & (1 << pos) != 0 || count.mentions(*atom) {
+                    in_lp |= 1 << pos;
+                    count = count.sum_over(*atom, &l.lo, l.step, &l.trip);
+                }
+            }
+            // renumber the dims that are in the LP
+            let positions: Vec<usize> = (0..nest.len()).filter(|p| in_lp & (1 << p) != 0).collect();
+            let compact = |mask: u32| positions.iter().enumerate().fold(0u32, |acc, (new, &old)| if mask & (1 << old) != 0 { acc | (1 << new) } else { acc });
+            let sets: Vec<u32> = dim_sets.iter().map(|&m| compact(m)).collect();
+            if let Some(sigma) = bounds::hbl_sigma(positions.len(), &sets) {
+                if sigma > Rat::one() {
+                    self.bounds.push(Bound {
+                        kind: format!("HBL, σ = {}", if sigma.d == 1 { sigma.n.to_string() } else { format!("{}/{}", sigma.n, sigma.d) }), citation: "CDKSY 2013".into(),
+                        moves: bounds::hbl_bound(&count, sigma), line, cold: false,
+                    });
+                }
+            }
+        }
+        // what each operand of a multiply-accumulate does in the innermost loop
         let Some(mac) = bounds::as_mac(s) else { return };
         let (Some(aa), Some(ab)) = (self.affine(mac.ia), self.affine(mac.ib)) else { return };
-        let va: Vec<LocalId> = aa.coeffs.keys().copied().collect();
-        let vb: Vec<LocalId> = ab.coeffs.keys().copied().collect();
-        if !bounds::is_contraction(&va, &vb) { return; }
         let es = self.elem_bytes(mac.a);
-        let n = self.times_here();
-        let nest: Vec<LocalId> = self.loops.iter().filter_map(|l| l.var).collect();
-        self.bounds.push(Bound {
-            kind: "matrix product", citation: "Hong–Kung 1981".into(),
-            moves: bounds::matmul_bound(&n, es), line: mac.line, operands: [mac.a, mac.b], nest,
-        });
-        // what each operand does in the innermost loop
         if let Some(inner) = self.loops.last().and_then(|l| l.var) {
             let m = self.machine();
             for (arr, aff) in [(mac.a, &aa), (mac.b, &ab)] {
@@ -986,6 +1060,52 @@ impl<'a, 'b, 'c> Fa<'a, 'b, 'c> {
         }
     }
 
+    /// The loop variables an affine index depends on, when the index is injective on their
+    /// ranges: sorted by the span each variable contributes, every coefficient must reach past
+    /// the whole span of the smaller ones (mixed radix), decided for all sizes ≥ 1.
+    fn injective_dims(&self, aff: &Affine, nest: &[(LocalId, usize, usize)]) -> Option<Vec<LocalId>> {
+        // (var, |coefficient·step|, span = |coefficient·step|·(trip − 1))
+        let mut parts: Vec<(LocalId, Poly, Poly)> = Vec::new();
+        for (v, c) in &aff.coeffs {
+            let &(_, _, k) = nest.iter().find(|(var, _, _)| var == v)?;
+            let l = &self.loops[k];
+            let unit = c.scale(Rat::int(l.step.abs()));
+            let unit = match self.numeric(&unit) {
+                Some(x) if x < 0.0 => unit.scale(Rat::int(-1)),
+                Some(_) => unit,
+                None => { if unit.terms.values().all(|k| k.n >= 0) { unit } else { return None; } }
+            };
+            let span = unit.mul(&l.trip.sub(&Poly::constant(1)));
+            parts.push((*v, unit, span));
+        }
+        if parts.is_empty() { return None; }
+        // ascending by unit: a total order is needed, dominance gives a partial one
+        parts.sort_by(|a, b| if bounds_dominates(&b.1, &a.1) { std::cmp::Ordering::Less } else { std::cmp::Ordering::Greater });
+        let mut covered = Poly::zero();
+        for (_, unit, span) in &parts {
+            // unit ≥ covered + 1
+            if !bounds_dominates(unit, &covered.add(&Poly::constant(1))) { return None; }
+            covered = covered.add(span);
+        }
+        Some(parts.into_iter().map(|p| p.0).collect())
+    }
+
+    /// `|π_D(I)|`: the number of distinct values the loop variables in `D` take together, exact
+    /// when their bounds mention only loops in `D`.
+    fn image_size(&self, dims: &[LocalId], nest: &[(LocalId, usize, usize)]) -> Option<Poly> {
+        let mut count = Poly::constant(1);
+        for (v, atom, k) in nest.iter().rev() {
+            let l = &self.loops[*k];
+            if dims.contains(v) {
+                count = count.sum_over(*atom, &l.lo, l.step, &l.trip);
+            } else if count.mentions(*atom) || l.trip.mentions(*atom) {
+                return None;
+            }
+        }
+        for (v, atom, _) in nest { if !dims.contains(v) && count.mentions(*atom) { return None; } }
+        Some(count)
+    }
+
     /// A sequential pass over `n` elements of `es` bytes, once per enclosing iteration.
     fn stream(&mut self, n: &Poly, es: i128) {
         if !self.replay { self.moves = self.moves.add_poly(&n.scale(Rat::int(es))); }
@@ -994,14 +1114,43 @@ impl<'a, 'b, 'c> Fa<'a, 'b, 'c> {
     // ---- the walk ----
 
     fn block(&mut self, b: &Block) -> Result<(), Fail> {
-        for s in &b.stmts { self.stmt(s)?; }
-        if let Some(t) = &b.tail { self.expr(t)?; }
-        Ok(())
+        self.open_aliases(b);
+        let r = (|| { for s in &b.stmts { self.stmt(s)?; } if let Some(t) = &b.tail { self.expr(t)?; } Ok(()) })();
+        self.close_aliases();
+        r
+    }
+
+    /// Scan a block for scalars stored to or loaded from an array element, before walking it.
+    fn open_aliases(&mut self, b: &Block) {
+        let mut opened: Vec<LocalId> = Vec::new();
+        let mut conflicted: Vec<LocalId> = Vec::new();
+        let scalar_of = |e: &Expr| -> Option<LocalId> { match &e.kind { ExprKind::Local(v) => Some(*v), ExprKind::Cast(x, _) => if let ExprKind::Local(v) = &x.kind { Some(*v) } else { None }, _ => None } };
+        let mut found: Vec<(LocalId, LocalId, Expr)> = Vec::new();
+        for st in &b.stmts {
+            match st {
+                Stmt::Assign(LValue::Index(arr, idx, _), _, e) => { if let Some(v) = scalar_of(e) { found.push((v, *arr, idx.clone())); } }
+                Stmt::Let(v, e) | Stmt::Assign(LValue::Var(v), None, e) => { if let ExprKind::Index(arr, idx) = &e.kind { found.push((*v, *arr, (**idx).clone())); } }
+                _ => {}
+            }
+        }
+        for (v, arr, idx) in found {
+            if !self.f.locals[v].ty.is_scalar() || conflicted.contains(&v) { continue; }
+            match self.scalar_alias.get(&v) {
+                Some((a2, i2)) if *a2 == arr && self.affine(i2).is_some() && self.affine(i2) == self.affine(&idx) => {}
+                Some(_) => { self.scalar_alias.remove(&v); conflicted.push(v); opened.retain(|x| *x != v); }
+                None => { self.scalar_alias.insert(v, (arr, idx)); opened.push(v); }
+            }
+        }
+        self.alias_scopes.push(opened);
+    }
+    fn close_aliases(&mut self) {
+        if let Some(opened) = self.alias_scopes.pop() { for v in opened { self.scalar_alias.remove(&v); } }
     }
 
     fn stmt(&mut self, s: &Stmt) -> Result<(), Fail> {
         match s {
             Stmt::Let(id, e) => {
+                self.recognise(s);
                 self.expr(e)?;
                 let l = &self.f.locals[*id];
                 if l.ty.is_arrayish() {
@@ -1153,7 +1302,7 @@ impl<'a, 'b, 'c> Fa<'a, 'b, 'c> {
                 r?;
                 self.leave_loop(body)
             }
-            Stmt::Expr(e) => self.expr(e),
+            Stmt::Expr(e) => { self.recognise(s); self.expr(e) }
             Stmt::Return(Some(e)) => self.expr(e),
             Stmt::Return(None) => Ok(()),
         }
@@ -1424,11 +1573,18 @@ impl<'a, 'b, 'c> Fa<'a, 'b, 'c> {
                         mv = mv.add_under(&r.conds, &overlap.scale(Rat::int(-1)));
                     }
                 }
-                // a bound found in the callee counts once per time this call runs
+                // a bound on a part is a bound on the whole, once: repeated calls are not
+                // multiplied, since a bound on any schedule of the part says nothing about what
+                // the repetitions may share. A cold-start bound travels only for arrays the caller
+                // itself received, which were in slow memory when the caller started.
                 if !self.replay {
-                    let o = self.times_here();
+                    let all_received = args.iter().all(|a| match &a.kind {
+                        ExprKind::Ref(s, _) | ExprKind::Local(s) if self.f.locals[*s].ty.is_arrayish() => self.f.params.contains(self.local_root.get(s).unwrap_or(s)),
+                        _ => true,
+                    });
                     for bd in &callee.bounds {
-                        self.bounds.push(Bound { moves: bd.moves.subst_many(&map).mul(&o), ..bd.clone() });
+                        if bd.cold && !all_received { continue; }
+                        self.bounds.push(Bound { moves: bd.moves.subst_many(&map), ..bd.clone() });
                     }
                     for n in &callee.notes {
                         let n2 = format!("in `{}`: {n}", callee.name);
@@ -1506,3 +1662,37 @@ fn bound_mentions(e: &Expr, l: LocalId) -> bool {
         _ => false,
     }
 }
+
+/// Every `x[i]` in an expression tree, reads only (the write is the statement's left side).
+fn collect_refs<'e>(e: &'e Expr, out: &mut Vec<(LocalId, &'e Expr)>) {
+    match &e.kind {
+        ExprKind::Index(a, i) => { out.push((*a, i)); collect_refs(i, out); }
+        ExprKind::Binary(_, a, b) | ExprKind::MinMax(_, a, b) => { collect_refs(a, out); collect_refs(b, out); }
+        ExprKind::Unary(_, a) | ExprKind::Cast(a, _) | ExprKind::Println(a) => collect_refs(a, out),
+        ExprKind::Call(_, args) => for a in args { collect_refs(a, out); },
+        ExprKind::If(c, t, els) => {
+            collect_refs(c, out);
+            for b in std::iter::once(t).chain(els.iter()) { for st in &b.stmts { if let Stmt::Expr(x) | Stmt::Let(_, x) = st { collect_refs(x, out); } } if let Some(x) = &b.tail { collect_refs(x, out); } }
+        }
+        ExprKind::Block(b) => { for st in &b.stmts { if let Stmt::Expr(x) | Stmt::Let(_, x) = st { collect_refs(x, out); } } if let Some(x) = &b.tail { collect_refs(x, out); } }
+        _ => {}
+    }
+}
+
+/// `q ≥ p` for all sizes ≥ 1, by the piecewise machinery's dominance.
+fn bounds_dominates(q: &Poly, p: &Poly) -> bool { super::piece::dominates(q, p) }
+
+/// Every scalar local read in an expression tree, loop variables included (they have no alias).
+fn collect_scalars(e: &Expr, out: &mut Vec<LocalId>) {
+    match &e.kind {
+        ExprKind::Local(v) => out.push(*v),
+        ExprKind::Index(_, i) => collect_scalars(i, out),
+        ExprKind::Binary(_, a, b) | ExprKind::MinMax(_, a, b) => { collect_scalars(a, out); collect_scalars(b, out); }
+        ExprKind::Unary(_, a) | ExprKind::Cast(a, _) | ExprKind::Println(a) => collect_scalars(a, out),
+        ExprKind::Call(_, args) => for a in args { collect_scalars(a, out); },
+        ExprKind::If(c, t, els) => { collect_scalars(c, out); for b in std::iter::once(t).chain(els.iter()) { if let Some(x) = &b.tail { collect_scalars(x, out); } } }
+        ExprKind::Block(b) => { if let Some(x) = &b.tail { collect_scalars(x, out); } }
+        _ => {}
+    }
+}
+

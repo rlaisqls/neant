@@ -1,5 +1,7 @@
 fill             work 5·out.len()                  moves 8·out.len() + B              exact
+                 lower bound      moves 8·out.len()                  (footprint, every distinct element crosses once)   gap 1× at M = 2 MiB, B = 64
                  footprint        out: [0, 8·out.len())   resident after if 8·out.len() < M
 total            work 4·xs.len()                   moves 8·xs.len() + B               exact
+                 lower bound      moves 8·xs.len()                   (footprint, every distinct element crosses once)   gap 1× at M = 2 MiB, B = 64
                  footprint        xs: [0, 8·xs.len())   resident after if 8·xs.len() < M
 main             work 14116                        moves 4·B + 16824                  exact, io

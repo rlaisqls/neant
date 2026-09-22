@@ -6,7 +6,7 @@
 use std::collections::BTreeMap;
 use std::fmt;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct Rat {
     pub n: i128,
     pub d: i128,
@@ -16,6 +16,15 @@ fn gcd(a: i128, b: i128) -> i128 {
     let (mut a, mut b) = (a.abs(), b.abs());
     while b != 0 { let t = a % b; a = b; b = t; }
     a
+}
+
+/// Numeric order: `d` is always positive, so cross-multiplication decides. (A derived order
+/// would have compared numerators first and put `3/2` above `2`.)
+impl PartialOrd for Rat {
+    fn partial_cmp(&self, o: &Rat) -> Option<std::cmp::Ordering> { Some(self.cmp(o)) }
+}
+impl Ord for Rat {
+    fn cmp(&self, o: &Rat) -> std::cmp::Ordering { (self.n * o.d).cmp(&(o.n * self.d)) }
 }
 
 impl Rat {
@@ -33,6 +42,7 @@ impl Rat {
     pub fn add(self, o: Rat) -> Rat { Rat::new(self.n * o.d + o.n * self.d, self.d * o.d) }
     pub fn mul(self, o: Rat) -> Rat { Rat::new(self.n * o.n, self.d * o.d) }
     pub fn neg(self) -> Rat { Rat { n: -self.n, d: self.d } }
+    pub fn sub(self, o: Rat) -> Rat { self.add(o.neg()) }
     pub fn to_f64(self) -> f64 { self.n as f64 / self.d as f64 }
 }
 
@@ -327,7 +337,9 @@ impl<'a> fmt::Display for PolyDisplay<'a> {
         };
         // highest degree first, then by monomial for determinism
         let mut terms: Vec<(&Mono, &Rat)> = self.p.terms.iter().collect();
-        terms.sort_by(|(m1, _), (m2, _)| m2.degree().cmp(&m1.degree()).then_with(|| m2.cmp(m1)));
+        // highest degree first; at equal degree the positive terms before the negative, so a
+        // bound reads `8·n³/√M − M` and not `−M + 8·n³/√M`
+        terms.sort_by(|(m1, c1), (m2, c2)| m2.degree().cmp(&m1.degree()).then_with(|| (c2.n > 0).cmp(&(c1.n > 0))).then_with(|| m2.cmp(m1)));
         for (i, (m, c)) in terms.iter().enumerate() {
             let neg = c.n < 0;
             let c = if neg { c.neg() } else { **c };

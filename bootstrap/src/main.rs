@@ -100,7 +100,7 @@ fn main() {
         "check" => {}
         "cost" => {
             let mut costs = cost::analyze(&module, &machine);
-            if use_iolb { iolb_bounds(&module, &mut costs); }
+            if use_iolb { iolb_bounds(&module, &mut costs, &machine); }
             for c in &costs {
                 print!("{}", cost::lock::report(c, &machine));
                 if let (Some(ev), cost::CostResult::Exact { work, moves }) = (&eval, &c.result) {
@@ -292,7 +292,7 @@ fn parse_bytes(s: Option<&String>) -> i128 {
 /// are decided at the machine's `B` and `M`, and the applicable pieces' maximum is taken.
 /// `--iolb`: hand every function IOLB can take to it and let its bound replace the catalogue's.
 /// A function the export refuses keeps whatever the catalogue said and gets a note saying why.
-fn iolb_bounds(module: &ir::Module, costs: &mut [cost::FuncCost]) {
+fn iolb_bounds(module: &ir::Module, costs: &mut [cost::FuncCost], machine: &cost::Machine) {
     if cost::iolb::command().is_none() {
         eprintln!("--iolb: set NEANT_IOLB to a command with `{{file}}` in it, e.g. `tests/kernels/iolb.sh {{file}}`");
         process::exit(2);
@@ -310,9 +310,8 @@ fn iolb_bounds(module: &ir::Module, costs: &mut [cost::FuncCost]) {
                 // one (the gap of a rewrite is measured against the first). IOLB does not always
                 // see through a tiled nest, where the catalogue's contraction bound stands.
                 let line = c.bounds.first().map_or(f.line, |b| b.line);
-                let b = cost::bounds::Bound { kind: "whole function", citation: "IOLB, Olivry et al. 2020".into(), moves: p, line, operands: [0, 0], nest: vec![] };
-                let hand_stronger = c.bounds.first().is_some_and(|h| cost::assert::dominated(&b.moves, &h.moves) && !cost::assert::dominated(&h.moves, &b.moves));
-                if hand_stronger { c.bounds.push(b); } else { c.bounds.insert(0, b); }
+                c.bounds.push(cost::bounds::Bound { kind: "whole function".into(), citation: "IOLB, Olivry et al. 2020".into(), moves: p, line, cold: false });
+                cost::bounds::strongest_first(&mut c.bounds, &machine);
             }
             Err(e) => c.notes.push(format!("IOLB gave no bound: {e}")),
         }

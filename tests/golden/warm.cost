@@ -1,3 +1,4 @@
 sum              work 4·xs.len()                   moves 8·xs.len() + B               exact
+                 lower bound      moves 8·xs.len()                   (footprint, every distinct element crosses once)   gap 1× at M = 2 MiB, B = 64
                  footprint        xs: [0, 8·xs.len())   resident after if 8·xs.len() < M
 main             work 340200202                    moves 40·B + 675200000             exact, io

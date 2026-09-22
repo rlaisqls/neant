@@ -1,3 +1,4 @@
 saxpy            work 7·x.len()                    moves 16·x.len() + 2·B             exact
+                 lower bound      moves 16·x.len()                   (footprint, every distinct element crosses once)   gap 1× at M = 2 MiB, B = 64
                  footprint        x: [0, 8·x.len())  y: [0, 8·x.len())   resident after if 16·x.len() < M
 main             work 87                           moves 7·B + 128                    exact, io

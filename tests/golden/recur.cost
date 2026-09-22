@@ -1,5 +1,5 @@
 fact             work 6·n + 6                      moves 0                            recurrence
-sum_from         work −7·i + 7·xs.len() + 7        moves −B·i + B·xs.len() + B        recurrence
+sum_from         work 7·xs.len() − 7·i + 7         moves B·xs.len() − B·i + B         recurrence
                  footprint        xs: [8·i, 8·i + 8)   resident after if 8 < M
 msum             work 20·hi − 20·lo − 10           moves 2·B·hi − 2·B·lo − B          recurrence
                  footprint        xs: [8·lo, 8·lo + 8)   resident after if 8 < M

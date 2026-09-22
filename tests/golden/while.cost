@@ -1,9 +1,12 @@
 count_lt         work 6·xs.len() + 1               moves 8·xs.len() + B               exact
+                 lower bound      moves 8·xs.len()                   (footprint, every distinct element crosses once)   gap 1× at M = 2 MiB, B = 64
                  footprint        xs: [0, 8·xs.len())   resident after if 8·xs.len() < M
 first_zero       work 5·xs.len() + 1               moves 8·xs.len() + B               exact
+                 lower bound      moves 8·xs.len()                   (footprint, every distinct element crosses once)   gap 1× at M = 2 MiB, B = 64
                  footprint        xs: [0, 8·xs.len())   resident after if 8·xs.len() < M
 collatz_steps    work 8·fuel + 3                   moves 0                            exact
 upper            work 10·s.len()                   moves 2·s.len() + 2·B              exact
+                 lower bound      moves 2·s.len()                    (footprint, every distinct element crosses once)   gap 1× at M = 2 MiB, B = 64
                  footprint        s: [0, s.len())  out: [0, s.len())   resident after if 2·s.len() < M
 countdown        work 3·from/2 + 1                 moves 0                            exact
 main             work 16641/2                      moves 8·B + 128                    exact, io
