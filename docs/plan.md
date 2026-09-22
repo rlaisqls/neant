@@ -188,11 +188,55 @@ general:
 **Exit:** the two-seed fixpoint passes in CI; `compiler/costs.lock` is committed; stage 0 is marked
 frozen in its README.
 
+### M7 — The constant factor
+
+Everything before this is asymptotic: the cost model proves the shape of a function's cost and
+leaves the constant to clang. The constant is where the last 1.2–2× on a hot kernel lives —
+latency chains, vector width, unroll factors, port pressure, prefetch distance — and it is where
+LLVM's heuristics stop and a person with an assembly listing starts. This milestone takes that
+work over, not by writing a better heuristic backend than LLVM (a solo project cannot) but by three
+things this language is unusually placed to do.
+
+**Prove the asymptote, search the constant.**
+
+- **A micro-architectural cost line.** What the matmul report does for moves, done for latency and
+  throughput: `dot` is reported as latency-bound on a 4-cycle FMA chain against a 0.5-cycle
+  throughput bound, with the fix — four independent accumulators — offered as `[apply]`. This is
+  what llvm-mca and uiCA compute for a basic block, made the default output for every function, and
+  made applicable because the type system knows whether the reduction may be reassociated (always
+  for integers; for `f64` only where the region allows `reassoc`).
+- **Schedules, separate from algorithms.** Halide's separation: `schedule matmul for <target> {
+  tile ..; vectorize ..; unroll ..; prefetch ..; }`. The algorithm fixes meaning and asymptotic
+  cost; the schedule moves only the constant, and cannot break either. Hand-tuning stops meaning
+  rewriting the algorithm and hoping.
+- **Search where heuristics stop.** For a hot kernel on a specific machine, enumerate schedules,
+  prune by the cost model (a schedule with worse `moves` is never run), measure the survivors,
+  keep the best, and persist it in `costs.lock` so it is still there tomorrow. This is the shape
+  in which search has actually beaten hand-tuned code — TVM/Ansor over cuDNN, Halide's
+  autoscheduler over hand schedules, CryptOpt over hand-written assembly — and the language makes
+  the search unusually cheap: no aliasing means every reordering is legal without analysis, known
+  sizes mean specialisation is free, and the cost model is the pruning function.
+
+**Where an own backend becomes justified.** Not to write better instruction selection than LLVM by
+hand, but to expose instruction selection and scheduling as a *search space* that LLVM does not
+offer — a backend that need not be good in general because it solves one kernel on one machine
+with time to spare. That is CryptOpt's position and the only one from which a small backend beats
+a large one. It also restores the property the previous language had and this one gave up by
+emitting C: that the bytes that run are bytes the compiler can be asked about.
+
+**Exit:** on a small set of kernels that are already at their moves bound after M2, the searched
+schedule beats `clang -O3` on the same C by a measured margin, the micro line predicted the
+bottleneck the search fixed, and the result survives a rebuild via `costs.lock`.
+
+The micro model is an approximation on out-of-order cores; uiCA's error against hardware is
+nonzero and this one's will be larger. It is therefore used only to prune, never to choose — the
+final choice is always a measurement.
+
 ### Not scheduled
 
-An own backend; generics beyond what the milestones need; strings and I/O beyond the harness;
-`dyn` dispatch costing; zero-copy persistence as a feature rather than a consequence; compile-time
-performance of the compiler itself.
+Generics beyond what the milestones need; strings and I/O beyond the harness; `dyn` dispatch
+costing; zero-copy persistence as a feature rather than a consequence; compile-time performance of
+the compiler itself.
 
 ## Layout of the repository
 
@@ -248,7 +292,8 @@ L1 to well past L3; the slope is fitted on the region past L3 where the I/O mode
 ## Rough shape of the calendar
 
 M0 one to two weeks. M1 three to four, half of it the experiment. M2 three. M3 four to six. M4
-six to eight. M5 four. M6 — the port — six to eight. That is roughly a quarter to M3, the point at
-which the language exists and the thesis is either standing or not; two more months to M4; and
-self-hosted somewhere around month eight or nine. Solo pace; the numbers are for ordering, not
-for promising.
+six to eight. M5 four. M6 — the port — six to eight. M7 is open-ended and starts with the micro
+cost line, which is the cheap part. That is roughly a quarter to M3, the point at which the
+language exists and the thesis is either standing or not; two more months to M4; self-hosted
+somewhere around month eight or nine; and the constant factor after that, for as long as it keeps
+paying. Solo pace; the numbers are for ordering, not for promising.
