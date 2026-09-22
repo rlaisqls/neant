@@ -9,11 +9,26 @@ so the plan front-loads the experiment that could falsify it and puts a kill cri
 
 ## Decisions taken up front
 
-**Rust, not self-hosted.** The previous language's single worst structural problem was the
-bootstrap: an image that could only be rebuilt by a binary that already carried a working one.
-This compiler is written in Rust, builds from source with `cargo build`, and stays that way. Zero
-dependencies is a goal, not a rule; a parser combinator or an SMT binding is acceptable if it saves
-a month.
+**Rust first, self-hosted later, two seeds forever.** The compiler will be written in neant. Not
+first, and not by deleting the thing that came before it — the previous language's single worst
+structural problem was the bootstrap: an image that could only be rebuilt by a binary that already
+carried a working one, because the Rust front end had been deleted the moment the self-hosted one
+worked. So:
+
+- **Stage 0 is Rust and is never deleted.** It builds with `cargo build` from a clean checkout. Once
+  the self-hosted compiler exists, stage 0 stops growing — it only has to compile the subset the
+  compiler is written in — but it stays in the tree and CI builds `compiler/` with it on every
+  commit.
+- **The second seed is the compiler's own C output**, committed as `bootstrap/neant.c`. Because the
+  backend emits C, the self-hosted compiler compiled by itself *is* a C file, and anyone with clang
+  can rebuild the tree from it. This is what the old image should have been: a seed that is
+  readable, diffable, and buildable with a tool everyone already has.
+- **The fixpoint is a test.** `clang bootstrap/neant.c → stage1; stage1 compiler/ → stage2;
+  stage2 compiler/ → stage3; stage2 == stage3`, and separately `stage0 compiler/ → stage2'` with
+  `stage2' == stage2`. Two independent roads to the same binary, checked in CI.
+
+Self-hosting is M6, not M0, for a reason given there. Zero dependencies is a goal, not a rule; a
+parser combinator or an SMT binding in stage 0 is acceptable if it saves a month.
 
 **Emit C, do not write a backend.** Cost inference is a static analysis; it needs no backend at
 all. What it needs is a way to *run* the analysed program on real hardware to check the prediction,
@@ -147,6 +162,32 @@ predicts.
 - **An LSP** that serves the cost line as an inlay hint after the signature, and the M2 gap report
   as a code action.
 
+### M6 — Self-hosting
+
+Rewrite the compiler in neant. This waits for M4 because a compiler is exactly the kind of program
+the early language is worst at: tree-shaped (the AST needs recursive types and therefore regions),
+string-heavy, hash-map-heavy, and full of `while` loops over tokens. Before M3 it cannot be
+expressed; before M4 it cannot be expressed comfortably. After M4 it is an ordinary program.
+
+The port is of the whole compiler, cost inference included. The Rust cost module written for
+M1–M3 is written a second time here; that is the price of validating the model early instead of
+waiting until the language could express its own analysis, and it is a bounded price — a few
+thousand lines, in a language whose shape is settled by then. Stage 0 is then frozen: it keeps
+whatever it has, gains nothing, and is only ever touched to keep compiling `compiler/`.
+
+Two things fall out of self-hosting *this* language that do not fall out of self-hosting in
+general:
+
+- **The compiler is the M3 corpus.** "Every function gets a line and nobody is silent" is tested on
+  the largest real program in the tree.
+- **`compiler/costs.lock` is the compiler's own complexity, stated.** Which pass is superlinear in
+  the size of the input, which one is `n · d` in nesting depth, which one is measured because it
+  recurses on the AST — a self-hosted compiler usually proves the language works; this one would
+  also state what its own compile time costs and why.
+
+**Exit:** the two-seed fixpoint passes in CI; `compiler/costs.lock` is committed; stage 0 is marked
+frozen in its README.
+
 ### Not scheduled
 
 An own backend; generics beyond what the milestones need; strings and I/O beyond the harness;
@@ -156,22 +197,29 @@ performance of the compiler itself.
 ## Layout of the repository
 
 ```
-Cargo.toml
-src/
-  lex.rs  parse.rs  ast.rs  resolve.rs  types.rs
-  ir.rs                 typed IR, every array value carries a size variable
-  cost/
-    size.rs             symbolic sizes and their normal form
-    work.rs             the work calculus
-    moves.rs            the I/O-model calculus (docs/cost-model.md is its spec)
-    recur.rs            recurrence extraction and solving           (M3)
-    bounds.rs           the lower-bound catalogue                    (M2)
-    lock.rs             costs.lock read/write/diff
-  emit_c.rs
-  main.rs               neant build | cost | lock | measure | validate
+stage0/                 the Rust compiler. Seed one. Frozen after M6, never deleted.
+  Cargo.toml
+  src/
+    lex.rs  parse.rs  ast.rs  resolve.rs  types.rs
+    ir.rs               typed IR, every array value carries a size variable
+    cost/
+      size.rs           symbolic sizes and their normal form
+      work.rs           the work calculus
+      moves.rs          the I/O-model calculus (docs/cost-model.md is its spec)
+      recur.rs          recurrence extraction and solving           (M3)
+      bounds.rs         the lower-bound catalogue                    (M2)
+      lock.rs           costs.lock read/write/diff
+    emit_c.rs
+    main.rs             neant build | cost | lock | measure | validate
+compiler/               the compiler in neant. Empty until M6, then the one that grows.
+  *.nt
+  costs.lock
+bootstrap/
+  neant.c               compiler/ compiled by itself. Seed two. Regenerated at each release.
 tests/
   golden/               .nt files with expected cost lines
   kernels/              the M1 experiment: kernels, sweep driver, perf harness
+  bootstrap.sh          the two-seed fixpoint
 docs/
   plan.md               this file
   cost-model.md         the calculus, written as M1 builds it
@@ -194,10 +242,13 @@ L1 to well past L3; the slope is fitted on the region past L3 where the I/O mode
 | Region inference is a research project | M4, not earlier; the explicit `Arena` is the fallback that always works |
 | "Measured" becomes the tier everyone lives in | The error that accompanies a fall to *measured* says exactly what would bring the function back to *exact*, and `costs.lock` makes the fall visible in review |
 | The generated-C path cannot express a layout the model wants | Discovered in M4, where the own-backend decision is revisited with evidence |
+| Self-hosting recreates the bootstrap trap | Two seeds, both exercised in CI on every commit; stage 0 is frozen, not deleted; the second seed is C, not an image |
+| Two compilers to maintain | Stage 0 stops growing at M6 and only has to compile `compiler/`; the cost module is written twice, once, and that is the whole overlap |
 
 ## Rough shape of the calendar
 
 M0 one to two weeks. M1 three to four, half of it the experiment. M2 three. M3 four to six. M4
-six to eight. That is roughly a quarter to M3 — the point at which the language exists and the
-thesis is either standing or not — and another two months to M4. Solo pace; the numbers are for
-ordering, not for promising.
+six to eight. M5 four. M6 — the port — six to eight. That is roughly a quarter to M3, the point at
+which the language exists and the thesis is either standing or not; two more months to M4; and
+self-hosted somewhere around month eight or nine. Solo pace; the numbers are for ordering, not
+for promising.
