@@ -602,3 +602,54 @@ This is the first time in the project that the language's own cost model was app
 compiler, produced a specific claim, and had that claim checked against hardware. The claim was
 wrong, the reason is understood, and the reason is a property of the model rather than of the port.
 That is the loop working.
+
+## A bug in the reference compiler, found by building the second one
+
+`site_range` in `analyze.rs` reports a site's byte range **shifted right by its loop's starting
+offset**, because the offset is counted twice. Found while designing the self-hosted footprint
+report (design §22), when a derivation straight from the source did not reproduce the printed range.
+
+```neant
+fn from2(a: &mut [f64]) { for i in 2..a.len() { a[i] = 1.0; } }
+fn from3(a: &mut [f64]) { for i in 3..a.len() { a[i] = 1.0; } }
+fn from0(a: &mut [f64]) { for i in 0..a.len() { a[i] = 1.0; } }
+```
+
+| function | true range | `neant cost` says |
+|---|---|---|
+| `from0` | `[0, 8·a.len())` | `[0, 8·a.len())` |
+| `from2` | `[16, 8·a.len())` | `[32, 8·a.len() + 16)` |
+| `from3` | `[24, 8·a.len())` | `[48, 8·a.len() + 24)` |
+
+Both ends are out by exactly the start. `from0` is right because zero doubled is zero, which is why
+the corpus never showed it: every loop in it starts at 0 except `stencil`'s, and `stencil`'s
+footprint was never checked against a hand computation.
+
+**The cause.** `affine()` gives a loop variable the form `Affine::var(l) + offset`, where `offset`
+is the loop's start expressed in the enclosing loops — it has to, so that `for i in ii*4..ii*4+4`
+is seen to move with `ii`. `site_range` then substitutes `rec.lo` and `rec.last()` for that same
+variable, and `rec.lo` *is* the start again. The constant is added once in the affine form and once
+in the substitution.
+
+**The fix** is one line: the affine form already carries the start, so the variable's own
+contribution runs from `0`, not from `rec.lo`:
+
+```rust
+let last_rel = rec.trip.sub(&Poly::constant(1)).scale(Rat::int(rec.step));
+let (a, b) = (Poly::zero(), c.mul(&last_rel));
+```
+
+Checked by hand against all three probes and against `stencil`'s two-deep nest, where it turns
+`dst: [16·n + 16, 8·n²)` into `[8·n + 8, 8·n² − 8·n − 8)` — the range the indices actually reach.
+
+**Why it matters, and it is not cosmetic.** A footprint is what a caller credits against: a call
+leaves its footprint resident, and a later call pays nothing for the part that is already there.
+A range shifted *right* claims bytes past the end were brought in, so a caller can be credited for
+memory the callee never touched — an under-report of `moves`, which is the unsound direction. The
+corpus does not contain the pair of calls that would show it, which is luck rather than safety.
+
+**How it was found is the point.** Not by reading `site_range` — three readings of it produced
+formulas that each matched the source and none of the output. It was found by *predicting* what a
+double count would print for `2..len` and `3..len` before running them, and then running them. The
+second implementation is only a check on the first when the two are derived independently and
+compared on numbers neither was tuned to.
