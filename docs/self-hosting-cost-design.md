@@ -945,3 +945,87 @@ polynomial machinery, which is the one thing §16 got right.
 depth 3 as well. Six of the nine declines; the other three are the SoA per-field residency ones and
 are unrelated. If it closes fewer than that, the measurement above is wrong somewhere and the place
 to look is which sites a level collects.
+
+## 19. What building the settle pass changed
+
+**Done. `moves` goes 64 → 70 exact and the declines 9 → 3**, and the three differences left are the
+`main`s where the emitter copies a whole-array assignment the Rust proves is in place — the group
+that has differed by design since the start. `matmul`, `stencil`, `tri`'s `pairs` and the `main`s
+that call them all settle, regime for regime, including the order the report lists the regimes in.
+
+§18 was right about the shape: the four "layers" were one change, `sites[]` was already recording
+what the pass needed, and no new polynomial machinery was required. What it did not predict is that
+**the pass is the smaller half of the work**. Six further things had to be right, and five of them
+were invisible until a column with two conditions existed to expose them.
+
+### A condition is carried in lines, and this is a correction
+
+The addendum to §16, committed this morning, said a condition's working set is carried in **bytes**,
+because bytes are what the report prints. That is now reversed: conditions are in **lines**, as
+`analyze.rs` carries them, and `costdump.nt` multiplies by `B` when it prints — which is exactly
+what `brief_cond` in `lock.rs` does and what should have been copied in the first place.
+
+The reason is not taste. `dominates` decides whether one working set is at least another by matching
+each monomial of the smaller to one of the larger that **covers it exponent by exponent**, and that
+relation is *not* invariant under multiplying both sides by `B`:
+
+```
+lines:  2·n + n² + 8·n²/B   dominates   2 + 8·n/B + n      ✓
+bytes:  2·B·n + B·n² + 8·n²  dominates  2·B + 8·n + B·n     ✗
+```
+
+The same two working sets, the same question, two answers. In lines the comparison rules out the
+regime where the inner level overflows `M` but the outer one does not; in bytes it does not, and
+`matmul` came out with a fourth regime that cannot occur. A unit is not a presentation choice when
+the comparison is exponent-wise.
+
+This also exposed a latent bug: `pol_eval` raised a factor to its exponent with `while e < exp`,
+which silently does nothing for a negative one, so `8·n²/B` evaluated as `8·n²`. Nothing had ever
+asked it to evaluate a polynomial with a negative exponent until conditions were in lines.
+
+### Three things `piece.rs` does to conditions that this had never done
+
+- **`simplify`**: a condition implied by another is not a condition. If the bigger working set fits
+  then so does the smaller; if the smaller does not fit then neither does the bigger.
+- **`prune_at`'s threshold reading**, which is the one that mattered. When every condition of a
+  piece is written in the same size variable, each is a **number**: the smallest `n` at which that
+  working set reaches `M`, found by bisection. The conditions are then intervals on `n` — `fits` is
+  `n < t`, `≥ M` is `n ≥ t` — of two of the same kind only the tighter says anything, and a piece
+  whose interval is empty cannot happen. This is strictly stronger than the symbolic `dominates`,
+  and it is what leaves `matmul`'s fitting regime saying `8·n² + 16·n + 2·B < M` **alone** rather
+  than beside the looser `B·n + 8·n + 2·B < M`. This compiler had only the variable-free half of
+  `prune_at`, which decides `128 < M` and nothing else.
+- **The order pieces are listed in**: fewest conditions first, then by polynomial. The polynomial
+  order is a `BTreeMap<Mono, Rat>` comparison, and reproducing it meant reproducing `Atom`'s own
+  order, in which **`Var` comes before `B`** — where this compiler numbers `B` as 0 and a size
+  variable as `3 + i`. `atom_rank` puts them back. `pairs` had the right two regimes in the wrong
+  order for an hour before that.
+
+### And two about what a site says
+
+- **Leading terms count size variables only.** `analyze.rs`'s `Mono::degree` filters to `Atom::Var`,
+  so `B`, `M` and the `log` atoms contribute nothing, and `4·n² + B·n + 12·n + B` leads with `4·n²`
+  alone. This compiler's `mono_degree` summed every exponent, which had never mattered because no
+  matching column had a `B`-bearing term below its leading degree. `mono_var_degree` is the fix and
+  the ordinary `mono_degree` still orders terms for display.
+- **A symbolic stride makes a footprint inexact.** Once `i*n` was affine rather than unreadable,
+  `stencil`'s sites looked like walks over a known range, so the call claimed residue and `main`
+  credited 512 bytes it should not have. This slice computes a footprint's range from *integer*
+  coefficients; a range it cannot state is not exact. `analyze.rs` reaches the same verdict for
+  `stencil`'s `src` and prints it: **no residue claimed**.
+
+### The test was comparing against a truncated expectation
+
+`rust_moves` split a regime on `"  if "`, two spaces. The report pads a polynomial into a column, so
+a polynomial long enough to fill it leaves **one** space — and that regime was silently dropped.
+`pairs`' first regime is 41 characters and was never compared. The harness now splits on `" if "`,
+and `pairs` counts as the exact match it was.
+
+That is worth stating plainly: for the length of this work the test could not have failed on a piece
+it never read. A test that skips what it cannot parse fails open.
+
+### What is still declined
+
+The three SoA per-field residency `main`s — `arrayview`, `particles`, `structs` — where a callee
+leaves a footprint per *field* resident and this slice tracks one per array. Unrelated to nested
+loops, and the next thing.

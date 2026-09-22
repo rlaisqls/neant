@@ -51,7 +51,12 @@ const EXACT: usize = 72;
 /// **piecewise** — a scattered walk costs the array's footprint when it fits in `M` and a line per
 /// touch when it does not — and their two regimes and the condition between them are compared as
 /// one string, exactly as the single-piece ones are (design §13).
-const EXACT_MOVES: usize = 64;
+///
+/// Nested loops settle here too, since `settle_moves` (design §18): `matmul`, `stencil` and `tri`'s
+/// `pairs` and the `main`s that call them, whose regimes are compared piece by piece including the
+/// order the report lists them in. The three still declined are the `main`s whose callee leaves a
+/// per-field footprint resident under SoA where this slice tracks one per array.
+const EXACT_MOVES: usize = 70;
 
 
 
@@ -99,8 +104,11 @@ fn rust_moves(out: &str) -> BTreeMap<String, String> {
         for l in lines[i + 1..].iter().take_while(|l| l.starts_with(' ')) {
             let t = l.trim();
             let Some(p) = t.strip_prefix("moves ") else { continue };
-            let Some(c) = p.find("  if ") else { continue };
-            pieces.push(format!("{} if {}", p[..c].trim(), p[c + 5..].trim()));
+            // one space, not two: the report pads the polynomial into a column, and a polynomial
+            // long enough to fill it leaves a single space — which silently dropped `pairs`'
+            // first regime and compared the rest against a truncated expectation
+            let Some(c) = p.find(" if ") else { continue };
+            pieces.push(format!("{} if {}", p[..c].trim(), p[c + 4..].trim()));
         }
         if !pieces.is_empty() { m.insert(name, pieces.join(" | ")); }
     }

@@ -1305,7 +1305,13 @@ fn foot_flags(src: &[u8], toks: &[Token], nodes: &[Node], sites: &[Site], ffoot:
         let mut k = 0;
         while k < wst[10] {
             if name_eq(src, toks, sites[k].arr, nodes[p].a) {
-                if sites[k].bad != 0 || sites[k].coef == 0 && sites[k].novar != 0 { walks = 2; }
+                // any level whose coefficient could not be read as a number: this slice computes a
+                // footprint's range from integer coefficients, so a symbolic stride — `a[i*n + k]`
+                // against `i` — leaves a range it cannot state, and a range it cannot state is not
+                // exact. `analyze.rs` reaches the same verdict for `stencil`'s `src` and says so:
+                // "no residue claimed".
+                if sites[k].bad != 0 || sites[k].b0 != 0 || sites[k].b1 != 0 || sites[k].b2 != 0
+                    || sites[k].coef == 0 && sites[k].novar != 0 { walks = 2; }
                 else if walks == 0 { walks = 1; }
             }
             k += 1;
@@ -1390,6 +1396,48 @@ fn conds_union(facs: &[Fac], terms: &[Term], pols: &[Pol], cnds: &mut [Cnd], wst
     start
 }
 
+// **A condition implied by another is not a condition.** If the bigger working set fits then so
+// does the smaller; if the smaller does not fit then neither does the bigger. `simplify` in
+// `piece.rs`, and without it `matmul` carries `≈ B·n + 8·n < M` beside `≈ 8·n² < M`, which says
+// nothing the other does not and splits one regime into two.
+fn conds_simplify(facs: &[Fac], terms: &mut [Term], pols: &mut [Pol], pst: &mut [i64],
+                  budget: &mut [f64], cnds: &mut [Cnd], wst: &mut [i64], a: i64, na: i64) -> i64 {
+    let start = wst[28];
+    let mut i = 0;
+    while i < na {
+        let mut implied = false;
+        let mut j = 0;
+        while j < na {
+            if i != j && cnds[a + i].fits == cnds[a + j].fits
+                && !pol_eq(facs, terms, pols, cnds[a + i].ws, cnds[a + j].ws) {
+                if cnds[a + i].fits == 1 {
+                    if pol_dominates(facs, terms, pols, pst, budget, cnds[a + j].ws, cnds[a + i].ws) {
+                        implied = true;
+                    }
+                } else {
+                    if pol_dominates(facs, terms, pols, pst, budget, cnds[a + i].ws, cnds[a + j].ws) {
+                        implied = true;
+                    }
+                };
+            };
+            j = j + 1;
+        }
+        if !implied {
+            let mut dup = false;
+            let mut k = 0;
+            while k < wst[28] - start {
+                if cnds[start + k].fits == cnds[a + i].fits
+                    && pol_eq(facs, terms, pols, cnds[start + k].ws, cnds[a + i].ws) { dup = true; }
+                k = k + 1;
+            }
+            if !dup { cnd_push(cnds, wst, cnds[a + i].ws, cnds[a + i].fits); };
+        };
+        i = i + 1;
+    }
+    wst[19] = wst[28] - start;
+    start
+}
+
 // is every condition of `a` also a condition of `b`
 fn conds_subset(facs: &[Fac], terms: &[Term], pols: &[Pol], cnds: &[Cnd],
                 a: i64, na: i64, b: i64, nb: i64) -> bool {
@@ -1409,6 +1457,70 @@ fn conds_subset(facs: &[Fac], terms: &[Term], pols: &[Pol], cnds: &[Cnd],
     all
 }
 
+// The smallest size at which this working set reaches `M`, by bisection, or −1 when the answer is
+// not a number and 1e30 when it never does. A working set with a negative coefficient is not
+// monotone and has no threshold. `threshold` in `piece.rs`.
+fn cnd_threshold(facs: &[Fac], terms: &[Term], pols: &[Pol], pst: &mut [i64], ws: i64) -> f64 {
+    let mut i = 0;
+    while i < pols[ws].n_term {
+        if terms[pols[ws].term + i].cn < 0 { return 0.0 - 1.0; }
+        i += 1;
+    }
+    let target = 2097152.0;
+    let f1 = pol_eval(facs, terms, pols, pst, ws, 64.0, target, 1.0) * 64.0;
+    if pst[6] != 0 { return 0.0 - 1.0; }
+    if f1 >= target { return 1.0; }
+    let mut hi = 2.0;
+    let mut fh = pol_eval(facs, terms, pols, pst, ws, 64.0, target, hi) * 64.0;
+    while fh < target {
+        hi = hi * 2.0;
+        if hi > 1e30 { return 1e30; }
+        fh = pol_eval(facs, terms, pols, pst, ws, 64.0, target, hi) * 64.0;
+    }
+    let mut lo = 1.0;
+    let mut k = 0;
+    while k < 200 {
+        let mid = (lo + hi) / 2.0;
+        let fm = pol_eval(facs, terms, pols, pst, ws, 64.0, target, mid) * 64.0;
+        if fm >= target { hi = mid; } else { lo = mid; }
+        k += 1;
+    }
+    hi
+}
+
+// the one size variable every condition of this piece is written in, or −1 when there is none or
+// more than one — the interval reading below needs a single axis to be an interval on
+fn piece_one_var(facs: &[Fac], terms: &[Term], pols: &[Pol], cnds: &[Cnd], pcs: &[Pce],
+                 d: i64) -> i64 {
+    let mut found = 0 - 1;
+    let mut ci = 0;
+    while ci < pcs[d].n_cnd {
+        let w = cnds[pcs[d].cnd + ci].ws;
+        let mut i = 0;
+        while i < pols[w].n_term {
+            let t = pols[w].term + i;
+            let mut f = 0;
+            while f < terms[t].n_fac {
+                let a = facs[terms[t].fac + f].atom;
+                if a >= 3 && a < 2000 {
+                    if found < 0 { found = a; }
+                    else if found != a { return 0 - 2; };
+                };
+                f += 1;
+            }
+            i += 1;
+        }
+        ci += 1;
+    }
+    found
+}
+
+// the order `piece.rs` sorts a cost's pieces into: fewest conditions first, then by polynomial
+fn piece_before(facs: &[Fac], terms: &[Term], pols: &[Pol], pcs: &[Pce], a: i64, b: i64) -> bool {
+    if pcs[a].n_cnd != pcs[b].n_cnd { return pcs[a].n_cnd < pcs[b].n_cnd; }
+    pol_cmp_ord(facs, terms, pols, pcs[a].poly, pcs[b].poly) < 0
+}
+
 // Close the pieces written at [start, wst[29]) into a cost, dropping any that another piece
 // already covers: a piece whose conditions are implied by another's and whose polynomial that
 // other dominates says nothing new. Without this the cross product grows without bound.
@@ -1425,11 +1537,10 @@ fn ck_close(facs: &[Fac], terms: &mut [Term], pols: &mut [Pol], pst: &mut [i64],
         let mut alive = true;
         let mut ci = 0;
         while ci < pcs[d].n_cnd {
-            // a condition's working set is carried in **bytes** — it is what the report prints,
-            // `16·nodes.len() < M` — so it is compared with `M` directly and not scaled by a line.
-            // `pol_num_at_b` rather than `pol_as_f64` because `2·B` is a number on this machine
-            // even though it is not a bare constant.
-            let w = pol_num_at_b(facs, terms, pols, pst, cnds[pcs[d].cnd + ci].ws, 64.0);
+            // a condition's working set is a count of **lines**, so the comparison with `M` scales
+            // it by one. `pol_num_at_b` rather than `pol_as_f64` because a working set of `2` lines
+            // may still be written with a `B` in it and is a number on this machine regardless.
+            let w = pol_num_at_b(facs, terms, pols, pst, cnds[pcs[d].cnd + ci].ws, 64.0) * 64.0;
             if pst[7] != 0 {
                 let holds = if w < 2097152.0 { 1 } else { 0 };
                 if holds != cnds[pcs[d].cnd + ci].fits { alive = false; }
@@ -1439,18 +1550,102 @@ fn ck_close(facs: &[Fac], terms: &mut [Term], pols: &mut [Pol], pst: &mut [i64],
             ci += 1;
         }
         if alive {
-            pcs[kept].cnd = cstart;
-            pcs[kept].n_cnd = wst[28] - cstart;
+            let ss = conds_simplify(facs, terms, pols, pst, budget, cnds, wst, cstart,
+                                    wst[28] - cstart);
+            pcs[kept].cnd = ss;
+            pcs[kept].n_cnd = wst[19];
             pcs[kept].poly = pcs[d].poly;
             kept += 1;
         }
         d += 1;
     }
     wst[29] = kept;
+    // **Conditions as intervals in the one size variable.** When every condition of a piece is
+    // written in the same variable, each is a threshold — the smallest size at which the working
+    // set reaches `M` — so `fits` reads `n < t` and `≥ M` reads `n ≥ t`. Of two conditions of the
+    // same kind only the tighter says anything, and a piece whose interval is empty cannot happen
+    // at all. `prune_at` in `piece.rs`. It is what leaves `matmul`'s fitting regime saying
+    // `8·n² + 16·n + 2·B < M` alone rather than beside the looser `B·n + 8·n + 2·B < M`, and what
+    // rules out the regime where the inner level overflows but the outer one does not.
+    let mut d2 = start;
+    let mut kept2 = start;
+    while d2 < wst[29] {
+        let v = piece_one_var(facs, terms, pols, cnds, pcs, d2);
+        let mut alive2 = true;
+        let mut ncnd2 = pcs[d2].n_cnd;
+        let mut cnd2 = pcs[d2].cnd;
+        if v >= 3 && pcs[d2].n_cnd > 0 {
+            let mut all = true;
+            let mut tight_hi = 1e30;
+            let mut tight_lo = 0.0;
+            let mut hi_b = 1e30;
+            let mut lo_b = 1.0;
+            let mut ci2 = 0;
+            while ci2 < pcs[d2].n_cnd {
+                let t = cnd_threshold(facs, terms, pols, pst, cnds[pcs[d2].cnd + ci2].ws);
+                if t < 0.0 {
+                    all = false;
+                } else if cnds[pcs[d2].cnd + ci2].fits == 1 {
+                    if t < tight_hi { tight_hi = t; };
+                    if t - 1.0 < hi_b { hi_b = t - 1.0; };
+                } else {
+                    if t > tight_lo { tight_lo = t; };
+                    if t > lo_b { lo_b = t; };
+                };
+                ci2 += 1;
+            }
+            if all && lo_b > hi_b { alive2 = false; };
+            if all && alive2 {
+                let ns = wst[28];
+                let mut ci3 = 0;
+                while ci3 < pcs[d2].n_cnd {
+                    let t = cnd_threshold(facs, terms, pols, pst, cnds[pcs[d2].cnd + ci3].ws);
+                    let keep_it = if cnds[pcs[d2].cnd + ci3].fits == 1 { t <= tight_hi }
+                                  else { t >= tight_lo };
+                    if keep_it {
+                        cnd_push(cnds, wst, cnds[pcs[d2].cnd + ci3].ws,
+                                 cnds[pcs[d2].cnd + ci3].fits);
+                    };
+                    ci3 += 1;
+                }
+                cnd2 = ns;
+                ncnd2 = wst[28] - ns;
+            };
+        };
+        if alive2 {
+            pcs[kept2].cnd = cnd2;
+            pcs[kept2].n_cnd = ncnd2;
+            pcs[kept2].poly = pcs[d2].poly;
+            kept2 += 1;
+        };
+        d2 += 1;
+    }
+    wst[29] = kept2;
+    kept = kept2;
     if kept == start {
         // every piece was ruled out: the cost is zero rather than nothing
         let z = pol_zero(facs, terms, pols, pst);
         pce_push(pcs, wst, 0, 0, z);
+    }
+    // the report lists the least-conditional pieces first, which is `ps.sort_by(conds.len())` in
+    // `piece.rs` — and the dominance prune below depends on the order, because equal pieces are
+    // broken by position
+    let mut si = start + 1;
+    while si < wst[29] {
+        let mut sj = si;
+        while sj > start && piece_before(facs, terms, pols, pcs, sj, sj - 1) {
+            let tc = pcs[sj].cnd;
+            let tn = pcs[sj].n_cnd;
+            let tp = pcs[sj].poly;
+            pcs[sj].cnd = pcs[sj - 1].cnd;
+            pcs[sj].n_cnd = pcs[sj - 1].n_cnd;
+            pcs[sj].poly = pcs[sj - 1].poly;
+            pcs[sj - 1].cnd = tc;
+            pcs[sj - 1].n_cnd = tn;
+            pcs[sj - 1].poly = tp;
+            sj -= 1;
+        }
+        si += 1;
     }
     let mut write = start;
     let mut i = start;
@@ -1587,8 +1782,34 @@ fn ck_max(facs: &[Fac], terms: &mut [Term], pols: &mut [Pol], pst: &mut [i64], b
 // no loop at that depth — `Site.path` in `analyze.rs`. A site's moves are a property of the levels
 // it sits in and not of the site alone (design §18), so the levels have to be nameable after the
 // walk has left them.
+// `c0`, `c1`, `c2` are the site's coefficient against each of those loops' variables, and `b0`,
+// `b1`, `b2` whether that coefficient could be read at all. They are taken **at the site**, where
+// the loop bodies are still open: `idx_coef` asks whether a variable is assigned in the body it
+// stands in, which is a question with no answer once the walk has left.
+//
+// `alen` and `es` are the array's length and its element's size, captured for the same reason —
+// the region rule needs the footprint of an array whose binding is out of scope by settle time.
 struct Site { arr: i64, idx: i64, inloop: i64, coef: i64, stride: i64, bad: i64, trip: i64, branch: i64,
-             novar: i64, field: i64, p0: i64, p1: i64, p2: i64 }
+             novar: i64, field: i64, p0: i64, p1: i64, p2: i64,
+             c0: i64, c1: i64, c2: i64, b0: i64, b1: i64, b2: i64, alen: i64, es: i64 }
+
+// the id of the loop this site sits in at depth `d`, or −1
+fn site_lp(sites: &[Site], s: i64, d: i64) -> i64 {
+    if d == 0 { return sites[s].p0; }
+    if d == 1 { return sites[s].p1; }
+    if d == 2 { return sites[s].p2; }
+    0 - 1
+}
+
+// the site's coefficient against the variable of the loop at depth `d`, with `wst[14]` left
+// non-zero when there is none to be had
+fn site_coef(sites: &[Site], wst: &mut [i64], s: i64, d: i64) -> i64 {
+    if d == 0 { wst[14] = sites[s].b0; return sites[s].c0; }
+    if d == 1 { wst[14] = sites[s].b1; return sites[s].c1; }
+    if d == 2 { wst[14] = sites[s].b2; return sites[s].c2; }
+    wst[14] = 2;
+    0
+}
 
 // **A loop record that outlives its loop** — `LoopRec` in `analyze.rs`. The per-depth state in
 // `wst[30..35]` is live only while the loop is open, because the walk settles each site where it
@@ -1597,22 +1818,52 @@ struct Site { arr: i64, idx: i64, inloop: i64, coef: i64, stride: i64, bad: i64,
 //
 //   wst[41]            how many loops this function has opened
 //   wst[42 + d]        the id of the loop currently open at depth `d`
-//   wst[100 + 5·id]    the loop variable's name token
+//   wst[100 + 8·id]    the loop variable's name token
 //            + 1       its atom, or −1 for a `while`, which has none and so cannot be summed over
 //            + 2       its first value, as a polynomial — `for j in i..n` starts at `i`
 //            + 3       its step
 //            + 4       its trip count, as a polynomial
-fn lp_open(wst: &mut [i64], depth: i64, var: i64, atom: i64, lo: i64, step: i64, trip: i64) {
-    if depth >= 4 || wst[41] >= 30 { return; }
+//            + 5       its first value as a *source node*, which is what an outer loop's stride is
+//                      read from: `for i in ii*4 .. ii*4+4` moves `a[i]` four elements a lap of `ii`
+fn lp_open(wst: &mut [i64], depth: i64, var: i64, atom: i64, lo: i64, step: i64, trip: i64,
+           lonode: i64) {
+    if depth >= 4 || wst[41] >= 40 { return; }
     let id = wst[41];
     wst[41] = id + 1;
     wst[42 + depth] = id;
-    let b = 100 + 5 * id;
+    let b = 100 + 8 * id;
     wst[b] = var;
     wst[b + 1] = atom;
     wst[b + 2] = lo;
     wst[b + 3] = step;
     wst[b + 4] = trip;
+    wst[b + 5] = lonode;
+}
+
+fn lp_var(wst: &[i64], id: i64) -> i64 { wst[100 + 8 * id] }
+fn lp_atom(wst: &[i64], id: i64) -> i64 { wst[100 + 8 * id + 1] }
+fn lp_lo(wst: &[i64], id: i64) -> i64 { wst[100 + 8 * id + 2] }
+fn lp_step(wst: &[i64], id: i64) -> i64 { wst[100 + 8 * id + 3] }
+fn lp_trip(wst: &[i64], id: i64) -> i64 { wst[100 + 8 * id + 4] }
+fn lp_lonode(wst: &[i64], id: i64) -> i64 { wst[100 + 8 * id + 5] }
+
+// `Σ` of `p` over one full run of this loop — exact over the loop's atom by Faulhaber, and `× trip`
+// when the loop has no atom or `p` does not mention it. `LoopRec::sum` in `analyze.rs`.
+fn lp_sum(facs: &mut [Fac], terms: &mut [Term], pols: &mut [Pol], pst: &mut [i64],
+          scratch: &mut [i64], wst: &[i64], id: i64, p: i64) -> i64 {
+    let a = lp_atom(wst, id);
+    if a < 0 { return pol_mul(facs, terms, pols, pst, p, lp_trip(wst, id)); }
+    pol_sum_over(facs, terms, pols, pst, p, a, lp_lo(wst, id), lp_step(wst, id), lp_trip(wst, id),
+                 scratch)
+}
+
+// the loop variable's last value, `lo + (trip − 1)·step`
+fn lp_last(facs: &mut [Fac], terms: &mut [Term], pols: &mut [Pol], pst: &mut [i64], wst: &[i64],
+           id: i64) -> i64 {
+    let one = pol_const(facs, terms, pols, pst, 1);
+    let t1 = pol_sub(facs, terms, pols, pst, lp_trip(wst, id), one);
+    let sc = pol_scale(facs, terms, pols, pst, t1, lp_step(wst, id), 1);
+    pol_add(facs, terms, pols, pst, lp_lo(wst, id), sc)
 }
 
 // two index expressions that name the same address: structurally equal, with variables compared by
@@ -1662,9 +1913,13 @@ fn assigns_var(src: &[u8], toks: &[Token], nodes: &[Node], b: i64, name: i64) ->
     hit
 }
 
-// the coefficient of the loop variable in an index, or the "not affine" marker in wst[14]
+// The coefficient of the loop variable in an index, with the verdict in `wst[14]`: 0 the returned
+// integer is the coefficient, 1 the index is affine but the coefficient is not a number, 2 the
+// index is not affine at all. The middle one exists because `analyze.rs` never compares a symbolic
+// stride with `B` — it treats it as a whole line or more — while a non-affine index gets the region
+// rule instead, and one flag cannot carry both (design §17).
 fn idx_coef(src: &[u8], toks: &[Token], nodes: &[Node], wst: &mut [i64], e: i64, lv: i64) -> i64 {
-    if e < 0 { wst[14] = 1; return 0; }
+    if e < 0 { wst[14] = 2; return 0; }
     let k = nodes[e].kind;
     if k == 60 { return 0; }
     if k == 65 {
@@ -1673,7 +1928,7 @@ fn idx_coef(src: &[u8], toks: &[Token], nodes: &[Node], wst: &mut [i64], e: i64,
         // inside the loop walks the array in a way this slice does not follow, and the assumption
         // that rounds up is a whole line per touch
         if assigns_var(src, toks, nodes, wst[22], nodes[e].a) {
-            wst[14] = 1;
+            wst[14] = 2;
             return 0;
         }
         return 0;
@@ -1695,11 +1950,37 @@ fn idx_coef(src: &[u8], toks: &[Token], nodes: &[Node], wst: &mut [i64], e: i64,
             if nodes[nodes[e].b].kind == 60 {
                 return int_value(src, toks, nodes[nodes[e].b].a) * idx_coef(src, toks, nodes, wst, nodes[e].a, lv);
             }
+            // **Neither factor is a literal.** `i * n` moves by `n` elements a lap of `i`: a stride
+            // that is affine but is not a number. Asked about a variable neither factor mentions —
+            // the same `i * n`, against `matmul`'s `j` — the product is simply constant, which is
+            // the case this used to fall off the end of and call non-affine.
+            let save = wst[14];
+            wst[14] = 0;
+            let ca = idx_coef(src, toks, nodes, wst, nodes[e].a, lv);
+            let fa = wst[14];
+            wst[14] = 0;
+            let cb = idx_coef(src, toks, nodes, wst, nodes[e].b, lv);
+            let fb = wst[14];
+            wst[14] = save;
+            if fa == 2 || fb == 2 {
+                wst[14] = 2;
+                return 0;
+            }
+            let amoves = ca != 0 || fa == 1;
+            let bmoves = cb != 0 || fb == 1;
+            // both factors move with it: the index is quadratic there, and not affine at all
+            if amoves && bmoves {
+                wst[14] = 2;
+                return 0;
+            }
+            if !amoves && !bmoves { return 0; }
+            if wst[14] < 1 { wst[14] = 1; };
+            return 0;
         }
     }
     // an index the compiler cannot follow — an arena walk, a call — moves by a whole line or more,
     // which is what `analyze.rs` assumes for the same case. Every assumption rounds up.
-    wst[14] = 1;
+    wst[14] = 2;
     0
 }
 
@@ -1763,8 +2044,8 @@ fn site_add(src: &[u8], toks: &[Token], nodes: &[Node], types: &[Ty], strs: &[St
             pst: &mut [i64], env: &mut [Env], cof: &mut [Cof], sites: &mut [Site], cks: &mut [Ck], cnds: &mut [Cnd], pcs: &mut [Pce], budget: &mut [f64],
             resid: &mut [Res], rargs: &mut [i64], subst: &mut [i64], slay: &[i64], wst: &mut [i64],
             arr: i64, idx: i64, fld: i64) -> i64 {
-    // three loops deep is past what the loop state here records
-    if wst[11] > 2 {
+    // four loops deep is past what a site's path records
+    if wst[11] > 3 {
         wst[1] = 1;
         return ck_zero(facs, terms, pols, pst, budget, cnds, pcs, cks, wst);
     }
@@ -1835,104 +2116,447 @@ fn site_add(src: &[u8], toks: &[Token], nodes: &[Node], types: &[Ty], strs: &[St
     sites[s].p0 = if wst[11] > 0 { wst[42] } else { -1 };
     sites[s].p1 = if wst[11] > 1 { wst[43] } else { -1 };
     sites[s].p2 = if wst[11] > 2 { wst[44] } else { -1 };
+    sites[s].es = es;
+    sites[s].alen = arg_len(src, toks, nodes, env, wst, arr);
+    // The coefficient against every enclosing loop, taken here because `idx_coef` asks whether a
+    // variable is assigned in the body it stands in. A loop *inside* `d` chains into `d`'s stride
+    // through its own lower bound: `for i in ii*4 .. ii*4+4` moves `a[i]` four elements a lap of
+    // `ii`, although `a[i]`'s index never mentions `ii`.
+    let nd = wst[11];
+    if nd > 2 {
+        wst[14] = 0;
+        sites[s].c2 = idx_coef(src, toks, nodes, wst, idx, lp_var(wst, wst[44]));
+        sites[s].b2 = wst[14];
+    };
+    if nd > 1 {
+        wst[14] = 0;
+        let mut a1 = idx_coef(src, toks, nodes, wst, idx, lp_var(wst, wst[43]));
+        if nd > 2 {
+            a1 = a1 + sites[s].c2
+                * idx_coef(src, toks, nodes, wst, lp_lonode(wst, wst[44]), lp_var(wst, wst[43]));
+        };
+        sites[s].c1 = a1;
+        sites[s].b1 = wst[14];
+    };
+    if nd > 0 {
+        wst[14] = 0;
+        let mut a0 = idx_coef(src, toks, nodes, wst, idx, lp_var(wst, wst[42]));
+        if nd > 1 {
+            a0 = a0 + sites[s].c1
+                * idx_coef(src, toks, nodes, wst, lp_lonode(wst, wst[43]), lp_var(wst, wst[42]));
+        };
+        if nd > 2 {
+            a0 = a0 + sites[s].c2
+                * idx_coef(src, toks, nodes, wst, lp_lonode(wst, wst[44]), lp_var(wst, wst[42]));
+        };
+        sites[s].c0 = a0;
+        sites[s].b0 = wst[14];
+    };
     wst[10] = s + 1;
 
-    // settled here rather than in a pass at the end, so that the moves of an `if`'s two arms can
-    // be compared: sites in different arms are *alternatives*, and only one of them happens
-    let b = pol_atom(facs, terms, pols, pst, 0);
-    if wst[11] == 0 { return ck_one(facs, terms, pols, pst, budget, cnds, pcs, cks, wst, b); }
-    let trip = sites[s].trip;
-    let cm = if sites[s].coef < 0 { 0 - sites[s].coef } else { sites[s].coef };
-    let stride = cm * sites[s].stride;
-    let scattered = sites[s].bad != 0 || sites[s].coef == 0 && sites[s].novar != 0;
-    // **Two loops deep**: the lines are counted innermost outwards (design §16). The inner level
-    // gives `1 + slide`; the outer adds its own slide, whose stride reads the inner loop's lower
-    // bound — `for i in ii*4 .. ii*4+4` moves this site by four elements a lap of `ii`.
-    if wst[11] == 2 && !scattered && stride > 0 && stride < 64 {
-        wst[14] = 0;
-        let c_out = idx_coef(src, toks, nodes, wst, idx, wst[30])
-            + sites[s].coef * idx_coef(src, toks, nodes, wst, wst[34 + 1], wst[30]);
-        if wst[14] != 0 {
-            wst[1] = 1;
-            return ck_zero(facs, terms, pols, pst, budget, cnds, pcs, cks, wst);
+    // The site is recorded and costs nothing here. Its moves are settled once the whole function
+    // has been walked, by `settle_moves`, because what a site costs depends on what *else* is in
+    // the loops it sits in (design §18).
+    ck_zero(facs, terms, pols, pst, budget, cnds, pcs, cks, wst)
+}
+
+// ---------------------------------------------------------------------------------------------
+// **Settling the sites, innermost level outwards** (design §18).
+//
+// A site's moves are not a property of the site. The working set at a level is the sum, over every
+// site inside that loop, of the lines that site touches per lap of it — they compete for the same
+// cache — and whether *that* fits `M` decides whether every site in the level keeps its reuse. So
+// the settle cannot happen where the site is seen, which is what `site_add` used to do and what
+// held this slice to one site per loop.
+//
+// The table: for each (site, depth) the alternatives that site has over one full run of the loop
+// at that depth, as a run in `lpes`.
+//
+//   sc[2·(3·s + d)]      where site `s`'s alternatives over its depth-`d` level start in `lpes`
+//            + 1         how many there are
+//   sc[24576 + k]        the `k`th site inside the level being settled
+//   sc[28672 + k]        the depth at which that level sits for it
+//   sc[32768 + k]        which of its alternatives is currently picked
+//
+// A condition's working set is carried in **bytes** here, as everywhere in this compiler — the
+// report prints it directly, where `analyze.rs` keeps lines and multiplies by `B` in `brief_cond`.
+
+// one alternative for the lines a site touches over one run of a level: the lines, the conditions
+// that produced them, and whether they are one contiguous region. `LP` in `analyze.rs`.
+struct Lpe { cnd: i64, n_cnd: i64, lines: i64, contig: i64 }
+
+fn lpe_push(lpes: &mut [Lpe], wst: &mut [i64], cnd: i64, n_cnd: i64, lines: i64, contig: i64) {
+    lpes[wst[45]].cnd = cnd;
+    lpes[wst[45]].n_cnd = n_cnd;
+    lpes[wst[45]].lines = lines;
+    lpes[wst[45]].contig = contig;
+    wst[45] = wst[45] + 1;
+}
+
+// append, unless an alternative written since `from` already says exactly this. The Rust dedups on
+// equality and deliberately does **not** prune by dominance here: two alternatives that differ only
+// in `contig` behave differently at the next level out.
+fn lpe_add(facs: &[Fac], terms: &[Term], pols: &[Pol], cnds: &[Cnd], lpes: &mut [Lpe],
+           wst: &mut [i64], from: i64, cnd: i64, n_cnd: i64, lines: i64, contig: i64) {
+    let mut i = from;
+    let mut seen = false;
+    while i < wst[45] {
+        if lpes[i].contig == contig && lpes[i].n_cnd == n_cnd
+            && pol_eq(facs, terms, pols, lpes[i].lines, lines)
+            && conds_subset(facs, terms, pols, cnds, lpes[i].cnd, lpes[i].n_cnd, cnd, n_cnd) {
+            seen = true;
         }
-        let cm0 = if c_out < 0 { 0 - c_out } else { c_out };
-        let s_out = cm0 * sites[s].stride;
-        // the inner level: one line, plus the slide, floored at one line
-        // the slide in lines: `t·s` over the atom `B`, with the test done at this machine's 64
-        let raw_in = pol_scale(facs, terms, pols, pst, sites[s].trip, stride, 1);
-        let test_in = pol_scale(facs, terms, pols, pst, sites[s].trip, stride, 64);
-        let isv = pol_as_f64(facs, terms, pols, pst, test_in);
-        let one = pol_const(facs, terms, pols, pst, 1);
-        let inner_slide = pol_div_atom(facs, terms, pols, pst, raw_in, 0);
-        let islide = if pst[7] != 0 && isv < 1.0 { one } else { inner_slide };
-        let lines_in = pol_add(facs, terms, pols, pst, one, islide);
-        // the working set at the outer level is what the inner one touches per lap; a symbolic one
-        // forks, and a second condition is past this slice
-        let test_lines = pol_add(facs, terms, pols, pst, one, if pst[7] != 0 && isv < 1.0 { one } else { test_in });
-        let wsv = pol_as_f64(facs, terms, pols, pst, test_lines);
-        if pst[7] == 0 || wsv * 64.0 >= 2097152.0 {
-            wst[1] = 1;
-            return ck_zero(facs, terms, pols, pst, budget, cnds, pcs, cks, wst);
-        }
-        let mut lines = lines_in;
-        if s_out >= 64 || c_out == 0 {
-            if c_out != 0 { lines = pol_mul(facs, terms, pols, pst, lines_in, wst[32]); };
-        } else {
-            let raw_out = pol_scale(facs, terms, pols, pst, wst[32], s_out, 1);
-            let oslide = pol_div_atom(facs, terms, pols, pst, raw_out, 0);
-            lines = pol_add(facs, terms, pols, pst, lines_in, oslide);
-        }
-        let mv = pol_mul(facs, terms, pols, pst, lines, b);
-        return ck_one(facs, terms, pols, pst, budget, cnds, pcs, cks, wst, mv);
+        i = i + 1;
     }
-    if wst[11] == 2 {
+    if !seen { lpe_push(lpes, wst, cnd, n_cnd, lines, contig); };
+}
+
+// how many alternatives the `k`th member has at the level just inside this one, and where they are
+fn pick_n(sites: &[Site], sc: &[i64], k: i64) -> i64 {
+    let s = sc[24576 + k];
+    let pos = sc[28672 + k];
+    if pos + 1 < sites[s].inloop { return sc[2 * (3 * s + pos + 1) + 1]; }
+    1
+}
+
+fn pick_at(sites: &[Site], sc: &[i64], base: i64, k: i64) -> i64 {
+    let s = sc[24576 + k];
+    let pos = sc[28672 + k];
+    if pos + 1 < sites[s].inloop { return sc[2 * (3 * s + pos + 1)] + sc[32768 + k]; }
+    base
+}
+
+// the sites inside this level, and the depth at which it sits for each; the count is the answer
+fn level_members(sites: &[Site], sc: &mut [i64], wst: &mut [i64], lid: i64) -> i64 {
+    let mut nm = 0;
+    let mut s = 0;
+    while s < wst[10] {
+        let mut d = 0;
+        while d < sites[s].inloop {
+            if site_lp(sites, s, d) == lid {
+                if nm < 4000 { sc[24576 + nm] = s; sc[28672 + nm] = d; nm = nm + 1; }
+                else { wst[1] = 1; };
+            };
+            d = d + 1;
+        }
+        s = s + 1;
+    }
+    nm
+}
+
+// is the `mi`th member the first site in this level to walk its array in a way the compiler cannot
+// follow? **An arena's lines are the arena's, however many sites walk it**: a later scattered site
+// on the same array adds nothing on the fitting side, because the bound is the array and it has
+// already been counted. `arenas_taken` in `analyze.rs`.
+fn arena_first(src: &[u8], toks: &[Token], sites: &[Site], sc: &[i64], wst: &mut [i64], nm: i64,
+               mi: i64) -> bool {
+    let me = sc[24576 + mi];
+    let mut k = 0;
+    let mut first = true;
+    while k < mi {
+        let q = sc[24576 + k];
+        let pos = sc[28672 + k];
+        let c = site_coef(sites, wst, q, pos);
+        if (wst[14] == 2 || c == 0 && sites[q].novar != 0)
+            && name_eq(src, toks, sites[q].arr, sites[me].arr) { first = false; }
+        k = k + 1;
+    }
+    first
+}
+
+// One site's alternative under one outcome of the level's working-set test. `fits` says whether the
+// level's working set was found to fit; when it does not, nothing in the level keeps its reuse.
+fn settle_one(src: &[u8], toks: &[Token], facs: &mut [Fac], terms: &mut [Term], pols: &mut [Pol],
+              pst: &mut [i64], budget: &mut [f64], cnds: &mut [Cnd], sites: &[Site],
+              lpes: &mut [Lpe], sc: &mut [i64], scratch: &mut [i64], wst: &mut [i64],
+              lid: i64, mi: i64, base: i64, ostart: i64, cstart: i64, ncnd: i64, fits: i64,
+              first: bool) {
+    let s = sc[24576 + mi];
+    let pos = sc[28672 + mi];
+    let alt = pick_at(sites, sc, base, mi);
+    let lines = lpes[alt].lines;
+    let contig = lpes[alt].contig;
+    let one = pol_const(facs, terms, pols, pst, 1);
+    let summed = lp_sum(facs, terms, pols, pst, scratch, wst, lid, lines);
+    let coef = site_coef(sites, wst, s, pos);
+    // a `while` with no induction variable gives nothing to move against, exactly as a coefficient
+    // the compiler could not read does
+    let scattered = wst[14] == 2 || lp_var(wst, lid) < 0;
+    // affine, but the stride is not a number: never compared with `B`, always a whole line or more
+    let symbolic = wst[14] == 1;
+
+    // **The region rule.** A walk the compiler cannot follow costs a fresh line per lap, unless the
+    // array it walks is small enough to stay in cache: once every line of it has been touched
+    // nothing more is fetched, whatever the order. So it costs at most the array, under the
+    // condition that the array fits — and that is worth saying only when the walk is longer than
+    // the array, since bounding a scatter by what it scatters over buys nothing until lines are
+    // revisited.
+    if fits == 1 && scattered && sites[s].alen >= 0 {
+        let foot = pol_scale(facs, terms, pols, pst, sites[s].alen, sites[s].es, 1);
+        let touched = pol_scale(facs, terms, pols, pst, summed, 64, 1);
+        if pol_dominates(facs, terms, pols, pst, budget, touched, foot) {
+            let arena = pol_div_atom(facs, terms, pols, pst, foot, 0);
+            let keep = if first { arena } else { pol_zero(facs, terms, pols, pst) };
+            // the array's lines, which is both what the site costs when it fits and the condition
+            let cf = wst[28];
+            let mut i = 0;
+            while i < ncnd {
+                cnd_push(cnds, wst, cnds[cstart + i].ws, cnds[cstart + i].fits);
+                i = i + 1;
+            }
+            cnd_push(cnds, wst, arena, 1);
+            if conds_feasible(facs, terms, pols, pst, budget, cnds, cf, ncnd + 1) {
+                lpe_add(facs, terms, pols, cnds, lpes, wst, ostart, cf, ncnd + 1, keep, 0);
+            };
+            let cn = wst[28];
+            let mut j = 0;
+            while j < ncnd {
+                cnd_push(cnds, wst, cnds[cstart + j].ws, cnds[cstart + j].fits);
+                j = j + 1;
+            }
+            cnd_push(cnds, wst, arena, 0);
+            if conds_feasible(facs, terms, pols, pst, budget, cnds, cn, ncnd + 1) {
+                lpe_add(facs, terms, pols, cnds, lpes, wst, ostart, cn, ncnd + 1, summed, 0);
+            };
+            return;
+        };
+    };
+
+    let mut total = summed;
+    let mut ctg = 0;
+    if fits == 1 {
+        // the set this site already has: itself summed when it varies with this level
+        let a = lp_atom(wst, lid);
+        let same = if a >= 0 && mono_mentions(facs, terms, pols, lines, a) { summed } else { lines };
+        if scattered || symbolic {
+            total = summed;
+        } else if coef == 0 {
+            // the site does not move with this loop at all: the same lines, every lap
+            total = same;
+            ctg = contig;
+        } else {
+            let cm = if coef < 0 { 0 - coef } else { coef };
+            let st = cm * sites[s].stride;
+            if st < 64 {
+                // the slide: how far the site walks over one full run of this level, in lines, and
+                // floored at one — a walk that covers less than a line still crosses one
+                let trips = lp_sum(facs, terms, pols, pst, scratch, wst, lid, one);
+                let raw = pol_scale(facs, terms, pols, pst, trips, st, 1);
+                let mut slide = pol_div_atom(facs, terms, pols, pst, raw, 0);
+                let test = pol_scale(facs, terms, pols, pst, trips, st, 64);
+                let tv = pol_as_f64(facs, terms, pols, pst, test);
+                if pst[7] != 0 && tv < 1.0 { slide = one; };
+                if contig == 1 {
+                    total = pol_add(facs, terms, pols, pst, same, slide);
+                    ctg = 1;
+                } else {
+                    total = pol_mul(facs, terms, pols, pst, same, slide);
+                }
+            };
+        };
+    };
+    lpe_add(facs, terms, pols, cnds, lpes, wst, ostart, cstart, ncnd, total, ctg);
+}
+
+// One combination of the members' alternatives: their working sets add, the level's test is taken
+// once for all of them, and the outcome is emitted for the one member being filled in.
+fn settle_combo(src: &[u8], toks: &[Token], facs: &mut [Fac], terms: &mut [Term], pols: &mut [Pol],
+                pst: &mut [i64], budget: &mut [f64], cnds: &mut [Cnd], sites: &[Site],
+                lpes: &mut [Lpe], sc: &mut [i64], scratch: &mut [i64], wst: &mut [i64],
+                lid: i64, nm: i64, mi: i64, base: i64, ostart: i64, first: bool) {
+    let b = pol_atom(facs, terms, pols, pst, 0);
+    let cstart = wst[28];
+    let mut ws = pol_zero(facs, terms, pols, pst);
+    let mut k = 0;
+    while k < nm {
+        let alt = pick_at(sites, sc, base, k);
+        ws = pol_add(facs, terms, pols, pst, ws, lpes[alt].lines);
+        let mut ci = 0;
+        while ci < lpes[alt].n_cnd {
+            let mut seen = false;
+            let mut j = 0;
+            while j < wst[28] - cstart {
+                if cnds[cstart + j].fits == cnds[lpes[alt].cnd + ci].fits
+                    && pol_eq(facs, terms, pols, cnds[cstart + j].ws, cnds[lpes[alt].cnd + ci].ws) {
+                    seen = true;
+                }
+                j = j + 1;
+            }
+            if !seen {
+                cnd_push(cnds, wst, cnds[lpes[alt].cnd + ci].ws, cnds[lpes[alt].cnd + ci].fits);
+            };
+            ci = ci + 1;
+        }
+        k = k + 1;
+    }
+    let ncnd = wst[28] - cstart;
+    if !conds_feasible(facs, terms, pols, pst, budget, cnds, cstart, ncnd) { return; };
+
+    // a working set that varies with this level's variable is tested at the variable's largest
+    let a = lp_atom(wst, lid);
+    let mut test = ws;
+    let mut testable = true;
+    if a >= 0 && mono_mentions(facs, terms, pols, ws, a) {
+        let sg = pol_atom_signs(facs, terms, pols, ws, a);
+        if sg > 0 {
+            let lst = lp_last(facs, terms, pols, pst, wst, lid);
+            test = pol_subst(facs, terms, pols, pst, ws, a, lst);
+        } else if sg < 0 {
+            test = pol_subst(facs, terms, pols, pst, ws, a, lp_lo(wst, lid));
+        } else {
+            testable = false;
+        };
+    };
+    // **A condition's working set is carried in lines**, as `analyze.rs` carries it, and the report
+    // multiplies by `B` when it prints. Not because either unit reads better, but because
+    // `dominates` compares monomials exponent by exponent and is *not* scale-invariant: in lines
+    // `2·n + n² + 8·n²/B` dominates `2 + 8·n/B + n`, and in bytes the same pair does not, which
+    // left `matmul` with a fourth regime that the comparison should have ruled out.
+    let v = pol_num_at_b(facs, terms, pols, pst, test, 64.0) * 64.0;
+    if !testable {
+        // no single extreme to test at, so it is assumed not to fit. Every assumption rounds up.
+        settle_one(src, toks, facs, terms, pols, pst, budget, cnds, sites, lpes, sc, scratch, wst,
+                   lid, mi, base, ostart, cstart, ncnd, 0, first);
+        return;
+    };
+    if pst[7] != 0 {
+        let fits = if v < 2097152.0 { 1 } else { 0 };
+        settle_one(src, toks, facs, terms, pols, pst, budget, cnds, sites, lpes, sc, scratch, wst,
+                   lid, mi, base, ostart, cstart, ncnd, fits, first);
+        return;
+    };
+    // symbolic: both regimes stand, each under its own condition
+    let cf = wst[28];
+    let mut i = 0;
+    while i < ncnd {
+        cnd_push(cnds, wst, cnds[cstart + i].ws, cnds[cstart + i].fits);
+        i = i + 1;
+    }
+    cnd_push(cnds, wst, test, 1);
+    if conds_feasible(facs, terms, pols, pst, budget, cnds, cf, ncnd + 1) {
+        settle_one(src, toks, facs, terms, pols, pst, budget, cnds, sites, lpes, sc, scratch, wst,
+                   lid, mi, base, ostart, cf, ncnd + 1, 1, first);
+    };
+    let cn = wst[28];
+    let mut j = 0;
+    while j < ncnd {
+        cnd_push(cnds, wst, cnds[cstart + j].ws, cnds[cstart + j].fits);
+        j = j + 1;
+    }
+    cnd_push(cnds, wst, test, 0);
+    if conds_feasible(facs, terms, pols, pst, budget, cnds, cn, ncnd + 1) {
+        settle_one(src, toks, facs, terms, pols, pst, budget, cnds, sites, lpes, sc, scratch, wst,
+                   lid, mi, base, ostart, cn, ncnd + 1, 0, first);
+    };
+}
+
+// Every combination of one alternative per member, for one member's column of the table. The
+// enumeration is re-run per member rather than stored, so that each member's alternatives land
+// contiguously in the bump arena; the combinations are the same every time.
+fn settle_level(src: &[u8], toks: &[Token], facs: &mut [Fac], terms: &mut [Term], pols: &mut [Pol],
+                pst: &mut [i64], budget: &mut [f64], cnds: &mut [Cnd], sites: &[Site],
+                lpes: &mut [Lpe], sc: &mut [i64], scratch: &mut [i64], wst: &mut [i64],
+                lid: i64, nm: i64, base: i64) {
+    let mut mi = 0;
+    while mi < nm {
+        let s = sc[24576 + mi];
+        let pos = sc[28672 + mi];
+        let ostart = wst[45];
+        let first = arena_first(src, toks, sites, sc, wst, nm, mi);
+        let mut c = 0;
+        while c < nm { sc[32768 + c] = 0; c = c + 1; }
+        let mut more = true;
+        while more {
+            settle_combo(src, toks, facs, terms, pols, pst, budget, cnds, sites, lpes, sc, scratch,
+                         wst, lid, nm, mi, base, ostart, first);
+            let mut k = 0;
+            let mut carry = true;
+            while carry && k < nm {
+                sc[32768 + k] = sc[32768 + k] + 1;
+                if sc[32768 + k] < pick_n(sites, sc, k) { carry = false; }
+                else { sc[32768 + k] = 0; k = k + 1; };
+            }
+            if carry { more = false; };
+        }
+        sc[2 * (3 * s + pos)] = ostart;
+        sc[2 * (3 * s + pos) + 1] = wst[45] - ostart;
+        mi = mi + 1;
+    }
+}
+
+// one site's whole cost, in bytes: its alternatives over its outermost level, each a line count
+fn site_top(facs: &mut [Fac], terms: &mut [Term], pols: &mut [Pol], pst: &mut [i64],
+            budget: &mut [f64], cnds: &mut [Cnd], pcs: &mut [Pce], cks: &mut [Ck],
+            sites: &[Site], lpes: &[Lpe], sc: &[i64], wst: &mut [i64], s: i64) -> i64 {
+    let b = pol_atom(facs, terms, pols, pst, 0);
+    if sites[s].inloop == 0 {
+        return ck_one(facs, terms, pols, pst, budget, cnds, pcs, cks, wst, b);
+    }
+    let ts = sc[2 * (3 * s)];
+    let tn = sc[2 * (3 * s) + 1];
+    if tn <= 0 {
         wst[1] = 1;
         return ck_zero(facs, terms, pols, pst, budget, cnds, pcs, cks, wst);
     }
-    if scattered || stride >= 64 {
-        let nofit = pol_mul(facs, terms, pols, pst, trip, b);
-        // A walk the compiler cannot follow **forks** (design §13): if the array fits in `M` every
-        // distinct element crosses once — the footprint — and if it does not, every touch crosses
-        // a line. A strided walk it *can* follow does not fork: that one really does take a line
-        // per touch either way.
-        let len = arg_len(src, toks, nodes, env, wst, arr);
-        if !scattered || len < 0 { return ck_one(facs, terms, pols, pst, budget, cnds, pcs, cks, wst, nofit); }
-        // the bound is the **whole array's** bytes, every field of it, however the struct is laid
-        // out: once every line of it has been touched nothing more is fetched, and under SoA the
-        // field arrays together are still the structure. Using the site's own stride here bounded
-        // a two-field arena by one field and made `arena.nt` choose SoA.
-        let foot = pol_scale(facs, terms, pols, pst, len, es, 1);
-        // …and only when the walk is **longer than the array**: bounding a scatter by the array it
-        // scatters over is worth something only once lines are revisited. `analyze.rs` compares the
-        // touches against the array's line count with `B` substituted, and so does this.
-        let touched = pol_scale(facs, terms, pols, pst, trip, 64, 1);
-        if !pol_dominates(facs, terms, pols, pst, budget, touched, foot) {
-            return ck_one(facs, terms, pols, pst, budget, cnds, pcs, cks, wst, nofit);
-        }
-        // **an arena's lines are the arena's, however many sites walk it.** A second scattered site
-        // on the same array adds nothing on the fitting side: the bound is the array, and it has
-        // already been counted. `analyze.rs` calls this `arenas_taken`; §13 had it as a `max` on
-        // the fitting side, which a general piece algebra cannot express because `add` there really
-        // does add. It belongs here, at the site, and not in the arithmetic.
-        let mut taken = false;
-        let mut q = 0;
-        while q < s {
-            if sites[q].inloop != 0 && (sites[q].bad != 0 || sites[q].coef == 0 && sites[q].novar != 0)
-                && name_eq(src, toks, sites[q].arr, sites[s].arr) { taken = true; }
-            q += 1;
-        }
-        let fits = if taken { pol_zero(facs, terms, pols, pst) } else { foot };
-        return ck_fork(facs, terms, pols, pst, budget, cnds, pcs, cks, wst, fits, nofit, foot);
+    let start = wst[29];
+    let mut i = 0;
+    while i < tn {
+        let mv = pol_mul(facs, terms, pols, pst, lpes[ts + i].lines, b);
+        pce_push(pcs, wst, lpes[ts + i].cnd, lpes[ts + i].n_cnd, mv);
+        i = i + 1;
     }
-    if stride == 0 { return ck_one(facs, terms, pols, pst, budget, cnds, pcs, cks, wst, b); }
-    let mut slide = pol_scale(facs, terms, pols, pst, trip, stride, 1);
-    // a walk that covers less than a line still crosses one: `analyze.rs` floors the slide at one
-    // line, which is what makes `arrays.nt`'s five-element loop cost `B` and not `40`
-    let total = pol_as_int(facs, terms, pols, pst, slide);
-    if pst[4] != 0 && total < 64 { slide = b; };
-    let one = pol_add(facs, terms, pols, pst, b, slide);
-    ck_one(facs, terms, pols, pst, budget, cnds, pcs, cks, wst, one)
+    ck_close(facs, terms, pols, pst, budget, cnds, pcs, cks, wst, start)
+}
+
+// The sites of one `if` arm, summed — with every `if` nested directly in it contributing the
+// *larger* of its two arms rather than their sum, because only one of them happens. `group` in
+// `analyze.rs`; the tag tree is `wst[500 + q]`, the arm each `if` sits in.
+fn group_moves(facs: &mut [Fac], terms: &mut [Term], pols: &mut [Pol], pst: &mut [i64],
+               budget: &mut [f64], cnds: &mut [Cnd], pcs: &mut [Pce], cks: &mut [Ck],
+               sites: &[Site], lpes: &[Lpe], sc: &[i64], wst: &mut [i64], tag: i64) -> i64 {
+    let mut total = ck_zero(facs, terms, pols, pst, budget, cnds, pcs, cks, wst);
+    let mut s = 0;
+    while s < wst[10] {
+        if sites[s].branch == tag {
+            let t = site_top(facs, terms, pols, pst, budget, cnds, pcs, cks, sites, lpes, sc, wst, s);
+            total = ck_add(facs, terms, pols, pst, budget, cnds, pcs, cks, wst, total, t);
+        };
+        s = s + 1;
+    }
+    let mut q = 1;
+    while q <= wst[21] {
+        if q < 3000 && wst[500 + q] == tag {
+            let t = group_moves(facs, terms, pols, pst, budget, cnds, pcs, cks, sites, lpes, sc,
+                                wst, q * 2);
+            let e = group_moves(facs, terms, pols, pst, budget, cnds, pcs, cks, sites, lpes, sc,
+                                wst, q * 2 + 1);
+            let m = ck_max(facs, terms, pols, pst, budget, cnds, pcs, cks, wst, t, e);
+            total = ck_add(facs, terms, pols, pst, budget, cnds, pcs, cks, wst, total, m);
+        };
+        q = q + 1;
+    }
+    total
+}
+
+fn settle_moves(src: &[u8], toks: &[Token], facs: &mut [Fac], terms: &mut [Term],
+                pols: &mut [Pol], pst: &mut [i64], budget: &mut [f64], cnds: &mut [Cnd],
+                pcs: &mut [Pce], cks: &mut [Ck], sites: &[Site], lpes: &mut [Lpe],
+                sc: &mut [i64], scratch: &mut [i64], wst: &mut [i64]) -> i64 {
+    wst[45] = 0;
+    let one = pol_const(facs, terms, pols, pst, 1);
+    // the alternative a site has at the level just inside its innermost: one line, contiguous
+    let base = wst[45];
+    lpe_push(lpes, wst, 0, 0, one, 1);
+    let mut lid = wst[41] - 1;
+    while lid >= 0 {
+        let nm = level_members(sites, sc, wst, lid);
+        if nm > 0 {
+            settle_level(src, toks, facs, terms, pols, pst, budget, cnds, sites, lpes, sc, scratch,
+                         wst, lid, nm, base);
+        };
+        lid = lid - 1;
+    }
+    group_moves(facs, terms, pols, pst, budget, cnds, pcs, cks, sites, lpes, sc, wst, 0)
 }
 
 fn m_expr(src: &[u8], toks: &[Token], nodes: &[Node], types: &[Ty], strs: &[Str], flds: &[Fld],
@@ -2046,6 +2670,9 @@ fn m_expr(src: &[u8], toks: &[Token], nodes: &[Node], types: &[Ty], strs: &[Str]
         let c = m_expr(src, toks, nodes, types, strs, flds, ntys, sigs, ptys, fm, ffoot, facs, terms, pols, pst, env, cof, sites, cks, cnds, pcs, budget, resid, rargs, subst, slay, wst, nodes[n].a);
         let saved = wst[20];
         wst[21] = wst[21] + 1;
+        // the arm this `if` itself sits in, so that the settle pass can rebuild the tree: a tag
+        // is unique per arm but says nothing about what encloses it (design §18)
+        if wst[21] < 3000 { wst[500 + wst[21]] = saved; } else { wst[1] = 1; };
         wst[20] = wst[21] * 2;
         // recursive calls count along the heavier arm only, as they do for `work`: `bsearch` calls
         // itself on each side and only one of them happens
@@ -2342,7 +2969,7 @@ fn m_stmt(src: &[u8], toks: &[Token], nodes: &[Node], types: &[Ty], strs: &[Str]
             wst[2] = atom + 1;
             let av = pol_atom(facs, terms, pols, pst, atom);
             env_add(env, wst, nodes[n].a, av, -1);
-            lp_open(wst, depth, nodes[n].a, atom, lo, 1, wst[13]);
+            lp_open(wst, depth, nodes[n].a, atom, lo, 1, wst[13], nodes[n].b);
             let body = m_block(src, toks, nodes, types, strs, flds, ntys, sigs, ptys, fm, ffoot, facs, terms, pols, pst, env, cof, sites, cks, cnds, pcs, budget, resid, rargs, subst, slay, wst, nodes[n].d);
             acc = ck_add(facs, terms, pols, pst, budget, cnds, pcs, cks, wst, a, b);
             acc = ck_add(facs, terms, pols, pst, budget, cnds, pcs, cks, wst, acc, body);
@@ -2366,7 +2993,7 @@ fn m_stmt(src: &[u8], toks: &[Token], nodes: &[Node], types: &[Ty], strs: &[Str]
             };
             // a `while` has no loop atom: nothing accumulated in it can be summed over its
             // variable, which is `LoopRec.atom = None` in `analyze.rs`
-            lp_open(wst, depth, wst[15], -1, -1, 1, t);
+            lp_open(wst, depth, wst[15], -1, -1, 1, t, -1);
             let body = m_block(src, toks, nodes, types, strs, flds, ntys, sigs, ptys, fm, ffoot, facs, terms, pols, pst, env, cof, sites, cks, cnds, pcs, budget, resid, rargs, subst, slay, wst, nodes[n].c);
             acc = ck_add(facs, terms, pols, pst, budget, cnds, pcs, cks, wst, a, b);
             acc = ck_add(facs, terms, pols, pst, budget, cnds, pcs, cks, wst, acc, body);
@@ -2395,7 +3022,7 @@ fn m_func(src: &[u8], toks: &[Token], nodes: &[Node], types: &[Ty], strs: &[Str]
           pols: &mut [Pol], pst: &mut [i64], env: &mut [Env], cof: &mut [Cof],
           sites: &mut [Site], cks: &mut [Ck], cnds: &mut [Cnd], pcs: &mut [Pce], budget: &mut [f64], resid: &mut [Res],
           rargs: &mut [i64], logs: &mut [i64], scratch: &mut [i64], subst: &mut [i64],
-          slay: &[i64], wst: &mut [i64], f: i64, si: i64) -> i64 {
+          slay: &[i64], lpes: &mut [Lpe], sc: &mut [i64], wst: &mut [i64], f: i64, si: i64) -> i64 {
     wst[0] = 0;
     wst[1] = 0;
     wst[10] = 0;
@@ -2423,7 +3050,11 @@ fn m_func(src: &[u8], toks: &[Token], nodes: &[Node], types: &[Ty], strs: &[Str]
         p = nodes[p].next;
     }
     wst[23] = 0;
-    let total = m_block(src, toks, nodes, types, strs, flds, ntys, sigs, ptys, fm, ffoot, facs, terms, pols, pst, env, cof, sites, cks, cnds, pcs, budget, resid, rargs, subst, slay, wst, nodes[f].d);
+    let walked = m_block(src, toks, nodes, types, strs, flds, ntys, sigs, ptys, fm, ffoot, facs, terms, pols, pst, env, cof, sites, cks, cnds, pcs, budget, resid, rargs, subst, slay, wst, nodes[f].d);
+    // the sites, settled now that every level is known — see `settle_moves`
+    let sm = settle_moves(src, toks, facs, terms, pols, pst, budget, cnds, pcs, cks, sites, lpes,
+                          sc, scratch, wst);
+    let total = ck_add(facs, terms, pols, pst, budget, cnds, pcs, cks, wst, walked, sm);
     if wst[1] != 0 { return -1; }
     if wst[23] == 0 { return total; }
     // the same solver the `work` column uses; a forked body would need the recurrence solved in
@@ -2487,7 +3118,7 @@ fn choose_layouts(src: &[u8], toks: &[Token], nodes: &[Node], types: &[Ty], strs
     let mut pst = [0, 0, 0, 0, 0, 0, 0, 0];
     let mut env = [Env { name: 0, val: 0, len: 0, root: 0 }; 4096];
     let mut cof = [Cof { name: 0, c: 0 }; 256];
-    let mut sites = [Site { arr: 0, idx: 0, inloop: 0, coef: 0, stride: 0, bad: 0, trip: 0, branch: 0, novar: 0, field: -1, p0: -1, p1: -1, p2: -1 }; 4096];
+    let mut sites = [Site { arr: 0, idx: 0, inloop: 0, coef: 0, stride: 0, bad: 0, trip: 0, branch: 0, novar: 0, field: -1, p0: -1, p1: -1, p2: -1, c0: 0, c1: 0, c2: 0, b0: 0, b1: 0, b2: 0, alen: -1, es: 0 }; 4096];
     let mut cks = [Ck { pce: 0, n_pce: 0 }; 262144];
     let mut cnds = [Cnd { ws: 0, fits: 0 }; 262144];
     let mut pcs = [Pce { cnd: 0, n_cnd: 0, poly: 0 }; 262144];
@@ -2498,7 +3129,9 @@ fn choose_layouts(src: &[u8], toks: &[Token], nodes: &[Node], types: &[Ty], strs
     let mut scratch = [0; 64];
     let mut ffoot = [0; 65536];
     let mut fm = [-1; 4096];
-    let mut wst = [0; 256];
+    let mut lpes = [Lpe { cnd: 0, n_cnd: 0, lines: 0, contig: 0 }; 65536];
+    let mut sc = [0; 40960];
+    let mut wst = [0; 4096];
 
     let mut sid = 0;
     while sid < n_structs {
@@ -2528,7 +3161,8 @@ fn choose_layouts(src: &[u8], toks: &[Token], nodes: &[Node], types: &[Ty], strs
                                         &ffoot, &mut facs, &mut terms, &mut pols, &mut pst, &mut env,
                                         &mut cof, &mut sites, &mut cks, &mut cnds, &mut pcs,
                                         &mut budget, &mut resid, &mut rargs, &mut logs,
-                                        &mut scratch, &mut subst, slay, &mut wst, f, si);
+                                        &mut scratch, &mut subst, slay, &mut lpes, &mut sc,
+                                        &mut wst, f, si);
                         foot_flags(src, toks, nodes, &sites, &mut ffoot, &wst, f, si);
                         if pass == 1 && fm[si] >= 0
                             && touches_struct(src, toks, nodes, types, sigs, ptys, sid, f, si) {
@@ -2569,7 +3203,7 @@ fn ck_eval(facs: &[Fac], terms: &[Term], pols: &[Pol], pst: &mut [i64], cnds: &[
         let mut holds = true;
         let mut j = 0;
         while j < pcs[p].n_cnd {
-            let w = pol_eval(facs, terms, pols, pst, cnds[pcs[p].cnd + j].ws, b, m, size);
+            let w = pol_eval(facs, terms, pols, pst, cnds[pcs[p].cnd + j].ws, b, m, size) * b;
             if pst[6] != 0 { bad = 1; };
             let fits = if w < m { 1 } else { 0 };
             if fits != cnds[pcs[p].cnd + j].fits { holds = false; }
@@ -2597,7 +3231,7 @@ fn pol_leading(facs: &[Fac], terms: &mut [Term], pols: &mut [Pol], pst: &mut [i6
     let mut top = 0 - 1;
     let mut i = 0;
     while i < pols[p].n_term {
-        let d = mono_degree(facs, terms[pols[p].term + i].fac, terms[pols[p].term + i].n_fac);
+        let d = mono_var_degree(facs, terms[pols[p].term + i].fac, terms[pols[p].term + i].n_fac);
         if d > top { top = d; };
         i += 1;
     }
@@ -2605,7 +3239,7 @@ fn pol_leading(facs: &[Fac], terms: &mut [Term], pols: &mut [Pol], pst: &mut [i6
     i = 0;
     while i < pols[p].n_term {
         let t = pols[p].term + i;
-        if mono_degree(facs, terms[t].fac, terms[t].n_fac) == top {
+        if mono_var_degree(facs, terms[t].fac, terms[t].n_fac) == top {
             terms[pst[1]].fac = terms[t].fac;
             terms[pst[1]].n_fac = terms[t].n_fac;
             terms[pst[1]].cn = terms[t].cn;
