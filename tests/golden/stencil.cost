@@ -2,7 +2,7 @@ stencil          work 25·n² − 97·n + 95            moves                   
                                                moves ≈ 40·n²                      if ≈ 40·n < M
                                                moves ≈ 40·n²                      if ≈ 40·n ≥ M
                  lower bound      moves 16·n² − 64·n + 64            (footprint, every distinct element crosses once)   gap 2× if ≈ 40·n < M; 2× if ≈ 40·n ≥ M at M = 2 MiB, B = 64
-                 footprint        src: [0, 8·src.len()) (whole array)  dst: [16·n + 16, 8·n²)   no residue claimed
+                 footprint        src: [0, 8·src.len()) (whole array)  dst: [8·n + 8, 8·n² − 8·n − 8)   no residue claimed
 total            work 4·g.len()                    moves 8·g.len() + B                exact
                  lower bound      moves 8·g.len()                    (footprint, every distinct element crosses once)   gap 1× at M = 2 MiB, B = 64
                  footprint        g: [0, 8·g.len())   resident after if 8·g.len() < M

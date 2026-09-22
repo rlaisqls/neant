@@ -5,5 +5,5 @@ pairs            work 3·a.len()² + 5·a.len()       moves                     
                  footprint        a: [0, 8·a.len()) (whole array)   no residue claimed
 tiles            work 21·n/4 + 1                   moves 8·n + 2·B                    exact
                  lower bound      moves 8·n                          (footprint, every distinct element crosses once)   gap 1× at M = 2 MiB, B = 64
-                 footprint        a: [32·ii, 32·ii + 8·n)   resident after if 8·n < M
+                 footprint        a: [0, 8·n)   resident after if 8·n < M
 main             work 102                          moves 6·B + 248                    exact, io

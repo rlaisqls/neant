@@ -648,6 +648,13 @@ A range shifted *right* claims bytes past the end were brought in, so a caller c
 memory the callee never touched — an under-report of `moves`, which is the unsound direction. The
 corpus does not contain the pair of calls that would show it, which is luck rather than safety.
 
+**Fixed, and the blast radius was two lines.** Only `stencil`'s and `tri`'s golden reports change,
+and only their `footprint` line; no `work`, `moves` or `lower bound` column in the corpus moves at
+all, and the self-hosted pass still agrees on all three of its columns. `tri`'s correction is the
+second thing the fix buys: it read `a: [32·ii, 32·ii + 8·n)`, a footprint stated in terms of a loop
+variable that does not exist when the function returns — `rec.lo` for `for i in ii*4..ii*4+4` is
+`ii*4`, so the double count put `ii` in a range a caller was supposed to read. It is now `[0, 8·n)`.
+
 **How it was found is the point.** Not by reading `site_range` — three readings of it produced
 formulas that each matched the source and none of the output. It was found by *predicting* what a
 double count would print for `2..len` and `3..len` before running them, and then running them. The

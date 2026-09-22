@@ -690,7 +690,13 @@ impl<'a, 'b, 'c> Fa<'a, 'b, 'c> {
                 Some(x) => x < 0.0,
                 None => { if c.terms.values().all(|k| k.n >= 0) { false } else { return None; } }
             };
-            let (a, b) = (c.mul(&rec.lo), c.mul(&rec.last()));
+            // **the affine form already carries the loop's start**, since `affine()` gives a loop
+            // variable `var + offset` so that an index is seen to move with the loops outside it.
+            // The variable's own contribution therefore runs from 0, not from `rec.lo` — adding
+            // `rec.lo` here counted the start twice and shifted the whole range right by it
+            // (docs/experiments.md, "A bug in the reference compiler").
+            let span = rec.trip.sub(&Poly::constant(1)).scale(Rat::int(rec.step));
+            let (a, b) = (Poly::zero(), c.mul(&span));
             if negative { lo = lo.add(&b); hi = hi.add(&a); } else { lo = lo.add(&a); hi = hi.add(&b); }
         }
         let st = Rat::int(site.stride);
