@@ -785,3 +785,87 @@ to validate a design made the design look finished.
 `n` elements against `i`, and `idx_coef` returns integers. The Rust's `Affine` carries polynomial
 coefficients. That is not a layer on top of the four above; it is a different representation of an
 index, and it should be designed rather than discovered.
+
+## 17. Symbolic strides, measured first — and they are not a representation
+
+The previous section ended by saying `matmul`'s `i * n` needs the Rust's `Affine`, a map from loop
+variable to **polynomial** coefficient, and that this is "a different representation of an index
+rather than a layer on top". That was an estimate, made from the shape of the Rust type and not
+from what the Rust does with it. Measured, it is wrong, and wrong in the cheap direction.
+
+### What the Rust actually does with a symbolic stride
+
+`analyze.rs:1285` decides a level from the site's stride, and there are three arms:
+
+```rust
+Some(sb) if sb.abs() >= m.b_bytes => (summed, false),   // a whole line or more
+Some(sb)                          => (…slide…, contig), // less than a line
+None                              => (summed, false),   // SYMBOLIC
+```
+
+**A symbolic stride is never compared with `B`, and never forks.** It falls in with "a whole line
+or more" — the assumption the section's own doc comment states, that every assumption rounds up.
+So a coefficient's *value* is needed only when it is a number; when it is not, the only thing asked
+of it is that it is not zero.
+
+The polynomial coefficient is therefore never used as a polynomial. It is used as a three-way tag.
+
+### Checked against the printed answer, by hand
+
+`matmul`'s fitting regime is `24·n² + 2·B·n`, and it decomposes exactly, loops `i`, `j`, `k`:
+
+| site | vs `k` | vs `j` | vs `i` | lines | × B |
+|---|---|---|---|---|---|
+| `a[i*n+k]` | coef 1 → 8 B, slide `8n/B` | coef 0 → reuse | coef `n` **symbolic** → summed | `n + 8n²/B` | `B·n + 8n²` |
+| `b[k*n+j]` | coef `n` **symbolic** → summed | coef 1 → 8 B, slide | coef 0 → reuse | `8n²/B` | `8n²` |
+| `c[i*n+j]` | — (not in `k`) | coef 1 → 8 B, slide | coef `n` **symbolic** → summed | `n + 8n²/B` | `B·n + 8n²` |
+
+Sum: `2·B·n + 24·n²`. That is the printed regime, term for term. Every appearance of a symbolic
+coefficient in the derivation is a `summed`, and no appearance of one is an arithmetic operand.
+
+### So what `idx_coef` becomes
+
+Not an `Affine`. Today it returns an `i64` and raises one flag, `wst[14]`, meaning "not affine".
+That flag is carrying **two different verdicts** at once, and separating them is the whole change:
+
+| verdict | today | wanted | what it costs |
+|---|---|---|---|
+| a known integer coefficient | returns it | unchanged | compare with `B`: slide, or a line |
+| **affine, coefficient not a number** | `wst[14] = 1` | a *second* flag | a line per lap — the `stride ≥ 64` arm, **no region rule** |
+| not affine at all | `wst[14] = 1` | unchanged | the region rule: fork against the array fitting |
+
+The distinction matters because the region rule is attached to the wrong one of them. `a[i*n+k]`
+against `i` is perfectly affine; bounding it by the array it walks, as a non-affine arena walk is
+bounded, would be a different and larger claim than the Rust's.
+
+The rules for a product, which is the only place a symbolic coefficient is born — where `c(e)` is
+the coefficient of the variable being asked about:
+
+- either factor not affine → not affine
+- `c(a) = 0` and `c(b) = 0` → `0`. **This is a fix, not an extension**: `i*n` asked about `j` is
+  constant, and today it falls off the end of `idx_coef` and is called non-affine.
+- exactly one factor moves → symbolic
+- both factors move → not affine, since the index is quadratic in that variable
+
+One subtlety the Rust gets by construction and this would not. `affine()` returns `None` for the
+**whole index** when it is non-affine in *any* variable — `pa.is_const()` is const in all loops at
+once — so `a[i*j + k]` is region-ruled at every level, including against `k` where it looks linear.
+Asking per variable, as `idx_coef` does, would answer `k` more precisely than the Rust and diverge.
+The non-affine verdict has to be **pooled across the open variables** and settled once for the site.
+Nothing in the corpus writes `i*j`; that is why it must be written down rather than relied on.
+
+### What it opens, which is nothing on its own
+
+Honest accounting, since §16 was over-optimistic about exactly this:
+
+- `stencil` is depth 2 and needs symbolic strides **and** the outer level's `sum_over` — layer (3).
+- `matmul` is depth 3. `site_add` declines at `wst[11] > 2`, and the per-depth loop state is packed
+  two slots apart (`wst[30..31]` the variable, `wst[32..33]` the trip, `wst[34..35]` the bound), so
+  a third depth collides with the next field. The slots have to be re-laid before the depth rises.
+- `tri`'s `pairs` needs **no** symbolic stride at all — its coefficients are 1 and 0. It needs
+  layers (2), (3) and (4) and nothing from this section.
+
+So symbolic strides close no column by themselves. They are the cheapest of the five things and
+they are a prerequisite for two of the nine declines, which is worth knowing before ordering the
+work — and the order that falls out is: layers (2)–(4) first, because `pairs` alone pays for them,
+then the slot re-lay, then this, which by then is the small one.
