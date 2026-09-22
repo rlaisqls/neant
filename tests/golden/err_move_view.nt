@@ -1,0 +1,7 @@
+fn main() {
+    let xs = [3, 1, 4, 1, 5];
+    let v = &xs;
+    let ys = xs;
+    println(v[0]);
+    println(ys[0]);
+}

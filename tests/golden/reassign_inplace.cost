@@ -1,0 +1,2 @@
+main             work 13                           moves 2·B + 48                     exact, io
+                 `ys = xs` (line 4) reuses `xs`'s buffer in place: moves 0

@@ -1,0 +1,2 @@
+main             work 14                           moves 2·B + 72                     exact, io
+                 `ys = xs` (line 5) copies: a view of `xs` is still read at line 8

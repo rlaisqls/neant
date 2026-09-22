@@ -140,6 +140,22 @@ pub struct Func {
     /// `#[cost(...)]` bounds: (key, expression text, line, col)
     pub asserts: Vec<(String, String, u32, u32)>,
     pub line: u32,
+    /// `ys = xs;` sites, indexed by `Stmt::Reassign`; resolved once the whole body is checked
+    pub reassigns: Vec<Reassign>,
+}
+
+/// `ys = xs;`: `src` is always dead after, `in_place` says whether `ys`'s buffer became `src`'s
+/// (no bytes moved) or `src` was copied into `ys`'s own buffer (a full write) — decided once, from
+/// the program text, in `types.rs` (docs/m5-design.md §2). `conflict_line` is the later use of a
+/// view rooted at `src` that forced the copy, when there is a single line to name; the loop case
+/// forces a copy with no such line.
+#[derive(Debug, Clone)]
+pub struct Reassign {
+    pub target: LocalId,
+    pub src: LocalId,
+    pub line: u32,
+    pub in_place: bool,
+    pub conflict_line: Option<u32>,
 }
 
 #[derive(Debug, Clone)]
@@ -174,6 +190,8 @@ pub enum Stmt {
     /// with `var` bound to `k`. One pass, no intermediate.
     LetBuild { id: LocalId, len: Expr, var: LocalId, body: Block },
     Assign(LValue, Option<crate::ast::BinOp>, Expr),
+    /// `ys = xs;` — index into the function's `reassigns`
+    Reassign(usize),
     For { var: LocalId, start: Expr, end: Expr, body: Block },
     /// `decreasing` is the programmer's measure, when the compiler needs one.
     While { cond: Expr, decreasing: Option<Expr>, body: Block, line: u32 },

@@ -1,0 +1,10 @@
+fn main() {
+    let mut ys = [0, 0, 0];
+    let xs = [1, 2, 3];
+    let mut i = 0;
+    while i < 2 {
+        ys = xs;
+        i += 1;
+    }
+    println(ys[0]);
+}

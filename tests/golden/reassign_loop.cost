@@ -1,0 +1,2 @@
+main             work 19                           moves B + 96                       exact, io
+                 `ys = xs` (line 6) copies: inside a loop, `xs` may be read again next lap

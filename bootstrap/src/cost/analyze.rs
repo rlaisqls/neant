@@ -1574,6 +1574,32 @@ impl<'a, 'b, 'c> Fa<'a, 'b, 'c> {
                 }
                 Ok(())
             }
+            Stmt::Reassign(idx) => {
+                let r = self.f.reassigns[*idx].clone();
+                let size = self.local_size.get(&r.src).or_else(|| self.local_size.get(&r.target)).cloned();
+                if r.in_place {
+                    self.add_work_n(1); // a pointer and a length, not a byte moved
+                    let (ynm, xnm) = (self.f.locals[r.target].name.clone(), self.f.locals[r.src].name.clone());
+                    let note = format!("`{ynm} = {xnm}` (line {}) reuses `{xnm}`'s buffer in place: moves 0", r.line);
+                    if !self.notes.contains(&note) { self.notes.push(note); }
+                } else {
+                    let Some(sz) = &size else {
+                        return Err(Fail::Unknown(format!("the size of `{}` is not tracked", self.f.locals[r.src].name), r.line));
+                    };
+                    self.add_work(sz.clone());
+                    let es = self.elem_bytes(r.target);
+                    self.stream(sz, es);
+                    let (ynm, xnm) = (self.f.locals[r.target].name.clone(), self.f.locals[r.src].name.clone());
+                    let note = match r.conflict_line {
+                        Some(vl) => format!("`{ynm} = {xnm}` (line {}) copies: a view of `{xnm}` is still read at line {vl}", r.line),
+                        None => format!("`{ynm} = {xnm}` (line {}) copies: inside a loop, `{xnm}` may be read again next lap", r.line),
+                    };
+                    if !self.notes.contains(&note) { self.notes.push(note); }
+                }
+                if let Some(sz) = size { self.local_size.insert(r.target, sz); }
+                self.local_root.insert(r.target, r.target);
+                Ok(())
+            }
             Stmt::For { var, start, end, body } => {
                 self.expr(start)?;
                 self.expr(end)?;
@@ -1715,7 +1741,7 @@ impl<'a, 'b, 'c> Fa<'a, 'b, 'c> {
                         // m changes by k·delta, so it decreases by −k·delta
                         acc = acc.add(k.mul(Rat::int(delta)).neg());
                     }
-                    Stmt::Assign(LValue::Var(_) | LValue::Index(..) | LValue::Field(..) | LValue::IndexField(..), _, _) | Stmt::Let(..) | Stmt::LetArray(..) | Stmt::LetRepeat(..) | Stmt::LetBuild { .. } => {}
+                    Stmt::Assign(LValue::Var(_) | LValue::Index(..) | LValue::Field(..) | LValue::IndexField(..), _, _) | Stmt::Let(..) | Stmt::LetArray(..) | Stmt::LetRepeat(..) | Stmt::LetBuild { .. } | Stmt::Reassign(..) => {}
                     Stmt::Expr(Expr { kind: ExprKind::If(_, t, e), .. }) => {
                         let bt = block(t, coef, f)?;
                         let be = match e { Some(e) => block(e, coef, f)?, None => Some(Rat::zero()) };

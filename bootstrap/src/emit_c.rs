@@ -276,6 +276,27 @@ static void nt_println_f64(double v) {
                     }
                 }
             }
+            Stmt::Reassign(idx) => {
+                let r = self.f.unwrap().reassigns[*idx].clone();
+                let ynm = self.local_name(r.target);
+                let xnm = self.local_name(r.src);
+                let ty = self.f.unwrap().locals[r.target].ty.clone();
+                let fields: Vec<String> = match self.soa_of(&ty) {
+                    Some(fs) => fs.iter().map(|(f, _)| format!("_{f}")).collect(),
+                    None => vec![String::new()],
+                };
+                if r.in_place {
+                    for suf in &fields { self.line(&format!("{ynm}{suf}_p = {xnm}{suf}_p;")); }
+                } else {
+                    let k = self.fresh("k");
+                    self.line(&format!("for (int64_t {k} = 0; {k} < {xnm}_n; {k}++) {{"));
+                    self.indent += 1;
+                    for suf in &fields { self.line(&format!("{ynm}{suf}_p[{k}] = {xnm}{suf}_p[{k}];")); }
+                    self.indent -= 1;
+                    self.line("}");
+                }
+                self.line(&format!("{ynm}_n = {xnm}_n;"));
+            }
             Stmt::LetArray(id, elems) => {
                 let nm = self.local_name(*id);
                 let ty = self.f.unwrap().locals[*id].ty.clone();

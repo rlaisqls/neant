@@ -130,11 +130,23 @@ struct Ctx<'a> {
     /// the id of the first local declared inside the innermost loop being checked: a move of an
     /// id below this line was born outside the loop and would move it again on the next lap.
     loop_start: Vec<LocalId>,
+    /// `let`-moves (src, line): resolved after the body is built, to reject one that leaves a
+    /// view of `src` alive past it (docs/m5-design.md §4).
+    let_moves: Vec<(LocalId, u32)>,
+    /// `ys = xs;` sites, in the order checked; `Stmt::Reassign` indexes this
+    reassigns: Vec<Reassign>,
+    /// indices into `reassigns` not yet decided in place or copy: not loop-forced, so resolved by
+    /// the last-use scan once the body is built (docs/m5-design.md §2)
+    reassign_pending: Vec<usize>,
 }
 
 fn check_func(f: &ast::Func, sigs: &HashMap<String, (FuncId, Vec<Ty>, Ty)>, structs: &[StructDef], struct_ids: &HashMap<String, StructId>) -> Result<Func> {
     let (_, ptys, ret) = &sigs[&f.name];
-    let mut cx = Ctx { sigs, structs, struct_ids, locals: vec![], scopes: vec![HashMap::new()], sizes: vec![], ret: ret.clone(), in_loop: 0, in_closure: 0, fresh: 0, pending_lets: vec![], root: HashMap::new(), moved: HashMap::new(), loop_start: vec![] };
+    let mut cx = Ctx {
+        sigs, structs, struct_ids, locals: vec![], scopes: vec![HashMap::new()], sizes: vec![], ret: ret.clone(),
+        in_loop: 0, in_closure: 0, fresh: 0, pending_lets: vec![], root: HashMap::new(), moved: HashMap::new(),
+        loop_start: vec![], let_moves: vec![], reassigns: vec![], reassign_pending: vec![],
+    };
     let mut params = Vec::new();
     for (p, ty) in f.params.iter().zip(ptys) {
         // a slice parameter's size is its own variable, named after the parameter
@@ -155,12 +167,13 @@ fn check_func(f: &ast::Func, sigs: &HashMap<String, (FuncId, Vec<Ty>, Ty)>, stru
         for u in &f.uses {
             if u != "io" && u != "unbounded" { return err(f.line, f.col, format!("unknown effect `{u}`; effects are `io` and `unbounded`")); }
         }
-        return Ok(Func { name: f.name.clone(), params, ret: ret.clone(), locals: cx.locals, sizes: cx.sizes, body: None, uses: f.uses.clone(), asserts: f.asserts.clone(), line: f.line });
+        return Ok(Func { name: f.name.clone(), params, ret: ret.clone(), locals: cx.locals, sizes: cx.sizes, body: None, uses: f.uses.clone(), asserts: f.asserts.clone(), line: f.line, reassigns: vec![] });
     };
     if !f.uses.is_empty() {
         return err(f.line, f.col, "effects are inferred for a function with a body; `uses` belongs on an `extern`");
     }
     let body = cx.block(ast_body)?;
+    cx.resolve_moves(&body)?;
     if body.tail.is_none() && *ret != Ty::Unit && !ends_in_return(&body) {
         return err(f.line, f.col, format!("`{}` returns `{ret}` but its body has no value", f.name));
     }
@@ -180,7 +193,7 @@ fn check_func(f: &ast::Func, sigs: &HashMap<String, (FuncId, Vec<Ty>, Ty)>, stru
             _ => return err(f.line, 0, format!("`{}` returns an owned array, but its body does not end in one", f.name)),
         }
     }
-    Ok(Func { name: f.name.clone(), params, ret, locals: cx.locals, sizes: cx.sizes, body: Some(body), uses: vec![], asserts: f.asserts.clone(), line: f.line })
+    Ok(Func { name: f.name.clone(), params, ret, locals: cx.locals, sizes: cx.sizes, body: Some(body), uses: vec![], asserts: f.asserts.clone(), line: f.line, reassigns: cx.reassigns })
 }
 
 fn ends_in_return(b: &Block) -> bool {
@@ -361,6 +374,7 @@ impl<'a> Ctx<'a> {
                             self.check_declared(&declared, &ce.ty, *line, *col)?;
                             let id = self.declare(name, ce.ty.clone(), *mutable);
                             self.moved.insert(src, *line);
+                            self.let_moves.push((src, *line));
                             self.root.insert(id, id);
                             return Ok(Stmt::Let(id, ce));
                         }
@@ -389,6 +403,27 @@ impl<'a> Ctx<'a> {
                             return err(target.line, target.col, format!("`{n}` is not mutable; declare it with `let mut`"));
                         }
                         if l.ty.is_arrayish() {
+                            // `ys = xs;`: a whole-array reassignment moves or copies xs into ys's
+                            // existing buffer, decided once the body is checked (docs/m5-design.md)
+                            if op.is_none() && matches!(l.ty, Ty::Array(..)) && val.ty == l.ty {
+                                if let ExprKind::Local(src) = val.kind {
+                                    if src != id {
+                                        // `self.expr(value)` above already rejected `xs` moved
+                                        let forced_loop = self.loop_start.last().is_some_and(|&start| src < start || id < start);
+                                        let ri = Reassign { target: id, src, line: *line, in_place: !forced_loop, conflict_line: None };
+                                        let idx = self.reassigns.len();
+                                        self.reassigns.push(ri);
+                                        if !forced_loop { self.reassign_pending.push(idx); }
+                                        self.moved.remove(&id);
+                                        self.moved.insert(src, *line);
+                                        // `ys` denotes a value disjoint from anything else now,
+                                        // in place or not: `xs` is dead either way (§3), so no
+                                        // future code can observe whether the buffer is shared
+                                        self.root.insert(id, id);
+                                        return Ok(Stmt::Reassign(idx));
+                                    }
+                                }
+                            }
                             return err(target.line, target.col, "cannot assign a whole array or view; assign elements");
                         }
                         (LValue::Var(id), l.ty.clone())
@@ -785,6 +820,42 @@ impl<'a> Ctx<'a> {
         r
     }
 
+    /// Once the whole body is checked: close the gap a `let`-move leaves open (a live view of
+    /// the source survives it), and decide each pending `ys = xs;` site in place or copy, both
+    /// from the same "does a view rooted at the source get read again" scan (docs/m5-design.md
+    /// §2, §4).
+    fn resolve_moves(&mut self, body: &Block) -> Result<()> {
+        let mut last = HashMap::new();
+        last_uses(body, &self.reassigns, &mut last);
+        for &(src, line) in &self.let_moves.clone() {
+            let root = self.root_of(src);
+            if let Some((vid, vline)) = self.conflicting_view(root, src, line, &last) {
+                return err(line, 0, format!(
+                    "`{}` is moved here while `{}` still views it, read again at line {vline}",
+                    self.locals[src].name, self.locals[vid].name));
+            }
+        }
+        let pending = std::mem::take(&mut self.reassign_pending);
+        for idx in pending {
+            let (src, line) = (self.reassigns[idx].src, self.reassigns[idx].line);
+            let root = self.root_of(src);
+            if let Some((_, vline)) = self.conflicting_view(root, src, line, &last) {
+                self.reassigns[idx].in_place = false;
+                self.reassigns[idx].conflict_line = Some(vline);
+            }
+        }
+        Ok(())
+    }
+
+    /// The latest line, after `line`, at which some view rooted at `root` (other than `src`
+    /// itself) is read — the fact that forces a copy, or rejects a `let`-move.
+    fn conflicting_view(&self, root: LocalId, src: LocalId, line: u32, last: &HashMap<LocalId, u32>) -> Option<(LocalId, u32)> {
+        self.locals.iter().enumerate()
+            .filter(|(id, l)| *id != src && matches!(l.ty, Ty::Slice(..)) && self.root_of(*id) == root)
+            .filter_map(|(id, _)| last.get(&id).filter(|&&l| l > line).map(|&l| (id, l)))
+            .max_by_key(|&(_, l)| l)
+    }
+
     /// A compiler-made local; the `#` keeps it out of the user's namespace.
     fn fresh_local(&mut self, base: &str, ty: Ty, mutable: bool) -> LocalId {
         let n = self.next_fresh();
@@ -1000,4 +1071,66 @@ enum Stage<'a> {
     Map(Vec<String>, &'a ast::Expr),
     Filter(Vec<String>, &'a ast::Expr),
     Enumerate,
+}
+
+/// For every local, the highest line at which it is read anywhere in `b` — a whole-function scan,
+/// not path-sensitive (sibling `if` branches are conflated, conservatively: docs/m5-design.md §9
+/// notes this is sound, only sometimes more conservative than a path-sensitive scan would be).
+/// Every local's read is inside its own lexical scope by construction, so a later line number is
+/// exactly "read again" — no CFG is needed.
+fn last_uses(b: &Block, reassigns: &[Reassign], into: &mut HashMap<LocalId, u32>) {
+    for s in &b.stmts { last_uses_stmt(s, reassigns, into); }
+    if let Some(t) = &b.tail { last_uses_expr(t, reassigns, into); }
+}
+
+fn mark(id: LocalId, line: u32, into: &mut HashMap<LocalId, u32>) {
+    let e = into.entry(id).or_insert(0);
+    if line > *e { *e = line; }
+}
+
+fn last_uses_stmt(s: &Stmt, reassigns: &[Reassign], into: &mut HashMap<LocalId, u32>) {
+    match s {
+        Stmt::Let(_, e) => last_uses_expr(e, reassigns, into),
+        Stmt::LetRepeat(_, e, n) => { last_uses_expr(e, reassigns, into); last_uses_expr(n, reassigns, into); }
+        Stmt::LetArray(_, elems) => { for e in elems { last_uses_expr(e, reassigns, into); } }
+        Stmt::LetBuild { len, body, .. } => { last_uses_expr(len, reassigns, into); last_uses(body, reassigns, into); }
+        Stmt::Assign(lv, _, v) => { last_uses_lvalue(lv, v.line, reassigns, into); last_uses_expr(v, reassigns, into); }
+        Stmt::Reassign(idx) => { let r = &reassigns[*idx]; mark(r.src, r.line, into); }
+        Stmt::For { start, end, body, .. } => { last_uses_expr(start, reassigns, into); last_uses_expr(end, reassigns, into); last_uses(body, reassigns, into); }
+        Stmt::While { cond, decreasing, body, .. } => {
+            last_uses_expr(cond, reassigns, into);
+            if let Some(d) = decreasing { last_uses_expr(d, reassigns, into); }
+            last_uses(body, reassigns, into);
+        }
+        Stmt::Break => {}
+        Stmt::Expr(e) => last_uses_expr(e, reassigns, into),
+        Stmt::Return(e) => { if let Some(e) = e { last_uses_expr(e, reassigns, into); } }
+    }
+}
+
+fn last_uses_lvalue(lv: &LValue, line: u32, reassigns: &[Reassign], into: &mut HashMap<LocalId, u32>) {
+    match lv {
+        LValue::Var(_) => {}
+        LValue::Index(id, idx, l) => { mark(*id, *l, into); last_uses_expr(idx, reassigns, into); }
+        LValue::Field(id, _) => mark(*id, line, into),
+        LValue::IndexField(id, idx, _, l) => { mark(*id, *l, into); last_uses_expr(idx, reassigns, into); }
+    }
+}
+
+fn last_uses_expr(e: &Expr, reassigns: &[Reassign], into: &mut HashMap<LocalId, u32>) {
+    match &e.kind {
+        ExprKind::Local(id) | ExprKind::Len(id) | ExprKind::Ref(id, _) => mark(*id, e.line, into),
+        ExprKind::Index(id, idx) => { mark(*id, e.line, into); last_uses_expr(idx, reassigns, into); }
+        ExprKind::Binary(_, a, b) | ExprKind::MinMax(_, a, b) => { last_uses_expr(a, reassigns, into); last_uses_expr(b, reassigns, into); }
+        ExprKind::Unary(_, a) | ExprKind::Field(a, _) | ExprKind::Cast(a, _) | ExprKind::Println(a) => last_uses_expr(a, reassigns, into),
+        ExprKind::StructLit(_, es) => { for e2 in es { last_uses_expr(e2, reassigns, into); } }
+        ExprKind::Call(_, args) => { for a in args { last_uses_expr(a, reassigns, into); } }
+        ExprKind::If(c, t, els) => {
+            last_uses_expr(c, reassigns, into);
+            last_uses(t, reassigns, into);
+            if let Some(b) = els { last_uses(b, reassigns, into); }
+        }
+        ExprKind::Block(b) => last_uses(b, reassigns, into),
+        ExprKind::Int(_) | ExprKind::Float(_) | ExprKind::Bool(_) | ExprKind::Byte(_) => {}
+    }
 }

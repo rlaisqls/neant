@@ -192,7 +192,22 @@ the next lap (`err_move_loop`). A local born inside the loop body may be moved f
 since lexically it is a fresh binding each time. What m4-design.md §2 also named — passing an
 array by value (`f(xs)`, a parameter of type `[T]`) — is not done: parameters are still views
 only, so the only move source is a `let`. Next: uniqueness, which needs this to have a subject —
-designed in [m5-design.md](m5-design.md), not yet built.
+designed in [m5-design.md](m5-design.md).
+
+**Uniqueness and in-place reuse, done.** `ys = xs;` — an existing `let mut` array reassigned from
+a plain variable of the same array type and size — moves `xs` (dead after, either way) and decides
+once, from the checked body, whether `ys` takes `xs`'s buffer (`moves 0`) or a fresh copy is
+written into `ys`'s own (`moves ys.len()·sizeof(elem)`): a backward scan finds the latest line, if
+any, at which a view rooted at `xs` is still read, and that alone forces the copy — not a piece,
+not a regime, a fact about the text (m5-design.md §2). The report names the line that forced it
+(`` `ys = xs` (line 5) copies: a view of `xs` is still read at line 8 ``) or says it reused in
+place. Inside a loop the copy is forced unconditionally when either name predates it, honestly,
+not solved (goldens `reassign_inplace`, `reassign_copy`, `reassign_loop`). The gap m5-design.md §4
+found in part 1 is closed the same way: `let ys = xs;` now rejects a move that leaves a view of the
+source alive (`err_move_view`) — `restrict` and the call-argument disjointness check depended on
+that being impossible, and until this it was not checked. Not done: the hardware measurement
+m5-design.md §7 asks for (exit tests 1–2, `perf` past L2) — the goldens are functional and cost-report
+only, the same gap M4's gate closed with a real measurement, not yet repeated here. Next: `span`.
 
 ## Self-hosting
 

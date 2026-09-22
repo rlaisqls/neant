@@ -1,0 +1,9 @@
+fn main() {
+    let mut ys = [0, 0, 0];
+    let xs = [1, 2, 3];
+    ys = xs;
+    ys[0] = 9;
+    println(ys[0]);
+    println(ys[1]);
+    println(ys.len());
+}

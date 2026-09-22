@@ -106,6 +106,7 @@ fn driver_with(m: &Module, fid: FuncId, n: i64, repeat: i64, shapes: &[Shape], w
     let main = Func {
         name: "main".into(), params: vec![], ret: Ty::Unit, locals, sizes: vec![],
         body: Some(Block { stmts, tail: None, ty: Ty::Unit }), uses: vec![], asserts: vec![], line,
+        reassigns: vec![],
     };
     let mut out = m.clone();
     match out.funcs.iter().position(|f| f.name == "main") {

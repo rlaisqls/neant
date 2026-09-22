@@ -107,6 +107,7 @@ impl<'a> Ex<'a> {
             Stmt::For { var, start, end, body } => { self.scan_expr(start)?; self.scan_expr(end)?; self.loop_ids.push(*var); self.loop_vars.push(*var); let r = self.scan_block(body); self.loop_vars.pop(); r }
             Stmt::While { line, .. } => Err(format!("a `while` (line {line}) is not static control; the polyhedral model needs `for` with affine bounds")),
             Stmt::LetRepeat(..) | Stmt::LetArray(..) | Stmt::LetBuild { .. } => Err("an array born inside the function is not part of a SCoP".into()),
+            Stmt::Reassign(..) => Err("a whole-array reassignment is not part of a SCoP".into()),
             Stmt::Break => Err("`break` is not static control".into()),
             Stmt::Return(None) => Ok(()),
         }
