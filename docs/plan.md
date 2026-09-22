@@ -147,10 +147,11 @@ region rule was measured too: where the arena does not fit, a chase over an LCG 
 what the model says within 1.2–1.4×; where it fits, the model is conservative by the number of
 walks, because a site whose index is loaded from memory claims no residue, and that is stated.
 
-**Deferred, with the reason.** Real moves (`let ys = xs`, arrays by value) are M5: today an array
-cannot be bound to another name at all, which is *stricter* than a move checker, not unsound, and
-nothing in the corpus needs to hand an array over except by returning it. Per-array layout needs
-monomorphisation (design §9). Owned returns of struct arrays are refused, since a SoA return is a
+**Deferred, with the reason.** Real moves (`let ys = xs`, arrays by value) were M5 (done there —
+see M5 below); at M4's close an array could not be bound to another name at all, which was
+*stricter* than a move checker, not unsound, and nothing in the M4 corpus needed to hand an array
+over except by returning it. Per-array layout needs monomorphisation (design §9). Owned returns of
+struct arrays are refused, since a SoA return is a
 tuple of pointers.
 
 **Coverage.** M4's corpus is 9 of 9 exact and the M3 corpus is unchanged at 6 of 11, so 15 of 20
@@ -181,6 +182,16 @@ something — and it held.
 
 `span` joins the cost; `T ≤ W/P + O(S)` becomes a statement about a parallel loop. Uniqueness in
 the Perceus style: `ys = xs; ys[3] = 9` is written one way and the cost line says `1` or `n`.
+
+**Real moves, done.** `let ys = xs;` moves an array local: the source is dead after, a walk over
+the structured control flow rejects a further use with the line of the move (`xs[0]` after, a
+branch that only moves it on one side and then uses it outside, the goldens `moves`,
+`err_move_use`, `err_move_if`), and a move inside a loop of a local born outside it is rejected
+outright — not deferred to a per-iteration check, since the same statement would move it again on
+the next lap (`err_move_loop`). A local born inside the loop body may be moved freely lap to lap,
+since lexically it is a fresh binding each time. What m4-design.md §2 also named — passing an
+array by value (`f(xs)`, a parameter of type `[T]`) — is not done: parameters are still views
+only, so the only move source is a `let`. Next: uniqueness, which needs this to have a subject.
 
 ## Self-hosting
 

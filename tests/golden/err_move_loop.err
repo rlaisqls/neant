@@ -1,0 +1,1 @@
+moving `xs` inside a loop would move it again on the next lap

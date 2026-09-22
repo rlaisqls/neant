@@ -125,11 +125,16 @@ struct Ctx<'a> {
     /// the array a view local looks into. A parameter's root is itself: callers keep parameters
     /// disjoint, so two parameters never share a root inside a function.
     root: HashMap<LocalId, LocalId>,
+    /// an array local that has been moved away, and where: any further use is rejected there.
+    moved: HashMap<LocalId, u32>,
+    /// the id of the first local declared inside the innermost loop being checked: a move of an
+    /// id below this line was born outside the loop and would move it again on the next lap.
+    loop_start: Vec<LocalId>,
 }
 
 fn check_func(f: &ast::Func, sigs: &HashMap<String, (FuncId, Vec<Ty>, Ty)>, structs: &[StructDef], struct_ids: &HashMap<String, StructId>) -> Result<Func> {
     let (_, ptys, ret) = &sigs[&f.name];
-    let mut cx = Ctx { sigs, structs, struct_ids, locals: vec![], scopes: vec![HashMap::new()], sizes: vec![], ret: ret.clone(), in_loop: 0, in_closure: 0, fresh: 0, pending_lets: vec![], root: HashMap::new() };
+    let mut cx = Ctx { sigs, structs, struct_ids, locals: vec![], scopes: vec![HashMap::new()], sizes: vec![], ret: ret.clone(), in_loop: 0, in_closure: 0, fresh: 0, pending_lets: vec![], root: HashMap::new(), moved: HashMap::new(), loop_start: vec![] };
     let mut params = Vec::new();
     for (p, ty) in f.params.iter().zip(ptys) {
         // a slice parameter's size is its own variable, named after the parameter
@@ -198,12 +203,20 @@ impl<'a> Ctx<'a> {
     }
     fn local_by_expr(&self, e: &ast::Expr, what: &str) -> Result<LocalId> {
         match &e.kind {
-            ast::ExprKind::Var(n) => self.lookup(n).map_or_else(
-                || err(e.line, e.col, format!("unknown variable `{n}`")),
-                Ok,
-            ),
+            ast::ExprKind::Var(n) => {
+                let id = self.lookup(n).map_or_else(|| err(e.line, e.col, format!("unknown variable `{n}`")), Ok)?;
+                self.check_moved(id, e.line, e.col)?;
+                Ok(id)
+            }
             _ => err(e.line, e.col, format!("{what} must be a variable for now")),
         }
+    }
+
+    fn check_moved(&self, id: LocalId, line: u32, col: u32) -> Result<()> {
+        if let Some(&at) = self.moved.get(&id) {
+            return err(line, col, format!("`{}` was moved at line {at}; using it again is an error", self.locals[id].name));
+        }
+        Ok(())
     }
 
     fn block(&mut self, b: &ast::Block) -> Result<Block> {
@@ -335,7 +348,21 @@ impl<'a> Ctx<'a> {
                             return Ok(Stmt::Let(id, ce));
                         }
                         if let Ty::Array(..) = ce.ty {
-                            return err(init.line, init.col, "an array cannot be moved into another variable; take a view with `&`");
+                            // `let ys = xs;` moves xs: a bare variable is the only source a move
+                            // can name, so the checked expression must be exactly that.
+                            let ExprKind::Local(src) = ce.kind else {
+                                return err(init.line, init.col, "an array can only be moved from a variable; take a view with `&`");
+                            };
+                            if let Some(&start) = self.loop_start.last() {
+                                if src < start {
+                                    return err(init.line, init.col, format!("moving `{}` inside a loop would move it again on the next lap", self.locals[src].name));
+                                }
+                            }
+                            self.check_declared(&declared, &ce.ty, *line, *col)?;
+                            let id = self.declare(name, ce.ty.clone(), *mutable);
+                            self.moved.insert(src, *line);
+                            self.root.insert(id, id);
+                            return Ok(Stmt::Let(id, ce));
                         }
                         if ce.ty == Ty::Unit {
                             return err(init.line, init.col, "cannot bind a `()` value");
@@ -435,7 +462,9 @@ impl<'a> Ctx<'a> {
                 self.scopes.push(HashMap::new());
                 let id = self.declare(var, Ty::I64, false);
                 self.in_loop += 1;
+                self.loop_start.push(self.locals.len());
                 let b = self.block(body)?;
+                self.loop_start.pop();
                 self.in_loop -= 1;
                 self.scopes.pop();
                 if b.ty != Ty::Unit {
@@ -457,7 +486,9 @@ impl<'a> Ctx<'a> {
                     None => None,
                 };
                 self.in_loop += 1;
+                self.loop_start.push(self.locals.len());
                 let b = self.block(body)?;
+                self.loop_start.pop();
                 self.in_loop -= 1;
                 if b.ty != Ty::Unit {
                     return err(body.line, body.col, format!("a loop body has type `()`, found `{}`", b.ty));
@@ -518,6 +549,7 @@ impl<'a> Ctx<'a> {
             ast::ExprKind::Bytes(_) => err(e.line, e.col, "a byte string can only initialise a `let`"),
             ast::ExprKind::Var(n) => {
                 let id = self.lookup(n).map_or_else(|| err(e.line, e.col, format!("unknown variable `{n}`")), Ok)?;
+                self.check_moved(id, e.line, e.col)?;
                 let ty = self.locals[id].ty.clone();
                 mk(ExprKind::Local(id), ty)
             }
@@ -706,11 +738,18 @@ impl<'a> Ctx<'a> {
                 if cc.ty != Ty::Bool {
                     return err(cond.line, cond.col, format!("`if` condition is `{}`, not `bool`", cc.ty));
                 }
+                // a local moved on either side is moved after the `if`; each side is checked from
+                // the same state, so a move on one side does not leak into the other
+                let saved = self.moved.clone();
                 let ct = self.block(then)?;
+                let moved_then = std::mem::replace(&mut self.moved, saved.clone());
                 let ce = match els {
                     Some(b) => Some(self.block(b)?),
                     None => None,
                 };
+                let mut moved_after = std::mem::replace(&mut self.moved, saved);
+                for (k, v) in moved_then { moved_after.entry(k).or_insert(v); }
+                self.moved = moved_after;
                 let ty = match &ce {
                     None => {
                         if ct.ty != Ty::Unit {
