@@ -49,9 +49,15 @@ let mut ps = [Point { x: 1.0, y: 2.0, z: 3.0 }; 4];  // a repeat build
 ps[2].y = 9.0;                                        // a field write
 ```
 
-**No golden ever reads or writes a whole element** — no `ps[i]`, no `ps[i] = Point { … }`, no
-struct-array argument passed by value, no struct-array return. Checked across the corpus, not
-assumed.
+**Correction, found while building it.** The first version of this section said no golden ever
+reads a whole element. `structs.nt` line 33 is `let q = ps[2];`, and the grep that "checked the
+corpus" required an identifier index and so walked past a numeric one. One occurrence, in one file,
+and it is the only one — but the claim was wrong and the measurement that produced it was careless.
+
+A whole-element read under SoA is a **gather**: the element's fields live in different arrays, so
+it is one site per field, which is what `analyze.rs` does (`if field.is_none() { for fi … }`). It
+costs more than the AoS read it replaces, and that is part of what the choice weighs. There is
+still no whole-element *write*, no struct array passed by value, and no struct-array return.
 
 So the emitter needs exactly four forms, and each is a small change:
 
@@ -62,9 +68,10 @@ So the emitter needs exactly four forms, and each is a small change:
 | `let ps = [Point { … }; n]` | one allocation, one fill loop | one allocation and one fill per field |
 | `&ps` as an argument | `ps_p, ps_n` | every field pointer, then `ps_n` |
 
-A whole-element access is **out of the slice** and must say so rather than emit something plausible
-— the emitter's refusal flag (`est[2]`) already exists for this, and a struct array that is read
-whole makes the program unsupported rather than wrong.
+A whole-element **read** is a fifth form: under SoA the emitter gathers the fields into a value,
+`((struct nt_Point){ .x = ps_x_p[i], .y = ps_y_p[i], .z = ps_z_p[i] })`. A whole-element **write**
+would be the scatter that mirrors it, and no golden does one, so it stays out of the slice behind
+the emitter's refusal flag (`est[2]`) rather than being written untested.
 
 ## 3. What the cost pass needs
 
@@ -100,3 +107,41 @@ Two, and the first is the one that matters:
 The risk is worth naming: this is the first change that can make the self-hosted compiler emit
 **wrong code** rather than merely report a wrong number. The behavioural test is the reason it is
 safe to attempt; without it this would not be worth the exposure.
+
+## 5. What building it changed
+
+**Done, and `AOS_INSTEAD` is deleted.** `moves` goes 56 → 63 exact, and the only differences left
+are the three `main`s where the Rust proves a whole-array assignment is in place and this emitter
+copies. The five golden programs with struct arrays go through the whole self-hosted chain and
+print exactly what `neant run` prints, which is the test that mattered.
+
+The compiler's shape changed with it: **the cost pass is now part of the compiler**, not only of
+the reporter. `compiler/main.nt` runs the layout choice before emitting, so the code it emits and
+the cost the reporter prints describe the same program. The seed doubled — `bootstrap/neant.c` is
+401 KB where it was 183 — and the fixpoint still holds.
+
+Four things the build changed:
+
+- **The footprint of a scattered walk is the whole array, every field of it.** Bounding a two-field
+  arena by one field made `arena.nt` and `tree.nt` choose SoA where the Rust chooses AoS — a
+  pointer chase reads the whole node either way, and under SoA it reads it from two arrays instead
+  of one, which is worse. Using the site's own stride there was the bug; the element's size is the
+  bound.
+- **A forked cost must be evaluated in the regime that applies.** The choice compares two numbers
+  at a reference point, and evaluating always in the fitting regime compared the wrong pair.
+- **The checker was not recording what it resolved — a fourth time.** `&ps` resolves its referent
+  by `sym_find`, so the emitter could not ask what `&ps` refers to in order to lay it out. Same
+  omission, same place, as for an assignment target's array and a plain variable target.
+- **The arenas had to be reset per layout pass.** Walking a whole module twice per struct, for a
+  compiler that is now five thousand lines, does not fit otherwise — and nothing from one layout's
+  walk is referred to again after it.
+
+### What is still not chosen
+
+`#[layout(aos|soa)]` pins a struct in the Rust compiler, and the parser rejects attributes, so a
+pinned struct is outside the slice rather than honoured. Nothing in the corpus pins one.
+
+And the choice is made on **less evidence** than the Rust's wherever this slice declines a
+function: `matmul`, `stencil` and `tri` contribute nothing to either total. None of them has a
+struct, so on this corpus the evidence is identical; that is luck, and the next corpus should not
+rely on it.

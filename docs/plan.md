@@ -356,7 +356,7 @@ calls halve the measure, which is the master theorem rather than `fib`'s exponen
 *on purpose*, because `ys = xs` costs 1 when
 in place and the array's length when copied — the self-hosted emitter has no uniqueness proof and
 always copies, so its cost says so. Charging 1 for parity would have been a cost report for code
-this compiler does not emit. **`moves`'s first slice landed too**: 56 columns exact for functions that call nothing, by the rule
+this compiler does not emit. **`moves`'s first slice landed too**: 63 columns exact for functions that call nothing, by the rule
 `t·s + B` for a contiguous site and `t·B` for a strided one, with 7 differing because the
 self-hosted emitter always lays an array of structs out as AoS while the Rust compiler chooses —
 the same principle as the `ys = xs` divergences, arrived at independently, and predicted in the
@@ -373,9 +373,11 @@ self-hosting work that changes what the compiler *emits* rather than what it com
 compiler picks AoS or SoA per struct from the cost model and the self-hosted emitter always emits
 AoS, which is nine of the thirteen recorded differences. The arrays design chose that deliberately,
 because the layout decision belongs to a cost calculus that was not self-hosted — a premise that
-has now expired. The measurement that makes it tractable: **no in-slice golden ever reads or writes
-a whole struct element of an array**, only fields, so SoA emission needs four forms rather than the
-general case.
+has now expired. **Done**: the self-hosted compiler now chooses AoS or SoA per struct as the Rust one does, emits
+the layout it chose, and the five golden programs with struct arrays print exactly what `neant run`
+prints. The cost pass is part of the compiler now rather than only of the reporter, so the code it
+emits and the cost it reports describe the same program; the seed doubled to 401 KB and the
+fixpoint still holds.
 
 **Regimes arrived with it**: a cost may fork once, so a scattered walk costs the array's footprint
 when it fits in `M` and a line per touch when it does not, and all five single-condition piecewise

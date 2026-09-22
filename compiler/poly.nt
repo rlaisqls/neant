@@ -489,3 +489,33 @@ fn log_atom(facs: &[Fac], terms: &[Term], pols: &[Pol], logs: &mut [i64], pst: &
     pst[5] = k + 1;
     2000 + k
 }
+
+// The value of a polynomial at a point, in `f64` — `B` and `M` from the machine and every size
+// atom at the same reference size. Only the layout choice wants this: it compares two whole-module
+// totals, and a comparison needs numbers where the report wants a formula. A `log` atom has no
+// value here and makes the answer unusable, which the caller checks through `pst[6]`.
+fn pol_eval(facs: &[Fac], terms: &[Term], pols: &[Pol], pst: &mut [i64], p: i64,
+            b: f64, m: f64, size: f64) -> f64 {
+    pst[6] = 0;
+    let mut total = 0.0;
+    let mut i = 0;
+    while i < pols[p].n_term {
+        let t = pols[p].term + i;
+        let mut v = (terms[t].cn as f64) / (terms[t].cd as f64);
+        let mut f = 0;
+        while f < terms[t].n_fac {
+            let a = facs[terms[t].fac + f].atom;
+            let base = if a == 0 { b } else if a == 1 { m } else if a >= 2000 { 0.0 } else { size };
+            if a >= 2000 { pst[6] = 1; };
+            let mut e = 0;
+            while e < facs[terms[t].fac + f].exp {
+                v = v * base;
+                e += 1;
+            }
+            f += 1;
+        }
+        total = total + v;
+        i += 1;
+    }
+    total
+}

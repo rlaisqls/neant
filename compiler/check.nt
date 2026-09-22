@@ -422,6 +422,9 @@ fn check_expr_inner(src: &[u8], toks: &[Token], nodes: &[Node], types: &mut [Ty]
         if s < 0 { cst[2] = 1; return -1; }
         let t = syms[s].ty;
         if !is_arrayish(types, t) { cst[2] = 1; return -1; }
+        // the referent is resolved here rather than through `check_expr`, so its type is recorded
+        // here too — the emitter asks what `&ps` refers to in order to lay it out
+        ntys[nodes[n].a] = t;
         let m = nodes[n].ival;
         // `&mut` of something that is not `let mut`, or of a `&[T]`, is refused
         if m == 1 {

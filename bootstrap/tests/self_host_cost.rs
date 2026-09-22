@@ -51,24 +51,8 @@ const EXACT: usize = 72;
 /// **piecewise** — a scattered walk costs the array's footprint when it fits in `M` and a line per
 /// touch when it does not — and their two regimes and the condition between them are compared as
 /// one string, exactly as the single-piece ones are (design §13).
-const EXACT_MOVES: usize = 56;
+const EXACT_MOVES: usize = 63;
 
-/// `(file, function)` where the self-hosted `moves` differs because **the self-hosted emitter
-/// always lays an array of structs out as AoS** (docs/self-hosting-arrays-design.md §4) while the
-/// Rust compiler chooses AoS or SoA from the cost model. Same principle as `COPIES_INSTEAD`,
-/// arrived at independently: a cost is a claim about the code the compiler emits.
-const AOS_INSTEAD: &[(&str, &str)] = &[
-    ("arrayview.nt", "tagged"),
-    ("particles.nt", "step"),
-    ("particles.nt", "kinetic"),
-    ("particles.nt", "centroid_x"),
-    ("structs.nt", "sum_x"),
-    ("structs.nt", "sum_all"),
-    ("structs.nt", "shift"),
-    // and the two callers that inherit it
-    ("particles.nt", "main"),
-    ("structs.nt", "main"),
-];
 
 
 
@@ -192,16 +176,13 @@ fn self_hosted_work_agrees_with_bootstrap() {
         for (fname, mw) in &want_moves {
             let Some(g) = got_moves.get(fname.as_str()) else { continue };
             if *g == "unknown" { continue; }
-            // a `moves` column may differ for either reason: the emitter lays structs out as AoS,
-            // and it copies a whole-array assignment the Rust proves is in place
-            let listed = AOS_INSTEAD.contains(&(name.as_str(), fname.as_str()))
-                || COPIES_INSTEAD.contains(&(name.as_str(), fname.as_str()));
+            // the only reason a `moves` column still differs: the emitter copies a whole-array
+            // assignment the Rust proves is in place. The layout family is gone — the self-hosted
+            // compiler chooses AoS or SoA for itself now (docs/self-hosting-layout-design.md).
+            let listed = COPIES_INSTEAD.contains(&(name.as_str(), fname.as_str()));
             if g == mw {
                 exact_moves += 1;
-                if AOS_INSTEAD.contains(&(name.as_str(), fname.as_str())) {
-                    failures.push(format!("{name} {fname} is listed as a moves difference, but the \
-                        two agree — delete it from AOS_INSTEAD"));
-                }
+
             } else if !listed {
                 failures.push(format!("{name} {fname}: `neant cost` says moves [{mw}], the \
                     self-hosted pass says [{g}]"));

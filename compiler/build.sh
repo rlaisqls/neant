@@ -13,7 +13,8 @@ TMP=$(mktemp -d)
 trap 'rm -rf "$TMP"' EXIT
 
 cat "$ROOT"/compiler/lex.nt "$ROOT"/compiler/parse.nt "$ROOT"/compiler/check.nt \
-    "$ROOT"/compiler/emit.nt "$ROOT"/compiler/main.nt > "$TMP/all.nt"
+    "$ROOT"/compiler/emit.nt "$ROOT"/compiler/poly.nt "$ROOT"/compiler/cost.nt \
+    "$ROOT"/compiler/main.nt > "$TMP/all.nt"
 
 # stage 1: the Rust compiler interprets the neant compiler, which compiles its own source
 "$NEANT" run "$TMP/all.nt" < "$TMP/all.nt" > "$TMP/stage2.c"

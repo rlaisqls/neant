@@ -1408,8 +1408,11 @@ fn ck_zero(facs: &[Fac], terms: &mut [Term], pols: &mut [Pol], pst: &mut [i64], 
 // `B` is symbolic in the answer and numeric in the test, exactly as it is in `analyze.rs`: the
 // machine's line is 64 bytes, and `8 < B` is decided here while `8·xs.len() + B` is what prints.
 
+// `field` is the field's name token, or −1 for a whole element. It matters twice: under SoA two
+// fields of one struct are two arrays and never one site, and the stride is the field's own size
+// rather than the element's.
 struct Site { arr: i64, idx: i64, inloop: i64, coef: i64, stride: i64, bad: i64, trip: i64, branch: i64,
-             novar: i64 }
+             novar: i64, field: i64 }
 
 // two index expressions that name the same address: structurally equal, with variables compared by
 // the bytes their tokens span. `cs[i].v` and `cs[i].tag` share an index and so share a site, which
@@ -1499,6 +1502,25 @@ fn idx_coef(src: &[u8], toks: &[Token], nodes: &[Node], wst: &mut [i64], e: i64,
     0
 }
 
+// is this array's element a struct the module has chosen SoA for
+fn is_soa(types: &[Ty], slay: &[i64], t: i64) -> bool {
+    if t < 0 { return false; }
+    if types[t].kind != 5 && types[t].kind != 6 { return false; }
+    let e = types[t].elem;
+    if e < 0 || types[e].kind != 7 { return false; }
+    slay[types[e].elem] == 1
+}
+
+// the bytes one field of this array's struct element occupies, or −1
+fn field_bytes(src: &[u8], toks: &[Token], types: &[Ty], strs: &[Str], flds: &[Fld], t: i64,
+               fld: i64) -> i64 {
+    let e = types[t].elem;
+    if e < 0 || types[e].kind != 7 { return -1; }
+    let f = field_find(src, toks, strs, flds, types[e].elem, fld);
+    if f < 0 { return -1; }
+    scalar_bytes(types, strs, flds, flds[f].ty)
+}
+
 // the bytes one element of this array occupies, or −1. A struct is laid out as C lays it out,
 // which is what `emit.nt` emits, so the size is the fields padded to the widest one.
 fn elem_bytes(types: &[Ty], strs: &[Str], flds: &[Fld], t: i64) -> i64 {
@@ -1538,7 +1560,8 @@ fn site_add(src: &[u8], toks: &[Token], nodes: &[Node], types: &[Ty], strs: &[St
             ntys: &[i64], sigs: &[Sig], ptys: &[i64], fm: &[i64], ffoot: &[i64],
             facs: &mut [Fac], terms: &mut [Term], pols: &mut [Pol],
             pst: &mut [i64], env: &mut [Env], cof: &mut [Cof], sites: &mut [Site], cks: &mut [Ck], budget: &mut [f64],
-            resid: &mut [Res], rargs: &mut [i64], wst: &mut [i64], arr: i64, idx: i64) -> i64 {
+            resid: &mut [Res], rargs: &mut [i64], slay: &[i64], wst: &mut [i64],
+            arr: i64, idx: i64, fld: i64) -> i64 {
     // a site two loops deep needs the per-level working set this slice does not compute
     if wst[11] > 1 {
         wst[1] = 1;
@@ -1550,6 +1573,36 @@ fn site_add(src: &[u8], toks: &[Token], nodes: &[Node], types: &[Ty], strs: &[St
         wst[1] = 1;
         return ck_zero(facs, terms, pols, pst, cks, budget, wst);
     }
+    // under SoA a field access walks that field's own array, so it steps by the field's size and
+    // not the element's — the one split M4 recorded as making AoS cost `24n` and SoA `8n`
+    let soa = is_soa(types, slay, t);
+    let mut step = es;
+    let mut sfld = -1;
+    if soa {
+        if fld < 0 {
+            // **a whole element under SoA is a gather**: the fields live in different arrays, so
+            // this is one site per field. `structs.nt`'s `let q = ps[2];` is the corpus's only
+            // one, and it is part of what the choice weighs against SoA.
+            let e2 = types[t].elem;
+            let si2 = types[e2].elem;
+            let mut acc2 = ck_zero(facs, terms, pols, pst, cks, budget, wst);
+            let mut k2 = 0;
+            while k2 < strs[si2].n_fields {
+                let one2 = site_add(src, toks, nodes, types, strs, flds, ntys, sigs, ptys, fm,
+                                    ffoot, facs, terms, pols, pst, env, cof, sites, cks, budget,
+                                    resid, rargs, slay, wst, arr, idx, flds[strs[si2].fields + k2].name);
+                acc2 = ck_add(facs, terms, pols, pst, cks, budget, wst, acc2, one2);
+                k2 += 1;
+            }
+            return acc2;
+        }
+        step = field_bytes(src, toks, types, strs, flds, t, fld);
+        sfld = fld;
+        if step < 0 {
+            wst[1] = 1;
+            return ck_zero(facs, terms, pols, pst, cks, budget, wst);
+        }
+    }
     let mut i = 0;
     while i < wst[10] {
         // the same address *on the same path*: two reads of `pos[0]` on either side of an `if`
@@ -1558,7 +1611,8 @@ fn site_add(src: &[u8], toks: &[Token], nodes: &[Node], types: &[Ty], strs: &[St
         // they agree on every branch they sit inside.
         if sites[i].inloop == wst[11] && sites[i].branch == wst[20]
             && name_eq(src, toks, sites[i].arr, nodes[arr].a)
-            && expr_same(src, toks, nodes, sites[i].idx, idx) {
+            && expr_same(src, toks, nodes, sites[i].idx, idx)
+            && (!soa || name_eq(src, toks, sites[i].field, sfld)) {
             return ck_zero(facs, terms, pols, pst, cks, budget, wst);
         }
         i += 1;
@@ -1570,7 +1624,8 @@ fn site_add(src: &[u8], toks: &[Token], nodes: &[Node], types: &[Ty], strs: &[St
     sites[s].idx = idx;
     sites[s].inloop = wst[11];
     sites[s].coef = c;
-    sites[s].stride = es;
+    sites[s].stride = step;
+    sites[s].field = sfld;
     sites[s].bad = wst[14];
     sites[s].trip = wst[13];
     sites[s].branch = wst[20];
@@ -1593,7 +1648,11 @@ fn site_add(src: &[u8], toks: &[Token], nodes: &[Node], types: &[Ty], strs: &[St
         // per touch either way.
         let len = arg_len(src, toks, nodes, env, wst, arr);
         if !scattered || len < 0 { return ck_one(cks, wst, nofit); }
-        let foot = pol_scale(facs, terms, pols, pst, len, sites[s].stride, 1);
+        // the bound is the **whole array's** bytes, every field of it, however the struct is laid
+        // out: once every line of it has been touched nothing more is fetched, and under SoA the
+        // field arrays together are still the structure. Using the site's own stride here bounded
+        // a two-field arena by one field and made `arena.nt` choose SoA.
+        let foot = pol_scale(facs, terms, pols, pst, len, es, 1);
         // …and only when the walk is **longer than the array**: bounding a scatter by the array it
         // scatters over is worth something only once lines are revisited. `analyze.rs` compares the
         // touches against the array's line count with `B` substituted, and so does this.
@@ -1617,28 +1676,28 @@ fn m_expr(src: &[u8], toks: &[Token], nodes: &[Node], types: &[Ty], strs: &[Str]
           ntys: &[i64], sigs: &[Sig], ptys: &[i64], fm: &[i64], ffoot: &[i64],
             facs: &mut [Fac], terms: &mut [Term], pols: &mut [Pol],
             pst: &mut [i64], env: &mut [Env], cof: &mut [Cof], sites: &mut [Site], cks: &mut [Ck], budget: &mut [f64],
-            resid: &mut [Res], rargs: &mut [i64], wst: &mut [i64], n: i64) -> i64 {
+            resid: &mut [Res], rargs: &mut [i64], slay: &[i64], wst: &mut [i64], n: i64) -> i64 {
     if n < 0 || wst[1] != 0 { return ck_zero(facs, terms, pols, pst, cks, budget, wst); }
     let k = nodes[n].kind;
     if k == 68 {
-        let i = m_expr(src, toks, nodes, types, strs, flds, ntys, sigs, ptys, fm, ffoot, facs, terms, pols, pst, env, cof, sites, cks, budget, resid, rargs, wst, nodes[n].b);
-        let s = site_add(src, toks, nodes, types, strs, flds, ntys, sigs, ptys, fm, ffoot, facs, terms, pols, pst, env, cof, sites, cks, budget, resid, rargs, wst, nodes[n].a, nodes[n].b);
+        let i = m_expr(src, toks, nodes, types, strs, flds, ntys, sigs, ptys, fm, ffoot, facs, terms, pols, pst, env, cof, sites, cks, budget, resid, rargs, slay, wst, nodes[n].b);
+        let s = site_add(src, toks, nodes, types, strs, flds, ntys, sigs, ptys, fm, ffoot, facs, terms, pols, pst, env, cof, sites, cks, budget, resid, rargs, slay, wst, nodes[n].a, nodes[n].b, -1);
         return ck_add(facs, terms, pols, pst, cks, budget, wst, i, s);
     }
     if k == 69 {
         let base = nodes[n].a;
         if nodes[base].kind == 68 {
-            let i = m_expr(src, toks, nodes, types, strs, flds, ntys, sigs, ptys, fm, ffoot, facs, terms, pols, pst, env, cof, sites, cks, budget, resid, rargs, wst, nodes[base].b);
-            let s = site_add(src, toks, nodes, types, strs, flds, ntys, sigs, ptys, fm, ffoot, facs, terms, pols, pst, env, cof, sites, cks, budget, resid, rargs, wst, nodes[base].a, nodes[base].b);
+            let i = m_expr(src, toks, nodes, types, strs, flds, ntys, sigs, ptys, fm, ffoot, facs, terms, pols, pst, env, cof, sites, cks, budget, resid, rargs, slay, wst, nodes[base].b);
+            let s = site_add(src, toks, nodes, types, strs, flds, ntys, sigs, ptys, fm, ffoot, facs, terms, pols, pst, env, cof, sites, cks, budget, resid, rargs, slay, wst, nodes[base].a, nodes[base].b, nodes[n].b);
             return ck_add(facs, terms, pols, pst, cks, budget, wst, i, s);
         }
-        return m_expr(src, toks, nodes, types, strs, flds, ntys, sigs, ptys, fm, ffoot, facs, terms, pols, pst, env, cof, sites, cks, budget, resid, rargs, wst, base);
+        return m_expr(src, toks, nodes, types, strs, flds, ntys, sigs, ptys, fm, ffoot, facs, terms, pols, pst, env, cof, sites, cks, budget, resid, rargs, slay, wst, base);
     }
     if k == 71 {
         let mut acc = ck_zero(facs, terms, pols, pst, cks, budget, wst);
         let mut a = nodes[n].b;
         while a >= 0 {
-            let w = m_expr(src, toks, nodes, types, strs, flds, ntys, sigs, ptys, fm, ffoot, facs, terms, pols, pst, env, cof, sites, cks, budget, resid, rargs, wst, a);
+            let w = m_expr(src, toks, nodes, types, strs, flds, ntys, sigs, ptys, fm, ffoot, facs, terms, pols, pst, env, cof, sites, cks, budget, resid, rargs, slay, wst, a);
             acc = ck_add(facs, terms, pols, pst, cks, budget, wst, acc, w);
             a = nodes[a].next;
         }
@@ -1670,10 +1729,10 @@ fn m_expr(src: &[u8], toks: &[Token], nodes: &[Node], types: &[Ty], strs: &[Str]
             // calls `sum` twenty times over a 1.6 MB array and twenty times over a 32 MB one, and
             // pays once for the first and twenty times for the second.
             let cold = call_moves(src, toks, nodes, types, strs, flds, sigs, ptys, fm, ffoot, facs,
-                                  terms, pols, pst, env, cks, budget, resid, rargs, wst, n, si);
+                                  terms, pols, pst, env, cks, budget, resid, rargs, slay, wst, n, si);
             if wst[1] != 0 { return acc; }
             let warm = call_moves(src, toks, nodes, types, strs, flds, sigs, ptys, fm, ffoot, facs,
-                                  terms, pols, pst, env, cks, budget, resid, rargs, wst, n, si);
+                                  terms, pols, pst, env, cks, budget, resid, rargs, slay, wst, n, si);
             if wst[1] != 0 { return acc; }
             let one = pol_const(facs, terms, pols, pst, 1);
             let rest = pol_sub(facs, terms, pols, pst, wst[13], one);
@@ -1713,7 +1772,7 @@ fn m_expr(src: &[u8], toks: &[Token], nodes: &[Node], types: &[Ty], strs: &[Str]
             return acc;
         }
         let cm = call_moves(src, toks, nodes, types, strs, flds, sigs, ptys, fm, ffoot, facs, terms,
-                            pols, pst, env, cks, budget, resid, rargs, wst, n, si);
+                            pols, pst, env, cks, budget, resid, rargs, slay, wst, n, si);
         return ck_add(facs, terms, pols, pst, cks, budget, wst, acc, cm);
     }
     if k == 75 {
@@ -1721,18 +1780,18 @@ fn m_expr(src: &[u8], toks: &[Token], nodes: &[Node], types: &[Ty], strs: &[Str]
         // same rule `work` follows, and the reason `vm.nt`'s dispatch chain costs three lines a
         // lap and not ten. Sites still carry a branch tag, because two reads of one address on
         // opposite sides of an `if` are two sites even though only one of them happens.
-        let c = m_expr(src, toks, nodes, types, strs, flds, ntys, sigs, ptys, fm, ffoot, facs, terms, pols, pst, env, cof, sites, cks, budget, resid, rargs, wst, nodes[n].a);
+        let c = m_expr(src, toks, nodes, types, strs, flds, ntys, sigs, ptys, fm, ffoot, facs, terms, pols, pst, env, cof, sites, cks, budget, resid, rargs, slay, wst, nodes[n].a);
         let saved = wst[20];
         wst[21] = wst[21] + 1;
         wst[20] = wst[21] * 2;
         // recursive calls count along the heavier arm only, as they do for `work`: `bsearch` calls
         // itself on each side and only one of them happens
         let before = wst[23];
-        let t = m_block(src, toks, nodes, types, strs, flds, ntys, sigs, ptys, fm, ffoot, facs, terms, pols, pst, env, cof, sites, cks, budget, resid, rargs, wst, nodes[n].b);
+        let t = m_block(src, toks, nodes, types, strs, flds, ntys, sigs, ptys, fm, ffoot, facs, terms, pols, pst, env, cof, sites, cks, budget, resid, rargs, slay, wst, nodes[n].b);
         let n_then = wst[23] - before;
         wst[23] = before;
         wst[20] = wst[21] * 2 + 1;
-        let e = m_block(src, toks, nodes, types, strs, flds, ntys, sigs, ptys, fm, ffoot, facs, terms, pols, pst, env, cof, sites, cks, budget, resid, rargs, wst, nodes[n].c);
+        let e = m_block(src, toks, nodes, types, strs, flds, ntys, sigs, ptys, fm, ffoot, facs, terms, pols, pst, env, cof, sites, cks, budget, resid, rargs, slay, wst, nodes[n].c);
         let n_else = wst[23] - before;
         wst[23] = before + if n_then > n_else { n_then } else { n_else };
         wst[20] = saved;
@@ -1740,21 +1799,21 @@ fn m_expr(src: &[u8], toks: &[Token], nodes: &[Node], types: &[Ty], strs: &[Str]
         return ck_add(facs, terms, pols, pst, cks, budget, wst, c, m);
     }
     if k == 76 {
-        return m_block(src, toks, nodes, types, strs, flds, ntys, sigs, ptys, fm, ffoot, facs, terms, pols, pst, env, cof, sites, cks, budget, resid, rargs, wst, n);
+        return m_block(src, toks, nodes, types, strs, flds, ntys, sigs, ptys, fm, ffoot, facs, terms, pols, pst, env, cof, sites, cks, budget, resid, rargs, slay, wst, n);
     }
     if k == 66 {
-        let a = m_expr(src, toks, nodes, types, strs, flds, ntys, sigs, ptys, fm, ffoot, facs, terms, pols, pst, env, cof, sites, cks, budget, resid, rargs, wst, nodes[n].a);
-        let b = m_expr(src, toks, nodes, types, strs, flds, ntys, sigs, ptys, fm, ffoot, facs, terms, pols, pst, env, cof, sites, cks, budget, resid, rargs, wst, nodes[n].b);
+        let a = m_expr(src, toks, nodes, types, strs, flds, ntys, sigs, ptys, fm, ffoot, facs, terms, pols, pst, env, cof, sites, cks, budget, resid, rargs, slay, wst, nodes[n].a);
+        let b = m_expr(src, toks, nodes, types, strs, flds, ntys, sigs, ptys, fm, ffoot, facs, terms, pols, pst, env, cof, sites, cks, budget, resid, rargs, slay, wst, nodes[n].b);
         return ck_add(facs, terms, pols, pst, cks, budget, wst, a, b);
     }
     if k == 67 || k == 74 {
-        return m_expr(src, toks, nodes, types, strs, flds, ntys, sigs, ptys, fm, ffoot, facs, terms, pols, pst, env, cof, sites, cks, budget, resid, rargs, wst, nodes[n].a);
+        return m_expr(src, toks, nodes, types, strs, flds, ntys, sigs, ptys, fm, ffoot, facs, terms, pols, pst, env, cof, sites, cks, budget, resid, rargs, slay, wst, nodes[n].a);
     }
     if k == 70 {
         let mut acc = ck_zero(facs, terms, pols, pst, cks, budget, wst);
         let mut fi = nodes[n].b;
         while fi >= 0 {
-            let v = m_expr(src, toks, nodes, types, strs, flds, ntys, sigs, ptys, fm, ffoot, facs, terms, pols, pst, env, cof, sites, cks, budget, resid, rargs, wst, nodes[fi].b);
+            let v = m_expr(src, toks, nodes, types, strs, flds, ntys, sigs, ptys, fm, ffoot, facs, terms, pols, pst, env, cof, sites, cks, budget, resid, rargs, slay, wst, nodes[fi].b);
             acc = ck_add(facs, terms, pols, pst, cks, budget, wst, acc, v);
             fi = nodes[fi].next;
         }
@@ -1772,7 +1831,7 @@ fn call_moves(src: &[u8], toks: &[Token], nodes: &[Node], types: &[Ty], strs: &[
               sigs: &[Sig], ptys: &[i64], fm: &[i64], ffoot: &[i64], facs: &mut [Fac],
               terms: &mut [Term], pols: &mut [Pol], pst: &mut [i64], env: &mut [Env],
               cks: &mut [Ck], budget: &mut [f64], resid: &mut [Res], rargs: &mut [i64],
-              wst: &mut [i64], n: i64, si: i64) -> i64 {
+              slay: &[i64], wst: &mut [i64], n: i64, si: i64) -> i64 {
     // A callee whose own cost forks hands its condition up: the caller adopts it, and `ck_add`
     // refuses later if the caller already had a different one. Every regime in this corpus reaches
     // `main` this way — `sum_list`, `stencil` and `is_palindrome` are all piecewise and all called.
@@ -1799,6 +1858,10 @@ fn call_moves(src: &[u8], toks: &[Token], nodes: &[Node], types: &[Ty], strs: &[
             };
         }
         let t = ptys[sigs[si].params + p];
+        // Under SoA a callee's footprint is **per field array** — `shift` touches only `.x` and so
+        // leaves only the x-array resident — and this slice's resident set is per array. Rather
+        // than credit a whole element where a third of one was brought in, decline.
+        if ffoot[si * 16 + p] != 0 && is_soa(types, slay, t) { wst[1] = 1; };
         if ffoot[si * 16 + p] == 2 { wst[27] = 1; };
         if ffoot[si * 16 + p] == 1 && t >= 0 && inner >= 0 && nodes[inner].kind == 65 {
             let es = elem_bytes(types, strs, flds, t);
@@ -1860,17 +1923,17 @@ fn m_block(src: &[u8], toks: &[Token], nodes: &[Node], types: &[Ty], strs: &[Str
            ntys: &[i64], sigs: &[Sig], ptys: &[i64], fm: &[i64], ffoot: &[i64],
             facs: &mut [Fac], terms: &mut [Term], pols: &mut [Pol],
             pst: &mut [i64], env: &mut [Env], cof: &mut [Cof], sites: &mut [Site], cks: &mut [Ck], budget: &mut [f64],
-            resid: &mut [Res], rargs: &mut [i64], wst: &mut [i64], n: i64) -> i64 {
+            resid: &mut [Res], rargs: &mut [i64], slay: &[i64], wst: &mut [i64], n: i64) -> i64 {
     if n < 0 || wst[1] != 0 { return ck_zero(facs, terms, pols, pst, cks, budget, wst); }
     let saved = wst[0];
     let mut acc = ck_zero(facs, terms, pols, pst, cks, budget, wst);
     let mut s = nodes[n].a;
     while s >= 0 && wst[1] == 0 {
-        let w = m_stmt(src, toks, nodes, types, strs, flds, ntys, sigs, ptys, fm, ffoot, facs, terms, pols, pst, env, cof, sites, cks, budget, resid, rargs, wst, s);
+        let w = m_stmt(src, toks, nodes, types, strs, flds, ntys, sigs, ptys, fm, ffoot, facs, terms, pols, pst, env, cof, sites, cks, budget, resid, rargs, slay, wst, s);
         acc = ck_add(facs, terms, pols, pst, cks, budget, wst, acc, w);
         s = nodes[s].next;
     }
-    let t = m_expr(src, toks, nodes, types, strs, flds, ntys, sigs, ptys, fm, ffoot, facs, terms, pols, pst, env, cof, sites, cks, budget, resid, rargs, wst, nodes[n].b);
+    let t = m_expr(src, toks, nodes, types, strs, flds, ntys, sigs, ptys, fm, ffoot, facs, terms, pols, pst, env, cof, sites, cks, budget, resid, rargs, slay, wst, nodes[n].b);
     wst[0] = saved;
     ck_add(facs, terms, pols, pst, cks, budget, wst, acc, t)
 }
@@ -1879,7 +1942,7 @@ fn m_stmt(src: &[u8], toks: &[Token], nodes: &[Node], types: &[Ty], strs: &[Str]
           ntys: &[i64], sigs: &[Sig], ptys: &[i64], fm: &[i64], ffoot: &[i64],
             facs: &mut [Fac], terms: &mut [Term], pols: &mut [Pol],
             pst: &mut [i64], env: &mut [Env], cof: &mut [Cof], sites: &mut [Site], cks: &mut [Ck], budget: &mut [f64],
-            resid: &mut [Res], rargs: &mut [i64], wst: &mut [i64], n: i64) -> i64 {
+            resid: &mut [Res], rargs: &mut [i64], slay: &[i64], wst: &mut [i64], n: i64) -> i64 {
     let k = nodes[n].kind;
     if k == 90 {
         let init = nodes[n].c;
@@ -1916,7 +1979,7 @@ fn m_stmt(src: &[u8], toks: &[Token], nodes: &[Node], types: &[Ty], strs: &[Str]
             };
             return ck_one(cks, wst, bytes);
         }
-        let w = m_expr(src, toks, nodes, types, strs, flds, ntys, sigs, ptys, fm, ffoot, facs, terms, pols, pst, env, cof, sites, cks, budget, resid, rargs, wst, init);
+        let w = m_expr(src, toks, nodes, types, strs, flds, ntys, sigs, ptys, fm, ffoot, facs, terms, pols, pst, env, cof, sites, cks, budget, resid, rargs, slay, wst, init);
         // the same environment the work walk keeps, and for the same reason: a `while`'s induction
         // variable needs its entry value, and an array's length is what a loop bound reads
         let t = ntys[init];
@@ -1934,17 +1997,17 @@ fn m_stmt(src: &[u8], toks: &[Token], nodes: &[Node], types: &[Ty], strs: &[Str]
         return w;
     }
     if k == 91 {
-        let mut acc = m_expr(src, toks, nodes, types, strs, flds, ntys, sigs, ptys, fm, ffoot, facs, terms, pols, pst, env, cof, sites, cks, budget, resid, rargs, wst, nodes[n].b);
+        let mut acc = m_expr(src, toks, nodes, types, strs, flds, ntys, sigs, ptys, fm, ffoot, facs, terms, pols, pst, env, cof, sites, cks, budget, resid, rargs, slay, wst, nodes[n].b);
         let tgt = nodes[n].a;
         if nodes[tgt].kind == 68 {
-            let i = m_expr(src, toks, nodes, types, strs, flds, ntys, sigs, ptys, fm, ffoot, facs, terms, pols, pst, env, cof, sites, cks, budget, resid, rargs, wst, nodes[tgt].b);
-            let sp = site_add(src, toks, nodes, types, strs, flds, ntys, sigs, ptys, fm, ffoot, facs, terms, pols, pst, env, cof, sites, cks, budget, resid, rargs, wst, nodes[tgt].a, nodes[tgt].b);
+            let i = m_expr(src, toks, nodes, types, strs, flds, ntys, sigs, ptys, fm, ffoot, facs, terms, pols, pst, env, cof, sites, cks, budget, resid, rargs, slay, wst, nodes[tgt].b);
+            let sp = site_add(src, toks, nodes, types, strs, flds, ntys, sigs, ptys, fm, ffoot, facs, terms, pols, pst, env, cof, sites, cks, budget, resid, rargs, slay, wst, nodes[tgt].a, nodes[tgt].b, -1);
             acc = ck_add(facs, terms, pols, pst, cks, budget, wst, acc, i);
             acc = ck_add(facs, terms, pols, pst, cks, budget, wst, acc, sp);
         } else if nodes[tgt].kind == 69 && nodes[nodes[tgt].a].kind == 68 {
             let b = nodes[tgt].a;
-            let i = m_expr(src, toks, nodes, types, strs, flds, ntys, sigs, ptys, fm, ffoot, facs, terms, pols, pst, env, cof, sites, cks, budget, resid, rargs, wst, nodes[b].b);
-            let sp = site_add(src, toks, nodes, types, strs, flds, ntys, sigs, ptys, fm, ffoot, facs, terms, pols, pst, env, cof, sites, cks, budget, resid, rargs, wst, nodes[b].a, nodes[b].b);
+            let i = m_expr(src, toks, nodes, types, strs, flds, ntys, sigs, ptys, fm, ffoot, facs, terms, pols, pst, env, cof, sites, cks, budget, resid, rargs, slay, wst, nodes[b].b);
+            let sp = site_add(src, toks, nodes, types, strs, flds, ntys, sigs, ptys, fm, ffoot, facs, terms, pols, pst, env, cof, sites, cks, budget, resid, rargs, slay, wst, nodes[b].a, nodes[b].b, nodes[tgt].b);
             acc = ck_add(facs, terms, pols, pst, cks, budget, wst, acc, i);
             acc = ck_add(facs, terms, pols, pst, cks, budget, wst, acc, sp);
         } else if nodes[tgt].kind == 65 {
@@ -1987,8 +2050,8 @@ fn m_stmt(src: &[u8], toks: &[Token], nodes: &[Node], types: &[Ty], strs: &[Str]
         wst[11] = depth + 1;
         let mut acc = ck_zero(facs, terms, pols, pst, cks, budget, wst);
         if k == 92 {
-            let a = m_expr(src, toks, nodes, types, strs, flds, ntys, sigs, ptys, fm, ffoot, facs, terms, pols, pst, env, cof, sites, cks, budget, resid, rargs, wst, nodes[n].b);
-            let b = m_expr(src, toks, nodes, types, strs, flds, ntys, sigs, ptys, fm, ffoot, facs, terms, pols, pst, env, cof, sites, cks, budget, resid, rargs, wst, nodes[n].c);
+            let a = m_expr(src, toks, nodes, types, strs, flds, ntys, sigs, ptys, fm, ffoot, facs, terms, pols, pst, env, cof, sites, cks, budget, resid, rargs, slay, wst, nodes[n].b);
+            let b = m_expr(src, toks, nodes, types, strs, flds, ntys, sigs, ptys, fm, ffoot, facs, terms, pols, pst, env, cof, sites, cks, budget, resid, rargs, slay, wst, nodes[n].c);
             let lo = val_of(src, toks, nodes, facs, terms, pols, pst, env, wst, nodes[n].b);
             let hi = val_of(src, toks, nodes, facs, terms, pols, pst, env, wst, nodes[n].c);
             if lo < 0 || hi < 0 {
@@ -2004,7 +2067,7 @@ fn m_stmt(src: &[u8], toks: &[Token], nodes: &[Node], types: &[Ty], strs: &[Str]
             wst[2] = atom + 1;
             let av = pol_atom(facs, terms, pols, pst, atom);
             env_add(env, wst, nodes[n].a, av, -1);
-            let body = m_block(src, toks, nodes, types, strs, flds, ntys, sigs, ptys, fm, ffoot, facs, terms, pols, pst, env, cof, sites, cks, budget, resid, rargs, wst, nodes[n].d);
+            let body = m_block(src, toks, nodes, types, strs, flds, ntys, sigs, ptys, fm, ffoot, facs, terms, pols, pst, env, cof, sites, cks, budget, resid, rargs, slay, wst, nodes[n].d);
             acc = ck_add(facs, terms, pols, pst, cks, budget, wst, a, b);
             acc = ck_add(facs, terms, pols, pst, cks, budget, wst, acc, body);
         } else {
@@ -2013,14 +2076,14 @@ fn m_stmt(src: &[u8], toks: &[Token], nodes: &[Node], types: &[Ty], strs: &[Str]
                 wst[1] = 1;
                 return ck_zero(facs, terms, pols, pst, cks, budget, wst);
             }
-            let a = m_expr(src, toks, nodes, types, strs, flds, ntys, sigs, ptys, fm, ffoot, facs, terms, pols, pst, env, cof, sites, cks, budget, resid, rargs, wst, nodes[n].a);
-            let b = m_expr(src, toks, nodes, types, strs, flds, ntys, sigs, ptys, fm, ffoot, facs, terms, pols, pst, env, cof, sites, cks, budget, resid, rargs, wst, nodes[n].b);
+            let a = m_expr(src, toks, nodes, types, strs, flds, ntys, sigs, ptys, fm, ffoot, facs, terms, pols, pst, env, cof, sites, cks, budget, resid, rargs, slay, wst, nodes[n].a);
+            let b = m_expr(src, toks, nodes, types, strs, flds, ntys, sigs, ptys, fm, ffoot, facs, terms, pols, pst, env, cof, sites, cks, budget, resid, rargs, slay, wst, nodes[n].b);
             wst[13] = t;
             // a `while` with a measure has no loop variable at all, so nothing in it is known to
             // move contiguously; one with an induction variable has that variable
             wst[12] = wst[15];
             wst[22] = nodes[n].c;
-            let body = m_block(src, toks, nodes, types, strs, flds, ntys, sigs, ptys, fm, ffoot, facs, terms, pols, pst, env, cof, sites, cks, budget, resid, rargs, wst, nodes[n].c);
+            let body = m_block(src, toks, nodes, types, strs, flds, ntys, sigs, ptys, fm, ffoot, facs, terms, pols, pst, env, cof, sites, cks, budget, resid, rargs, slay, wst, nodes[n].c);
             acc = ck_add(facs, terms, pols, pst, cks, budget, wst, a, b);
             acc = ck_add(facs, terms, pols, pst, cks, budget, wst, acc, body);
         }
@@ -2033,7 +2096,7 @@ fn m_stmt(src: &[u8], toks: &[Token], nodes: &[Node], types: &[Ty], strs: &[Str]
     }
     if k == 94 { return ck_zero(facs, terms, pols, pst, cks, budget, wst); }
     if k == 95 || k == 96 {
-        return m_expr(src, toks, nodes, types, strs, flds, ntys, sigs, ptys, fm, ffoot, facs, terms, pols, pst, env, cof, sites, cks, budget, resid, rargs, wst, nodes[n].a);
+        return m_expr(src, toks, nodes, types, strs, flds, ntys, sigs, ptys, fm, ffoot, facs, terms, pols, pst, env, cof, sites, cks, budget, resid, rargs, slay, wst, nodes[n].a);
     }
     wst[1] = 1;
     ck_zero(facs, terms, pols, pst, cks, budget, wst)
@@ -2047,8 +2110,8 @@ fn m_func(src: &[u8], toks: &[Token], nodes: &[Node], types: &[Ty], strs: &[Str]
           facs: &mut [Fac], terms: &mut [Term],
           pols: &mut [Pol], pst: &mut [i64], env: &mut [Env], cof: &mut [Cof],
           sites: &mut [Site], cks: &mut [Ck], budget: &mut [f64], resid: &mut [Res],
-          rargs: &mut [i64], logs: &mut [i64], scratch: &mut [i64], wst: &mut [i64],
-          f: i64, si: i64) -> i64 {
+          rargs: &mut [i64], logs: &mut [i64], scratch: &mut [i64], slay: &[i64],
+          wst: &mut [i64], f: i64, si: i64) -> i64 {
     wst[0] = 0;
     wst[1] = 0;
     wst[10] = 0;
@@ -2075,7 +2138,7 @@ fn m_func(src: &[u8], toks: &[Token], nodes: &[Node], types: &[Ty], strs: &[Str]
         p = nodes[p].next;
     }
     wst[23] = 0;
-    let total = m_block(src, toks, nodes, types, strs, flds, ntys, sigs, ptys, fm, ffoot, facs, terms, pols, pst, env, cof, sites, cks, budget, resid, rargs, wst, nodes[f].d);
+    let total = m_block(src, toks, nodes, types, strs, flds, ntys, sigs, ptys, fm, ffoot, facs, terms, pols, pst, env, cof, sites, cks, budget, resid, rargs, slay, wst, nodes[f].d);
     if wst[1] != 0 { return -1; }
     if wst[23] == 0 { return total; }
     // the same solver the `work` column uses; a forked body would need the recurrence solved in
@@ -2084,4 +2147,126 @@ fn m_func(src: &[u8], toks: &[Token], nodes: &[Node], types: &[Ty], strs: &[Str]
     let solved = solve_recurrence(types, sigs, ptys, facs, terms, pols, logs, pst, rargs, scratch, si, cks[total].fits, wst[23]);
     if solved < 0 { return -1; }
     ck_one(cks, wst, solved)
+}
+
+// does this function take or build an array whose element is struct `sid`
+fn touches_struct(src: &[u8], toks: &[Token], nodes: &[Node], types: &[Ty], sigs: &[Sig],
+                  ptys: &[i64], sid: i64, f: i64, si: i64) -> bool {
+    let mut p = 0;
+    let mut hit = false;
+    while p < sigs[si].n_params {
+        let t = ptys[sigs[si].params + p];
+        if t >= 0 && (types[t].kind == 5 || types[t].kind == 6) {
+            let e = types[t].elem;
+            if e >= 0 && types[e].kind == 7 && types[e].elem == sid { hit = true; }
+        }
+        p += 1;
+    }
+    if builds_struct(nodes, types, sid, nodes[f].d) { hit = true; };
+    hit
+}
+
+// does this block build an array of struct `sid`
+fn builds_struct(nodes: &[Node], types: &[Ty], sid: i64, b: i64) -> bool {
+    if b < 0 { return false; }
+    let mut hit = false;
+    let mut s = nodes[b].a;
+    while s >= 0 {
+        let k = nodes[s].kind;
+        if k == 90 {
+            let init = nodes[s].c;
+            if nodes[init].kind == 78 && nodes[nodes[init].a].kind == 70 { hit = true; }
+        } else if k == 92 || k == 93 {
+            let inner = if k == 92 { nodes[s].d } else { nodes[s].c };
+            if builds_struct(nodes, types, sid, inner) { hit = true; }
+        }
+        s = nodes[s].next;
+    }
+    hit
+}
+
+// ---- the layout choice ----
+//
+// For each struct: walk every function twice, once with that struct AoS and once SoA, and sum what
+// the touching ones move at a reference point — `B` and `M` from the machine, every size variable
+// at a million. **Strictly fewer bytes wins; a tie is AoS**, the same margin `choose_layouts` uses.
+// A function this slice declines contributes nothing to either side, exactly as an `Unknown`
+// contributes zero there, so the choice is made on whatever evidence there is and no more.
+fn choose_layouts(src: &[u8], toks: &[Token], nodes: &[Node], types: &[Ty], strs: &[Str],
+                  flds: &[Fld], ntys: &[i64], sigs: &[Sig], ptys: &[i64], slay: &mut [i64],
+                  first: i64, n_structs: i64) {
+    let mut facs = [Fac { atom: 0, exp: 0 }; 262144];
+    let mut terms = [Term { fac: 0, n_fac: 0, cn: 0, cd: 0 }; 262144];
+    let mut pols = [Pol { term: 0, n_term: 0 }; 262144];
+    let mut logs = [-1; 1024];
+    let mut pst = [0, 0, 0, 0, 0, 0, 0];
+    let mut env = [Env { name: 0, val: 0, len: 0, root: 0 }; 4096];
+    let mut cof = [Cof { name: 0, c: 0 }; 256];
+    let mut sites = [Site { arr: 0, idx: 0, inloop: 0, coef: 0, stride: 0, bad: 0, trip: 0, branch: 0, novar: 0, field: -1 }; 4096];
+    let mut cks = [Ck { fits: 0, nofit: 0, ws: 0 }; 262144];
+    let mut budget = [0.0; 4096];
+    let mut resid = [Res { root: 0, foot: 0 }; 128];
+    let mut rargs = [-1; 64];
+    let mut scratch = [0; 64];
+    let mut ffoot = [0; 65536];
+    let mut fm = [-1; 4096];
+    let mut wst = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+
+    let mut sid = 0;
+    while sid < n_structs {
+        let mut total_aos = 0.0;
+        let mut total_soa = 0.0;
+        let mut which = 0;
+        while which < 2 {
+            slay[sid] = which;
+            // the arenas start over for each layout: nothing from the other one is referred to
+            // again, and a walk of a whole module twice per struct would otherwise not fit
+            pst[0] = 0;
+            pst[1] = 0;
+            pst[2] = 0;
+            pst[5] = 0;
+            wst[25] = 0;
+            // two sub-passes, as the reporter does: a call to a function declared later needs its
+            // callee's moves, and without them every caller declines and contributes nothing
+            let mut pass = 0;
+            while pass < 2 {
+                let mut f = first;
+                let mut si = 0;
+                while f >= 0 {
+                    if nodes[f].kind == 110 {
+                        fm[si] = m_func(src, toks, nodes, types, strs, flds, ntys, sigs, ptys, &fm,
+                                        &ffoot, &mut facs, &mut terms, &mut pols, &mut pst, &mut env,
+                                        &mut cof, &mut sites, &mut cks, &mut budget, &mut resid,
+                                        &mut rargs, &mut logs, &mut scratch, slay, &mut wst, f, si);
+                        foot_flags(src, toks, nodes, &sites, &mut ffoot, &wst, f, si);
+                        if pass == 1 && fm[si] >= 0
+                            && touches_struct(src, toks, nodes, types, sigs, ptys, sid, f, si) {
+                            // a forked cost is evaluated in the regime that applies at the
+                            // reference point, not always in the fitting one
+                            let mut which_p = cks[fm[si]].fits;
+                            if cks[fm[si]].ws >= 0 {
+                                let wsv = pol_eval(&facs, &terms, &pols, &mut pst, cks[fm[si]].ws,
+                                                   64.0, 2097152.0, 1000000.0);
+                                if pst[6] == 0 && wsv >= 2097152.0 { which_p = cks[fm[si]].nofit; };
+                            };
+                            let v = pol_eval(&facs, &terms, &pols, &mut pst, which_p,
+                                             64.0, 2097152.0, 1000000.0);
+                            if pst[6] == 0 {
+                                if which == 0 { total_aos = total_aos + v; }
+                                else { total_soa = total_soa + v; };
+                            }
+                        }
+                        si += 1;
+                    } else if nodes[f].kind == 116 {
+                        si += 1;
+                    }
+                    f = nodes[f].next;
+                }
+                pass += 1;
+            }
+            which += 1;
+        }
+        slay[sid] = if total_soa < total_aos * 0.999 { 1 } else { 0 };
+        sid += 1;
+    }
 }

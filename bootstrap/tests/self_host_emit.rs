@@ -45,9 +45,12 @@ fn main() {{
         if bad != 0 {{
             println(-1);
         }} else {{
+            let mut slay = [0; 1024];
+            choose_layouts(&buf, &toks, &nodes, &types, &strs, &flds, &ntys, &sigs, &ptys,
+                           &mut slay, first, cst[7]);
             let mut out = [b'\0'; 262144];
             let mut est = [0, 0, 0];
-            let len = emit_program(&mut out, &mut est, &buf, &toks, &nodes, &types, &strs, &flds, &ntys, &sigs, &ptys, first);
+            let len = emit_program(&mut out, &mut est, &buf, &toks, &nodes, &types, &strs, &flds, &slay, &ntys, &sigs, &ptys, first);
             if len < 0 {{
                 // the emitter refused: something in this program is outside its slice
                 println(len);
@@ -62,7 +65,8 @@ fn main() {{
 
 #[test]
 fn self_hosted_emit_runs_the_same() {
-    let stages = ["compiler/lex.nt", "compiler/parse.nt", "compiler/check.nt", "compiler/emit.nt"]
+    let stages = ["compiler/lex.nt", "compiler/parse.nt", "compiler/check.nt", "compiler/emit.nt",
+                  "compiler/poly.nt", "compiler/cost.nt"]
         .map(|p| std::fs::read_to_string(repo(p)).unwrap())
         .join("\n");
     let dir = std::env::temp_dir().join(format!("neant-self-host-emit-{}", std::process::id()));
@@ -156,8 +160,10 @@ fn self_hosted_emit_runs_the_same() {
 /// is a file that silently stops matching its source. Regenerate it with `compiler/build.sh`.
 #[test]
 fn the_self_hosted_compiler_reaches_its_fixpoint() {
+    // the cost pass is part of the compiler now: the layout choice runs before emission, so what
+    // the compiler emits and what the cost reporter prints describe the same program
     let names = ["compiler/lex.nt", "compiler/parse.nt", "compiler/check.nt", "compiler/emit.nt",
-                 "compiler/main.nt"];
+                 "compiler/poly.nt", "compiler/cost.nt", "compiler/main.nt"];
     // concatenated in dependency order, which is the whole build system: there is no module
     // system, so these are fragments of one program (compiler/build.sh does the same)
     let stage1_src: String = names.iter().map(|p| std::fs::read_to_string(repo(p)).unwrap()).collect();
