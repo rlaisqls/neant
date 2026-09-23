@@ -62,6 +62,37 @@ pub enum Atom {
     /// moves, at the arguments shown. It stands in the caller's cost where the callee's would, so
     /// the rest of the caller stays exact, and it is never given a value.
     Opaque(Box<Opaque>),
+    /// An `i64` read from memory where a size was needed (stage D): `cst[7]`, `pols[p].n_term`.
+    /// It is a size like any other, but not a parameter: it names the value the read returned,
+    /// minted at the read and shared by later reads of the same text until the array is written.
+    Read(Box<Read>),
+}
+
+/// Which array a read looks into: one of the function's parameters (by position, so a caller can
+/// rename it to its own argument) or an array of its own.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum Root {
+    Param(usize, String),
+    Local(String),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct Read {
+    /// which read: two with the same text and a write between them are two values
+    pub id: u64,
+    pub root: Root,
+    /// the element, as a size; `None` (`_`) when it is not one, and then the atom is the most any
+    /// element holds — or the least, when `least`, for a size bounded from below
+    pub index: Option<Poly>,
+    pub field: Option<String>,
+    pub least: bool,
+}
+
+impl Read {
+    /// A read with no element is the most (or least) the array holds over the whole run, one
+    /// value whichever read it came from: the reads' numbers stop mattering, and two of them
+    /// are one atom.
+    pub fn canon(self) -> Read { if self.index.is_none() { Read { id: 0, ..self } } else { self } }
 }
 
 /// `work[f](n, _)`: the cost of one call to `f`, in terms of the arguments that are size
@@ -82,6 +113,26 @@ impl Opaque {
 
 impl Atom {
     pub fn clone_ref(&self) -> Box<Atom> { Box::new(self.clone()) }
+    /// A size: what a cost is a polynomial in, and what degree counts.
+    pub fn is_size(&self) -> bool { matches!(self, Atom::Var(_) | Atom::Read(_)) }
+    /// The polynomials inside an atom, which substitution and `mentions` reach into.
+    fn inner(&self) -> Vec<&Poly> {
+        match self {
+            Atom::Log(p) => vec![&**p],
+            Atom::Opaque(o) => o.args.iter().flatten().collect(),
+            Atom::Read(r) => r.index.iter().collect(),
+            _ => vec![],
+        }
+    }
+    /// The same atom with each polynomial inside it mapped, `None` making it `_`.
+    fn map_inner(&self, f: &dyn Fn(&Poly) -> Option<Poly>) -> Atom {
+        match self {
+            Atom::Log(p) => Atom::Log(Box::new(f(p).unwrap_or_else(|| (**p).clone()))),
+            Atom::Opaque(o) => o.map_args(f),
+            Atom::Read(r) => Atom::Read(Box::new(Read { index: r.index.as_ref().and_then(|p| f(p)), ..(**r).clone() }.canon())),
+            other => other.clone(),
+        }
+    }
 }
 
 /// A product of atoms with nonzero exponents. The empty product is 1.
@@ -108,7 +159,7 @@ impl Mono {
     }
     /// Total degree in size variables, for ordering terms. `B` and `M` do not count.
     fn degree(&self) -> Rat {
-        self.factors.iter().filter(|(a, _)| matches!(a, Atom::Var(_))).fold(Rat::zero(), |acc, (_, e)| acc.add(*e))
+        self.factors.iter().filter(|(a, _)| a.is_size()).fold(Rat::zero(), |acc, (_, e)| acc.add(*e))
     }
 }
 
@@ -205,11 +256,43 @@ impl Poly {
         }
     }
     pub fn has_vars(&self) -> bool {
-        self.terms.keys().any(|m| m.factors.keys().any(|a| matches!(a, Atom::Var(_) | Atom::Log(_) | Atom::Opaque(_))))
+        self.terms.keys().any(|m| m.factors.keys().any(|a| matches!(a, Atom::Var(_) | Atom::Log(_) | Atom::Opaque(_) | Atom::Read(_))))
     }
     /// Whether some term is an unknown callee's cost.
     pub fn has_opaque(&self) -> bool {
         self.terms.keys().any(|m| m.factors.keys().any(|a| matches!(a, Atom::Opaque(_))))
+    }
+    /// The same polynomial with every read's array renamed, for a caller: a parameter becomes
+    /// the array the caller passed.
+    pub fn rename_roots(&self, f: &dyn Fn(&Root) -> Root) -> Poly {
+        let has = |a: &Atom| matches!(a, Atom::Read(_) | Atom::Opaque(_));
+        if !self.terms.keys().any(|m| m.factors.keys().any(has)) { return self.clone(); }
+        let mut out = Poly::zero();
+        for (m, c) in &self.terms {
+            let mut fs = BTreeMap::new();
+            for (a, e) in &m.factors {
+                let a = match a {
+                    Atom::Read(r) => Atom::Read(Box::new(Read { root: f(&r.root), index: r.index.as_ref().map(|p| p.rename_roots(f)), ..(**r).clone() })),
+                    Atom::Opaque(_) => a.map_inner(&|p| Some(p.rename_roots(f))),
+                    other => other.clone(),
+                };
+                fs.insert(a, *e);
+            }
+            let mut t = Poly::zero();
+            t.terms.insert(Mono { factors: fs }, *c);
+            out = out.add(&t);
+        }
+        out
+    }
+    /// Whether some term is the most or least an array holds rather than a value it holds.
+    pub fn has_loose_read(&self) -> bool {
+        fn loose(p: &Poly) -> bool {
+            p.terms.keys().any(|m| m.factors.keys().any(|a| match a {
+                Atom::Read(r) => r.index.is_none(),
+                other => other.inner().iter().any(|q| loose(q)),
+            }))
+        }
+        loose(self)
     }
     /// The callees whose unknown costs this polynomial names.
     pub fn opaque_callees(&self, out: &mut Vec<String>) {
@@ -223,12 +306,19 @@ impl Poly {
     /// for an argument about to lose its meaning — a variable a caller cannot name, or a loop
     /// variable being summed away.
     pub fn hide_args(&self, hide: &dyn Fn(&Poly) -> bool) -> Poly {
-        if !self.has_opaque() { return self.clone(); }
+        if !self.terms.keys().any(|m| m.factors.keys().any(|a| matches!(a, Atom::Opaque(_) | Atom::Read(_)))) { return self.clone(); }
         let mut out = Poly::zero();
         for (m, c) in &self.terms {
             let mut f = BTreeMap::new();
             for (a, e) in &m.factors {
-                let a = match a { Atom::Opaque(o) => o.map_args(&|p| if hide(p) { None } else { Some(p.clone()) }), other => other.clone() };
+                let a = match a {
+                    // a read that loses its element is the most any element holds where it adds to
+                    // the cost, and the least where it is subtracted: an upper bound either way
+                    Atom::Read(r) if r.index.as_ref().is_some_and(|p| hide(p)) =>
+                        Atom::Read(Box::new(Read { index: None, least: c.n < 0, ..(**r).clone() }.canon())),
+                    Atom::Opaque(_) | Atom::Read(_) => a.map_inner(&|p| if hide(p) { None } else { Some(p.clone()) }),
+                    other => other.clone(),
+                };
                 f.insert(a, *e);
             }
             let mut t = Poly::zero();
@@ -269,8 +359,7 @@ impl Poly {
             for a in m.factors.keys() {
                 match a {
                     Atom::Var(i) => { if !out.contains(i) { out.push(*i); } }
-                    Atom::Opaque(o) => for p in o.args.iter().flatten() { for i in p.vars() { if !out.contains(&i) { out.push(i); } } },
-                    _ => {}
+                    other => for p in other.inner() { for i in p.vars() { if !out.contains(&i) { out.push(i); } } },
                 }
             }
         }
@@ -327,17 +416,14 @@ impl Poly {
     pub fn mentions(&self, atom: usize) -> bool {
         self.terms.keys().any(|m| m.factors.keys().any(|a| match a {
             Atom::Var(i) => *i == atom,
-            Atom::Log(inner) => inner.mentions(atom),
-            Atom::Opaque(o) => o.args.iter().flatten().any(|p| p.mentions(atom)),
-            _ => false,
+            other => other.inner().iter().any(|p| p.mentions(atom)),
         }))
     }
     /// Largest variable index used, for allocating fresh atoms above it.
     pub fn max_var(&self) -> Option<usize> {
         self.terms.keys().flat_map(|m| m.factors.keys()).filter_map(|a| match a {
             Atom::Var(i) => Some(*i),
-            Atom::Opaque(o) => o.args.iter().flatten().filter_map(|p| p.max_var()).max(),
-            _ => None,
+            other => other.inner().iter().filter_map(|p| p.max_var()).max(),
         }).max()
     }
 
@@ -354,7 +440,7 @@ impl Poly {
                     Atom::Var(v) if *v == var => var_pow = Some(*e),
                     // a log of an expression that mentions the variable: substitute inside
                     Atom::Log(inner) => { rest.factors.insert(Atom::Log(Box::new(inner.subst(var, by))), *e); }
-                    Atom::Opaque(o) => { rest.factors.insert(o.map_args(&|p| Some(p.subst(var, by))), *e); }
+                    Atom::Opaque(_) | Atom::Read(_) => { rest.factors.insert(a.map_inner(&|p| Some(p.subst(var, by))), *e); }
                     other => { rest.factors.insert(other.clone(), *e); }
                 }
             }
@@ -436,7 +522,7 @@ impl Poly {
                         }
                     }
                     Atom::Log(inner) => { rest.factors.insert(Atom::Log(Box::new(inner.subst_pow(var, by))), *e); }
-                    Atom::Opaque(o) => { rest.factors.insert(o.map_args(&|p| Some(p.subst_pow(var, by))), *e); }
+                    Atom::Opaque(_) | Atom::Read(_) => { rest.factors.insert(a.map_inner(&|p| Some(p.subst_pow(var, by))), *e); }
                     other => {
                         let ne = rest.factors.get(other).map_or(*e, |x| x.add(*e));
                         if ne.is_zero() { rest.factors.remove(other); } else { rest.factors.insert(other.clone(), ne); }
@@ -491,6 +577,12 @@ impl<'a> fmt::Display for PolyDisplay<'a> {
                     let args: Vec<String> = o.args.iter().map(|a| a.as_ref().map_or("_".into(), |p| p.display(self.names).to_string())).collect();
                     format!("{which}[{}]({})", o.callee, args.join(", "))
                 }
+                Atom::Read(r) => {
+                    let root = match &r.root { Root::Param(_, n) | Root::Local(n) => n.clone() };
+                    let idx = r.index.as_ref().map_or("_".to_string(), |p| p.display(self.names).to_string());
+                    let s = match &r.field { Some(f) => format!("{root}[{idx}].{f}"), None => format!("{root}[{idx}]") };
+                    if r.index.is_some() { s } else if r.least { format!("min({s})") } else { format!("max({s})") }
+                }
             }
         };
         let atom_str = |a: &Atom, e: Rat| -> String {
@@ -511,7 +603,7 @@ impl<'a> fmt::Display for PolyDisplay<'a> {
             if i > 0 { write!(f, "{}", if neg { " − " } else { " + " })?; }
             else if neg { write!(f, "−")?; }
             let mut ordered: Vec<(&Atom, &Rat)> = m.factors.iter().collect();
-            ordered.sort_by_key(|(a, _)| match a { Atom::B => 0, Atom::M => 1, Atom::P => 2, Atom::Var(i) => 3 + *i, Atom::Log(_) => 1_000_000, Atom::Opaque(_) => 2_000_000 });
+            ordered.sort_by_key(|(a, _)| match a { Atom::B => 0, Atom::M => 1, Atom::P => 2, Atom::Var(i) => 3 + *i, Atom::Read(_) => 500_000, Atom::Log(_) => 1_000_000, Atom::Opaque(_) => 2_000_000 });
             let num: Vec<String> = ordered.iter().filter(|(_, e)| e.n > 0).map(|(a, e)| atom_str(a, **e)).collect();
             let den: Vec<String> = ordered.iter().filter(|(_, e)| e.n < 0).map(|(a, e)| atom_str(a, e.neg())).collect();
             // a rational with a big denominator (a tile count, a division by a constant) reads as

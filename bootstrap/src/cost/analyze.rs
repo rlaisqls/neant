@@ -16,7 +16,10 @@ use crate::ir::*;
 use super::bounds::{self, Bound};
 use super::rewrite;
 use super::piece::{Cond, Cost, Piece};
-use super::size::{Atom, Opaque, Poly, Rat};
+use super::size::{Atom, Opaque, Poly, Rat, Read, Root};
+
+/// Every read atom's number, unique across functions, since a callee's reads travel into its callers.
+static NEXT_READ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 #[derive(Debug, Clone, Copy)]
 pub struct Machine {
@@ -150,7 +153,7 @@ pub fn choose_layouts(m: &mut Module, machine: &Machine) -> Vec<LayoutChoice> {
             let at = |c: &FuncCost| -> (f64, String) {
                 match &c.result {
                     CostResult::Exact { moves, .. } => {
-                        let point = |a: Atom| match a { Atom::B => Some(machine.b_bytes as f64), Atom::M => Some(machine.m_bytes as f64), Atom::P => Some(machine.p_cores as f64), Atom::Var(_) => Some(1e6), Atom::Log(_) | Atom::Opaque(_) => None };
+                        let point = |a: Atom| match a { Atom::B => Some(machine.b_bytes as f64), Atom::M => Some(machine.m_bytes as f64), Atom::P => Some(machine.p_cores as f64), Atom::Var(_) => Some(1e6), Atom::Log(_) | Atom::Opaque(_) | Atom::Read(_) => None };
                         (moves.eval(&point, machine).unwrap_or(0.0), super::lock::brief(moves, &c.names))
                     }
                     CostResult::Unknown { .. } => (0.0, "unknown".into()),
@@ -243,7 +246,7 @@ fn tile_choice(an: &mut Analyzer, f: &Func) -> Option<TileChoice> {
     let CostResult::Exact { work, moves, .. } = &c.result else { return None };
     if std::env::var("NEANT_DEBUG_TILE").is_ok() { eprint!("{}", super::lock::report(&c, &machine)); }
     // the reference point: this machine, every size a million — tiling is for large sizes
-    let point = |t: Option<f64>| move |a: Atom| match a { Atom::B => Some(machine.b_bytes as f64), Atom::M => Some(machine.m_bytes as f64), Atom::P => Some(machine.p_cores as f64), Atom::Var(v) if v == tvar => t, Atom::Var(_) => Some(1e6), Atom::Log(_) | Atom::Opaque(_) => None };
+    let point = |t: Option<f64>| move |a: Atom| match a { Atom::B => Some(machine.b_bytes as f64), Atom::M => Some(machine.m_bytes as f64), Atom::P => Some(machine.p_cores as f64), Atom::Var(v) if v == tvar => t, Atom::Var(_) => Some(1e6), Atom::Log(_) | Atom::Opaque(_) | Atom::Read(_) => None };
     let holds = |conds: &[Cond]| conds.iter().all(|c| c.ws.eval(&point(None)).is_some_and(|ws| ((ws * (machine.b_bytes as f64)) < (machine.m_bytes as f64)) == c.fits));
     let mut best: Option<(f64, Poly, bool, Poly, Piece)> = None;
     let half = Poly::atom(Atom::M).scale(Rat::new(1, 2));
@@ -561,6 +564,12 @@ struct Fa<'a, 'b, 'c> {
     has_call: Vec<bool>,
     /// declarations this function's cost composes, transitively
     rests_on: Vec<String>,
+    /// sizes read from memory so far, by array, element and field: a later read of the same
+    /// element is the same value until something writes the array (stage D)
+    reads: std::cell::RefCell<HashMap<(LocalId, Option<Poly>, Option<usize>, bool), Poly>>,
+    /// for each open loop, the arrays its body writes: a read of one of them is a different value
+    /// every iteration, and not a size
+    loop_writes: Vec<Vec<LocalId>>,
 }
 
 impl<'a, 'b, 'c> Fa<'a, 'b, 'c> {
@@ -570,6 +579,7 @@ impl<'a, 'b, 'c> Fa<'a, 'b, 'c> {
             local_size: HashMap::new(), local_affine: HashMap::new(), initial: HashMap::new(), at_entry: false,
             loops: vec![], work: Cost::zero(), moves: Cost::zero(), span: Cost::zero(), saved: vec![], branch: vec![], next_if: 0,
             local_root: HashMap::new(), resident: vec![], call_moves: Cost::zero(), saved_calls: vec![], replay: false, has_call: vec![], rests_on: vec![],
+            reads: Default::default(), loop_writes: vec![],
         };
         for (i, &p) in f.params.iter().enumerate() {
             let l = &f.locals[p];
@@ -663,6 +673,12 @@ impl<'a, 'b, 'c> Fa<'a, 'b, 'c> {
             }
             other => other,
         };
+        // a size that is the most (or least) an array holds makes the cost an upper bound
+        if tier != "modulo" {
+            if let CostResult::Exact { work, moves, .. } = &result {
+                if work.has_loose_read() || moves.has_loose_read() { tier = "bound"; }
+            }
+        }
         // `#[cost(...)]`: the inferred cost must stay within the declaration. Without `sizes`,
         // by asymptotic dominance in every regime; with `sizes`, as numbers at those bounds and
         // the machine's B and M — a budget in real units.
@@ -688,7 +704,7 @@ impl<'a, 'b, 'c> Fa<'a, 'b, 'c> {
                             match a {
                                 Atom::B => Some(m.b_bytes as f64), Atom::M => Some(m.m_bytes as f64), Atom::P => Some(m.p_cores as f64),
                                 Atom::Var(i) => declared.sizes.iter().find(|(v, _)| *v == i).map(|(_, x)| *x),
-                                Atom::Log(_) | Atom::Opaque(_) => None,
+                                Atom::Log(_) | Atom::Opaque(_) | Atom::Read(_) => None,
                             }
                         };
                         match (inferred.eval(&at, &m), asserted.eval(&at)) {
@@ -713,6 +729,10 @@ impl<'a, 'b, 'c> Fa<'a, 'b, 'c> {
         if !foot.is_zero() {
             self.bounds.push(Bound { kind: "footprint".into(), citation: "every distinct element crosses once".into(), moves: foot, line: self.f.line, cold: true });
         }
+        // a bound still in a loop's atom — a read at the loop variable, left behind when the loop
+        // closed — is in no size a caller can name; dropping it only weakens what is claimed
+        let np = self.f.params.len();
+        self.bounds.retain(|b| b.moves.vars().iter().all(|&v| v < np));
         bounds::strongest_first(&mut self.bounds, &m);
         FuncCost { name: self.f.name.clone(), names: self.names, result, bounds: self.bounds, notes: self.notes, suggestions: vec![], effects, violations, tier, footprint, resident, declared, rests_on: self.rests_on, result_size: self.result_size.clone() }
     }
@@ -1039,7 +1059,7 @@ impl<'a, 'b, 'c> Fa<'a, 'b, 'c> {
             Atom::B => Some(m.b_bytes as f64),
             Atom::M => Some(m.m_bytes as f64),
             Atom::P => Some(m.p_cores as f64),
-            Atom::Var(_) | Atom::Log(_) | Atom::Opaque(_) => None,
+            Atom::Var(_) | Atom::Log(_) | Atom::Opaque(_) | Atom::Read(_) => None,
         })
     }
 
@@ -1084,8 +1104,67 @@ impl<'a, 'b, 'c> Fa<'a, 'b, 'c> {
                 }
             }
             ExprKind::Block(b) if b.stmts.is_empty() => self.size_of(b.tail.as_ref()?, bound),
+            ExprKind::Index(arr, idx) if self.f.locals[*arr].ty.elem() == Some(&Ty::I64) => self.read(*arr, idx, None, bound),
+            ExprKind::Field(inner, fi) => match &inner.kind {
+                ExprKind::Index(arr, idx) if self.field_ty(*arr, *fi) == Some(&Ty::I64) => self.read(*arr, idx, Some(*fi), bound),
+                _ => None,
+            },
             _ => None,
         }
+    }
+
+    /// A size that is exactly this expression's value, not one side of a bound on it.
+    fn exact_size(&self, e: &Expr) -> Option<Poly> {
+        match (self.size_of(e, Dir::Upper), self.size_of(e, Dir::Lower)) {
+            (Some(a), Some(b)) if a == b => Some(a),
+            _ => None,
+        }
+    }
+
+    fn field_ty(&self, arr: LocalId, fi: usize) -> Option<&'a Ty> {
+        match self.f.locals[arr].ty.elem() {
+            Some(Ty::Struct(sid)) => self.an.m.structs[*sid].fields.get(fi).map(|(_, t)| t),
+            _ => None,
+        }
+    }
+
+    /// An `i64` read from an array as a size: the value the read returns, as an atom of its own
+    /// (stage D). Not a size inside a loop that writes the array, where it changes from one
+    /// iteration to the next. The element is a size when its index is one exactly, and `_`
+    /// otherwise, which makes the atom the most any element holds.
+    fn read(&self, arr: LocalId, idx: &Expr, field: Option<usize>, bound: Dir) -> Option<Poly> {
+        let root = self.local_root.get(&arr).copied().unwrap_or(arr);
+        if self.loop_writes.iter().any(|w| w.contains(&root)) { return None; }
+        let index = self.exact_size(idx);
+        let least = index.is_none() && bound == Dir::Lower;
+        let key = (root, index.clone(), field, least);
+        if let Some(p) = self.reads.borrow().get(&key) { return Some(p.clone()); }
+        let name = self.f.locals[root].name.clone();
+        let root_ref = match self.f.params.iter().position(|&p| p == root) { Some(i) => Root::Param(i, name), None => Root::Local(name) };
+        let fname = field.and_then(|fi| match self.f.locals[root].ty.elem() {
+            Some(Ty::Struct(sid)) => self.an.m.structs[*sid].fields.get(fi).map(|(n, _)| n.clone()),
+            _ => None,
+        });
+        let id = NEXT_READ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let p = Poly::atom(Atom::Read(Box::new(Read { id, root: root_ref, index, field: fname, least }.canon())));
+        self.reads.borrow_mut().insert(key, p.clone());
+        Some(p)
+    }
+
+    /// A write to `arr`: every size read from it is stale.
+    fn wrote(&self, arr: LocalId) {
+        let root = self.local_root.get(&arr).copied().unwrap_or(arr);
+        self.reads.borrow_mut().retain(|k, _| k.0 != root);
+    }
+
+    /// The arrays a loop body writes, by root, for `loop_writes`.
+    fn written_roots(&self, body: &Block) -> Vec<LocalId> {
+        let mut w = Writes::default();
+        w.block(body);
+        let mut out: Vec<LocalId> = w.arrays.iter().map(|a| self.local_root.get(a).copied().unwrap_or(*a)).collect();
+        out.sort();
+        out.dedup();
+        out
     }
 
     /// An index expression as an affine function of the loop variables in scope.
@@ -1594,9 +1673,13 @@ impl<'a, 'b, 'c> Fa<'a, 'b, 'c> {
                     }
                     if let Some(s0) = src { let r = self.local_root.get(&s0).copied().unwrap_or(s0); self.local_root.insert(*id, r); }
                 } else if l.ty == Ty::I64 && !l.mutable {
-                    if let Some(a) = self.affine(e) { self.local_affine.insert(*id, a); }
+                    match self.affine(e) {
+                        Some(a) => { self.local_affine.insert(*id, a); }
+                        // a value read from memory: a size, though not an affine one
+                        None => if let Some(p) = self.exact_size(e) { self.local_affine.insert(*id, Affine::constant(p)); },
+                    }
                 } else if l.ty == Ty::I64 {
-                    let v = self.size_of(e, Dir::Upper).map(|p| vec![p]);
+                    let v = self.exact_size(e).map(|p| vec![p]);
                     self.initial.insert(*id, v);
                 }
                 Ok(())
@@ -1613,9 +1696,13 @@ impl<'a, 'b, 'c> Fa<'a, 'b, 'c> {
                 let atom = self.new_atom(&self.f.locals[*var].name.clone());
                 self.enter_loop(Loop { id: 0, var: Some(*var), atom: Some(atom), trip: size, lo: Poly::zero(), step: 1, offset: Some(Affine::constant(Poly::zero())) });
                 self.add_work_n(3); // store, increment, compare-and-branch
+                let w = self.written_roots(body);
+                self.loop_writes.push(w);
                 let r = self.block(body);
                 r?;
-                self.leave_loop(body)
+                self.leave_loop(body)?;
+                self.loop_writes.pop();
+                Ok(())
             }
             Stmt::LetRepeat(id, e, n) => {
                 self.expr(e)?;
@@ -1646,7 +1733,7 @@ impl<'a, 'b, 'c> Fa<'a, 'b, 'c> {
                 if let LValue::Var(v) = lv {
                     if self.f.locals[*v].ty == Ty::I64 {
                         // inside a loop the value at the loop's next iteration is not this one
-                        let val = if op.is_none() && self.loops.is_empty() { self.size_of(e, Dir::Upper).map(|p| vec![p]) } else { None };
+                        let val = if op.is_none() && self.loops.is_empty() { self.exact_size(e).map(|p| vec![p]) } else { None };
                         self.initial.insert(*v, val);
                     }
                 }
@@ -1658,18 +1745,21 @@ impl<'a, 'b, 'c> Fa<'a, 'b, 'c> {
                         self.expr(idx)?;
                         self.add_work_n(if op.is_some() { 3 } else { 1 });
                         self.access(*arr, idx, None);
+                        self.wrote(*arr);
                     }
                     LValue::Field(..) => self.add_work_n(if op.is_some() { 1 } else { 0 }),
                     LValue::IndexField(arr, idx, fi, _) => {
                         self.expr(idx)?;
                         self.add_work_n(if op.is_some() { 3 } else { 1 });
                         self.access(*arr, idx, Some(*fi));
+                        self.wrote(*arr);
                     }
                 }
                 Ok(())
             }
             Stmt::Reassign(idx) => {
                 let r = self.f.reassigns[*idx].clone();
+                self.wrote(r.target);
                 let size = self.local_size.get(&r.src).or_else(|| self.local_size.get(&r.target)).cloned();
                 if r.in_place {
                     self.add_work_n(1); // a pointer and a length, not a byte moved
@@ -1716,9 +1806,13 @@ impl<'a, 'b, 'c> Fa<'a, 'b, 'c> {
                 let atom = self.new_atom(&self.f.locals[*var].name.clone());
                 self.enter_loop(Loop { id: 0, var: Some(*var), atom: Some(atom), trip, lo, step: 1, offset: a_lo });
                 self.add_work_n(2); // increment, compare-and-branch, per iteration
+                let w = self.written_roots(body);
+                self.loop_writes.push(w);
                 let r = self.block(body);
                 r?;
-                self.leave_loop(body)
+                self.leave_loop(body)?;
+                self.loop_writes.pop();
+                Ok(())
             }
             Stmt::ParFor { var, end, body, acc, op } => {
                 let _ = (acc, op); // the combine's own work is inside `body`, walked normally
@@ -1731,13 +1825,21 @@ impl<'a, 'b, 'c> Fa<'a, 'b, 'c> {
                 let atom = self.new_atom(&self.f.locals[*var].name.clone());
                 self.enter_loop(Loop { id: 0, var: Some(*var), atom: Some(atom), trip: trip.clone(), lo: Poly::zero(), step: 1, offset: Some(Affine::constant(Poly::zero())) });
                 self.add_work_n(2);
+                let w = self.written_roots(body);
+                self.loop_writes.push(w);
                 let r = self.block(body);
                 r?;
-                self.leave_par_loop(body, &trip)
+                self.leave_par_loop(body, &trip)?;
+                self.loop_writes.pop();
+                Ok(())
             }
             Stmt::Break => Ok(()),
             Stmt::While { cond, decreasing, body, line } => {
                 self.expr(cond)?;
+                // the condition and the measure are read again every iteration: a size read from
+                // an array the body writes is not one
+                let w = self.written_roots(body);
+                self.loop_writes.push(w);
                 // the trip count: the programmer's measure, else an induction variable found in
                 // the condition and stepped by a constant in the body
                 // (trip, induction variable and its entry value, when there is one)
@@ -1779,9 +1881,18 @@ impl<'a, 'b, 'c> Fa<'a, 'b, 'c> {
                 };
                 self.enter_loop(Loop { id: 0, var, atom, trip, lo, step, offset });
                 self.add_work_n(1);
+                // the condition runs once more than the body: the walk above was the last, failing
+                // test, and this one is the test before each iteration. Only its memory is
+                // charged here — its work is the loop's compare-and-branch, as it always was
+                let (w0, sp0) = (self.work.clone(), self.span.clone());
+                self.expr(cond)?;
+                self.work = w0;
+                self.span = sp0;
                 let r = self.block(body);
                 r?;
-                self.leave_loop(body)
+                self.leave_loop(body)?;
+                self.loop_writes.pop();
+                Ok(())
             }
             Stmt::Expr(e) => { self.recognise(s); self.expr(e) }
             Stmt::Return(Some(e)) => self.expr(e),
@@ -1887,6 +1998,14 @@ impl<'a, 'b, 'c> Fa<'a, 'b, 'c> {
     /// `i > e` with `i -= c` is the mirror. Anything else is not an induction variable.
     fn induction_trip(&self, cond: &Expr, body: &Block) -> Result<(Poly, Option<(LocalId, Poly, i128)>), String> {
         let ask = "`while` has no measure the compiler can find; write `while cond decreasing <expr>` with an `i64` that goes down by at least one every iteration".to_string();
+        // `a && b` stops no later than either: the first conjunct with a trip bounds the loop, as
+        // a `break` does — an upper bound (cost-model § Loops without a range)
+        if let ExprKind::Binary(BinOp::And, a, b) = &cond.kind {
+            return match self.induction_trip(a, body) {
+                Ok(t) => Ok(t),
+                Err(ea) => self.induction_trip(b, body).map_err(|eb| if eb == ask { ea } else { eb }),
+            };
+        }
         let ExprKind::Binary(op, l, r) = &cond.kind else { return Err(ask) };
         // normalise to (var, bound, ascending)
         let (var, bound, asc) = match (&l.kind, &r.kind, op) {
@@ -1900,7 +2019,9 @@ impl<'a, 'b, 'c> Fa<'a, 'b, 'c> {
         if !self.f.locals[var].mutable || self.f.locals[var].ty != Ty::I64 { return Err(ask); }
         let Some(step) = single_step(body, var) else { return Err(format!("`{name}` is compared in the `while` condition but is not stepped by a constant exactly once in the body; {ask}")) };
         if (asc && step <= 0) || (!asc && step >= 0) { return Err(format!("`{name}` steps away from its bound; {ask}")); }
-        if assigns(body, |l| l != var && bound_mentions(bound, l)) { return Err(format!("the bound of `{name}` is assigned inside the body; {ask}")); }
+        let mut w = Writes::default();
+        w.block(body);
+        if w.locals.iter().any(|&l| l != var && bound_mentions(bound, l)) { return Err(format!("the bound of `{name}` is assigned inside the body; {ask}")); }
         let Some(e) = self.size_of(bound, if asc { Dir::Upper } else { Dir::Lower }) else { return Err(format!("the bound of `{name}` is not a size expression; {ask}")) };
         let i0 = match self.initial.get(&var) {
             Some(Some(vs)) if vs.len() == 1 => vs[0].clone(),
@@ -1984,6 +2105,14 @@ impl<'a, 'b, 'c> Fa<'a, 'b, 'c> {
             ExprKind::Block(b) => self.block(b),
             ExprKind::Call(fid, args) => {
                 for a in args { self.expr(a)?; }
+                // an array handed over writable may come back changed
+                for a in args {
+                    match &a.kind {
+                        ExprKind::Ref(s, true) => self.wrote(*s),
+                        ExprKind::Local(s) if self.f.locals[*s].ty.is_arrayish() && !matches!(self.f.locals[*s].ty, Ty::Slice(_, false, _)) => self.wrote(*s),
+                        _ => {}
+                    }
+                }
                 self.add_work_n(2); // call and return; arguments are register moves
                 if Some(*fid) == self.self_fid {
                     if self.replay { return Ok(()); }
@@ -2076,9 +2205,23 @@ impl<'a, 'b, 'c> Fa<'a, 'b, 'c> {
                         ));
                     }
                 }
-                w = w.subst_many(&map);
-                mv = mv.subst_many(&map);
-                sp = sp.subst_many(&map);
+                // the callee's reads are of the arrays this call passed it
+                let rename = |r: &Root| -> Root {
+                    match r {
+                        Root::Param(i, n) => match roots.get(*i).copied().flatten() {
+                            Some(rt) => {
+                                let name = self.f.locals[rt].name.clone();
+                                match self.f.params.iter().position(|&p| p == rt) { Some(j) => Root::Param(j, name), None => Root::Local(name) }
+                            }
+                            None => Root::Local(format!("{}.{n}", callee.name)),
+                        },
+                        Root::Local(n) if !n.contains('.') => Root::Local(format!("{}.{n}", callee.name)),
+                        other => other.clone(),
+                    }
+                };
+                w = w.rename_roots(&rename).subst_many(&map);
+                mv = mv.rename_roots(&rename).subst_many(&map);
+                sp = sp.rename_roots(&rename).subst_many(&map);
                 self.last_result = callee.result_size.as_ref().map(|p| p.subst_many(&map));
                 // the callee's footprint in this function's arrays (none is known of a declared callee)
                 let feet: Vec<(LocalId, Poly, Poly, bool)> = callee.footprint.iter().filter(|_| !declared_only && !opaque).filter_map(|f| {
@@ -2198,7 +2341,8 @@ fn bound_mentions(e: &Expr, l: LocalId) -> bool {
         ExprKind::Local(v) => *v == l,
         ExprKind::Len(v) => *v == l,
         ExprKind::Binary(_, a, b) | ExprKind::MinMax(_, a, b) => bound_mentions(a, l) || bound_mentions(b, l),
-        ExprKind::Unary(_, a) | ExprKind::Cast(a, _) => bound_mentions(a, l),
+        ExprKind::Unary(_, a) | ExprKind::Cast(a, _) | ExprKind::Field(a, _) => bound_mentions(a, l),
+        ExprKind::Index(_, i) => bound_mentions(i, l),
         _ => false,
     }
 }
@@ -2296,5 +2440,61 @@ fn callees_expr(e: &Expr, out: &mut Vec<FuncId>) {
         ExprKind::If(c, t, els) => { callees_expr(c, out); callees_block(t, out); if let Some(b) = els { callees_block(b, out); } }
         ExprKind::Block(b) => callees_block(b, out),
         ExprKind::Int(_) | ExprKind::Float(_) | ExprKind::Bool(_) | ExprKind::Byte(_) | ExprKind::Local(_) | ExprKind::Len(_) | ExprKind::Ref(..) => {}
+    }
+}
+
+/// What a block writes: the locals it assigns and the arrays it stores into, including through a
+/// call that is handed an array writable.
+#[derive(Default)]
+struct Writes {
+    locals: Vec<LocalId>,
+    arrays: Vec<LocalId>,
+}
+
+impl Writes {
+    fn block(&mut self, b: &Block) {
+        for st in &b.stmts {
+            match st {
+                Stmt::Let(_, e) | Stmt::Expr(e) | Stmt::Return(Some(e)) => self.expr(e),
+                Stmt::LetRepeat(_, a, n) => { self.expr(a); self.expr(n); }
+                Stmt::LetArray(_, es) => for e in es { self.expr(e); },
+                Stmt::LetBuild { len, body, .. } => { self.expr(len); self.block(body); }
+                Stmt::Assign(lv, _, e) => {
+                    match lv {
+                        LValue::Var(v) | LValue::Field(v, _) => self.locals.push(*v),
+                        LValue::Index(a, i, _) | LValue::IndexField(a, i, _, _) => { self.arrays.push(*a); self.expr(i); }
+                    }
+                    self.expr(e);
+                }
+                Stmt::For { var, start, end, body } => { self.locals.push(*var); self.expr(start); self.expr(end); self.block(body); }
+                Stmt::ParFor { var, end, body, acc, .. } => { self.locals.push(*var); self.locals.push(*acc); self.expr(end); self.block(body); }
+                Stmt::While { cond, decreasing, body, .. } => {
+                    self.expr(cond);
+                    if let Some(d) = decreasing { self.expr(d); }
+                    self.block(body);
+                }
+                // `ys = xs`: a new buffer or `xs`'s, either way not what a read of `ys` saw
+                Stmt::Reassign(_) | Stmt::Break | Stmt::Return(None) => {}
+            }
+        }
+        if let Some(t) = &b.tail { self.expr(t); }
+    }
+    fn expr(&mut self, e: &Expr) {
+        match &e.kind {
+            ExprKind::Call(_, args) => for a in args {
+                match &a.kind {
+                    ExprKind::Ref(s, true) => self.arrays.push(*s),
+                    ExprKind::Local(s) => self.arrays.push(*s),
+                    _ => {}
+                }
+                self.expr(a);
+            },
+            ExprKind::Binary(_, a, b) | ExprKind::MinMax(_, a, b) => { self.expr(a); self.expr(b); }
+            ExprKind::Unary(_, a) | ExprKind::Field(a, _) | ExprKind::Println(a) | ExprKind::Cast(a, _) | ExprKind::Index(_, a) => self.expr(a),
+            ExprKind::StructLit(_, es) => for x in es { self.expr(x); },
+            ExprKind::If(c, t, els) => { self.expr(c); self.block(t); if let Some(b) = els { self.block(b); } }
+            ExprKind::Block(b) => self.block(b),
+            ExprKind::Int(_) | ExprKind::Float(_) | ExprKind::Bool(_) | ExprKind::Byte(_) | ExprKind::Local(_) | ExprKind::Len(_) | ExprKind::Ref(..) => {}
+        }
     }
 }

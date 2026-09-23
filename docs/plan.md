@@ -496,6 +496,39 @@ could become `modulo` too, with the argument as `_`, but only by giving an exact
 treatment as an unknown one, which throws away a cost the compiler has — worth doing only if (2)
 does not make those arguments sizes first. Next is (2).
 
+**(2) done, 2026-09-23** (cost-model § A size read from memory; golden `bfs`). An `i64` read
+from an array where a size is needed is an atom of its own, `toks[a].len` or `offsets[u]`, the
+same atom for the same text until the array is written, and no size inside a loop that writes it;
+a read at an index that is not a size is `max(xs[_])` (or `min`, bounding from below) and makes
+the line `bound`, an upper bound that says so. Two smaller changes rode along because the
+compiler's loops needed them: `while a && b` takes its trip from the first conjunct that has one,
+and the condition's memory is charged every iteration. Measured on the compiler, text unchanged:
+**92 exact, 37 modulo, 28 bound, 119 unknown**, from 81, 33, 0 and 162. The unknowns now:
+
+| cause | functions |
+|---|---|
+| the compared variable is not stepped by a constant exactly once | 29 |
+| calls a callee in its own cycle of calls | 27 |
+| a `while` bound is not a size expression | 19 |
+| a `while` with no measure the compiler can find | 17 |
+| an exact callee's cost depends on an argument that is not a size expression | 14 |
+| recursion with no shrinking argument, an entry value set in an earlier loop | 9 |
+| `unbounded`, an `extern` | 4 |
+
+The three trip-count rows are 65, from 111; the `for` whose bound is not a size is gone as a row.
+Two things this did not do. The atom is not yet followed back to the store that wrote it, which
+the step's own wording asked for where the checker can see one — so `bfs`, one of M3's two holes,
+is now a bound, `n·(max(offsets[_]) − min(offsets[_]))`, and not the `edges.len()` a
+potential-method count of its pushes would give; that is (3). And the self-hosted pass has no read
+atoms: it declines where it declined before, so the parity test lists `bfs` as a footprint it
+states more narrowly (three arrays of four), which is the one new entry. And it costs compile
+time: `neant check` on the compiler takes 5.5 s where it took 1.1 s, all of it in choosing layouts,
+which costs the whole program once per struct and layout. Each read atom that sizes a window is a
+fit condition of its own, so the regimes multiply — `pol_nth` has 16 — where parameters alone kept
+them few; as first written, before a read that loses its element was made one atom and the
+conditions were summed with the cost, it was 81 s and 64 regimes. Folding regimes that no machine
+can tell apart is the fix, and is not done. Next is (3).
+
 **Not in this stage, but what makes the number meaningful afterwards.** The roofline term M5
 decided (`moves/BW` taken as a `max` with `work/P`), so the prediction reaches time; argv, modules
 and arrays by value, without which a domain corpus (stage C's control loops and kernels) cannot be

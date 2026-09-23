@@ -151,7 +151,7 @@ fn dominates(u: &super::size::Mono, t: &super::size::Mono) -> bool {
     let exp = |m: &super::size::Mono, a: &Atom| m.factors.get(a).copied().unwrap_or(Rat::zero());
     let mut vars: Vec<Atom> = Vec::new();
     for a in u.factors.keys().chain(t.factors.keys()) {
-        if matches!(a, Atom::Var(_)) && !vars.contains(a) { vars.push(*a.clone_ref()); }
+        if a.is_size() && !vars.contains(a) { vars.push(*a.clone_ref()); }
     }
     for v in &vars {
         let (eu, et) = (exp(u, v), exp(t, v));

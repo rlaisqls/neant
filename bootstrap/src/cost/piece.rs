@@ -147,8 +147,14 @@ impl Cost {
     }
     pub fn mul_poly(&self, p: &Poly) -> Cost { self.map(|q| q.mul(p)) }
     pub fn scale(&self, r: Rat) -> Cost { self.map(|q| q.scale(r)) }
+    /// A condition that reads an element at the atom is decided at the most that element holds:
+    /// the atom is gone once summed, and a regime cannot be chosen per iteration.
     pub fn sum_over(&self, atom: usize, lo: &Poly, step: i128, trip: &Poly) -> Cost {
-        self.map(|q| q.sum_over(atom, lo, step, trip))
+        let hide = |p: &Poly| p.mentions(atom);
+        Cost::from_pieces(self.pieces.iter().map(|p| Piece {
+            conds: p.conds.iter().map(|c| Cond { ws: c.ws.hide_args(&hide), fits: c.fits }).collect(),
+            poly: p.poly.sum_over(atom, lo, step, trip),
+        }).collect())
     }
     /// Substitution reaches into the conditions too.
     pub fn subst_many(&self, map: &[(usize, Poly)]) -> Cost {
@@ -256,8 +262,15 @@ impl Cost {
     pub fn mentions(&self, atom: usize) -> bool { self.pieces.iter().any(|p| p.poly.mentions(atom) || p.conds.iter().any(|c| c.ws.mentions(atom))) }
     pub fn max_var(&self) -> Option<usize> { self.pieces.iter().filter_map(|p| p.poly.max_var()).max() }
     pub fn has_opaque(&self) -> bool { self.pieces.iter().any(|p| p.poly.has_opaque()) }
+    pub fn has_loose_read(&self) -> bool { self.pieces.iter().any(|p| p.poly.has_loose_read()) }
     pub fn opaque_callees(&self, out: &mut Vec<String>) { for p in &self.pieces { p.poly.opaque_callees(out); } }
     pub fn hide_args(&self, hide: &dyn Fn(&Poly) -> bool) -> Cost { self.map(|q| q.hide_args(hide)) }
+    pub fn rename_roots(&self, f: &dyn Fn(&super::size::Root) -> super::size::Root) -> Cost {
+        Cost::from_pieces(self.pieces.iter().map(|p| Piece {
+            conds: p.conds.iter().map(|c| Cond { ws: c.ws.rename_roots(f), fits: c.fits }).collect(),
+            poly: p.poly.rename_roots(f),
+        }).collect())
+    }
 
     /// Value at a full assignment: the conditions are decided with the machine's `B` and `M`,
     /// and the applicable pieces' maximum is taken.

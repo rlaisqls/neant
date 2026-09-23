@@ -39,8 +39,8 @@ fn repo(sub: &str) -> PathBuf {
 /// deliberate divergence should land here and be argued, not absorbed.
 const COPIES_INSTEAD: &[(&str, &str)] = &[];
 
-/// Functions whose **footprint** this pass states more narrowly than `neant cost`: it reports none
-/// where the Rust reports one. A narrowing, not a disagreement — the two never state *different*
+/// Functions whose **footprint** this pass states more narrowly than `neant cost`: it reports none,
+/// or fewer arrays, where the Rust reports one. A narrowing, not a disagreement — the two never state *different*
 /// footprints, and a missing one only costs a caller a credit it could have had.
 ///
 /// `parse`'s `number` is the whole list. Its `while` carries a `decreasing` measure the compiler
@@ -48,7 +48,13 @@ const COPIES_INSTEAD: &[(&str, &str)] = &[];
 /// `pos` by then and this walk has not, because it stops at the loop it cannot bound instead of
 /// walking the body for sites it will not cost. Widening it means collecting sites past a decline,
 /// which is a change to the walk, not to the footprint.
-const FOOTPRINT_NARROWER: &[(&str, &str)] = &[("parse.nt", "number")];
+///
+/// `bfs.nt`'s `bfs` is the same stop one loop later, and states a subset rather than none: its
+/// inner loop runs `offsets[u]..offsets[u + 1]`, which the Rust now bounds by a size read from
+/// memory (stage D (2)) and walks, reaching `edges`; this pass has no read atoms, declines that
+/// loop, and states the three arrays it touched before it. A listed function may state fewer
+/// entries than `neant cost`, never a different one, and claims no residue.
+const FOOTPRINT_NARROWER: &[(&str, &str)] = &[("parse.nt", "number"), ("bfs.nt", "bfs")];
 
 /// The same for the **footprint lower bound**: stated where `neant cost` states one and this pass
 /// states none. A `while` loop is given no loop atom by this pass — only a `for` mints one — so a
@@ -87,7 +93,7 @@ const EXACT_MOVES: usize = 98;
 /// whole of it is resident on return, whitespace-normalised so the report's column padding is not
 /// part of the comparison. Counted over every function, so one that should state no footprint and
 /// states none counts too.
-const EXACT_FOOT: usize = 115;
+const EXACT_FOOT: usize = 114;
 
 /// The same for the **footprint lower bound** — `moves` cannot be less than the distinct bytes a
 /// function's parameter arrays reach. Counted over every function, so a `main` that should have no
@@ -182,6 +188,28 @@ fn rust_foot(out: &str) -> BTreeMap<String, String> {
         m.insert(cur.clone(), format!("{e} {res}").trim().to_string());
     }
     m
+}
+
+/// Whether footprint `g` names only entries `w` names too, and claims no residue: what a walk that
+/// stopped early states of what a longer walk found.
+fn foot_subset(w: &str, g: &str) -> bool {
+    fn entries(s: &str) -> Option<Vec<String>> {
+        let (es, res) = s.rsplit_once(" | ").map_or((s, s), |(a, b)| (a, b));
+        let toks: Vec<&str> = es.split(' ').collect();
+        let mut out: Vec<String> = Vec::new();
+        for (i, t) in toks.iter().enumerate() {
+            let starts = t.ends_with(':') && toks.get(i + 1).is_some_and(|n| n.starts_with('['));
+            match out.last_mut() {
+                Some(e) if !starts => { e.push(' '); e.push_str(t); }
+                _ => out.push(t.to_string()),
+            }
+        }
+        (res == "none" || res == "| none").then_some(out)
+    }
+    match (entries(w), entries(g)) {
+        (Some(we), Some(ge)) => ge.iter().all(|e| we.contains(e)),
+        _ => false,
+    }
 }
 
 fn rust_bounds(out: &str) -> BTreeMap<String, String> {
@@ -305,6 +333,7 @@ fn self_hosted_work_agrees_with_bootstrap() {
                 (Some(w), "none") => failures.push(format!("{name} {fname}: `neant cost` states \
                     footprint [{w}], the self-hosted pass states none and is not listed as narrower")),
                 (Some(w), g) if w == g => exact_foot += 1,
+                (Some(w), g) if listed && foot_subset(w, g) => {}
                 (Some(w), g) => failures.push(format!("{name} {fname}: `neant cost` states \
                     footprint [{w}], the self-hosted pass says [{g}]")),
             }

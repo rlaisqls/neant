@@ -15,8 +15,9 @@ Or it gets one sentence saying why not, with a line number. It never gets nothin
 ## Size variables
 
 A function's atoms are its parameters, in order: a slice parameter `a: &[T]` contributes
-`a.len()`, an `i64` parameter `n` contributes `n`. There are no other atoms — every size inside
-the body must reduce to these and constants, or the function's cost is unknown.
+`a.len()`, an `i64` parameter `n` contributes `n`. The one other kind of atom is a value read
+from memory (§ A size read from memory) — every size inside the body must reduce to these and
+constants, or the function's cost is unknown.
 
 An `i64` expression is a **size expression** when it is built from integer literals, size
 atoms, `.len()` of a local whose size is known, immutable `let`s bound to size expressions, loop
@@ -293,10 +294,14 @@ A `while` gets a trip count in one of two ways, or none.
   read *at entry*: mutable locals in it stand for what they were last assigned. `decreasing
   j − i` after `let mut i = 0; let mut j = s.len() − 1` is `s.len() − 1`. The programmer is
   promising `m` goes down by at least one per iteration; the compiler does not check it.
-- **Neither**, or a measure that reads memory (`decreasing s.len() − pos[0]`): the function's
-  cost is unknown, the message says which, and `neant measure` is the way to a number.
+- **Neither**, or a measure that reads an array the body writes (`decreasing s.len() − pos[0]`
+  with `pos[0] += 1` inside): the function's cost is unknown, the message says which, and `neant
+  measure` is the way to a number.
 
-`break` changes nothing: every bound here is an upper bound.
+`break` changes nothing: every bound here is an upper bound. Nor does `&&`: `while a && b` stops
+no later than either conjunct would, so the first conjunct that has a trip count bounds the loop.
+The condition is evaluated once more than the body runs, and the memory it reads is charged each
+time; its work is the loop's compare-and-branch, as it always was.
 
 ## Recursion
 
@@ -401,6 +406,33 @@ credited to what follows and nothing is claimed resident after it. Three things 
 a callee declared `unbounded`, whose term would be infinite; a callee in the same cycle of calls
 as the caller, whose cost is a system of recurrences in which neither can be a term of the other;
 and an exact callee whose cost depends on an argument that is not a size expression.
+
+## A size read from memory
+
+An `i64` read from an array — an element `xs[e]` of an `[i64]`, or a field `xs[e].f` of type
+`i64` — is a size where a size is needed: a loop bound, a `while` bound, an immutable `let`, the
+entry value of an induction variable. It is an atom of its own, minted at the read and named by
+its text, `offsets[u]` or `pols[p].n_term`; nothing is known of its value, so a cost in it is
+exact in it the way a cost in a parameter is exact in the parameter. Where `e` is itself a size
+expression the atom is that element. Where it is not, the atom is `max(xs[_])` — the most any
+element holds — or `min(xs[_])` where the size bounds something from below, as the start of a
+range does, and the line's tier is `bound`, not `exact`: it is an upper bound and says so. The
+same happens to an element whose index a loop sums away, in the cost and in the fit conditions
+between its regimes alike. `max(xs[_])` is one atom however many reads produced it — the most the
+array holds over the run — so two of them multiply to a square and do not fork a regime apiece.
+A footprint lower bound that is still in a closed loop's variable is dropped rather than
+widened, since a `max` would make a lower bound larger.
+
+A read names a value, not a place. Two reads of the same text are one atom until something writes
+the array — a store into it, `ys = xs` onto it, or passing it to a call that may write it (`&mut`,
+or an owned array). Inside a loop whose body writes the array, a read of it is no size at all,
+since it differs from one iteration to the next. Through a call the callee's reads come with its
+cost: a read of a parameter becomes a read of the caller's argument, and a read of the callee's
+own array stays as `f.xs[…]`, a value the caller cannot name any better.
+
+What the atom is not yet: the expression the value was written from. `let k = n; xs[0] = k` then
+a loop to `xs[0]` is a loop to the atom `xs[0]`, not to `n` — following a store to its load is
+what plan § Stage D (2) left for later.
 
 ## The measured tier
 

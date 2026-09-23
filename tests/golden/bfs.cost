@@ -1,5 +1,10 @@
-bfs              unknown: loop bound is not a size expression (line 16)
+bfs              work ≈ 12·dist.len()·max(offsets[_]) − 12·dist.len()·min(offsets[_]) moves                              bound  (4 regimes)
+                                               moves ≈ B·dist.len()·max(offsets[_]) − B·dist.len()·min(offsets[_]) if ≈ 3·B·max(offsets[_]) − 3·B·min(offsets[_]) < M
+                                               moves ≈ 3·B·dist.len()·max(offsets[_]) − 3·B·dist.len()·min(offsets[_]) if ≈ 3·B·max(offsets[_]) − 3·B·min(offsets[_]) ≥ M
+                                               moves ≈ 3·B·dist.len()·max(offsets[_]) − 3·B·dist.len()·min(offsets[_]) if ≈ 3·B·max(offsets[_]) − 3·B·min(offsets[_]) < M and 8·dist.len() ≥ M
+                                               moves ≈ 2·B·dist.len()·max(offsets[_]) − 2·B·dist.len()·min(offsets[_]) if ≈ 3·B·max(offsets[_]) − 3·B·min(offsets[_]) < M and 8·dist.len() < M
                  lower bound      moves 8·dist.len()                 (footprint, every distinct element crosses once)
-                 footprint        offsets: [0, 8·offsets.len()) (whole array)  dist: [0, 8·dist.len()) (whole array)  queue: [0, 8·queue.len()) (whole array)   no residue claimed
-main             work work[bfs](7, 5, 6, 6, 0) + 31 moves moves[bfs](7, 5, 6, 6, 0) + 2·B + 192 modulo, io
-                 rests on         bfs (unknown)
+                 footprint        offsets: [0, 8·offsets.len()) (whole array)  edges: [0, 8·edges.len()) (whole array)  dist: [0, 8·dist.len()) (whole array)  queue: [0, 8·queue.len()) (whole array)   no residue claimed
+main             work 72·max(offsets[_]) − 72·min(offsets[_]) + 95 moves                              bound, io  (2 regimes)
+                                               moves ≈ 18·B·max(offsets[_]) − 18·B·min(offsets[_]) if ≈ 3·B·max(offsets[_]) − 3·B·min(offsets[_]) ≥ M
+                                               moves ≈ 12·B·max(offsets[_]) − 12·B·min(offsets[_]) if ≈ 3·B·max(offsets[_]) − 3·B·min(offsets[_]) < M
