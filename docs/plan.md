@@ -416,6 +416,66 @@ neant's `i64` is `int64_t` where libc's parameter is `int`. Also found along the
 reassignment cannot be type-checked without them, which the checker design had said the opposite
 of.
 
+## Stage D — ordinary code
+
+**Why this comes before the rest of self-hosting.** Self-hosting is, by this document's own words,
+not a proof of anything, and the parity work left — span, the report lines — proves nothing more.
+What the project has to prove is the governing number: that the exact tier moves on ordinary code
+(§ Who switches). And self-hosting produced, as a by-product, the largest ordinary program this
+language has — one not written to suit the rules, since it was written to compile itself. Measured
+2026-09-23, `neant cost` on `compiler/*.nt` concatenated as `build.sh` does: **81 of 276 functions
+exact, 29%.** The 195 unknowns split in two:
+
+| cause | functions |
+|---|---|
+| calls a callee whose cost is unknown | 95 |
+| a loop bound is not a size expression | 55 |
+| a `while` with no measure the compiler can find | 22 |
+| the compared variable is not stepped by a constant exactly once | 16 |
+| recursion with no shrinking argument, an entry value set in an earlier loop, `unbounded`, an `extern` | 7 |
+
+So half the unknowns are contagion, not ignorance, and most of the rest are one shape: a trip count
+read from memory. `tok_text_eq` walks `i < toks[a].len`, a length stored in a field — a size, but
+not one the calculus can name, because sizes today are only array lengths and immutable locals.
+These are the two holes M3 named, a worklist whose trip count is not a size expression and a
+measure that reads memory, at the scale of a real program.
+
+**Claim.** The exact tier grows on code that was not written for the rules, by extending what a
+size is — not by asking the programmer for more measures.
+
+**Do.**
+1. **Unknowns stop propagating.** A call to a callee with no cost contributes a named term `c(f)`
+   to the caller, in the callee's argument sizes where they are size expressions, and the rest of
+   the caller's cost stays exact. The caller's tier becomes *exact modulo* the named callees, the
+   report and the lockfile say which, and `rests on` carries them like an `extern` declaration. A
+   caller of an unknown is then exactly as informative as a caller of a declared callee, which it
+   already is.
+2. **Sizes read from data.** A field of integer type read at a loop bound becomes a size atom of
+   its own (`toks[a].len`), minted at the read, so a loop over it is exact in that atom. Where the
+   value was written from an array length or a size expression the checker can see, the atom is
+   that expression; otherwise it stays free and is reported as such.
+3. **Amortised trip counts.** A worklist loop — pop until empty, pushes inside — is bounded by the
+   total pushes, charged at the push sites (the potential method, as RAML does for OCaml). The
+   total is a size expression when every push site is inside a loop that is one.
+4. **The compiler's coverage is a tracked number.** `compiler/costs.lock` is committed and the
+   exact count out of 276 is recorded here at every change to the calculus, beside the M3/M4
+   corpus's 15 of 20.
+
+**Exit.** Measured on the compiler, whose text is not changed to help: the contagion row goes to
+zero by construction (1); the other rows fall by (2) and (3); and the exact share, counting *exact
+modulo* separately, is reported. The M3 corpus is re-counted with it, and its two holes are either
+closed or named as what (2) and (3) do not reach.
+
+**Kill.** If, with (1)–(3), the compiler is still mostly unknown for reasons that are not the
+rows above, the calculus does not reach ordinary code, and § Who switches is reopened with the
+number in hand — the positioning question stage C was meant to answer and could not, for want of
+a corpus.
+
+**Not in this stage, but what makes the number meaningful afterwards.** The roofline term M5
+decided (`moves/BW` taken as a `max` with `work/P`), so the prediction reaches time; argv, modules
+and arrays by value, without which a domain corpus (stage C's control loops and kernels) cannot be
+written; and the editor surface the README describes, which does not exist.
+
 ## M7 — the constant factor
 
 Prove the asymptote, search the constant. A micro-architectural cost line (what llvm-mca and uiCA
