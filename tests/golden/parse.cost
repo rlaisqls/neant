@@ -6,4 +6,5 @@ atom             unknown: calls `atom`, whose cost is unknown (mutually recursiv
                  footprint        pos: [0, 8)   resident after if 8 < M
 term             unknown: calls `atom`, whose cost is unknown (mutually recursive with another function; only self-recursion is solved) (line 29)
 expr             unknown: calls `atom`, whose cost is unknown (mutually recursive with another function; only self-recursion is solved) (line 38)
-main             unknown: calls `atom`, whose cost is unknown (mutually recursive with another function; only self-recursion is solved) (line 49)
+main             work 2·work[expr](11, 1) + 30     moves 2·moves[expr](11, 1) + 38    modulo, io
+                 rests on         expr (unknown)

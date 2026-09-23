@@ -471,6 +471,31 @@ rows above, the calculus does not reach ordinary code, and § Who switches is re
 number in hand — the positioning question stage C was meant to answer and could not, for want of
 a corpus.
 
+**(1) done, 2026-09-23** (cost-model § An unknown callee is a term; golden `modulo`). An unknown
+callee is `work[f](…)` / `moves[f](…)` in its caller, the caller's tier is `modulo`, and it rests
+on `f (unknown)`. Measured on the compiler again, its text unchanged: **81 exact, 33 modulo, 162
+unknown**, from 81 and 195. The contagion row did not go to zero, and the reason is the finding:
+of the 95 functions that were unknown only by what they called, 33 are now `modulo` and the other
+62 had **causes of their own that contagion was hiding** — the walk used to stop at the first
+unknown call and never reached them. The unknowns now, every one for its own reason:
+
+| cause | functions |
+|---|---|
+| a loop bound is not a size expression | 59 |
+| a `while` with no measure the compiler can find | 30 |
+| the compared variable is not stepped by a constant exactly once | 22 |
+| calls a callee in its own cycle of calls (mutual recursion, left unknown on purpose) | 22 |
+| an exact callee's cost depends on an argument that is not a size expression | 15 |
+| recursion with no shrinking argument, an entry value set in an earlier loop | 10 |
+| `unbounded`, an `extern` | 4 |
+
+So the table this stage opened with undercounted what (2) and (3) have to reach: 111 functions
+(the first three rows) are trip counts the calculus cannot name, not 93. Mutual recursion, which
+M3 already named, is 22 more and is not in (1)–(3); the fifteen whose argument is not a size
+could become `modulo` too, with the argument as `_`, but only by giving an exact callee the same
+treatment as an unknown one, which throws away a cost the compiler has — worth doing only if (2)
+does not make those arguments sizes first. Next is (2).
+
 **Not in this stage, but what makes the number meaningful afterwards.** The roofline term M5
 decided (`moves/BW` taken as a `max` with `work/P`), so the prediction reaches time; argv, modules
 and arrays by value, without which a domain corpus (stage C's control loops and kernels) cannot be

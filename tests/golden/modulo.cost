@@ -1,0 +1,9 @@
+walk             unknown: the `decreasing` measure is not shown to decrease: there is a path through the body along which it changes by 0 (line 5)
+twice            work ≈ 4·xs.len() + work[walk](xs.len()) + work[walk](3) moves ≈ 8·xs.len() + moves[walk](xs.len()) + moves[walk](3) modulo
+                 lower bound      moves 8·xs.len()                   (footprint, every distinct element crosses once)
+                 footprint        xs: [0, 8·xs.len())   resident after if 8·xs.len() < M
+                 rests on         walk (unknown)
+each             work n·work[walk] + 5·n           moves n·moves[walk] + moves[walk](0) − moves[walk] modulo
+                 rests on         walk (unknown)
+main             work ≈ work[walk](4) + work[walk](3) + 4·work[walk] + 52 moves ≈ moves[walk](4) + moves[walk](3) + moves[walk](0) + 3·moves[walk] + B + 64 modulo, io
+                 rests on         walk (unknown)

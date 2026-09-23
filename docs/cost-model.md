@@ -366,7 +366,8 @@ unbounded`, and is the boundary stage C measures and audits.
 ## What a line rests on
 
 A line's tier says how its numbers were obtained: `exact` and `recurrence` by the calculus,
-`declared` by a person, `measured` by the machine. A function that composes a declared callee
+`modulo` by the calculus up to the unknown callees it names, `declared` by a person, `measured`
+by the machine. A function that composes a declared callee
 rests on that declaration, and says so — `rests on labs (declared, extern)`, or `(declared,
 checked)` when the callee has a body the compiler verified against its declaration — transitively
 up the call graph. The tier column is therefore an audit chain: every number in `costs.lock` is
@@ -380,6 +381,26 @@ each size, within the counter's known factors — work up to 1.5× + 2, moves up
 per call, because reads pair, prefetch overfetches and process noise divides by the repeats. The
 verdict, `confirmed` or `EXCEEDED`, and the range it was measured over go into the lockfile with
 `--lock`, and `neant lock` keeps that annotation when it regenerates the file.
+
+## An unknown callee is a term
+
+A call to a function whose cost is unknown does not make the caller unknown. The callee's cost
+enters the caller as a named term, `work[f](…)` and `moves[f](…)`, over the callee's parameters
+that carry a size — an array's length, an `i64`'s value — with each argument the caller can state
+as a size expression written in, and `_` for one it cannot. A term with a `_` is the most one call
+costs over every value that argument takes, so two calls that differ only there are the same term;
+a loop summing a call whose argument is its own variable does the same, since a term cannot be
+summed over an argument (`for k in 0..n { walk(k) }` is `n·work[walk]`). The rest of the caller
+is costed as before and its tier is `modulo`, with `rests on f (unknown)` naming the callee, which
+carries its own reason on its own line. The term substitutes through callers like any size, is
+never given a value, is never dropped as lower order, and is covered by a `#[cost]` bound only by
+the same term — so a declaration never holds of a cost with an unknown in it.
+
+The callee is seen the way a declared one is: no footprint and no residue, so nothing it reads is
+credited to what follows and nothing is claimed resident after it. Three things stay unknown:
+a callee declared `unbounded`, whose term would be infinite; a callee in the same cycle of calls
+as the caller, whose cost is a system of recurrences in which neither can be a term of the other;
+and an exact callee whose cost depends on an argument that is not a size expression.
 
 ## The measured tier
 

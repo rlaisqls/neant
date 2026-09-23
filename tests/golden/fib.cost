@@ -1,3 +1,4 @@
 fib              unknown: 2 recursive calls each shrinking `n` by a constant: exponential (line 3)
 fact             work 6·n + 6                      moves 0                            recurrence
-main             unknown: calls `fib`, whose cost is unknown (2 recursive calls each shrinking `n` by a constant: exponential) (line 11)
+main             work work[fib](20) + 102          moves moves[fib](20)               modulo, io
+                 rests on         fib (unknown)

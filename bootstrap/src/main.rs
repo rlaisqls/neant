@@ -550,6 +550,7 @@ fn eval_one(c: &cost::FuncCost, cost: &cost::Cost, ev: &str, m: &cost::Machine) 
                 vals.iter().find(|(k, _)| k == name).map(|(_, v)| *v)
             }
             Atom::Log(_) => None, // handled inside eval
+            Atom::Opaque(_) => None,
         }
     };
     cost.eval(&f, m)

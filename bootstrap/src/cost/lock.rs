@@ -67,6 +67,7 @@ fn leading_numeric(p: &Poly, m: &Machine) -> Option<(Vec<(usize, super::size::Ra
                 Atom::P => coef *= (m.p_cores as f64).powf(e.to_f64()),
                 Atom::Var(i) => key.push((*i, *e)),
                 Atom::Log(_) => key.push((usize::MAX, *e)),
+                Atom::Opaque(_) => key.push((usize::MAX - 1, *e)),
             }
         }
         *groups.entry(key).or_insert(0.0) += coef;

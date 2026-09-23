@@ -1,2 +1,3 @@
 f                unknown: the `decreasing` measure is not shown to decrease: there is a path through the body along which it changes by 0 (line 5)
-main             unknown: calls `f`, whose cost is unknown (the `decreasing` measure is not shown to decrease: there is a path through the body along which it changes by 0) (line 12)
+main             work work[f](5) + 3               moves moves[f](5)                  modulo, io
+                 rests on         f (unknown)

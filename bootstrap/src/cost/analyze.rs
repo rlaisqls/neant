@@ -16,7 +16,7 @@ use crate::ir::*;
 use super::bounds::{self, Bound};
 use super::rewrite;
 use super::piece::{Cond, Cost, Piece};
-use super::size::{Atom, Poly, Rat};
+use super::size::{Atom, Opaque, Poly, Rat};
 
 #[derive(Debug, Clone, Copy)]
 pub struct Machine {
@@ -108,7 +108,7 @@ pub struct Suggestion {
 
 /// Every function's cost, with no rewrites tried: what the layout pass compares.
 pub fn analyze_costs(m: &Module, machine: &Machine) -> Vec<FuncCost> {
-    let mut an = Analyzer { m, machine: *machine, done: vec![None; m.funcs.len()], active: vec![false; m.funcs.len()] };
+    let mut an = Analyzer::new(m, machine);
     for i in 0..m.funcs.len() { an.func(i); }
     an.done.into_iter().map(|c| c.unwrap()).collect()
 }
@@ -150,7 +150,7 @@ pub fn choose_layouts(m: &mut Module, machine: &Machine) -> Vec<LayoutChoice> {
             let at = |c: &FuncCost| -> (f64, String) {
                 match &c.result {
                     CostResult::Exact { moves, .. } => {
-                        let point = |a: Atom| match a { Atom::B => Some(machine.b_bytes as f64), Atom::M => Some(machine.m_bytes as f64), Atom::P => Some(machine.p_cores as f64), Atom::Var(_) => Some(1e6), Atom::Log(_) => None };
+                        let point = |a: Atom| match a { Atom::B => Some(machine.b_bytes as f64), Atom::M => Some(machine.m_bytes as f64), Atom::P => Some(machine.p_cores as f64), Atom::Var(_) => Some(1e6), Atom::Log(_) | Atom::Opaque(_) => None };
                         (moves.eval(&point, machine).unwrap_or(0.0), super::lock::brief(moves, &c.names))
                     }
                     CostResult::Unknown { .. } => (0.0, "unknown".into()),
@@ -175,7 +175,7 @@ pub fn choose_layouts(m: &mut Module, machine: &Machine) -> Vec<LayoutChoice> {
 }
 
 pub fn analyze(m: &Module, machine: &Machine) -> Vec<FuncCost> {
-    let mut an = Analyzer { m, machine: *machine, done: vec![None; m.funcs.len()], active: vec![false; m.funcs.len()] };
+    let mut an = Analyzer::new(m, machine);
     for i in 0..m.funcs.len() {
         an.func(i);
     }
@@ -243,7 +243,7 @@ fn tile_choice(an: &mut Analyzer, f: &Func) -> Option<TileChoice> {
     let CostResult::Exact { work, moves, .. } = &c.result else { return None };
     if std::env::var("NEANT_DEBUG_TILE").is_ok() { eprint!("{}", super::lock::report(&c, &machine)); }
     // the reference point: this machine, every size a million — tiling is for large sizes
-    let point = |t: Option<f64>| move |a: Atom| match a { Atom::B => Some(machine.b_bytes as f64), Atom::M => Some(machine.m_bytes as f64), Atom::P => Some(machine.p_cores as f64), Atom::Var(v) if v == tvar => t, Atom::Var(_) => Some(1e6), Atom::Log(_) => None };
+    let point = |t: Option<f64>| move |a: Atom| match a { Atom::B => Some(machine.b_bytes as f64), Atom::M => Some(machine.m_bytes as f64), Atom::P => Some(machine.p_cores as f64), Atom::Var(v) if v == tvar => t, Atom::Var(_) => Some(1e6), Atom::Log(_) | Atom::Opaque(_) => None };
     let holds = |conds: &[Cond]| conds.iter().all(|c| c.ws.eval(&point(None)).is_some_and(|ws| ((ws * (machine.b_bytes as f64)) < (machine.m_bytes as f64)) == c.fits));
     let mut best: Option<(f64, Poly, bool, Poly, Piece)> = None;
     let half = Poly::atom(Atom::M).scale(Rat::new(1, 2));
@@ -332,9 +332,33 @@ struct Analyzer<'a> {
     machine: Machine,
     done: Vec<Option<FuncCost>>,
     active: Vec<bool>,
+    /// `reach[f][g]`: `f` calls `g`, directly or through others
+    reach: Vec<Vec<bool>>,
 }
 
 impl<'a> Analyzer<'a> {
+    fn new(m: &'a Module, machine: &Machine) -> Analyzer<'a> {
+        let n = m.funcs.len();
+        let direct: Vec<Vec<FuncId>> = m.funcs.iter().map(|f| {
+            let mut out = Vec::new();
+            if let Some(b) = &f.body { callees_block(b, &mut out); }
+            out
+        }).collect();
+        let reach = (0..n).map(|s| {
+            let mut seen = vec![false; n];
+            let mut stack: Vec<FuncId> = direct[s].clone();
+            while let Some(g) = stack.pop() {
+                if seen[g] { continue; }
+                seen[g] = true;
+                stack.extend(direct[g].iter().copied());
+            }
+            seen
+        }).collect();
+        Analyzer { m, machine: *machine, done: vec![None; n], active: vec![false; n], reach }
+    }
+    /// Two distinct functions that call each other, however indirectly: a cost of either is a
+    /// system of recurrences, and neither can stand as a named term in the other.
+    fn mutual(&self, f: FuncId, g: FuncId) -> bool { f != g && self.reach[f][g] && self.reach[g][f] }
     fn func(&mut self, fid: FuncId) -> &FuncCost {
         if self.done[fid].is_none() {
             let f = &self.m.funcs[fid];
@@ -623,6 +647,22 @@ impl<'a, 'b, 'c> Fa<'a, 'b, 'c> {
             }
             Err(Fail::Unknown(reason, line)) => CostResult::Unknown { reason, line },
         };
+        // exact modulo the unknown callees it names — unless one of them is this function, reached
+        // back through a cycle: a cost stated in terms of itself is a recurrence, not a cost
+        let result = match result {
+            CostResult::Exact { work, moves, span } if work.has_opaque() || moves.has_opaque() => {
+                let mut named = Vec::new();
+                work.opaque_callees(&mut named);
+                moves.opaque_callees(&mut named);
+                if named.contains(&self.f.name) {
+                    CostResult::Unknown { reason: "mutually recursive with another function; only self-recursion is solved".into(), line: self.f.line }
+                } else {
+                    tier = "modulo";
+                    CostResult::Exact { work, moves, span }
+                }
+            }
+            other => other,
+        };
         // `#[cost(...)]`: the inferred cost must stay within the declaration. Without `sizes`,
         // by asymptotic dominance in every regime; with `sizes`, as numbers at those bounds and
         // the machine's B and M — a budget in real units.
@@ -648,7 +688,7 @@ impl<'a, 'b, 'c> Fa<'a, 'b, 'c> {
                             match a {
                                 Atom::B => Some(m.b_bytes as f64), Atom::M => Some(m.m_bytes as f64), Atom::P => Some(m.p_cores as f64),
                                 Atom::Var(i) => declared.sizes.iter().find(|(v, _)| *v == i).map(|(_, x)| *x),
-                                Atom::Log(_) => None,
+                                Atom::Log(_) | Atom::Opaque(_) => None,
                             }
                         };
                         match (inferred.eval(&at, &m), asserted.eval(&at)) {
@@ -999,7 +1039,7 @@ impl<'a, 'b, 'c> Fa<'a, 'b, 'c> {
             Atom::B => Some(m.b_bytes as f64),
             Atom::M => Some(m.m_bytes as f64),
             Atom::P => Some(m.p_cores as f64),
-            Atom::Var(_) | Atom::Log(_) => None,
+            Atom::Var(_) | Atom::Log(_) | Atom::Opaque(_) => None,
         })
     }
 
@@ -1966,26 +2006,38 @@ impl<'a, 'b, 'c> Fa<'a, 'b, 'c> {
                 let declared_only = callee.declared.work.is_some() && callee.declared.moves.is_some();
                 // a declared callee has no span of its own (no `span_at_most` yet): its work
                 // stands in, which is always a safe over-approximation (span ≤ work)
+                if !self.replay && callee.effects.contains(&"unbounded") {
+                    return Err(Fail::Unknown(format!("calls `{}`, which is declared unbounded", callee.name), e.line));
+                }
+                // an unknown callee does not make this function unknown (stage D): its cost is a
+                // named term, `work[f](…)`, over the parameters that carry a size — an array's
+                // length, an `i64`'s value — and the rest of this function stays exact modulo it
+                let opaque = !declared_only && matches!(callee.result, CostResult::Unknown { .. })
+                    && !self.self_fid.is_some_and(|me| self.an.mutual(me, *fid));
                 let (mut w, mut mv, mut sp) = if declared_only {
                     let w = Cost::poly(callee.declared.work.clone().unwrap());
                     (w.clone(), Cost::poly(callee.declared.moves.clone().unwrap()), w)
                 } else {
                     match &callee.result {
                         CostResult::Exact { work, moves, span } => (work.clone(), moves.clone(), span.clone()),
-                        CostResult::Unknown { reason, .. } => {
+                        CostResult::Unknown { reason, .. } if !opaque => {
                             let reason = if reason.starts_with("calls `") { reason.clone() }
                                 else { format!("calls `{}`, whose cost is unknown ({reason})", callee.name) };
                             return Err(Fail::Unknown(reason, e.line));
                         }
+                        CostResult::Unknown { .. } => {
+                            let args: Vec<Option<Poly>> = cf.params.iter().enumerate()
+                                .map(|(i, &p)| if cf.locals[p].ty.is_arrayish() || cf.locals[p].ty == Ty::I64 { Some(Poly::var(i)) } else { None })
+                                .collect();
+                            let term = |moves: bool| Cost::poly(Poly::atom(Atom::Opaque(Box::new(Opaque { callee: callee.name.clone(), moves, args: args.clone() }))));
+                            (term(false), term(true), term(false))
+                        }
                     }
                 };
-                if !self.replay && callee.effects.contains(&"unbounded") {
-                    return Err(Fail::Unknown(format!("calls `{}`, which is declared unbounded", callee.name), e.line));
-                }
                 // provenance: a declared callee is an assumption this line now rests on
                 if !self.replay {
-                    if declared_only {
-                        let how = if cf.body.is_none() { "declared, extern" } else { "declared, checked" };
+                    if declared_only || opaque {
+                        let how = if opaque { "unknown" } else if cf.body.is_none() { "declared, extern" } else { "declared, checked" };
                         let tag = format!("{} ({how})", callee.name);
                         if !self.rests_on.contains(&tag) { self.rests_on.push(tag); }
                     }
@@ -1993,6 +2045,7 @@ impl<'a, 'b, 'c> Fa<'a, 'b, 'c> {
                 }
                 let mut map: Vec<(usize, Poly)> = Vec::new();
                 let mut roots: Vec<Option<LocalId>> = Vec::new();
+                let mut unnamed: Vec<(usize, u32)> = Vec::new();
                 for (i, (a, &p)) in args.iter().zip(&cf.params).enumerate() {
                     let (by, root) = if cf.locals[p].ty.is_arrayish() {
                         match &a.kind {
@@ -2003,15 +2056,24 @@ impl<'a, 'b, 'c> Fa<'a, 'b, 'c> {
                     roots.push(root);
                     match by {
                         Some(b) => map.push((i, b)),
-                        None => {
-                            let used = w.mentions(i) || mv.mentions(i) || sp.mentions(i) || callee.footprint.iter().any(|f| f.param == i || f.lo.mentions(i) || f.hi.mentions(i));
-                            if used {
-                                return Err(Fail::Unknown(
-                                    format!("argument {} to `{}` is not a size expression, and `{}`'s cost depends on it", i + 1, callee.name, callee.name),
-                                    a.line,
-                                ));
-                            }
-                        }
+                        None => unnamed.push((i, a.line)),
+                    }
+                }
+                // an argument this call cannot name is `_` wherever it is only an unknown
+                // callee's argument; anywhere else the cost depends on it and is unknown here
+                if !unnamed.is_empty() {
+                    let hide = |p: &Poly| unnamed.iter().any(|(i, _)| p.mentions(*i));
+                    w = w.hide_args(&hide);
+                    mv = mv.hide_args(&hide);
+                    sp = sp.hide_args(&hide);
+                }
+                for &(i, line) in &unnamed {
+                    let used = w.mentions(i) || mv.mentions(i) || sp.mentions(i) || (!opaque && callee.footprint.iter().any(|f| f.param == i || f.lo.mentions(i) || f.hi.mentions(i)));
+                    if used {
+                        return Err(Fail::Unknown(
+                            format!("argument {} to `{}` is not a size expression, and `{}`'s cost depends on it", i + 1, callee.name, callee.name),
+                            line,
+                        ));
                     }
                 }
                 w = w.subst_many(&map);
@@ -2019,7 +2081,7 @@ impl<'a, 'b, 'c> Fa<'a, 'b, 'c> {
                 sp = sp.subst_many(&map);
                 self.last_result = callee.result_size.as_ref().map(|p| p.subst_many(&map));
                 // the callee's footprint in this function's arrays (none is known of a declared callee)
-                let feet: Vec<(LocalId, Poly, Poly, bool)> = callee.footprint.iter().filter(|_| !declared_only).filter_map(|f| {
+                let feet: Vec<(LocalId, Poly, Poly, bool)> = callee.footprint.iter().filter(|_| !declared_only && !opaque).filter_map(|f| {
                     let root = roots.get(f.param).copied().flatten()?;
                     Some((root, f.lo.subst_many(&map), f.hi.subst_many(&map), f.exact))
                 }).collect();
@@ -2069,7 +2131,7 @@ impl<'a, 'b, 'c> Fa<'a, 'b, 'c> {
                 if dbg { eprintln!("   net   {}", mv.display(&self.names)); }
                 // after the call: what it leaves resident replaces what was
                 self.resident.clear();
-                if let (Some(cond), false) = (&callee.resident, declared_only) {
+                if let (Some(cond), false) = (&callee.resident, declared_only || opaque) {
                     let cond = Cond { ws: cond.ws.subst_many(&map), fits: true };
                     for (root, lo, hi, exact) in feet { if exact { self.resident.push(Res { root, lo, hi, conds: vec![cond.clone()] }); } }
                 } else if dbg {
@@ -2199,3 +2261,40 @@ fn collect_scalars(e: &Expr, out: &mut Vec<LocalId>) {
     }
 }
 
+
+/// Every function a block calls directly.
+fn callees_block(b: &Block, out: &mut Vec<FuncId>) {
+    for st in &b.stmts {
+        match st {
+            Stmt::Let(_, e) | Stmt::Expr(e) | Stmt::Return(Some(e)) => callees_expr(e, out),
+            Stmt::LetRepeat(_, a, n) => { callees_expr(a, out); callees_expr(n, out); }
+            Stmt::LetArray(_, es) => for e in es { callees_expr(e, out); },
+            Stmt::LetBuild { len, body, .. } => { callees_expr(len, out); callees_block(body, out); }
+            Stmt::Assign(lv, _, e) => {
+                match lv { LValue::Index(_, i, _) | LValue::IndexField(_, i, _, _) => callees_expr(i, out), _ => {} }
+                callees_expr(e, out);
+            }
+            Stmt::For { start, end, body, .. } => { callees_expr(start, out); callees_expr(end, out); callees_block(body, out); }
+            Stmt::ParFor { end, body, .. } => { callees_expr(end, out); callees_block(body, out); }
+            Stmt::While { cond, decreasing, body, .. } => {
+                callees_expr(cond, out);
+                if let Some(d) = decreasing { callees_expr(d, out); }
+                callees_block(body, out);
+            }
+            Stmt::Reassign(_) | Stmt::Break | Stmt::Return(None) => {}
+        }
+    }
+    if let Some(t) = &b.tail { callees_expr(t, out); }
+}
+
+fn callees_expr(e: &Expr, out: &mut Vec<FuncId>) {
+    match &e.kind {
+        ExprKind::Call(f, args) => { if !out.contains(f) { out.push(*f); } for a in args { callees_expr(a, out); } }
+        ExprKind::Binary(_, a, b) | ExprKind::MinMax(_, a, b) => { callees_expr(a, out); callees_expr(b, out); }
+        ExprKind::Unary(_, a) | ExprKind::Field(a, _) | ExprKind::Println(a) | ExprKind::Cast(a, _) | ExprKind::Index(_, a) => callees_expr(a, out),
+        ExprKind::StructLit(_, es) => for x in es { callees_expr(x, out); },
+        ExprKind::If(c, t, els) => { callees_expr(c, out); callees_block(t, out); if let Some(b) = els { callees_block(b, out); } }
+        ExprKind::Block(b) => callees_block(b, out),
+        ExprKind::Int(_) | ExprKind::Float(_) | ExprKind::Bool(_) | ExprKind::Byte(_) | ExprKind::Local(_) | ExprKind::Len(_) | ExprKind::Ref(..) => {}
+    }
+}

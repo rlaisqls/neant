@@ -255,6 +255,9 @@ impl Cost {
     pub fn has_vars(&self) -> bool { self.pieces.iter().any(|p| p.poly.has_vars()) }
     pub fn mentions(&self, atom: usize) -> bool { self.pieces.iter().any(|p| p.poly.mentions(atom) || p.conds.iter().any(|c| c.ws.mentions(atom))) }
     pub fn max_var(&self) -> Option<usize> { self.pieces.iter().filter_map(|p| p.poly.max_var()).max() }
+    pub fn has_opaque(&self) -> bool { self.pieces.iter().any(|p| p.poly.has_opaque()) }
+    pub fn opaque_callees(&self, out: &mut Vec<String>) { for p in &self.pieces { p.poly.opaque_callees(out); } }
+    pub fn hide_args(&self, hide: &dyn Fn(&Poly) -> bool) -> Cost { self.map(|q| q.hide_args(hide)) }
 
     /// Value at a full assignment: the conditions are decided with the machine's `B` and `M`,
     /// and the applicable pieces' maximum is taken.

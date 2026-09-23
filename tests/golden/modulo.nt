@@ -1,0 +1,31 @@
+// an unknown callee is a named term in its caller, not a reason to give up on the caller
+fn walk(n: i64) -> i64 {
+    let mut i = n;
+    let mut s = 0;
+    while i > 0 decreasing i {
+        s += i;
+        if s < 0 { i += 1; }
+        i -= 1;
+    }
+    s
+}
+
+fn twice(xs: &[i64]) -> i64 {
+    let mut t = 0;
+    for k in 0..xs.len() { t += xs[k]; }
+    t + walk(xs.len()) + walk(3)
+}
+
+// a loop over calls whose argument is the loop variable: that argument is `_`, the term the most
+// any one of them costs
+fn each(n: i64) -> i64 {
+    let mut t = 0;
+    for k in 0..n { t += walk(k); }
+    t
+}
+
+fn main() {
+    let xs = [1, 2, 3, 4];
+    println(twice(&xs));
+    println(each(4));
+}

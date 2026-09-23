@@ -162,6 +162,10 @@ fn dominates(u: &super::size::Mono, t: &super::size::Mono) -> bool {
             if exp(u, &lv) < exp(t, &lv) { return false; }
         }
     }
+    // an unknown callee's cost is covered only by the same term, at least as often
+    for (a, e) in &t.factors {
+        if matches!(a, Atom::Opaque(_)) && exp(u, a) < *e { return false; }
+    }
     // a log of something the asserted side does not have at all
     for a in t.factors.keys() {
         if let Atom::Log(inner) = a {
