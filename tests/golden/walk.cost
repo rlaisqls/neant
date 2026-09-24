@@ -1,0 +1,13 @@
+struct Cell      layout AoS  decided by sum_list (B·walk(cells[_].next), SoA 2·B·walk(cells[_].next)), sum_all (B·walk(cells[_].next)² + B·walk(cells[_].next), SoA 2·B·walk(cells[_].next)² + 2·B·walk(cells[_].next)), main (≈ B·walk(cells[_].next)², SoA ≈ 2·B·walk(cells[_].next)²)
+sum_list         work 4·walk(cells[_].next) + 1    moves B·walk(cells[_].next)        bound
+                 footprint        cells: [0, 24·cells.len()) (whole array)   no residue claimed
+sum_all          work 4·walk(cells[_].next)² + 7·walk(cells[_].next) + 1 moves B·walk(cells[_].next)² + B·walk(cells[_].next) bound
+                 footprint        cells: [0, 24·cells.len()) (whole array)   no residue claimed
+bump             work 3                            moves B                            exact
+                 footprint        cells: [24·i, 24·i + 8)   resident after if 8 < M
+double_list      work 7·walk(cells[_].next) + 1    moves 2·B·walk(cells[_].next)      bound
+                 footprint        cells: [0, 24·cells.len()) (whole array)   no residue claimed
+dup_each         unknown: `s` walks the list `cells[_].next`, which the body may write, itself or through a call; `while` has no measure the compiler can find; write `while cond decreasing <expr>` with an `i64` that goes down by at least one every iteration (line 46)
+chain_len        work 3·walk(next[_]) + 1          moves B·walk(next[_])              bound
+                 footprint        next: [0, 8·next.len()) (whole array)   no residue claimed
+main             work ≈ 4·walk(cells[_].next)²     moves ≈ B·walk(cells[_].next)²     bound, io

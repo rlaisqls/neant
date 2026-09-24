@@ -294,6 +294,8 @@ A `while` gets a trip count in one of two ways, or none.
   read *at entry*: mutable locals in it stand for what they were last assigned. `decreasing
   j − i` after `let mut i = 0; let mut j = s.len() − 1` is `s.len() − 1`. The programmer is
   promising `m` goes down by at least one per iteration; the compiler does not check it.
+- **A walk down a list.** `while s >= 0 { …; s = xs[s].f }` follows links, not a count, and runs
+  at most the longest walk along them, `walk(xs[_].f)` (§ A walk down a list).
 - **Neither**, or a measure that reads an array the body writes (`decreasing s.len() − pos[0]`
   with `pos[0] += 1` inside): the function's cost is unknown, the message says which, and `neant
   measure` is the way to a number.
@@ -424,8 +426,9 @@ A footprint lower bound that is still in a closed loop's variable is dropped rat
 widened, since a `max` would make a lower bound larger.
 
 A read names a value, not a place. Two reads of the same text are one atom until something writes
-the array — a store into it, `ys = xs` onto it, or passing it to a call that may write it (`&mut`,
-or an owned array). Inside a loop whose body writes the array, a read of it is no size at all,
+the array — a store into it, `ys = xs` onto it, or passing it to a call that may write it — handed
+over `&mut` or owned, to a callee that stores into it, itself or further down (§ A walk down a
+list). Inside a loop whose body writes the array, a read of it is no size at all,
 since it differs from one iteration to the next. Through a call the callee's reads come with its
 cost: a read of a parameter becomes a read of the caller's argument, and a read of the callee's
 own array stays as `f.xs[…]`, a value the caller cannot name any better.
@@ -433,6 +436,40 @@ own array stays as `f.xs[…]`, a value the caller cannot name any better.
 What the atom is not yet: the expression the value was written from. `let k = n; xs[0] = k` then
 a loop to `xs[0]` is a loop to the atom `xs[0]`, not to `n` — following a store to its load is
 what plan § Stage D (2) left for later.
+
+## A walk down a list
+
+`while s >= 0 { …; s = xs[s].f }` walks a list threaded through the array `xs` by the `i64` field
+`f` — the arena idiom, where a link is an index and `−1` ends the list. It runs at most as many
+times as **the longest walk along `f`**, the atom `walk(xs[_].f)`: the most steps `s = xs[s].f`
+takes, from any element, to reach a negative index, over the run. `xs[s]` of an `[i64]` is the
+same with no field, `walk(xs[_])`. Nothing is known of the atom's value, as nothing is of
+`max(xs[_])`, so the line's tier is `bound`; if no walk is a cycle it is at most `xs.len()`, and if
+one is, a loop that follows it and ends did so by another way out — a `break`, or another conjunct
+of the condition. `arena.nt` states that promise itself, `decreasing nodes.len() − steps`, and is
+exact in `nodes.len()`; the atom is what a loop gets that promises nothing.
+
+It applies when `s` is a mutable `i64` compared as `s >= 0` (or `0 <= s`, or as one conjunct of
+an `&&`), assigned `xs[s].f` exactly once, at the top level of the body, and nowhere else in it;
+and when **nothing in the body writes `f`** — no store to `xs[_].f` or to a whole element, no
+`ys = xs` on it, and no call that may write `f` in what it is handed. Which fields a call may write
+is each function's own summary, per parameter, to a fixed point over the call graph: the fields it
+stores into, and what the callees it passes the array on to write; an `extern` handed an array
+writable may write any. So a body that writes `val` while it walks `next`, itself or through a
+callee, keeps its bound, and one that splices the list as it walks it is unknown and says why:
+the walk may visit what it just inserted, and does not end.
+
+The same summary is what *reads* consult (§ A size read from memory): a call counts as writing an
+array only where the callee may store into it, so handing a view to a function that only reads it
+no longer makes the reads of it stale, after the call or anywhere in a loop around it.
+
+Two consequences in the calculus around it. An element read is at most the most its array holds,
+`xs[e] ≤ max(xs[_])`, and dominance knows it, so a fit condition on the element is implied by one
+on the maximum and the regimes that contradict that are dropped. And an exact callee whose
+footprint ends depend on an argument the call cannot name no longer makes the caller unknown: the
+footprint is kept inexact, so nothing is credited from it and nothing claimed resident after, a
+lower bound in that argument is not handed up, and the cost goes through as before — the argument
+`_` in a read's element, which makes it the `max`.
 
 ## The measured tier
 

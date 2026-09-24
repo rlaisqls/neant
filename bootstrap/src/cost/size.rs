@@ -86,6 +86,10 @@ pub struct Read {
     pub index: Option<Poly>,
     pub field: Option<String>,
     pub least: bool,
+    /// not a value but a walk (stage D (3)): the most steps `s = xs[s].f` takes from any element
+    /// to a negative index, over the run — infinite if some walk is a cycle, and at most
+    /// `xs.len()` if none is. Always `_`, so always `bound`.
+    pub walk: bool,
 }
 
 impl Read {
@@ -185,8 +189,9 @@ impl Poly {
     pub fn is_zero(&self) -> bool { self.terms.is_empty() }
 
     pub fn add(&self, o: &Poly) -> Poly {
-        let mut t = self.terms.clone();
-        for (m, c) in &o.terms {
+        let (big, small) = if o.terms.len() > self.terms.len() { (o, self) } else { (self, o) };
+        let mut t = big.terms.clone();
+        for (m, c) in &small.terms {
             let nc = t.get(m).map_or(*c, |x| x.add(*c));
             if nc.is_zero() { t.remove(m); } else { t.insert(m.clone(), nc); }
         }
@@ -203,7 +208,7 @@ impl Poly {
             for (m2, c2) in &o.terms {
                 let mut t = Poly::zero();
                 t.terms.insert(m1.mul(m2), c1.mul(*c2));
-                out = out.add(&t);
+                out.add_in_place(t);
             }
         }
         out
@@ -280,9 +285,31 @@ impl Poly {
             }
             let mut t = Poly::zero();
             t.terms.insert(Mono { factors: fs }, *c);
-            out = out.add(&t);
+            out.add_in_place(t);
         }
         out
+    }
+    /// The same polynomial made no smaller by trading each element read for the most its array
+    /// holds where the term adds, and the least where it subtracts: `xs[e] ≤ max(xs[_])`.
+    /// `None` when there is no element to trade.
+    pub fn widen_reads(&self) -> Option<Poly> {
+        if !self.terms.keys().any(|m| m.factors.iter().any(|(a, e)| e.n > 0 && matches!(a, Atom::Read(r) if r.index.is_some()))) { return None; }
+        let mut out = Poly::zero();
+        for (m, c) in &self.terms {
+            let mut fs = BTreeMap::new();
+            for (a, e) in &m.factors {
+                let a = match a {
+                    Atom::Read(r) if r.index.is_some() && e.n > 0 => Atom::Read(Box::new(Read { index: None, least: c.n < 0, ..(**r).clone() }.canon())),
+                    other => other.clone(),
+                };
+                let ne = fs.get(&a).map_or(*e, |x: &Rat| x.add(*e));
+                fs.insert(a, ne);
+            }
+            let mut t = Poly::zero();
+            t.terms.insert(Mono { factors: fs }, *c);
+            out.add_in_place(t);
+        }
+        Some(out)
     }
     /// Whether some term is the most or least an array holds rather than a value it holds.
     pub fn has_loose_read(&self) -> bool {
@@ -323,7 +350,7 @@ impl Poly {
             }
             let mut t = Poly::zero();
             t.terms.insert(Mono { factors: f }, *c);
-            out = out.add(&t);
+            out.add_in_place(t);
         }
         out
     }
@@ -347,6 +374,8 @@ impl Poly {
     pub fn subst_many(&self, map: &[(usize, Poly)]) -> Poly {
         // route through fresh temporaries: shift every replaced variable to a high index first
         let shift = 1_000_000usize;
+        let map: Vec<&(usize, Poly)> = map.iter().filter(|(v, _)| self.mentions(*v)).collect();
+        if map.is_empty() { return self.clone(); }
         let mut p = self.clone();
         for (i, (v, _)) in map.iter().enumerate() { p = p.subst(*v, &Poly::var(shift + i)); }
         for (i, (_, by)) in map.iter().enumerate() { p = p.subst(shift + i, by); }
@@ -409,7 +438,7 @@ impl Poly {
             let j = rest.factors.remove(&Atom::Var(K)).map_or(0, |e| e.n as usize);
             let mut t = Poly::zero();
             t.terms.insert(rest, *c);
-            out = out.add(&t.mul(&Poly::faulhaber(j, trip)));
+            out.add_in_place(t.mul(&Poly::faulhaber(j, trip)));
         }
         out
     }
@@ -430,6 +459,7 @@ impl Poly {
     /// Replace one size variable by a polynomial. The variable's exponents must be
     /// nonnegative integers; a fractional exponent on a variable never arises in the calculus.
     pub fn subst(&self, var: usize, by: &Poly) -> Poly {
+        if !self.mentions(var) { return self.clone(); }
         let mut out = Poly::zero();
         for (m, c) in &self.terms {
             let mut rest = Mono::one();
@@ -449,9 +479,16 @@ impl Poly {
                 let k = if e.is_int() && e.n >= 0 { e.n } else { 0 };
                 t = t.mul(&by.pow(k));
             }
-            out = out.add(&t);
+            out.add_in_place(t);
         }
         out
+    }
+    /// `self += o`, without copying `self`.
+    fn add_in_place(&mut self, o: Poly) {
+        for (m, c) in o.terms {
+            let nc = self.terms.get(&m).map_or(c, |x| x.add(c));
+            if nc.is_zero() { self.terms.remove(&m); } else { self.terms.insert(m, nc); }
+        }
     }
 
     /// The same polynomial with `B` and `M` at their machine values: the form in which two
@@ -474,7 +511,7 @@ impl Poly {
             }
             let mut t = Poly::zero();
             t.terms.insert(rest, coef);
-            out = out.add(&t);
+            out.add_in_place(t);
         }
         out
     }
@@ -531,7 +568,7 @@ impl Poly {
             }
             let mut t = Poly::zero();
             t.terms.insert(rest, coef);
-            out = out.add(&t);
+            out.add_in_place(t);
         }
         out
     }
@@ -581,7 +618,8 @@ impl<'a> fmt::Display for PolyDisplay<'a> {
                     let root = match &r.root { Root::Param(_, n) | Root::Local(n) => n.clone() };
                     let idx = r.index.as_ref().map_or("_".to_string(), |p| p.display(self.names).to_string());
                     let s = match &r.field { Some(f) => format!("{root}[{idx}].{f}"), None => format!("{root}[{idx}]") };
-                    if r.index.is_some() { s } else if r.least { format!("min({s})") } else { format!("max({s})") }
+                    if r.walk { format!("walk({s})") }
+                    else if r.index.is_some() { s } else if r.least { format!("min({s})") } else { format!("max({s})") }
                 }
             }
         };

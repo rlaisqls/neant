@@ -141,15 +141,20 @@ pub fn choose_layouts(m: &mut Module, machine: &Machine) -> Vec<LayoutChoice> {
             continue;
         }
         let mut totals = [0f64; 2];
-        let mut costs: [Vec<FuncCost>; 2] = [vec![], vec![]];
+        // only the functions that touch the type are compared, and their costs need only their
+        // callees': the rest of the program is not analysed per layout
+        let touches: Vec<bool> = m.funcs.iter().map(|f| f.locals.iter().any(|l| matches!(l.ty.elem(), Some(Ty::Struct(s)) if *s == sid))).collect();
+        let mut costs: [Vec<Option<FuncCost>>; 2] = [vec![], vec![]];
         for (k, l) in [Layout::Aos, Layout::Soa].into_iter().enumerate() {
             m.structs[sid].layout = l;
-            costs[k] = analyze_costs(m, machine);
+            let mut an = Analyzer::new(m, machine);
+            for (fi, t) in touches.iter().enumerate() { if *t { an.func(fi); } }
+            costs[k] = an.done;
         }
         // functions that touch this type, and what each moves under the two layouts
         let mut decided_by: Vec<(String, String, String)> = Vec::new();
         for (fi, f) in m.funcs.iter().enumerate() {
-            if !f.locals.iter().any(|l| matches!(l.ty.elem(), Some(Ty::Struct(s)) if *s == sid)) { continue; }
+            if !touches[fi] { continue; }
             let at = |c: &FuncCost| -> (f64, String) {
                 match &c.result {
                     CostResult::Exact { moves, .. } => {
@@ -159,8 +164,8 @@ pub fn choose_layouts(m: &mut Module, machine: &Machine) -> Vec<LayoutChoice> {
                     CostResult::Unknown { .. } => (0.0, "unknown".into()),
                 }
             };
-            let (va, sa) = at(&costs[0][fi]);
-            let (vs, ss) = at(&costs[1][fi]);
+            let (va, sa) = at(costs[0][fi].as_ref().unwrap());
+            let (vs, ss) = at(costs[1][fi].as_ref().unwrap());
             totals[0] += va;
             totals[1] += vs;
             if sa != ss { decided_by.push((f.name.clone(), sa, ss)); }
@@ -337,6 +342,9 @@ struct Analyzer<'a> {
     active: Vec<bool>,
     /// `reach[f][g]`: `f` calls `g`, directly or through others
     reach: Vec<Vec<bool>>,
+    /// `field_writes[f][i]`: the fields of the array `f`'s `i`th parameter that `f` may write,
+    /// itself or through its callees — what a list walk in a caller needs left alone
+    field_writes: Vec<Vec<FieldWrites>>,
 }
 
 impl<'a> Analyzer<'a> {
@@ -357,7 +365,7 @@ impl<'a> Analyzer<'a> {
             }
             seen
         }).collect();
-        Analyzer { m, machine: *machine, done: vec![None; n], active: vec![false; n], reach }
+        Analyzer { m, machine: *machine, done: vec![None; n], active: vec![false; n], reach, field_writes: field_writes(m) }
     }
     /// Two distinct functions that call each other, however indirectly: a cost of either is a
     /// system of recurrences, and neither can stand as a named term in the other.
@@ -1146,7 +1154,7 @@ impl<'a, 'b, 'c> Fa<'a, 'b, 'c> {
             _ => None,
         });
         let id = NEXT_READ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        let p = Poly::atom(Atom::Read(Box::new(Read { id, root: root_ref, index, field: fname, least }.canon())));
+        let p = Poly::atom(Atom::Read(Box::new(Read { id, root: root_ref, index, field: fname, least, walk: false }.canon())));
         self.reads.borrow_mut().insert(key, p.clone());
         Some(p)
     }
@@ -1158,10 +1166,11 @@ impl<'a, 'b, 'c> Fa<'a, 'b, 'c> {
     }
 
     /// The arrays a loop body writes, by root, for `loop_writes`.
+    /// A call counts only where the callee may write what it is handed, by `field_writes`.
     fn written_roots(&self, body: &Block) -> Vec<LocalId> {
-        let mut w = Writes::default();
-        w.block(body);
-        let mut out: Vec<LocalId> = w.arrays.iter().map(|a| self.local_root.get(a).copied().unwrap_or(*a)).collect();
+        let mut roots = self.local_root.clone();
+        let mut out: Vec<LocalId> = Vec::new();
+        stores_block(body, self.f, &mut roots, &self.an.field_writes, &mut |r, _| out.push(r));
         out.sort();
         out.dedup();
         out
@@ -1996,6 +2005,50 @@ impl<'a, 'b, 'c> Fa<'a, 'b, 'c> {
     /// stepped by the constant `c` exactly once in the body and nowhere else, `e` is a size
     /// expression, and `i₀` — the last assignment to `i` before the loop — is one too.
     /// `i > e` with `i -= c` is the mirror. Anything else is not an induction variable.
+    /// `while s >= 0 { …; s = xs[s].f }` follows a list threaded through `xs`, and runs at most
+    /// as many times as the longest walk along `f`, the atom `walk(xs[_].f)` — when `s` is
+    /// assigned that once, at the top level of the body, and nowhere else, and nothing in the
+    /// body writes `f`, itself or through a callee (cost-model § A walk down a list). `xs[s]` of an
+    /// `[i64]` is the same with no field.
+    /// `Err(None)` when the loop is not that shape, `Err(Some(why))` when it is but the list may
+    /// change under it.
+    fn walk_trip(&self, var: LocalId, body: &Block) -> Result<Poly, Option<String>> {
+        let is_step = |st: &Stmt| -> Option<(LocalId, Option<usize>)> {
+            let Stmt::Assign(LValue::Var(v), None, e) = st else { return None };
+            if *v != var { return None; }
+            let (base, field) = match &e.kind {
+                ExprKind::Field(inner, fi) => (&**inner, Some(*fi)),
+                _ => (e, None),
+            };
+            let ExprKind::Index(arr, idx) = &base.kind else { return None };
+            if !matches!(idx.kind, ExprKind::Local(l) if l == var) { return None; }
+            let ok = match field { Some(fi) => self.field_ty(*arr, fi) == Some(&Ty::I64), None => self.f.locals[*arr].ty.elem() == Some(&Ty::I64) };
+            ok.then_some((*arr, field))
+        };
+        let steps: Vec<usize> = body.stmts.iter().enumerate().filter(|(_, st)| is_step(st).is_some()).map(|(k, _)| k).collect();
+        let [k] = steps[..] else { return Err(None) };
+        let Some((arr, field)) = is_step(&body.stmts[k]) else { return Err(None) };
+        let rest = Block { stmts: body.stmts.iter().enumerate().filter(|(j, _)| *j != k).map(|(_, st)| st.clone()).collect(), tail: body.tail.clone(), ty: body.ty.clone() };
+        if assigns(&rest, |l| l == var) { return Err(None); }
+        let mut roots = self.local_root.clone();
+        let root = roots.get(&arr).copied().unwrap_or(arr);
+        let mut moved = false;
+        stores_block(body, self.f, &mut roots, &self.an.field_writes, &mut |r, fi| {
+            if r == root && (fi.is_none() || field.is_none() || fi == field) { moved = true; }
+        });
+        let name = self.f.locals[root].name.clone();
+        let fname = field.and_then(|fi| match self.f.locals[root].ty.elem() {
+            Some(Ty::Struct(sid)) => self.an.m.structs[*sid].fields.get(fi).map(|(n, _)| n.clone()),
+            _ => None,
+        });
+        if moved {
+            let list = match &fname { Some(f) => format!("{name}[_].{f}"), None => format!("{name}[_]") };
+            return Err(Some(format!("`{}` walks the list `{list}`, which the body may write, itself or through a call", self.f.locals[var].name)));
+        }
+        let root_ref = match self.f.params.iter().position(|&p| p == root) { Some(i) => Root::Param(i, name), None => Root::Local(name) };
+        Ok(Poly::atom(Atom::Read(Box::new(Read { id: 0, root: root_ref, index: None, field: fname, least: false, walk: true }))))
+    }
+
     fn induction_trip(&self, cond: &Expr, body: &Block) -> Result<(Poly, Option<(LocalId, Poly, i128)>), String> {
         let ask = "`while` has no measure the compiler can find; write `while cond decreasing <expr>` with an `i64` that goes down by at least one every iteration".to_string();
         // `a && b` stops no later than either: the first conjunct with a trip bounds the loop, as
@@ -2017,6 +2070,15 @@ impl<'a, 'b, 'c> Fa<'a, 'b, 'c> {
         };
         let name = &self.f.locals[var].name;
         if !self.f.locals[var].mutable || self.f.locals[var].ty != Ty::I64 { return Err(ask); }
+        // `s >= 0` with `s = xs[s].f` in the body is a walk down a list, not a count
+        let to_negative = matches!((&l.kind, &r.kind, op), (ExprKind::Local(_), ExprKind::Int(0), BinOp::Ge) | (ExprKind::Int(0), ExprKind::Local(_), BinOp::Le));
+        if to_negative {
+            match self.walk_trip(var, body) {
+                Ok(t) => return Ok((t, None)),
+                Err(Some(why)) => return Err(format!("{why}; {ask}")),
+                Err(None) => {}
+            }
+        }
         let Some(step) = single_step(body, var) else { return Err(format!("`{name}` is compared in the `while` condition but is not stepped by a constant exactly once in the body; {ask}")) };
         if (asc && step <= 0) || (!asc && step >= 0) { return Err(format!("`{name}` steps away from its bound; {ask}")); }
         let mut w = Writes::default();
@@ -2105,11 +2167,13 @@ impl<'a, 'b, 'c> Fa<'a, 'b, 'c> {
             ExprKind::Block(b) => self.block(b),
             ExprKind::Call(fid, args) => {
                 for a in args { self.expr(a)?; }
-                // an array handed over writable may come back changed
-                for a in args {
+                // an array handed over writable may come back changed, where the callee may
+                // store into it (`field_writes`)
+                for (i, a) in args.iter().enumerate() {
+                    let may = self.an.field_writes[*fid].get(i).is_none_or(|w| w.all || !w.fields.is_empty());
                     match &a.kind {
-                        ExprKind::Ref(s, true) => self.wrote(*s),
-                        ExprKind::Local(s) if self.f.locals[*s].ty.is_arrayish() && !matches!(self.f.locals[*s].ty, Ty::Slice(_, false, _)) => self.wrote(*s),
+                        ExprKind::Ref(s, true) if may => self.wrote(*s),
+                        ExprKind::Local(s) if may && self.f.locals[*s].ty.is_arrayish() && !matches!(self.f.locals[*s].ty, Ty::Slice(_, false, _)) => self.wrote(*s),
                         _ => {}
                     }
                 }
@@ -2197,7 +2261,9 @@ impl<'a, 'b, 'c> Fa<'a, 'b, 'c> {
                     sp = sp.hide_args(&hide);
                 }
                 for &(i, line) in &unnamed {
-                    let used = w.mentions(i) || mv.mentions(i) || sp.mentions(i) || (!opaque && callee.footprint.iter().any(|f| f.param == i || f.lo.mentions(i) || f.hi.mentions(i)));
+                    // a footprint whose ends depend on it is not dropped but made inexact below:
+                    // then nothing is credited from it and nothing claimed resident after
+                    let used = w.mentions(i) || mv.mentions(i) || sp.mentions(i) || (!opaque && callee.footprint.iter().any(|f| f.param == i));
                     if used {
                         return Err(Fail::Unknown(
                             format!("argument {} to `{}` is not a size expression, and `{}`'s cost depends on it", i + 1, callee.name, callee.name),
@@ -2226,7 +2292,8 @@ impl<'a, 'b, 'c> Fa<'a, 'b, 'c> {
                 // the callee's footprint in this function's arrays (none is known of a declared callee)
                 let feet: Vec<(LocalId, Poly, Poly, bool)> = callee.footprint.iter().filter(|_| !declared_only && !opaque).filter_map(|f| {
                     let root = roots.get(f.param).copied().flatten()?;
-                    Some((root, f.lo.subst_many(&map), f.hi.subst_many(&map), f.exact))
+                    let named = !unnamed.iter().any(|(i, _)| f.lo.mentions(*i) || f.hi.mentions(*i));
+                    Some((root, f.lo.subst_many(&map), f.hi.subst_many(&map), f.exact && named))
                 }).collect();
                 let dbg = std::env::var("NEANT_DEBUG_CALLS").is_ok() && !self.replay;
                 if dbg {
@@ -2264,6 +2331,8 @@ impl<'a, 'b, 'c> Fa<'a, 'b, 'c> {
                     });
                     for bd in &callee.bounds {
                         if bd.cold && !all_received { continue; }
+                        // a lower bound in an argument this call cannot name has no value here
+                        if unnamed.iter().any(|(i, _)| bd.moves.mentions(*i)) { continue; }
                         self.bounds.push(Bound { moves: bd.moves.subst_many(&map), ..bd.clone() });
                     }
                     for n in &callee.notes {
@@ -2274,8 +2343,10 @@ impl<'a, 'b, 'c> Fa<'a, 'b, 'c> {
                 if dbg { eprintln!("   net   {}", mv.display(&self.names)); }
                 // after the call: what it leaves resident replaces what was
                 self.resident.clear();
-                if let (Some(cond), false) = (&callee.resident, declared_only || opaque) {
-                    let cond = Cond { ws: cond.ws.subst_many(&map), fits: true };
+                let hide = |p: &Poly| unnamed.iter().any(|(i, _)| p.mentions(*i));
+                let resident = callee.resident.as_ref().map(|c| c.ws.hide_args(&hide)).filter(|ws| !hide(ws));
+                if let (Some(ws), false) = (resident, declared_only || opaque) {
+                    let cond = Cond { ws: ws.subst_many(&map), fits: true };
                     for (root, lo, hi, exact) in feet { if exact { self.resident.push(Res { root, lo, hi, conds: vec![cond.clone()] }); } }
                 } else if dbg {
                     eprintln!("   leaves nothing resident (callee.resident={})", callee.resident.is_some());
@@ -2443,12 +2514,10 @@ fn callees_expr(e: &Expr, out: &mut Vec<FuncId>) {
     }
 }
 
-/// What a block writes: the locals it assigns and the arrays it stores into, including through a
-/// call that is handed an array writable.
+/// The locals a block assigns. What it stores into arrays is `stores_block`'s.
 #[derive(Default)]
 struct Writes {
     locals: Vec<LocalId>,
-    arrays: Vec<LocalId>,
 }
 
 impl Writes {
@@ -2462,7 +2531,7 @@ impl Writes {
                 Stmt::Assign(lv, _, e) => {
                     match lv {
                         LValue::Var(v) | LValue::Field(v, _) => self.locals.push(*v),
-                        LValue::Index(a, i, _) | LValue::IndexField(a, i, _, _) => { self.arrays.push(*a); self.expr(i); }
+                        LValue::Index(_, i, _) | LValue::IndexField(_, i, _, _) => self.expr(i),
                     }
                     self.expr(e);
                 }
@@ -2481,14 +2550,7 @@ impl Writes {
     }
     fn expr(&mut self, e: &Expr) {
         match &e.kind {
-            ExprKind::Call(_, args) => for a in args {
-                match &a.kind {
-                    ExprKind::Ref(s, true) => self.arrays.push(*s),
-                    ExprKind::Local(s) => self.arrays.push(*s),
-                    _ => {}
-                }
-                self.expr(a);
-            },
+            ExprKind::Call(_, args) => for a in args { self.expr(a); },
             ExprKind::Binary(_, a, b) | ExprKind::MinMax(_, a, b) => { self.expr(a); self.expr(b); }
             ExprKind::Unary(_, a) | ExprKind::Field(a, _) | ExprKind::Println(a) | ExprKind::Cast(a, _) | ExprKind::Index(_, a) => self.expr(a),
             ExprKind::StructLit(_, es) => for x in es { self.expr(x); },
@@ -2496,5 +2558,109 @@ impl Writes {
             ExprKind::Block(b) => self.block(b),
             ExprKind::Int(_) | ExprKind::Float(_) | ExprKind::Bool(_) | ExprKind::Byte(_) | ExprKind::Local(_) | ExprKind::Len(_) | ExprKind::Ref(..) => {}
         }
+    }
+}
+
+/// The fields of an array a function may write: some by position, or every one — a store to a
+/// whole element, `ys = xs`, or an `extern` handed it writable.
+#[derive(Debug, Clone, Default, PartialEq)]
+struct FieldWrites {
+    all: bool,
+    fields: std::collections::BTreeSet<usize>,
+}
+
+impl FieldWrites {
+    fn add(&mut self, field: Option<usize>) {
+        match field { Some(fi) => { self.fields.insert(fi); } None => self.all = true }
+    }
+}
+
+/// Every function's `FieldWrites` per parameter, to a fixed point over the call graph: a
+/// function writes what it stores into and what the callees it hands the array to write.
+fn field_writes(m: &Module) -> Vec<Vec<FieldWrites>> {
+    let mut summ: Vec<Vec<FieldWrites>> = m.funcs.iter().map(|f| {
+        f.params.iter().map(|&p| {
+            let writable = matches!(f.locals[p].ty, Ty::Slice(_, true, _) | Ty::Array(..));
+            FieldWrites { all: f.body.is_none() && writable, fields: Default::default() }
+        }).collect()
+    }).collect();
+    loop {
+        let mut changed = false;
+        for (fid, f) in m.funcs.iter().enumerate() {
+            let Some(body) = &f.body else { continue };
+            let mut roots: HashMap<LocalId, LocalId> = f.params.iter().map(|&p| (p, p)).collect();
+            let mut next = summ[fid].clone();
+            stores_block(body, f, &mut roots, &summ, &mut |root, field| {
+                if let Some(i) = f.params.iter().position(|&p| p == root) { next[i].add(field); }
+            });
+            if next != summ[fid] { summ[fid] = next; changed = true; }
+        }
+        if !changed { return summ; }
+    }
+}
+
+/// Walk a block for stores into arrays, calling `hit(root, field)` for each: `Some(fi)` for a
+/// store to field `fi`, `None` for one that may change any. `roots` follows views to the array
+/// they look into, and grows with the views the block binds.
+fn stores_block(b: &Block, f: &Func, roots: &mut HashMap<LocalId, LocalId>, summ: &[Vec<FieldWrites>], hit: &mut dyn FnMut(LocalId, Option<usize>)) {
+    for st in &b.stmts {
+        match st {
+            Stmt::Let(id, e) => {
+                stores_expr(e, f, roots, summ, hit);
+                if let ExprKind::Ref(s, _) | ExprKind::Local(s) = &e.kind {
+                    if f.locals[*id].ty.is_arrayish() { let r = roots.get(s).copied().unwrap_or(*s); roots.insert(*id, r); }
+                }
+            }
+            Stmt::Expr(e) | Stmt::Return(Some(e)) => stores_expr(e, f, roots, summ, hit),
+            Stmt::LetRepeat(_, a, n) => { stores_expr(a, f, roots, summ, hit); stores_expr(n, f, roots, summ, hit); }
+            Stmt::LetArray(_, es) => for e in es { stores_expr(e, f, roots, summ, hit); },
+            Stmt::LetBuild { len, body, .. } => { stores_expr(len, f, roots, summ, hit); stores_block(body, f, roots, summ, hit); }
+            Stmt::Assign(lv, _, e) => {
+                match lv {
+                    LValue::Index(a, i, _) => { hit(roots.get(a).copied().unwrap_or(*a), None); stores_expr(i, f, roots, summ, hit); }
+                    LValue::IndexField(a, i, fi, _) => { hit(roots.get(a).copied().unwrap_or(*a), Some(*fi)); stores_expr(i, f, roots, summ, hit); }
+                    LValue::Var(_) | LValue::Field(..) => {}
+                }
+                stores_expr(e, f, roots, summ, hit);
+            }
+            // `ys = xs`: either buffer may be the other's afterwards
+            Stmt::Reassign(idx) => {
+                let r = &f.reassigns[*idx];
+                hit(roots.get(&r.target).copied().unwrap_or(r.target), None);
+                hit(roots.get(&r.src).copied().unwrap_or(r.src), None);
+            }
+            Stmt::For { start, end, body, .. } => { stores_expr(start, f, roots, summ, hit); stores_expr(end, f, roots, summ, hit); stores_block(body, f, roots, summ, hit); }
+            Stmt::ParFor { end, body, .. } => { stores_expr(end, f, roots, summ, hit); stores_block(body, f, roots, summ, hit); }
+            Stmt::While { cond, decreasing, body, .. } => {
+                stores_expr(cond, f, roots, summ, hit);
+                if let Some(d) = decreasing { stores_expr(d, f, roots, summ, hit); }
+                stores_block(body, f, roots, summ, hit);
+            }
+            Stmt::Break | Stmt::Return(None) => {}
+        }
+    }
+    if let Some(t) = &b.tail { stores_expr(t, f, roots, summ, hit); }
+}
+
+fn stores_expr(e: &Expr, f: &Func, roots: &mut HashMap<LocalId, LocalId>, summ: &[Vec<FieldWrites>], hit: &mut dyn FnMut(LocalId, Option<usize>)) {
+    match &e.kind {
+        ExprKind::Call(g, args) => for (i, a) in args.iter().enumerate() {
+            if let ExprKind::Ref(s, true) | ExprKind::Local(s) = &a.kind {
+                if f.locals[*s].ty.is_arrayish() {
+                    let r = roots.get(s).copied().unwrap_or(*s);
+                    match summ[*g].get(i) {
+                        Some(w) if !w.all => for fi in &w.fields { hit(r, Some(*fi)); },
+                        _ => hit(r, None),
+                    }
+                }
+            }
+            stores_expr(a, f, roots, summ, hit);
+        },
+        ExprKind::Binary(_, a, b) | ExprKind::MinMax(_, a, b) => { stores_expr(a, f, roots, summ, hit); stores_expr(b, f, roots, summ, hit); }
+        ExprKind::Unary(_, a) | ExprKind::Field(a, _) | ExprKind::Println(a) | ExprKind::Cast(a, _) | ExprKind::Index(_, a) => stores_expr(a, f, roots, summ, hit),
+        ExprKind::StructLit(_, es) => for x in es { stores_expr(x, f, roots, summ, hit); },
+        ExprKind::If(c, t, els) => { stores_expr(c, f, roots, summ, hit); stores_block(t, f, roots, summ, hit); if let Some(b) = els { stores_block(b, f, roots, summ, hit); } }
+        ExprKind::Block(b) => stores_block(b, f, roots, summ, hit),
+        ExprKind::Int(_) | ExprKind::Float(_) | ExprKind::Bool(_) | ExprKind::Byte(_) | ExprKind::Local(_) | ExprKind::Len(_) | ExprKind::Ref(..) => {}
     }
 }

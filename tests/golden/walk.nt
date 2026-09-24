@@ -1,0 +1,83 @@
+// lists threaded through an arena, walked with no measure: `arena.nt` promises `decreasing
+// nodes.len() - steps` and is exact in `nodes.len()`; these promise nothing, and each loop is
+// bounded by the longest walk along the link it follows, `walk(cells[_].next)`
+struct Cell { val: i64, next: i64, sub: i64 }
+
+fn sum_list(cells: &[Cell], head: i64) -> i64 {
+    let mut s = head;
+    let mut total = 0;
+    while s >= 0 {
+        total += cells[s].val;
+        s = cells[s].next;
+    }
+    total
+}
+
+// a list of lists: `sub` heads each inner one, and the walks multiply
+fn sum_all(cells: &[Cell], head: i64) -> i64 {
+    let mut s = head;
+    let mut total = 0;
+    while s >= 0 {
+        total += sum_list(cells, cells[s].sub);
+        s = cells[s].next;
+    }
+    total
+}
+
+fn bump(cells: &mut [Cell], i: i64) {
+    cells[i].val = cells[i].val * 2;
+}
+
+// the body writes the cells, but through `bump`, which writes `val` and not `next`: the list the
+// loop follows stays put
+fn double_list(cells: &mut [Cell], head: i64) {
+    let mut s = head;
+    while s >= 0 {
+        bump(cells, s);
+        s = cells[s].next;
+    }
+}
+
+// a copy after every cell: the body writes `next` as it walks, and the walk then visits every
+// copy it makes, so it never ends — there is no fixed list to bound it by, and it is unknown
+fn dup_each(cells: &mut [Cell], head: i64, free: i64) {
+    let mut s = head;
+    let mut f = free;
+    while s >= 0 {
+        cells[f].val = cells[s].val;
+        cells[f].next = cells[s].next;
+        cells[s].next = f;
+        f += 1;
+        s = cells[s].next;
+    }
+}
+
+// the same over an `[i64]` of links, with no field
+fn chain_len(next: &[i64], start: i64) -> i64 {
+    let mut s = start;
+    let mut n = 0;
+    while s >= 0 {
+        n += 1;
+        s = next[s];
+    }
+    n
+}
+
+fn main() {
+    // 0 → 1 → 2 is the outer list; 0 heads 3 → 4, 1 heads 5, 2 heads nothing
+    let mut cells = [Cell { val: 0, next: -1, sub: -1 }; 6];
+    for k in 0..6 {
+        cells[k].val = k + 1;
+    }
+    cells[0].next = 1;
+    cells[1].next = 2;
+    cells[3].next = 4;
+    cells[0].sub = 3;
+    cells[1].sub = 5;
+    println(sum_list(&cells, 0));
+    println(sum_all(&cells, 0));
+    double_list(&mut cells, 0);
+    println(sum_list(&cells, 0));
+    let links = [2, -1, 1, 0];
+    println(chain_len(&links, 3));
+}

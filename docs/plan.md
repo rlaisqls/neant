@@ -529,6 +529,57 @@ them few; as first written, before a read that loses its element was made one at
 conditions were summed with the cost, it was 81 s and 64 regimes. Folding regimes that no machine
 can tell apart is the fix, and is not done. Next is (3).
 
+**(3) done, 2026-09-24, as a walk down a list rather than a worklist** (cost-model § A walk down
+a list; golden `walk`). The step as written, a pop-until-empty loop bounded by its pushes, turned
+out to reach nothing: the compiler has no such loop, and `bfs`, the one M3 named, pushes inside
+the loop it bounds, so its total is its own trip count — it ends because of the `dist[v] < 0`
+guard, which a count of pushes cannot see. What the compiler does have, 26 times among the
+functions unknown for their own reason, is `while s >= 0 { …; s = nodes[s].next }` down a list
+in an arena. Such a loop now runs at most `walk(nodes[_].next)`, the longest walk along the link,
+when nothing in the body writes `next` — decided by a summary, per function and parameter, of the
+fields it may store into, itself or through its callees. The line is `bound`: the atom is at most
+`nodes.len()` only if no list is a cycle, which is `arena.nt`'s `decreasing` promise and not
+something the compiler checks. Three things rode along. The same summary replaces "a call handed
+the array writable" wherever a read asks whether its array was written, so a view passed to a
+function that only reads it no longer makes every read of it stale. Dominance knows that an
+element is at most its array's `max`, so regimes that contradict it are dropped. And an exact
+callee whose footprint depends on an argument the caller cannot name makes the footprint inexact
+instead of making the caller unknown.
+
+Measured on the compiler, text unchanged: **92 exact, 46 modulo, 32 bound, 105 unknown**, from 92,
+37, 28 and 119. The walk itself reached 24 of the 26; the other two, `check_block` and
+`check_program`, call a checker that splices desugared statements into the list it is walking,
+and are refused, rightly. The unknowns now:
+
+| cause | functions |
+|---|---|
+| calls a callee in its own cycle of calls | 35 |
+| a `while` with no measure the compiler can find | 20 |
+| a `while` bound is not a size expression | 16 |
+| recursion with no shrinking argument, recursive calls that depend on the input, an entry value set in an earlier loop | 13 |
+| an exact callee's cost depends on an argument that is not a size expression | 12 |
+| `unbounded`, an `extern` | 4 |
+| the compared variable is not stepped by a constant exactly once | 3 |
+| a walk down a list the body may write | 2 |
+
+The "not stepped" row, 29 in (2), was the walk. As with (1), most of what it reached had a
+second cause behind the first: mutual recursion is now the largest row (27 → 35), because walks
+over statement lists are how the compiler's recursive descent is written, and the walk only moves
+the verdict on to the recursion. That row and the recursion row, 48 functions together, are
+M3's second hole, recursion with a measure that reads memory: a tree in an arena, walked by
+recursing over each node's children. That is the potential method, a node count as the potential,
+and it is what is left of this stage besides (4), the committed `compiler/costs.lock`.
+
+It costs compile time again, and most of that was paid back. `written_roots` made more reads
+survive, which let `pol_cmp_ord` and `piece_before` be costed for the first time, with 128 regimes
+each, and `neant check` on the compiler went to 113 s. Three changes that leave every report byte
+for byte the same brought it to 7.2 s, against 5.5 s before: adding a polynomial to every piece of
+a cost no longer prunes it again, since a shift changes no piece's feasibility or dominance;
+substitution accumulates in place and skips variables a polynomial does not mention; and layout
+choice analyses, per struct and layout, only the functions that touch the struct, with their
+callees as they are reached, instead of the whole program 39 times. Folding regimes that no
+machine can tell apart is still not done.
+
 **Not in this stage, but what makes the number meaningful afterwards.** The roofline term M5
 decided (`moves/BW` taken as a `max` with `work/P`), so the prediction reaches time; argv, modules
 and arrays by value, without which a domain corpus (stage C's control loops and kernels) cannot be

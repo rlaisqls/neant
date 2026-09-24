@@ -34,6 +34,13 @@ pub struct Cost {
 /// covers `B·n` because `n ≥ 1`. Undecided cases are false: sound, not complete. Sizes of zero
 /// are the boundary the model does not distinguish.
 pub fn dominates(q: &Poly, p: &Poly) -> bool {
+    if dominates_as_written(q, p) { return true; }
+    // an element is at most the most its array holds and at least the least: `p` with its
+    // elements widened that way is no smaller, so `q` covering that covers `p`
+    p.widen_reads().is_some_and(|r| dominates_as_written(q, &r))
+}
+
+fn dominates_as_written(q: &Poly, p: &Poly) -> bool {
     if q.sub(p).terms.values().all(|c| c.n >= 0) { return true; }
     // budgets of q's terms, consumed by the terms of p they cover
     let mut budget: Vec<(&super::size::Mono, f64)> = q.terms.iter().filter(|(_, c)| c.n > 0).map(|(m, c)| (m, c.to_f64())).collect();
@@ -125,6 +132,14 @@ impl Cost {
     }
 
     pub fn add(&self, o: &Cost) -> Cost {
+        // one unconditional side shifts every piece of the other by the same polynomial, which
+        // changes no piece's feasibility and no piece's dominance over another: what was pruned
+        // stays pruned, and only the order, which is by polynomial, needs doing again
+        if let Some((c, r)) = o.single().map(|r| (self, r)).or_else(|| self.single().map(|r| (o, r))) {
+            let mut ps: Vec<Piece> = c.pieces.iter().map(|p| Piece { conds: p.conds.clone(), poly: p.poly.add(r) }).collect();
+            ps.sort_by(|a, b| a.conds.len().cmp(&b.conds.len()).then_with(|| a.poly.cmp(&b.poly)));
+            return Cost { pieces: ps };
+        }
         let mut out = Vec::new();
         for a in &self.pieces {
             for b in &o.pieces {
@@ -136,7 +151,7 @@ impl Cost {
         }
         Cost::from_pieces(out)
     }
-    pub fn add_poly(&self, p: &Poly) -> Cost { self.map(|q| q.add(p)) }
+    pub fn add_poly(&self, p: &Poly) -> Cost { self.add(&Cost::poly(p.clone())) }
     pub fn max(&self, o: &Cost) -> Cost {
         let mut ps = self.pieces.clone();
         ps.extend(o.pieces.iter().cloned());
