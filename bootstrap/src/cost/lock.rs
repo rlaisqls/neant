@@ -175,7 +175,15 @@ pub fn render_with(source_name: &str, costs: &[FuncCost], existing: &str, layout
             Some((name, l[i..].to_string()))
         }).collect();
     let mut lines: Vec<String> = costs.iter().map(|c| {
-        let mut l = line(c);
+        // no `(line N)`: a lockfile is read in review, and a line number that moves because
+        // something above it grew is a change to every unknown below it and to nothing else
+        let mut l = match &c.result {
+            CostResult::Unknown { .. } if c.declared.work.is_none() || c.declared.moves.is_none() => {
+                let full = line(c);
+                match full.rfind(" (line ") { Some(i) => { let j = i + full[i..].find(')').unwrap() + 1; format!("{}{}", &full[..i], &full[j..]) } None => full }
+            }
+            _ => line(c),
+        };
         if c.tier == "declared" { if let Some(m) = measured.get(&c.name) { l.push_str(m); } }
         if !c.rests_on.is_empty() { l.push_str(&format!("  rests on {}", c.rests_on.join("; "))); }
         l
@@ -244,11 +252,17 @@ pub fn pretty_line(c: &FuncCost) -> String {
 }
 
 /// Lines that differ between an existing lockfile and a fresh rendering, as `(old, new)` pairs
-/// keyed by function name. Header lines are ignored.
+/// keyed by function name, or by struct for a layout line. Header lines are ignored.
 pub fn diff(old: &str, new: &str) -> Vec<(String, String)> {
     let entries = |s: &str| -> std::collections::BTreeMap<String, String> {
         s.lines().filter(|l| !l.starts_with('#') && !l.trim().is_empty())
-            .map(|l| (l.split_whitespace().next().unwrap_or("").to_string(), l.to_string()))
+            .map(|l| {
+                // a layout line is keyed by its struct, or every layout but the last goes unseen
+                let mut w = l.split_whitespace();
+                let first = w.next().unwrap_or("");
+                let key = if first == "layout" { format!("layout {}", w.next().unwrap_or("")) } else { first.to_string() };
+                (key, l.to_string())
+            })
             .collect()
     };
     let (a, b) = (entries(old), entries(new));

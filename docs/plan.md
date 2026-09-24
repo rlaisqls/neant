@@ -546,7 +546,7 @@ element is at most its array's `max`, so regimes that contradict it are dropped.
 callee whose footprint depends on an argument the caller cannot name makes the footprint inexact
 instead of making the caller unknown.
 
-Measured on the compiler, text unchanged: **92 exact, 46 modulo, 32 bound, 105 unknown**, from 92,
+Measured on the compiler, text unchanged: **92 exact, 47 modulo, 32 bound, 105 unknown**, from 92,
 37, 28 and 119. The walk itself reached 24 of the 26; the other two, `check_block` and
 `check_program`, call a checker that splices desugared statements into the list it is walking,
 and are refused, rightly. The unknowns now:
@@ -579,6 +579,18 @@ substitution accumulates in place and skips variables a polynomial does not ment
 choice analyses, per struct and layout, only the functions that touch the struct, with their
 callees as they are reached, instead of the whole program 39 times. Folding regimes that no
 machine can tell apart is still not done.
+
+**(4) done, 2026-09-24.** `compiler/costs.lock` is committed, and `self_host_lock.rs` fails when it
+is not what `neant lock` writes today for the concatenation `build.sh` compiles — so a change to
+the calculus or to the compiler's text that moves any of the 276 lines has to show up in review as
+a change to that file. `compiler/lock.sh` regenerates it and prints the count, which is read from
+the lockfile and nowhere else: **92 exact, 47 modulo, 32 bound, 105 unknown**. (The 46 recorded for
+(3) was a miscount; the four did not add to 276.) Two things the lockfile had to learn first. It
+kept the report's `(line N)` on every unknown, and in a concatenation of seven files every edit
+moves the line of every unknown below it, a hundred lines of diff for none of substance; the
+lockfile now leaves the line out. And `neant lock --check` keyed its diff by a line's first word,
+so every `layout` line shared one key and a change of layout to any struct but the last went
+unseen; they are keyed by struct now.
 
 **Not in this stage, but what makes the number meaningful afterwards.** The roofline term M5
 decided (`moves/BW` taken as a `max` with `work/P`), so the prediction reaches time; argv, modules

@@ -654,5 +654,7 @@ fib              unknown: calls `fib`, whose cost is unknown (recursive; recurre
 `exact` means both costs were derived by the rules above with no unknown. It does not mean the
 machine will agree to the byte; it means the shape is proven and the constant is the rules'. A
 piecewise cost prints its regimes on the lines under the function; `costs.lock` keeps every piece
-exactly on the function's one line. `--eval n=1792,B=64` decides the conditions at the machine's
+exactly on the function's one line, and leaves out the `(line N)` the report ends an unknown with:
+the lockfile is read in review, where a number that moves because something above it grew is noise
+on every unknown below it. `--eval n=1792,B=64` decides the conditions at the machine's
 `B` and `M` and prints the applicable piece's numbers. `#[cost]` must hold in every piece.
