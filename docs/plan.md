@@ -627,7 +627,25 @@ above, and is the next thing to add before the potential method.
 **Not in this stage, but what makes the number meaningful afterwards.** The roofline term M5
 decided (`moves/BW` taken as a `max` with `work/P`), so the prediction reaches time; argv, modules
 and arrays by value, without which a domain corpus (stage C's control loops and kernels) cannot be
-written; and the editor surface the README describes, which does not exist.
+written; and the editor surface the README describes, which did not exist.
+
+**The editor surface, 2026-09-26.** `neant hints f.nt` prints the report as one JSON document:
+each function with the line of its `fn`, its tier, the grey text (`work …   moves …   exact`, the
+README's wording, from the same `brief` the report uses), its work and moves as the lockfile
+states them, its regimes, bounds, footprint, what it rests on, and for an unknown the cause and
+the line the report names; lex, parse and type errors and broken `#[cost]` bounds are diagnostics
+with a line and a column instead of a message on stderr. It computes nothing: every field is a
+line of `neant cost` or of `costs.lock` taken apart (bootstrap/src/hints.rs), and on the
+concatenated compiler it counts what `lock.sh` counts, 92 exact, 47 modulo, 32 bound, 105 unknown
+of 276. `editors/vscode` is a VS Code extension in plain JavaScript that runs it on open and on
+save, prints each function's cost in grey after its signature with the report in the hover, and
+puts the errors in the Problems panel; its grammar is the lexer's keyword and operator set.
+`tests/hints/` pins the output on `dot` (exact), `fib` (unknown, recurrence, modulo), a type error
+and a broken budget. What is left: the hints are for the saved file — an edit that moves lines
+clears them until the next save, since the compiler reads the file and not the buffer — and the
+analysis is whole-file, 65 s on the compiler under a debug build, so an editor wants a release
+build and, later, a cache keyed by function. The `✓` the README draws after `exact` is not
+printed: nothing in the report says what it would check.
 
 ## M7 — the constant factor
 
@@ -664,6 +682,7 @@ the choice is reopened with the number in hand.
 bootstrap/              everything that builds the compiler from nothing
   Cargo.toml, src/      the Rust compiler. Seed one. Frozen after self-hosting, never deleted.
     lex.rs  parse.rs  ast.rs  types.rs  ir.rs  emit_c.rs  main.rs
+    hints.rs            `neant hints`: the report as JSON, for an editor
     cost/
       size.rs           symbolic sizes and costs: rational polynomials over atoms, B and M
       piece.rs          piecewise costs: conditions, max, feasibility
@@ -677,8 +696,10 @@ bootstrap/              everything that builds the compiler from nothing
       lock.rs           costs.lock and the report
   neant.c               compiler/ compiled by itself. Seed two. (self-hosting)
 compiler/               the compiler in neant. Empty until self-hosting.
+editors/                the grey text in an editor: vscode/ (grammar, hints, diagnostics); README.md
 tests/
   golden/               .nt programs with expected output (.out, .exit), rejection (.err), cost report (.cost)
+  hints/                what `neant hints` prints for some of golden/, one .json each
   kernels/              the M1/M2 experiments: kernel templates and sweep.py, the perf harness; iolb.sh runs IOLB in docker
 docs/
   plan.md               this file

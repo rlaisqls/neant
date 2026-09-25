@@ -10,6 +10,7 @@
 //!   neant measure f.nt --fn name [--sizes 1000,4000,...] [--shape p=n*n,...] [--repeat k] [--cpu 5] [--lock]
 //!                                             run the function over a size sweep under perf and fit ~n^k
 //!   any command: --apply fn:tile[,fn:transpose]  rewrite a function first
+//!   neant hints f.nt                          every function's cost and every error as JSON, for an editor
 //!   neant lexdump f.nt   this lexer's token kinds, one per line, numbered per compiler/lex.nt's
 //!                        own scheme (`lex_kind_number`) — the self-hosted lexer's cross-check
 //!                        (bootstrap/tests/self_host_lex.rs, docs/self-hosting-design.md)
@@ -18,6 +19,7 @@ mod ast;
 mod cost;
 mod diag;
 mod emit_c;
+mod hints;
 mod ir;
 mod lex;
 mod parse;
@@ -101,6 +103,7 @@ fn main() {
         }
         return;
     }
+    if cmd == "hints" { print!("{}", hints::run(&file, &src, &machine)); return; }
     let mut module = match compile(&src) {
         Ok(m) => m,
         Err(e) => { eprintln!("{}:{e}", file.display()); process::exit(1); }

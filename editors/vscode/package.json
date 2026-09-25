@@ -1,0 +1,65 @@
+{
+  "name": "neant",
+  "displayName": "neant",
+  "description": "Syntax highlighting for neant, and the compiler's inferred cost of every function as grey text next to its signature.",
+  "version": "0.1.0",
+  "publisher": "neant",
+  "license": "UNLICENSED",
+  "engines": { "vscode": "^1.75.0" },
+  "categories": ["Programming Languages"],
+  "main": "./extension.js",
+  "activationEvents": [],
+  "contributes": {
+    "languages": [
+      {
+        "id": "neant",
+        "aliases": ["neant"],
+        "extensions": [".nt"],
+        "configuration": "./language-configuration.json"
+      }
+    ],
+    "grammars": [
+      { "language": "neant", "scopeName": "source.neant", "path": "./syntaxes/neant.tmLanguage.json" }
+    ],
+    "commands": [
+      { "command": "neant.refreshHints", "title": "neant: Refresh cost hints" }
+    ],
+    "configuration": {
+      "title": "neant",
+      "properties": {
+        "neant.path": {
+          "type": "string",
+          "default": "neant",
+          "description": "The neant compiler: a name on PATH, or a path to bootstrap/target/debug/neant. A relative path is taken from the workspace folder."
+        },
+        "neant.args": {
+          "type": "array",
+          "items": { "type": "string" },
+          "default": [],
+          "description": "Extra arguments to `neant hints`, e.g. [\"-M\", \"32768\", \"-B\", \"64\"] for another cache."
+        },
+        "neant.hints.style": {
+          "type": "string",
+          "enum": ["decoration", "inlay", "off"],
+          "default": "decoration",
+          "description": "How each function's cost is shown: grey text after the `fn` line, a VS Code inlay hint there, or not at all (diagnostics are still reported)."
+        },
+        "neant.hints.maxLength": {
+          "type": "number",
+          "default": 120,
+          "description": "Longest grey text shown on the line; the full report is in the hover."
+        },
+        "neant.unknownsAsDiagnostics": {
+          "type": "boolean",
+          "default": true,
+          "description": "Report where each unknown cost comes from as a hint-level diagnostic at the line the report names."
+        },
+        "neant.timeoutMs": {
+          "type": "number",
+          "default": 120000,
+          "description": "How long `neant hints` may run on one file."
+        }
+      }
+    }
+  }
+}

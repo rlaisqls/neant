@@ -1,0 +1,126 @@
+{
+  "$schema": "https://raw.githubusercontent.com/martinring/tmlanguage/master/tmlanguage.json",
+  "name": "neant",
+  "scopeName": "source.neant",
+  "fileTypes": ["nt"],
+  "comment": "Built from bootstrap/src/lex.rs: its keywords, its literals and its operators, and nothing else. The builtin types (i64 f64 bool u8) are identifiers to the lexer and names to the checker (bootstrap/src/types.rs).",
+  "patterns": [
+    { "include": "#comment" },
+    { "include": "#attribute" },
+    { "include": "#function" },
+    { "include": "#struct" },
+    { "include": "#literal" },
+    { "include": "#keyword" },
+    { "include": "#type" },
+    { "include": "#call" },
+    { "include": "#operator" }
+  ],
+  "repository": {
+    "comment": {
+      "name": "comment.line.double-slash.neant",
+      "match": "//.*$"
+    },
+    "attribute": {
+      "name": "meta.attribute.neant",
+      "begin": "(#)(\\[)\\s*([A-Za-z_][A-Za-z0-9_]*)",
+      "beginCaptures": {
+        "1": { "name": "punctuation.definition.attribute.neant" },
+        "2": { "name": "punctuation.section.attribute.begin.neant" },
+        "3": { "name": "entity.name.function.attribute.neant" }
+      },
+      "end": "\\]",
+      "endCaptures": { "0": { "name": "punctuation.section.attribute.end.neant" } },
+      "patterns": [
+        { "include": "#string" },
+        { "name": "variable.other.key.neant", "match": "\\b[A-Za-z_][A-Za-z0-9_]*\\b(?=\\s*=)" },
+        { "name": "keyword.operator.assignment.neant", "match": "=" },
+        { "name": "constant.language.neant", "match": "\\b[A-Za-z_][A-Za-z0-9_]*\\b" }
+      ]
+    },
+    "function": {
+      "match": "\\b(extern\\s+)?(fn)\\s+([A-Za-z_][A-Za-z0-9_]*)",
+      "captures": {
+        "1": { "name": "storage.modifier.extern.neant" },
+        "2": { "name": "keyword.declaration.function.neant" },
+        "3": { "name": "entity.name.function.neant" }
+      }
+    },
+    "struct": {
+      "match": "\\b(struct)\\s+([A-Za-z_][A-Za-z0-9_]*)",
+      "captures": {
+        "1": { "name": "keyword.declaration.struct.neant" },
+        "2": { "name": "entity.name.type.struct.neant" }
+      }
+    },
+    "literal": {
+      "patterns": [
+        { "include": "#byte" },
+        { "include": "#string" },
+        { "name": "constant.language.boolean.neant", "match": "\\b(true|false)\\b" },
+        { "name": "constant.numeric.float.neant", "match": "\\b[0-9][0-9_]*\\.[0-9][0-9_]*([eE][+-]?[0-9]+)?\\b" },
+        { "name": "constant.numeric.float.neant", "match": "\\b[0-9][0-9_]*[eE][+-]?[0-9]+\\b" },
+        { "name": "constant.numeric.integer.neant", "match": "\\b[0-9][0-9_]*\\b" }
+      ]
+    },
+    "byte": {
+      "patterns": [
+        {
+          "name": "string.quoted.single.byte.neant",
+          "match": "b'(?:[^'\\\\]|\\\\[ntr0\\\\'\"])'",
+          "captures": { "0": { "patterns": [{ "include": "#escape" }] } }
+        },
+        {
+          "name": "string.quoted.double.bytes.neant",
+          "begin": "b\"",
+          "end": "\"|$",
+          "patterns": [{ "include": "#escape" }]
+        }
+      ]
+    },
+    "escape": {
+      "name": "constant.character.escape.neant",
+      "match": "\\\\[ntr0\\\\'\"]"
+    },
+    "string": {
+      "name": "string.quoted.double.neant",
+      "begin": "\"",
+      "end": "\"|$"
+    },
+    "keyword": {
+      "patterns": [
+        { "name": "keyword.control.neant", "match": "\\b(if|else|for|in|while|break|return)\\b" },
+        { "name": "keyword.other.decreasing.neant", "match": "\\bdecreasing\\b" },
+        { "name": "keyword.other.effects.neant", "match": "\\buses\\b" },
+        { "name": "storage.modifier.neant", "match": "\\b(let|mut|extern)\\b" },
+        { "name": "keyword.declaration.neant", "match": "\\b(fn|struct)\\b" },
+        { "name": "keyword.operator.cast.neant", "match": "\\bas\\b" }
+      ]
+    },
+    "type": {
+      "patterns": [
+        { "name": "support.type.primitive.neant", "match": "\\b(i64|f64|bool|u8)\\b" },
+        { "name": "entity.name.type.neant", "match": "\\b[A-Z][A-Za-z0-9_]*\\b" }
+      ]
+    },
+    "call": {
+      "match": "\\b([a-z_][A-Za-z0-9_]*)\\s*(?=\\()",
+      "captures": { "1": { "name": "entity.name.function.call.neant" } }
+    },
+    "operator": {
+      "patterns": [
+        { "name": "keyword.operator.arrow.neant", "match": "->" },
+        { "name": "keyword.operator.range.neant", "match": "\\.\\." },
+        { "name": "keyword.operator.comparison.neant", "match": "==|!=|<=|>=|<|>" },
+        { "name": "keyword.operator.assignment.compound.neant", "match": "\\+=|-=|\\*=|/=" },
+        { "name": "keyword.operator.logical.neant", "match": "&&|\\|\\||!" },
+        { "name": "keyword.operator.arithmetic.neant", "match": "\\+|-|\\*|/|%" },
+        { "name": "keyword.operator.borrow.neant", "match": "&" },
+        { "name": "keyword.operator.closure.neant", "match": "\\|" },
+        { "name": "keyword.operator.assignment.neant", "match": "=" },
+        { "name": "punctuation.accessor.dot.neant", "match": "\\." },
+        { "name": "punctuation.separator.neant", "match": "[,;:]" },
+        { "name": "punctuation.brackets.neant", "match": "[()\\[\\]{}]" }
+      ]
+    }
+  }
+}
