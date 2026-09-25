@@ -41,20 +41,24 @@ pub fn dominates(q: &Poly, p: &Poly) -> bool {
 }
 
 fn dominates_as_written(q: &Poly, p: &Poly) -> bool {
-    if q.sub(p).terms.values().all(|c| c.n >= 0) { return true; }
-    // budgets of q's terms, consumed by the terms of p they cover
-    let mut budget: Vec<(&super::size::Mono, f64)> = q.terms.iter().filter(|(_, c)| c.n > 0).map(|(m, c)| (m, c.to_f64())).collect();
+    // the argument is about `q − p ≥ 0`: its positive terms are the budget and its negative terms
+    // what the budget must cover. Budgeting `q`'s positive terms against `p`'s alone would drop
+    // `q`'s negative ones, and call `32·i − 32 ≥ 32·i`
+    let d = q.sub(p);
+    if d.terms.values().all(|c| c.n >= 0) || univariate_nonneg(&d) { return true; }
+    let mut budget: Vec<(&super::size::Mono, f64)> = d.terms.iter().filter(|(_, c)| c.n > 0).map(|(m, c)| (m, c.to_f64())).collect();
     let covers = |big: &super::size::Mono, small: &super::size::Mono| -> bool {
         // for every atom in either term, `big` has at least the exponent — so a `B⁻¹` in `big`
         // that `small` lacks disqualifies it: `8n²/B` does not cover `n`
         let zero = Rat::zero();
-        big.factors.keys().chain(small.factors.keys()).all(|a| big.factors.get(a).unwrap_or(&zero) >= small.factors.get(a).unwrap_or(&zero))
+        let ge = |small: &super::size::Mono| big.factors.keys().chain(small.factors.keys()).all(|a| big.factors.get(a).unwrap_or(&zero) >= small.factors.get(a).unwrap_or(&zero));
+        // and the least element is at most the most: `n·max(xs[_])` covers `n·min(xs[_])`
+        ge(small) || small.factors.keys().any(|a| matches!(a, Atom::Read(r) if r.least && !r.walk)) && ge(&least_as_most(small))
     };
-    let mut ps: Vec<(&super::size::Mono, f64)> = p.terms.iter().map(|(m, c)| (m, c.to_f64())).collect();
+    let mut ps: Vec<(&super::size::Mono, f64)> = d.terms.iter().filter(|(_, c)| c.n < 0).map(|(m, c)| (m, -c.to_f64())).collect();
     // largest terms first, so they take the budget they need
     ps.sort_by(|a, b| b.0.cmp(a.0));
     for (pm, pc) in ps {
-        if pc <= 0.0 { continue; }
         let mut need = pc;
         for (qm, qb) in budget.iter_mut() {
             if *qb <= 0.0 || !covers(qm, pm) { continue; }
@@ -66,6 +70,62 @@ fn dominates_as_written(q: &Poly, p: &Poly) -> bool {
         if need > 1e-12 { return false; }
     }
     true
+}
+
+/// `m` with every least-element read replaced by the most-element read of the same array: a term
+/// no smaller than `m`, since every atom is at least one.
+fn least_as_most(m: &super::size::Mono) -> super::size::Mono {
+    let mut out = super::size::Mono::default();
+    for (a, e) in &m.factors {
+        let a = match a { Atom::Read(r) if r.least && !r.walk => Atom::Read(Box::new(super::size::Read { least: false, ..(**r).clone() })), other => other.clone() };
+        let cur = out.factors.get(&a).copied().unwrap_or(Rat::zero());
+        out.factors.insert(a, cur.add(*e));
+    }
+    out
+}
+
+/// `d ≥ 0` for every integer value ≥ 1 of its one atom, decided exactly when `d` is a polynomial in
+/// one integer-valued atom — a size, a read, `B` or `M` — with whole exponents: past the Cauchy
+/// bound on its roots its sign is its leading coefficient's, and below it there are finitely many
+/// integers to evaluate. `8·n² − 32·n + 32`, which is `8·(n − 2)²`, is out of reach of any term
+/// budget and within reach of this.
+fn univariate_nonneg(d: &Poly) -> bool {
+    let mut atom: Option<&Atom> = None;
+    let mut coef: std::collections::BTreeMap<i128, Rat> = std::collections::BTreeMap::new();
+    for (m, c) in &d.terms {
+        let k = match m.factors.len() {
+            0 => 0,
+            1 => {
+                let (a, e) = m.factors.iter().next().unwrap();
+                if !matches!(a, Atom::Var(_) | Atom::Read(_) | Atom::B | Atom::M) || e.d != 1 || e.n < 0 { return false; }
+                if atom.is_some_and(|x| x != a) { return false; }
+                atom = Some(a);
+                e.n
+            }
+            _ => return false,
+        };
+        coef.insert(k, *c);
+    }
+    let Some((&deg, &lead)) = coef.iter().next_back() else { return true };
+    if lead.n < 0 { return false; }
+    // every real root is below 1 + max |aᵢ / a_deg|
+    let mut bound = 1.0f64;
+    for (&k, c) in &coef { if k != deg { bound = bound.max(1.0 + (c.to_f64() / lead.to_f64()).abs()); } }
+    if !(bound <= 4096.0) { return false; }
+    (1..=bound.ceil() as i128).all(|x| {
+        let mut v = Rat::zero();
+        for (&k, c) in &coef { v = v.add(c.mul(Rat::int(x.pow(k as u32)))); }
+        v.n >= 0
+    })
+}
+
+/// Does `q` grow at least as fast as `p`? `q`'s positive terms budgeted against `p`'s, every
+/// negative term on either side dropped — so `n·(max(xs[_]) − min(xs[_])) ⪰ n/8` though the two
+/// reads may be equal. Not an inequality and never used as one: it chooses between two bounds
+/// that are both sound, which is what "the walk is longer than the arena" means in the region rule.
+pub fn dominates_eventually(q: &Poly, p: &Poly) -> bool {
+    let pos = |x: &Poly| Poly { terms: x.terms.iter().filter(|(_, c)| c.n > 0).map(|(m, c)| (m.clone(), *c)).collect() };
+    dominates_as_written(&pos(q), &pos(p))
 }
 
 /// Can these conditions hold together? A `fits` on `ws₁` and a `¬fits` on `ws₂ ≤ ws₁` cannot.

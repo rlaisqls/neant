@@ -931,7 +931,9 @@ fn while_trip(src: &[u8], toks: &[Token], nodes: &[Node], facs: &mut [Fac], term
         let span = if asc { pol_sub(facs, terms, pols, pst, e, i0) }
                    else { pol_sub(facs, terms, pols, pst, i0, e) };
         let mag = if step < 0 { 0 - step } else { step };
-        trip = pol_scale(facs, terms, pols, pst, span, 1, mag);
+        // `<=` and `>=` run the bound itself too: `i >= 0` from `n − 1` is `n` laps
+        let reach = if op == 8 || op == 10 { pol_add(facs, terms, pols, pst, span, pol_const(facs, terms, pols, pst, mag)) } else { span };
+        trip = pol_scale(facs, terms, pols, pst, reach, 1, mag);
         atom = wst[2];
         wst[2] = atom + 1;
         lo = i0;
@@ -2221,7 +2223,9 @@ fn site_range(src: &[u8], toks: &[Token], nodes: &[Node], facs: &mut [Fac], term
             if !pol_all_nonneg(pols, terms, c) { return false; }
             false
         };
-        if neg {
+        // the end the span extends is the sign of `c·step`, not of `c`: a loop counting down
+        // walks toward lower addresses
+        if neg != (lp_step(wst, id) < 0) {
             lo = pol_add(facs, terms, pols, pst, lo, span);
         } else {
             hi = pol_add(facs, terms, pols, pst, hi, span);

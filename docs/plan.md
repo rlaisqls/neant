@@ -592,6 +592,38 @@ lockfile now leaves the line out. And `neant lock --check` keyed its diff by a l
 so every `layout` line shared one key and a change of layout to any struct but the last went
 unseen; they are keyed by struct now.
 
+**What the lockfile showed as soon as it was read (2026-09-24).** Reading the compiler's
+report line by line turned up costs no machine can have: the SoA alternative the layout choice
+weighed for `Token` in `collect_structs` was `≈ −8·toks.len()·walk(nodes[_].next)²`, and
+`sym_find` claimed its symbols resident under `−32·cst[1] < M`. Four faults, each also in every
+program shaped like it, and each labelled `exact` or claimed as residue while wrong (golden
+`descend`, which reproduces all four on the old code):
+
+1. **Dominance ignored the larger side's negative terms.** `q ≥ p` budgeted `q`'s positive terms
+   against `p`'s and dropped the rest, so `32·i − 32 ≥ 32·i` held — and a resident range from the
+   last iteration was taken to contain this iteration's. The argument is now about `q − p`. Two
+   rules keep what the old one got right by accident: `max(xs[_])` covers `min(xs[_])`, and a
+   difference in one integer size is decided exactly (`8·(n − 2)² ≥ 0` in `stencil`). The region
+   rule's "the walk is longer than the arena", which chooses between two sound bounds, is a growth
+   comparison of its own, `dominates_eventually`, not an inequality.
+2. **The second walk of a loop started from this iteration's residue**, not the last one's, so a
+   call at `xs[i]` was credited for re-reading `xs[i]`. The residue is shifted back one step.
+3. **A footprint that was a hull was exact**: two fields of one element under SoA became one range
+   with the `8·n` bytes between them, and ranges with an end at `max`/`min` of an array were
+   treated as read byte for byte. Only ranges that overlap or touch merge; a loose end is inexact.
+4. **A loop counting down had its range inverted, and `<=`/`>=` lost their last lap.** The end a
+   loop extends is the sign of coefficient times step, and an inclusive bound runs `+1`. The
+   self-hosted pass had copied both rules and is fixed with them; seed two is rebuilt.
+
+The count does not move — **92 exact, 47 modulo, 32 bound, 105 unknown** — and 22 lines of the
+lockfile do: the `− 10·max(toks[_].len)` in every downward symbol search was the lost lap, and
+`cand_measure` and `solve_recurrence` shed a credit larger than what they were charged. What is
+left open: `asym_dominated` has `− 32·max(terms[_].n_fac)·min(terms[_].n_fac)·pols[inferred].n_term`
+that none of its positive terms covers, which `asserts_hold` inherits as a negative leading term;
+some range inside it is a `max − min` hull multiplied through, and it is not yet found. A test
+that every cost the compiler prints is non-negative by `dominates` would have caught all of the
+above, and is the next thing to add before the potential method.
+
 **Not in this stage, but what makes the number meaningful afterwards.** The roofline term M5
 decided (`moves/BW` taken as a `max` with `work/P`), so the prediction reaches time; argv, modules
 and arrays by value, without which a domain corpus (stage C's control loops and kernels) cannot be

@@ -1,0 +1,56 @@
+// counting down, stepping onto the bound, and what a call may be credited for — four places the
+// calculus was wrong before stage D (4) and said `exact` anyway
+//
+// `down` runs `n` times, not `n − 1`: `>=` includes the bound. Its footprint starts at 0: a loop
+// that counts down extends the range toward lower addresses. `each` pays a line per call: the
+// element the last call read is `xs[i − 1]`, not the one this call reads. And `pair` reads two
+// fields of one element, which under SoA are `8·n` bytes apart, so its footprint is not the span
+// between them.
+
+#[layout(soa)]
+struct P { a: i64, b: i64 }
+
+fn down(xs: &[i64]) -> i64 {
+    let mut i = xs.len() - 1;
+    let mut s = 0;
+    while i >= 0 {
+        s += xs[i];
+        i -= 1;
+    }
+    s
+}
+
+fn upto(xs: &[i64]) -> i64 {
+    let mut i = 0;
+    let mut s = 0;
+    while i <= xs.len() - 1 {
+        s += xs[i];
+        i += 1;
+    }
+    s
+}
+
+fn get(xs: &[i64], i: i64) -> i64 {
+    xs[i]
+}
+
+fn each(xs: &[i64]) -> i64 {
+    let mut s = 0;
+    for i in 0..xs.len() {
+        s += get(xs, i);
+    }
+    s
+}
+
+fn pair(ps: &[P], i: i64) -> i64 {
+    ps[i].a + ps[i].b
+}
+
+fn main() {
+    let xs = [3; 16];
+    let ps = [P { a: 1, b: 2 }; 4];
+    println(down(&xs));
+    println(upto(&xs));
+    println(each(&xs));
+    println(pair(&ps, 2));
+}

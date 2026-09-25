@@ -1,0 +1,13 @@
+struct P         layout SoA  fixed by #[layout]
+down             work 4·xs.len() + 2               moves 8·xs.len() + B               exact
+                 lower bound      moves 8·xs.len()                   (footprint, every distinct element crosses once)   gap 1× at M = 2 MiB, B = 64
+                 footprint        xs: [0, 8·xs.len())   resident after if 8·xs.len() < M
+upto             work 4·xs.len() + 2               moves 8·xs.len() + B               exact
+                 lower bound      moves 8·xs.len()                   (footprint, every distinct element crosses once)   gap 1× at M = 2 MiB, B = 64
+                 footprint        xs: [0, 8·xs.len())   resident after if 8·xs.len() < M
+get              work 1                            moves B                            exact
+                 footprint        xs: [8·i, 8·i + 8)   resident after if 8 < M
+each             work 6·xs.len()                   moves B·xs.len()                   exact
+pair             work 3                            moves 2·B                          exact
+                 footprint        ps: [0, 16·ps.len()) (whole array)   no residue claimed
+main             work 263                          moves 20·B + 320                   exact, io

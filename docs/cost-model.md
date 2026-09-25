@@ -113,7 +113,12 @@ pieces whose conditions hold there. Pieces whose conditions contradict each othe
 symbolically when one working set dominates another term by term (sizes are at least one, so
 `B·n²` covers `B·n`), and at the machine's `B` and `M` when every condition of a piece is in one
 size variable: each is then an interval of that variable, and an empty intersection is an
-impossible regime. The conditions themselves stay symbolic; only their feasibility is decided
+impossible regime. Term by term means the argument is about `q − p ≥ 0`: its positive terms are
+a budget, and every negative term must be covered by one with at least its exponents — `q`'s own
+negative terms included, which is what makes `32·i − 32 ≥ 32·i` false. The least element of an
+array is at most its most, so `n·max(xs[_])` covers `n·min(xs[_])`; and a difference in one
+integer size is decided exactly, below the bound on its roots by evaluation and above it by its
+leading sign, which is how `8·n² − 32·n + 32 ≥ 0` is known. The conditions themselves stay symbolic; only their feasibility is decided
 for the machine, so another cache size may keep more or fewer regimes. Nothing is folded
 ([decisions.md](decisions.md) §2, §3). The naive product analysed on its own comes out in three
 regimes:
@@ -140,6 +145,12 @@ exactly from the affine indices and loop ranges when it can be, and marked as th
 it cannot — and its **residue**: the condition under which that footprint is still resident when
 it returns (its total working set, including internal arrays, under `M`). A range that is not exact
 forfeits the residue: the footprint may be over-approximated for a fit test, never for a credit.
+Exact means every byte of the range was read. Two ranges on one parameter are one exact range
+only when they overlap or touch — two fields of one element under SoA are `8·n` bytes apart, and
+the span between them was never read — and a range with an end at the most or least an array
+holds is a hull over elements, not a range, so it is not exact either. A loop's range extends
+from its first iteration toward the sign of `coefficient · step`: a loop counting down reaches
+lower addresses.
 
 A call composes the callee's signature: the callee's cost, with this call's argument sizes
 substituted for its atoms, and its footprint mapped onto this function's arrays through the
@@ -151,7 +162,9 @@ the byte, what a re-analysis with `n = 1984` cost before this rule replaced it.
 
 A loop that calls is walked twice: once as written, which costs the first iteration with whatever
 was resident at entry, and once more with the residue its own body leaves, which costs every
-iteration after the first — only the calls are recounted in the second walk. `for r in 0..20 {
+iteration after the first — only the calls are recounted in the second walk. What the second
+walk starts from is the residue of the iteration before, so it is shifted back one step in the
+loop's variable: a call that reads `xs[i]` finds `xs[i − 1]` resident, not `xs[i]`. `for r in 0..20 {
 sum(&xs) }` over an array that fits `M` is then one scan and nineteen line-touches, not twenty
 scans; over an array that does not fit, twenty.
 
@@ -288,7 +301,8 @@ A `while` gets a trip count in one of two ways, or none.
 - **An induction variable.** `while i < e { … i += c … }` runs at most `(e − i₀)/c` times when
   `i` is a mutable `i64` stepped by the constant `c` exactly once in the body and nowhere else,
   `e` is a size expression that the body does not assign, and `i₀` — the last thing assigned to
-  `i` before the loop — is one too. `i > e` with `i -= c` is the mirror. The variable then acts
+  `i` before the loop — is one too. `i > e` with `i -= c` is the mirror. `i <= e` and `i >= e`
+  run the bound too, `(e − i₀)/c + 1`: `i >= 0` from `n − 1` is `n` laps. The variable then acts
   as a loop variable for the stride rule, so `xs[i]` inside is a sequential access.
 - **A declared measure.** `while cond decreasing m { … }` runs at most `m` times, where `m` is
   read *at entry*: mutable locals in it stand for what they were last assigned. `decreasing

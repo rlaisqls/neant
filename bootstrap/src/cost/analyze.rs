@@ -764,8 +764,11 @@ impl<'a, 'b, 'c> Fa<'a, 'b, 'c> {
             // `rec.lo` here counted the start twice and shifted the whole range right by it
             // (docs/experiments.md, "A bug in the reference compiler").
             let span = rec.trip.sub(&Poly::constant(1)).scale(Rat::int(rec.step));
-            let (a, b) = (Poly::zero(), c.mul(&span));
-            if negative { lo = lo.add(&b); hi = hi.add(&a); } else { lo = lo.add(&a); hi = hi.add(&b); }
+            // which end the span extends is the sign of `c·step`: a loop counting down with a
+            // positive coefficient walks toward lower addresses, and taking `c`'s sign alone
+            // gave `sym_find`'s `i = n − 1` down to 0 the range `[32·n − 32, 40)`
+            let b = c.mul(&span);
+            if negative != (rec.step < 0) { lo = lo.add(&b); } else { hi = hi.add(&b); }
         }
         let st = Rat::int(site.stride);
         Some((lo.scale(st).add(&site.base), hi.scale(st).add(&Poly::constant(site.es)).add(&site.base)))
@@ -787,15 +790,19 @@ impl<'a, 'b, 'c> Fa<'a, 'b, 'c> {
                 if !feet.contains_key(&(usize::MAX - root)) { feet.insert(usize::MAX - root, (Poly::zero(), h, true)); }
                 continue;
             };
-            let (lo, hi, exact) = match self.site_range(site) { Some((l, h)) => (l, h, true), None => { let (l, h) = whole(root); (l, h, false) } };
+            // a range whose end is the most or least an array holds is a hull over elements, not
+            // a range every byte of which was read
+            let (lo, hi, exact) = match self.site_range(site) { Some((l, h)) => { let ex = !l.has_loose_read() && !h.has_loose_read(); (l, h, ex) } None => { let (l, h) = whole(root); (l, h, false) } };
             match feet.get_mut(&pi) {
                 None => { feet.insert(pi, (lo, hi, exact)); }
                 Some(e) => {
-                    // two ranges on one parameter: the same range twice is one, two disjoint
-                    // field arrays under SoA are the span from the first to the last, and
-                    // anything else falls back to the whole array
+                    // two ranges on one parameter: the same range twice is one, two that overlap
+                    // or touch are their union, and anything else falls back to the whole array.
+                    // Not the span of two ranges with a gap between them — two fields of one
+                    // element under SoA are `8·n` apart — since an exact range is one every byte
+                    // of which was read: callers are credited for it and told it is resident
                     if exact && e.2 && e.0 == lo && e.1 == hi {}
-                    else if exact && e.2 && (super::piece::dominates(&lo, &e.1) || super::piece::dominates(&e.0, &hi)) {
+                    else if exact && e.2 && super::piece::dominates(&e.1, &lo) && super::piece::dominates(&hi, &e.0) {
                         let (nlo, nhi) = (if super::piece::dominates(&e.0, &lo) { lo.clone() } else { e.0.clone() },
                                           if super::piece::dominates(&hi, &e.1) { hi.clone() } else { e.1.clone() });
                         *e = (nlo, nhi, true);
@@ -1010,6 +1017,17 @@ impl<'a, 'b, 'c> Fa<'a, 'b, 'c> {
                 let outer_replay = self.replay;
                 self.replay = true;
                 self.push_frame();
+                // what the walk left resident is the *previous* iteration's: in the loop's own
+                // variable it is at `i − step`, or a call at `xs[i]` is credited for re-reading
+                // the element it reads for the first time
+                if let Some(a) = rec.atom {
+                    let back = Poly::var(a).sub(&Poly::constant(rec.step));
+                    for r in &mut self.resident {
+                        r.lo = r.lo.subst(a, &back);
+                        r.hi = r.hi.subst(a, &back);
+                        for c in &mut r.conds { c.ws = c.ws.subst(a, &back); }
+                    }
+                }
                 let r = self.block(body);
                 // keep only the recounted call moves; everything else returns to what it was
                 let (pw, pm, psp) = self.saved.pop().unwrap();
@@ -1387,7 +1405,7 @@ impl<'a, 'b, 'c> Fa<'a, 'b, 'c> {
                                     // arena, which is a comparison between a trip count and a
                                     // number of lines: it needs this machine's `B`
                                     let mm = self.machine();
-                                    let longer = super::piece::dominates(&summed.at_machine(mm.b_bytes, mm.m_bytes), &arena.at_machine(mm.b_bytes, mm.m_bytes));
+                                    let longer = super::piece::dominates_eventually(&summed.at_machine(mm.b_bytes, mm.m_bytes), &arena.at_machine(mm.b_bytes, mm.m_bytes));
                                     if longer {
                                         let first = !arenas_taken.contains(&root);
                                         arenas_taken.push(root);
@@ -2091,6 +2109,8 @@ impl<'a, 'b, 'c> Fa<'a, 'b, 'c> {
             _ => return Err(format!("`{name}` is assigned inside a loop before this one, so its entry value is not known")),
         };
         let span = if asc { e.sub(&i0) } else { i0.sub(&e) };
+        // `<=` and `>=` run the bound itself too: `i >= 0` from `n − 1` is `n` iterations, not `n − 1`
+        let span = if matches!(op, BinOp::Le | BinOp::Ge) { span.add(&Poly::constant(step.abs() as i128)) } else { span };
         // the variable steps by |step| per iteration: indices in it move by step·elem bytes,
         // which the stride rule sees through the loop variable's coefficient
         Ok((span.scale(Rat::new(1, step.abs() as i128)), Some((var, i0, step as i128))))
@@ -2293,7 +2313,9 @@ impl<'a, 'b, 'c> Fa<'a, 'b, 'c> {
                 let feet: Vec<(LocalId, Poly, Poly, bool)> = callee.footprint.iter().filter(|_| !declared_only && !opaque).filter_map(|f| {
                     let root = roots.get(f.param).copied().flatten()?;
                     let named = !unnamed.iter().any(|(i, _)| f.lo.mentions(*i) || f.hi.mentions(*i));
-                    Some((root, f.lo.subst_many(&map), f.hi.subst_many(&map), f.exact && named))
+                    let (lo, hi) = (f.lo.subst_many(&map), f.hi.subst_many(&map));
+                    let loose = lo.has_loose_read() || hi.has_loose_read();
+                    Some((root, lo, hi, f.exact && named && !loose))
                 }).collect();
                 let dbg = std::env::var("NEANT_DEBUG_CALLS").is_ok() && !self.replay;
                 if dbg {
