@@ -54,7 +54,12 @@ pub fn emit(m: &Module, opts: &Options) -> String {
         e.f = Some(f);
         e.func(f);
     }
-    e.out.push_str("int main(void) { ntu_main(); return 0; }\n");
+    // a program that reads its arguments hands them to `rt.c` first; any other keeps `main(void)`
+    if m.funcs.iter().any(|f| crate::input::is_builtin(f) && f.name.starts_with("arg")) {
+        e.out.push_str("void nt_set_args(int argc, char **argv);\nint main(int argc, char **argv) { nt_set_args(argc, argv); ntu_main(); return 0; }\n");
+    } else {
+        e.out.push_str("int main(void) { ntu_main(); return 0; }\n");
+    }
     e.out
 }
 
@@ -191,7 +196,10 @@ static void nt_println_f64(double v) {
         // prefix is `ntu_`, not `nt_`, so a function named `alloc` or `idx` cannot land on one of
         // this file's own runtime helpers (`nt_alloc`, `nt_idx`, `nt_println_*`) or on a generated
         // temporary (`nt_end2`) — found by the self-hosted parser, which has an `alloc`
-        if f.body.is_none() { let _ = write!(self.out, "{ret} {}(", f.name); }
+        // an input builtin is `nt_` in `rt.c`, so it cannot meet a program's own extern of that
+        // name — `rt.c`'s older `read_file(path, buf)` among them
+        if crate::input::is_builtin(f) { let _ = write!(self.out, "{ret} nt_{}(", f.name); }
+        else if f.body.is_none() { let _ = write!(self.out, "{ret} {}(", f.name); }
         else { let _ = write!(self.out, "static {ret} ntu_{}(", f.name); }
         if f.params.is_empty() {
             self.out.push_str("void");
@@ -547,7 +555,8 @@ static void nt_println_f64(double v) {
                 let callee = &self.m.funcs[*fid];
                 let mut parts = Vec::new();
                 for a in args { parts.extend(self.expr(a).parts()); }
-                if callee.body.is_none() { s(format!("{}({})", callee.name, parts.join(", "))) }
+                if crate::input::is_builtin(callee) { s(format!("nt_{}({})", callee.name, parts.join(", "))) }
+                else if callee.body.is_none() { s(format!("{}({})", callee.name, parts.join(", "))) }
                 else { s(format!("ntu_{}({})", callee.name, parts.join(", "))) }
             }
             ExprKind::Println(a) => {

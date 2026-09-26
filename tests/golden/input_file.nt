@@ -1,0 +1,23 @@
+// A named file: `read_file(&path)` is the whole file as a `[u8]`, its length a size of its own
+// (`data.len()`), and `file_size(&path)` is the error value — −1 when the file cannot be opened.
+// The path is the program's first argument (input_file.args); the harness runs it from this
+// directory, so the data is input_file.txt next to it.
+
+fn lines(xs: &[u8]) -> i64 {
+    let mut n = 0;
+    for i in 0..xs.len() {
+        if xs[i] == b'\n' {
+            n += 1;
+        }
+    }
+    n
+}
+
+fn main() {
+    let path = arg(0);
+    println(file_size(&path));
+    let data = read_file(&path);
+    println(data.len());
+    println(lines(&data));
+    println(data[0]);
+}

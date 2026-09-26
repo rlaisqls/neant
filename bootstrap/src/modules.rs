@@ -91,7 +91,9 @@ pub fn load(root: &Path, src: &str) -> Result<(Program, Sources), String> {
     let toks = lex::lex(src).map_err(|e| format!("{root_name}:{e}"))?;
     let (uses, toks) = split_uses(toks).map_err(|e| format!("{root_name}:{e}"))?;
     if uses.is_empty() {
-        let prog = parse::parse(toks).map_err(|e| format!("{root_name}:{e}"))?;
+        let used = crate::input::called(&toks);
+        let mut prog = parse::parse(toks).map_err(|e| format!("{root_name}:{e}"))?;
+        crate::input::add(&mut prog, &used);
         sources.files.push((root_name, 0, lines(src)));
         return Ok((prog, sources));
     }
@@ -103,12 +105,16 @@ pub fn load(root: &Path, src: &str) -> Result<(Program, Sources), String> {
     let known: Vec<String> = l.parsed.iter()
         .flat_map(|ts| ts.windows(2).filter_map(|w| match (&w[0].tok, &w[1].tok) { (Tok::Struct, Tok::Ident(n)) => Some(n.clone()), _ => None }))
         .collect();
+    // the input builtins any file calls (docs/decisions.md §9), declared once for the program
+    let used: Vec<&str> = crate::input::NAMES.iter().copied()
+        .filter(|n| l.parsed.iter().any(|ts| crate::input::called(ts).contains(n))).collect();
     for toks in std::mem::take(&mut l.parsed) {
         let p = parse::parse_knowing(toks, &known).map_err(|e| l.sources.error(&e))?;
         l.prog.funcs.extend(p.funcs);
         l.prog.structs.extend(p.structs);
     }
     l.duplicates()?;
+    crate::input::add(&mut l.prog, &used);
     Ok((l.prog, l.sources))
 }
 
