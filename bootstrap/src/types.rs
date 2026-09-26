@@ -378,6 +378,14 @@ impl<'a> Ctx<'a> {
                 };
                 // arrays are born here and only here
                 match &init.kind {
+                    // `let s = "…"`: the literal's bytes as a `[u8; n]`, as `b"…"` (docs/decisions.md §12)
+                    ast::ExprKind::Str(t) => {
+                        let out: Vec<Expr> = t.bytes().map(|b| Expr { kind: ExprKind::Byte(b), ty: Ty::U8, line: init.line }).collect();
+                        let ty = Ty::Array(Box::new(Ty::U8), Size::Const(out.len() as i64));
+                        self.check_declared(&declared, &ty, *line, *col)?;
+                        let id = self.declare(name, ty, *mutable);
+                        Ok(Stmt::LetArray(id, out))
+                    }
                     ast::ExprKind::Bytes(bytes) => {
                         let out: Vec<Expr> = bytes.iter().map(|b| Expr { kind: ExprKind::Byte(*b), ty: Ty::U8, line: init.line }).collect();
                         let ty = Ty::Array(Box::new(Ty::U8), Size::Const(out.len() as i64));
@@ -795,7 +803,7 @@ impl<'a> Ctx<'a> {
             ast::ExprKind::Bool(v) => mk(ExprKind::Bool(*v), Ty::Bool),
             ast::ExprKind::Byte(v) => mk(ExprKind::Byte(*v), Ty::U8),
             ast::ExprKind::Bytes(_) => err(e.line, e.col, "a byte string can only initialise a `let`"),
-            ast::ExprKind::Str(_) => err(e.line, e.col, "a string literal is text for `print` or `println`; it is not a value"),
+            ast::ExprKind::Str(_) => err(e.line, e.col, "a string literal is text for `print` or `println`, a `[u8]` bound by `let`, or an argument where `&[u8]` is taken"),
             ast::ExprKind::Var(n) => {
                 let id = self.lookup(n).map_or_else(|| err(e.line, e.col, format!("unknown variable `{n}`")), Ok)?;
                 self.check_moved(id, e.line, e.col)?;
@@ -984,8 +992,23 @@ impl<'a> Ctx<'a> {
                     }
                     roots.push((r, mutable, k));
                 }
+                // a string literal where a `&[u8]` is taken: bound to a local of its own just
+                // before the call, and the view of that passed (docs/decisions.md §12)
+                let mut texts: Vec<Stmt> = Vec::new();
                 for (a, pty) in args.iter().zip(&ptys) {
-                    let ca = self.expr(a)?;
+                    let ca = if let ast::ExprKind::Str(t) = &a.kind {
+                        if !matches!(pty, Ty::Slice(el, false, _) if **el == Ty::U8) {
+                            return err(a.line, a.col, format!("a string literal is a `[u8]`, passed as `&[u8]`; `{name}` takes `{pty}` here"));
+                        }
+                        if matches!(ret, Ty::Array(..)) {
+                            return err(a.line, a.col, format!("`{name}` returns an owned array; bind the literal with `let` first"));
+                        }
+                        let (id, st) = self.text_local(t, a.line);
+                        texts.push(st);
+                        let ty = self.locals[id].ty.clone();
+                        let Ty::Array(el, sz) = ty else { unreachable!() };
+                        Expr { kind: ExprKind::Ref(id, false), ty: Ty::Slice(el, false, sz), line: a.line }
+                    } else { self.expr(a)? };
                     let ok = match (&ca.ty, pty) {
                         // `[T; k]` by value: the argument is moved in, as by `let` (§7)
                         (_, Ty::Array(ep, Size::Const(k))) => {
@@ -1013,6 +1036,10 @@ impl<'a> Ctx<'a> {
                         return err(a.line, a.col, format!("argument of type `{}` where `{pty}` is expected", ca.ty));
                     }
                     cargs.push(ca);
+                }
+                if !texts.is_empty() {
+                    let call = Expr { kind: ExprKind::Call(fid, cargs), ty: ret.clone(), line };
+                    return mk(ExprKind::Block(Block { stmts: texts, tail: Some(Box::new(call)), ty: ret.clone() }), ret);
                 }
                 mk(ExprKind::Call(fid, cargs), ret)
             }
@@ -1166,6 +1193,12 @@ impl<'a> Ctx<'a> {
     }
 
     /// A compiler-made local; the `#` keeps it out of the user's namespace.
+    /// A string literal as a `[u8; n]` local, and the `let` that builds it: its bytes as written.
+    fn text_local(&mut self, t: &str, line: u32) -> (LocalId, Stmt) {
+        let bytes: Vec<Expr> = t.bytes().map(|b| Expr { kind: ExprKind::Byte(b), ty: Ty::U8, line }).collect();
+        let id = self.fresh_local("text", Ty::Array(Box::new(Ty::U8), Size::Const(bytes.len() as i64)), false);
+        (id, Stmt::LetArray(id, bytes))
+    }
     fn fresh_local(&mut self, base: &str, ty: Ty, mutable: bool) -> LocalId {
         let n = self.next_fresh();
         self.declare(&format!("{base}#{n}"), ty, mutable)

@@ -1,5 +1,5 @@
-// a string literal is not a value: only `print` and `println` take one
+// a string literal is read-only: it is passed where `&[u8]` is taken, not `&mut [u8]`
+fn upper(s: &mut [u8]) { s[0] = b'M'; }
 fn main() {
-    let t = "mean";
-    println(t);
+    upper("mean");
 }
