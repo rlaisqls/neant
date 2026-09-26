@@ -451,6 +451,48 @@ What the atom is not yet: the expression the value was written from. `let k = n;
 a loop to `xs[0]` is a loop to the atom `xs[0]`, not to `n` — following a store to its load is
 what plan § Stage D (2) left for later.
 
+## Program input
+
+The input builtins (decisions.md §9) are externs with declared costs, so a caller rests on them
+like on any declaration. What the calculus adds is the size of what they return, in three cases:
+
+- **`arg_count()` is exact.** The number of arguments is fixed for the run, so every call returns
+  the same value: one atom, `arg_count()`, minted once per function when the program has the
+  builtin, and the callee's `arg_count()` is its caller's own at a call rather than a new one. A
+  loop to it, directly or through an immutable `let`, is exact in it, as a loop to a parameter
+  is (`input_argc.cost`: `main  work 6·arg_count() + 28`).
+- **An array returned outside a loop is exact.** `let a = arg(0)` or `let d = read_file(&p)`: an
+  extern that returns `[T]` names its result's length `result.len()` in its declaration, and the
+  caller gets an atom of its own for it at the call, named after the local, `a.len()`
+  (`input_args.cost`). It is free the way a parameter's length is. Through a function that reads
+  and returns, the caller gets a new atom again (`first_len.a.len()` in `modules/input`).
+- **`arg(k)` inside a loop is a bound.** Each lap's argument has a length of its own, an atom that
+  would not survive the lap. What does survive is the longest argument: the lap's array is taken
+  at `max(arg[_].len())`, a read atom with no element (§ A size read from memory), shared by every
+  function, so the line is `bound` and a loop over all of them reads `arg_count()·max(arg[_].len())`
+  (`input_perlap.cost`). As for an array born in a loop by `[e; n]`, the lap's array is one local
+  to the calculus: where it fits, its read after the first lap is credited as resident.
+- **Anything else read inside a loop stays unknown**, with the call named: `read_file` per lap
+  (`input_perlap_file.cost`: "calls `read_file` in a loop: what it reads is a size of its own at
+  every iteration"). No whole bounds it: the files are not known to the run the way its arguments
+  are. So does a function that returns an argument it read, called per lap: the provenance of its
+  result's atom does not travel with it.
+
+**The declarations, measured.** `neant measure --fn arg_count|arg|read_file|file_size` runs each
+builtin on a real input of `n` bytes, an argument of `n` bytes or a file of `n` bytes, because the
+ordinary driver cannot build either and has no value for `result.len()`. Before this, a
+declaration the sweep could not evaluate was reported as confirmed; it is now reported as not.
+On the machine (`--cpu 5`, 10000 calls per size, n = 1000..32000) the first declarations failed
+for three of the four, and in the same place: they had no constant. `arg_count` measured 12.5
+instructions a call against a declared 1 — the call into `rt.c`, which the compiler cannot
+inline; opening a file measured about 2000 user-space instructions for `file_size` and about 2260
+for `read_file` at small `n`, against a declared `path.len()`. `arg` was confirmed as declared:
+it measured about `n/3 + 300` instructions and a few lines of traffic, well under `n` and `n`.
+The declarations now carry the constants, `10` and `+ 2500`, and all four are confirmed. The
+kernel's share of a read, the copy into the buffer among it, is not in the counter (it counts
+user space), so `moves` is confirmed here only as not exceeded; a file read streams through the
+page cache, which the model does not see.
+
 ## A walk down a list
 
 `while s >= 0 { …; s = xs[s].f }` walks a list threaded through the array `xs` by the `i64` field

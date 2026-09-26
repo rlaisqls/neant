@@ -14,15 +14,17 @@ use crate::lex::{Tok, Token};
 
 /// The declarations. A read of `n` bytes is priced as the model prices a sequential write of `n`
 /// bytes (`[b'\0'; n]` is work `n`, moves `n`): the bytes land in a fresh array once. A path is
-/// read once, the same way.
+/// read once, the same way. The constants are `neant measure`'s (docs/cost-model.md § Program
+/// input): a call into `rt.c` that the compiler cannot inline is about ten instructions, and opening
+/// a file about two thousand in user space — the kernel's side of it is not in the counter.
 const PRELUDE: &str = r#"
-#[cost(work_at_most = "1", moves_at_most = "0")]
+#[cost(work_at_most = "10", moves_at_most = "0")]
 extern fn arg_count() -> i64 uses io;
 #[cost(work_at_most = "result.len()", moves_at_most = "result.len()")]
 extern fn arg(k: i64) -> [u8] uses io;
-#[cost(work_at_most = "result.len() + path.len()", moves_at_most = "result.len() + path.len()")]
+#[cost(work_at_most = "result.len() + path.len() + 2500", moves_at_most = "result.len() + path.len()")]
 extern fn read_file(path: &[u8]) -> [u8] uses io;
-#[cost(work_at_most = "path.len()", moves_at_most = "path.len()")]
+#[cost(work_at_most = "path.len() + 2500", moves_at_most = "path.len()")]
 extern fn file_size(path: &[u8]) -> i64 uses io;
 "#;
 
@@ -51,4 +53,41 @@ pub fn add(prog: &mut ast::Program, used: &[&str]) {
 
 pub fn is_builtin(f: &crate::ir::Func) -> bool {
     f.line == 0 && f.body.is_none() && NAMES.contains(&f.name.as_str())
+}
+
+/// What `neant measure --fn <builtin>` runs at size `n` (docs/cost-model.md § Program input): a
+/// `main` that calls the builtin `repeat` times on a real input of `n` bytes — an argument of `n`
+/// bytes given to the binary, or a file of `n` bytes written into `dir` — or, without the call, the
+/// same loop, to be subtracted. The ordinary driver cannot: it fills a path with a pattern, runs
+/// the binary with no arguments, and has no value for `result.len()`, which is not a parameter.
+pub struct Probe {
+    pub module: crate::ir::Module,
+    /// the binary's arguments
+    pub args: Vec<String>,
+    /// the sizes the declaration is evaluated at, as `--eval` takes them
+    pub ev: String,
+}
+
+pub fn probe(name: &str, n: i64, repeat: i64, with_call: bool, dir: &std::path::Path) -> Result<Probe, String> {
+    let file = dir.join(format!("probe{n}.bin"));
+    let path = file.to_string_lossy().to_string();
+    if path.contains(['"', '\\', '\n']) { return Err(format!("the probe's path needs escaping: {path}")); }
+    let (call, args, ev) = match name {
+        "arg_count" => ("acc += arg_count();".to_string(), vec![], "n=0".to_string()),
+        "arg" => ("let a = arg(0);\n        acc += a.len();".to_string(), vec!["x".repeat(n as usize)], format!("k=0,result.len()={n}")),
+        "read_file" | "file_size" => {
+            std::fs::write(&file, vec![b'x'; n as usize]).map_err(|e| format!("{path}: {e}"))?;
+            let call = if name == "read_file" { "let d = read_file(&p);\n        acc += d.len();" } else { "acc += file_size(&p);" };
+            (call.to_string(), vec![], format!("path.len()={}{}", path.len(), if name == "read_file" { format!(",result.len()={n}") } else { String::new() }))
+        }
+        other => return Err(format!("`{other}` is not an input builtin")),
+    };
+    let body = if with_call { call } else { "acc += 1;".to_string() };
+    let src = format!("fn main() {{\n    let p = b\"{path}\";\n    let mut acc = 0;\n    for r in 0..{repeat} {{\n        {body}\n    }}\n    println(acc + p.len());\n}}\n");
+    let toks = crate::lex::lex(&src).map_err(|e| e.to_string())?;
+    let used = called(&toks);
+    let mut prog = crate::parse::parse(toks).map_err(|e| e.to_string())?;
+    add(&mut prog, &used);
+    let module = crate::types::check(&prog).map_err(|e| e.to_string())?;
+    Ok(Probe { module, args, ev })
 }

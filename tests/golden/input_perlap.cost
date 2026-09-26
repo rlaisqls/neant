@@ -1,0 +1,6 @@
+main             work 6·arg_count()·max(arg[_].len()) + 4·arg_count() + 13 moves                              bound, io  (2 regimes)
+                                               moves 2·arg_count()·max(arg[_].len()) + B·arg_count() if ≈ max(arg[_].len()) ≥ M
+                                               moves arg_count()·max(arg[_].len()) + max(arg[_].len()) + B if ≈ max(arg[_].len()) < M
+                 rests on         arg_count (declared, extern); arg (declared, extern)
+arg_count        work ≤ 10                         moves ≤ 0                          declared, io
+arg              work ≤ result.len()               moves ≤ result.len()               declared, io

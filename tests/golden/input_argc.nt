@@ -1,0 +1,21 @@
+// `arg_count()` is a size: the number of arguments is fixed for the run, so every call returns the
+// same value, one atom `arg_count()` for the whole program. A loop to it is exact in that atom, in
+// `main` and in a function that asks again, which its caller reads as its own `arg_count()`.
+
+fn count_twice() -> i64 {
+    let mut c = 0;
+    for k in 0..arg_count() {
+        c += 2;
+    }
+    c
+}
+
+fn main() {
+    let n = arg_count();
+    let mut s = 0;
+    for k in 0..n {
+        s += k;
+    }
+    println(s);
+    println(count_twice());
+}

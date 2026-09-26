@@ -522,6 +522,10 @@ struct Fa<'a, 'b, 'c> {
     /// when that size is an atom minted at the call for an extern's `result.len()` (program
     /// input), so the `let` can name it after the local: `data.len()`
     last_result_atom: Option<usize>,
+    /// `arg_count()`, one atom for the whole function when the program has the builtin: the
+    /// number of arguments is fixed for the run, so every call returns it (docs/cost-model.md
+    /// § Program input)
+    argc_atom: Option<usize>,
     /// A scalar that a statement of the enclosing block stores into, or loads from, an array
     /// element (`c[i·n + j] = acc`): inside that block the scalar *is* that element's running
     /// value, and a statement using it references the element. Register promotion does not
@@ -586,7 +590,7 @@ struct Fa<'a, 'b, 'c> {
 impl<'a, 'b, 'c> Fa<'a, 'b, 'c> {
     fn new(an: &'b mut Analyzer<'a>, f: &'c Func, self_fid: Option<FuncId>) -> Self {
         let mut fa = Fa {
-            an, f, names: param_names(f), sites: vec![], loop_recs: vec![], bounds: vec![], images: HashMap::new(), result_size: None, last_result: None, last_result_atom: None, scalar_alias: HashMap::new(), alias_scopes: vec![], notes: vec![], io: false, self_fid, rec_calls: vec![],
+            an, f, names: param_names(f), sites: vec![], loop_recs: vec![], bounds: vec![], images: HashMap::new(), result_size: None, last_result: None, last_result_atom: None, argc_atom: None, scalar_alias: HashMap::new(), alias_scopes: vec![], notes: vec![], io: false, self_fid, rec_calls: vec![],
             local_size: HashMap::new(), local_affine: HashMap::new(), initial: HashMap::new(), at_entry: false,
             loops: vec![], work: Cost::zero(), moves: Cost::zero(), span: Cost::zero(), saved: vec![], branch: vec![], next_if: 0,
             local_root: HashMap::new(), resident: vec![], call_moves: Cost::zero(), saved_calls: vec![], replay: false, has_call: vec![], rests_on: vec![],
@@ -601,7 +605,16 @@ impl<'a, 'b, 'c> Fa<'a, 'b, 'c> {
                 fa.local_affine.insert(p, Affine::constant(Poly::var(i)));
             }
         }
+        if fa.an.m.funcs.iter().any(|g| crate::input::is_builtin(g) && g.name == "arg_count") {
+            fa.argc_atom = Some(fa.new_atom("arg_count()"));
+        }
         fa
+    }
+
+    /// Whether `fid` is the `arg_count()` builtin, whose value is the atom `argc_atom`.
+    fn is_argc(&self, fid: FuncId) -> bool {
+        let g = &self.an.m.funcs[fid];
+        crate::input::is_builtin(g) && g.name == "arg_count"
     }
 
     fn run(mut self) -> FuncCost {
@@ -1119,6 +1132,7 @@ impl<'a, 'b, 'c> Fa<'a, 'b, 'c> {
                 Some(a.konst.clone())
             }
             ExprKind::Len(l) => self.local_size.get(l).cloned(),
+            ExprKind::Call(fid, _) if self.is_argc(*fid) => self.argc_atom.map(Poly::var),
             ExprKind::Cast(inner, Ty::I64) => self.size_of(inner, bound),
             // min is bounded above by either argument, max below by either: the first that is a size
             ExprKind::MinMax(true, a, b) if bound == Dir::Upper => self.size_of(a, bound).or_else(|| self.size_of(b, bound)),
@@ -1215,6 +1229,7 @@ impl<'a, 'b, 'c> Fa<'a, 'b, 'c> {
                 self.local_affine.get(l).cloned()
             }
             ExprKind::Len(l) => self.local_size.get(l).map(|p| Affine::constant(p.clone())),
+            ExprKind::Call(fid, _) if self.is_argc(*fid) => self.argc_atom.map(|a| Affine::constant(Poly::var(a))),
             ExprKind::Cast(inner, Ty::I64) => self.affine(inner),
             // `min(ii*T + T, n)` as a loop end: the tile bound, the rectangular hull of the rest
             ExprKind::MinMax(true, a, _) => self.affine(a),
@@ -2306,12 +2321,23 @@ impl<'a, 'b, 'c> Fa<'a, 'b, 'c> {
                 // extern returned, program input, reached here directly or through a callee that
                 // read it — is a new quantity at every call: this function gets an atom of its
                 // own for it, free the way a parameter's length is. Once per call, so not in a
-                // loop, where each lap would read an input of its own length
+                // loop, where each lap would read an input of its own length: there `arg(k)` is
+                // at most the longest argument, `max(arg[_].len())`, a bound, and anything else
+                // is unknown. `arg_count()` is the same number in every function and every lap,
+                // so the callee's is this function's own
                 self.last_result_atom = None;
                 for k in cf.params.len()..callee.names.len() {
                     let in_result = callee.result_size.as_ref().is_some_and(|p| p.mentions(k));
                     if !(w.mentions(k) || mv.mentions(k) || sp.mentions(k) || in_result) { continue; }
+                    if let (true, Some(a)) = (callee.names[k] == "arg_count()", self.argc_atom) {
+                        map.push((k, Poly::var(a)));
+                        continue;
+                    }
                     if !self.loops.is_empty() {
+                        if crate::input::is_builtin(cf) && cf.name == "arg" && callee.result_size == Some(Poly::var(k)) {
+                            map.push((k, longest_arg()));
+                            continue;
+                        }
                         return Err(Fail::Unknown(format!("calls `{}` in a loop: what it reads is a size of its own at every iteration, `{}`", callee.name, callee.names[k]), e.line));
                     }
                     let a = self.new_atom(&format!("{}.{}", callee.name, callee.names[k]));
@@ -2328,6 +2354,7 @@ impl<'a, 'b, 'c> Fa<'a, 'b, 'c> {
                             }
                             None => Root::Local(format!("{}.{n}", callee.name)),
                         },
+                        Root::Local(n) if n == LONGEST_ARG => r.clone(),
                         Root::Local(n) if !n.contains('.') => Root::Local(format!("{}.{n}", callee.name)),
                         other => other.clone(),
                     }
@@ -2407,6 +2434,16 @@ impl<'a, 'b, 'c> Fa<'a, 'b, 'c> {
             }
         }
     }
+}
+
+/// The root of `max(arg[_].len())`: the arguments, as if an array of them, which every function
+/// shares, so a caller does not rename it to the callee's own.
+const LONGEST_ARG: &str = "arg";
+
+/// The longest argument's length, `max(arg[_].len())`: what `arg(k)` returns at most when a loop
+/// reads one per lap. A read atom with no element, so the line that has it is `bound`.
+fn longest_arg() -> Poly {
+    Poly::atom(Atom::Read(Box::new(Read { id: 0, root: Root::Local(LONGEST_ARG.into()), index: None, field: Some("len()".into()), least: false, walk: false })))
 }
 
 /// The constant `var` is stepped by in `body`, when it is assigned exactly once there as

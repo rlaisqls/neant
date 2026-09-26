@@ -1,0 +1,12 @@
+// A file read per lap stays unknown: its length is a size of its own every iteration, and unlike
+// the arguments there is no whole to take the most of, so the calculus names the call and stops.
+
+fn main() {
+    let mut total = 0;
+    for k in 0..arg_count() {
+        let path = arg(k);
+        let data = read_file(&path);
+        total += data.len();
+    }
+    println(total);
+}
