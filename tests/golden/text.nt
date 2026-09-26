@@ -1,0 +1,17 @@
+// Text output: a string literal is the argument of `print` (no newline) or `println`. It is
+// written byte for byte — `\` is an ordinary byte, there are no escapes — and costs one call and
+// its bytes, a constant.
+fn report(label: i64, x: f64) {
+    if label == 0 { print("low  "); } else { print("high "); }
+    println(x);
+}
+
+fn main() {
+    println("readings");
+    report(0, 0.5);
+    report(1, 7.25);
+    println("path C:\dir 100% é");
+    print("");
+    println("");
+    println("end");
+}

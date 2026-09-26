@@ -403,6 +403,8 @@ mod parsedump {
             ExprKind::Bool(_) => { o.push(62); Ok(()) }
             ExprKind::Byte(_) => { o.push(63); Ok(()) }
             ExprKind::Bytes(_) => { o.push(64); Ok(()) }
+            // a string literal for `print`/`println` is not in the self-hosted parser yet
+            ExprKind::Str(_) => Err("a string literal".into()),
             ExprKind::Var(_) => { o.push(65); Ok(()) }
             ExprKind::Binary(_, l, r) => { o.push(66); expr(l, o)?; expr(r, o) }
             ExprKind::Unary(_, a) => { o.push(67); expr(a, o) }

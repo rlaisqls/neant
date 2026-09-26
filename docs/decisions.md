@@ -4,6 +4,37 @@ Design decisions with the reasoning that produced them, so the reasoning is not 
 code is. Newest first. A decision is recorded when it was argued over, when it rejected
 alternatives worth remembering, or when a future reader would otherwise ask "why on earth".
 
+## 10 — Text output is a literal written by `print` and `println`, not a string value
+
+**Decided and implemented 2026-09-26.** The corpus could not label a number (`rejected_string`):
+`println("mean error")` was `expected an expression, found a string`. What the front end already
+had: the lexer reads `"…"` as `Tok::Str`, with no escapes and not past the end of a line, for
+`#[cost(…)]` values only; and `b"…"` as `Tok::Bytes`, with escapes, which a `let` turns into a
+`[u8; n]` array — a buffer, sized, indexable, costed as one. A report needs neither a string type
+nor a buffer: it needs bytes that go to the output.
+
+So the surface is the smallest that writes a label. **A string literal is the argument of
+`print` or `println` and nothing else.** `println("…")` writes the literal and a newline,
+`print("…")` the literal alone, so `print("x = "); println(x)` puts a name and a number on one
+line; `println(x)` of a scalar is unchanged, and `print` takes only a literal. Anywhere else —
+`let t = "a"`, an argument to a function — a literal is rejected with that reason. The literal is
+the lexer's `Tok::Str` as it was: bytes as written, UTF-8 included, `\` an ordinary byte, no
+escapes and no `"` inside; a newline is `println`. `print` and `println` are both builtin names.
+
+Rejected, and why. *A `[u8]` printed as text* (`println(b"…")`, or `print(&bytes)`) would reuse
+the byte string, but it makes a label a buffer the analysis tracks, sizes and charges as an
+array, and asks every reader to know that a `[u8]` argument prints as characters while a `u8`
+prints as a number. *A string type* is a value with a length, a layout and operations, all of
+which need a cost; nothing in the corpus asks for more than a fixed label. Either can come later
+without changing what a literal in `print` means.
+
+**What the calculus charges.** A literal of `n` bytes written out is one call, work 1, and its
+bytes read from where the literal lives, moves `n` — `n + 1` for `println`'s newline — a
+constant, and the function gets `io`. The emitter writes `fputs` of a C literal with every byte
+other than a letter, a digit or a space escaped in octal, so the C holds exactly the source's
+bytes. `text.nt` pins it; `tests/corpus/report` is `rejected_string` turned into a labelled
+report, exact.
+
 ## 9 — Program input: arguments and a named file are externs that return `[u8]`
 
 **Decided and implemented 2026-09-26.** Until now a program's only input was stdin, read the way

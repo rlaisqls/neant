@@ -58,3 +58,5 @@ pid        abs              exact
 pid        main             unknown
 pid        arg              declared
 pid        read_file        declared
+report     mean_abs_error   exact
+report     main             exact

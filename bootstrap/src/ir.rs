@@ -262,6 +262,8 @@ pub enum ExprKind {
     ArrayVal(Vec<Expr>),
     Call(FuncId, Vec<Expr>),
     Println(Box<Expr>),
+    /// `print("…")` / `println("…")`: a literal written to the output, with a newline for `println`
+    Text(String, bool),
     Len(LocalId),
     /// A view of a local array or a reborrow of a local slice.
     Ref(LocalId, bool),

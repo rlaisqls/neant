@@ -121,7 +121,7 @@ impl<'a> Ex<'a> {
             ExprKind::Call(fid, _) => Err(format!("a call to `{}` is not part of a SCoP", self.m.funcs[*fid].name)),
             ExprKind::If(c, t, els) => { self.scan_expr(c)?; self.scan_block(t)?; if let Some(b) = els { self.scan_block(b)?; } Ok(()) }
             ExprKind::Block(b) => self.scan_block(b),
-            ExprKind::Println(_) => Err("`println` is not part of a SCoP".into()),
+            ExprKind::Println(_) | ExprKind::Text(..) => Err("`println` is not part of a SCoP".into()),
             ExprKind::Field(..) | ExprKind::StructLit(..) | ExprKind::FieldIndex(..) | ExprKind::ArrayVal(..) => Err("a struct is not part of a SCoP: the polyhedral model reads arrays of scalars".into()),
             _ => Ok(()),
         }
@@ -313,7 +313,7 @@ impl<'a> Ex<'a> {
             ExprKind::If(c, t, els) => format!("({} ? {} : {})", self.expr(c), t.tail.as_ref().map_or("0".to_string(), |x| self.expr(x)), els.as_ref().and_then(|b| b.tail.as_ref()).map_or("0".to_string(), |x| self.expr(x))),
             ExprKind::Block(b) => b.tail.as_ref().map_or("0".to_string(), |x| self.expr(x)),
             ExprKind::Ref(a, _) => self.f.locals[*a].name.clone(),
-            ExprKind::Call(..) | ExprKind::Println(_) | ExprKind::Field(..) | ExprKind::StructLit(..) | ExprKind::FieldIndex(..) | ExprKind::ArrayVal(..) => "0".into(),
+            ExprKind::Call(..) | ExprKind::Println(_) | ExprKind::Text(..) | ExprKind::Field(..) | ExprKind::StructLit(..) | ExprKind::FieldIndex(..) | ExprKind::ArrayVal(..) => "0".into(),
         }
     }
 }

@@ -95,7 +95,7 @@ Rejected, each kept as a minimal case in `tests/corpus/rejected_*` with its erro
 
 | case | what one would write | error |
 |---|---|---|
-| `rejected_string` | `println("mean error")` — any labelled report | `expected an expression, found a string` |
+| `rejected_string` | `println("mean error")` — any labelled report | accepted since 2026-09-26 (decisions §10): `print("…")` and `println("…")` write a literal; the case is now `tests/corpus/report` |
 | `rejected_grid2d` | `let g = [[0.0; n]; n]` — a plate as rows | `an array literal can only initialise a let for now` |
 | `rejected_vecparam` | `dot(a, a)` with `fn dot(a: [f64; 3], b: [f64; 3])` | ``argument 2 moves `a` into `dot`, which argument 1 already moved`` — a double move, rejected rightly; until 2026-09-26 the message spoke of views and `&mut` |
 

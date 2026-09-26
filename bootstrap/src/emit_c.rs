@@ -638,6 +638,14 @@ static void nt_println_f64(double v) {
                 else if callee.body.is_none() { s(format!("{}({})", callee.name, parts.join(", "))) }
                 else { s(format!("ntu_{}({})", callee.name, parts.join(", "))) }
             }
+            // bytes as written, each one escaped so the C literal holds exactly them
+            ExprKind::Text(t, nl) => {
+                let mut lit = String::new();
+                for b in t.bytes().chain(nl.then_some(b'\n')) {
+                    if b.is_ascii_alphanumeric() || b == b' ' { lit.push(b as char); } else { lit.push_str(&format!("\\{b:03o}")); }
+                }
+                s(format!("fputs(\"{lit}\", stdout)"))
+            }
             ExprKind::Println(a) => {
                 let f = match a.ty { Ty::I64 => "nt_println_i64", Ty::F64 => "nt_println_f64", Ty::U8 => "nt_println_u8", _ => "nt_println_bool" };
                 let v = self.expr(a).scalar();

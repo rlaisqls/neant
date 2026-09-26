@@ -414,6 +414,7 @@ impl Parser {
             Tok::Float(v) => { self.next(); mk(ExprKind::Float(v)) }
             Tok::Byte(v) => { self.next(); mk(ExprKind::Byte(v)) }
             Tok::Bytes(v) => { self.next(); mk(ExprKind::Bytes(v)) }
+            Tok::Str(v) => { self.next(); mk(ExprKind::Str(v)) }
             Tok::True => { self.next(); mk(ExprKind::Bool(true)) }
             Tok::False => { self.next(); mk(ExprKind::Bool(false)) }
             Tok::Ident(name) => {

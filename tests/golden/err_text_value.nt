@@ -1,0 +1,5 @@
+// a string literal is not a value: only `print` and `println` take one
+fn main() {
+    let t = "mean";
+    println(t);
+}

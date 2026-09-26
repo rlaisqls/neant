@@ -1,0 +1,20 @@
+// A report with labels: `print("…")` writes a literal and `println("…")` one with a newline, so
+// each number is named on its line (docs/decisions.md §10). Once rejected as rejected_string.
+fn mean_abs_error(xs: &[f64], ys: &[f64]) -> f64 {
+    let mut s = 0.0;
+    for i in 0..xs.len() {
+        let d = xs[i] - ys[i];
+        s += max(d, 0.0 - d);
+    }
+    s / (xs.len() as f64)
+}
+
+fn main() {
+    let predicted = [1.0, 2.5, 2.0, 4.0];
+    let observed = [1.25, 2.0, 2.0, 3.5];
+    println("mean error");
+    print("  mae = ");
+    println(mean_abs_error(&predicted, &observed));
+    print("  n = ");
+    println(predicted.len());
+}

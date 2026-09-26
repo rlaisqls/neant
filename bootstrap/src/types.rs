@@ -47,8 +47,8 @@ pub fn check(prog: &ast::Program) -> Result<Module> {
         if sigs.contains_key(&f.name) {
             return err(f.line, f.col, format!("function `{}` is defined twice", f.name));
         }
-        if f.name == "println" {
-            return err(f.line, f.col, "`println` is a builtin");
+        if f.name == "println" || f.name == "print" {
+            return err(f.line, f.col, format!("`{}` is a builtin", f.name));
         }
         let mut ptys = Vec::new();
         for p in &f.params {
@@ -735,6 +735,7 @@ impl<'a> Ctx<'a> {
             ast::ExprKind::Bool(v) => mk(ExprKind::Bool(*v), Ty::Bool),
             ast::ExprKind::Byte(v) => mk(ExprKind::Byte(*v), Ty::U8),
             ast::ExprKind::Bytes(_) => err(e.line, e.col, "a byte string can only initialise a `let`"),
+            ast::ExprKind::Str(_) => err(e.line, e.col, "a string literal is text for `print` or `println`; it is not a value"),
             ast::ExprKind::Var(n) => {
                 let id = self.lookup(n).map_or_else(|| err(e.line, e.col, format!("unknown variable `{n}`")), Ok)?;
                 self.check_moved(id, e.line, e.col)?;
@@ -860,6 +861,15 @@ impl<'a> Ctx<'a> {
                 mk(ExprKind::MinMax(name == "min", Box::new(a), Box::new(b)), ty)
             }
             ast::ExprKind::Call(name, args) => {
+                // `print("…")`, `println("…")`: a literal written out (docs/decisions.md §10)
+                if name == "println" || name == "print" {
+                    if let [ast::Expr { kind: ast::ExprKind::Str(t), .. }] = &args[..] {
+                        return mk(ExprKind::Text(t.clone(), name == "println"), Ty::Unit);
+                    }
+                    if name == "print" {
+                        return err(e.line, e.col, "`print` writes a string literal without a newline; a value is printed with `println`");
+                    }
+                }
                 if name == "println" {
                     if args.len() != 1 {
                         return err(e.line, e.col, "`println` takes one argument");
@@ -1381,6 +1391,6 @@ fn last_uses_expr(e: &Expr, reassigns: &[Reassign], into: &mut HashMap<LocalId, 
             if let Some(b) = els { last_uses(b, reassigns, into); }
         }
         ExprKind::Block(b) => last_uses(b, reassigns, into),
-        ExprKind::Int(_) | ExprKind::Float(_) | ExprKind::Bool(_) | ExprKind::Byte(_) => {}
+        ExprKind::Int(_) | ExprKind::Float(_) | ExprKind::Bool(_) | ExprKind::Byte(_) | ExprKind::Text(..) => {}
     }
 }

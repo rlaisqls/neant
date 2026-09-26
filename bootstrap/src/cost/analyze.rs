@@ -2229,6 +2229,14 @@ impl<'a, 'b, 'c> Fa<'a, 'b, 'c> {
             ExprKind::MinMax(_, a, b) => { self.expr(a)?; self.expr(b)?; self.add_work_n(2); Ok(()) } // compare, select
             ExprKind::Unary(_, a) | ExprKind::Cast(a, _) => { self.expr(a)?; self.add_work_n(1); Ok(()) }
             ExprKind::Println(a) => { self.expr(a)?; self.add_work_n(1); if !self.replay { self.io = true; } Ok(()) }
+            // a literal of n bytes written out: one call, and its n bytes (the newline one more)
+            // read from where the literal lives, a constant (docs/decisions.md §10)
+            ExprKind::Text(t, nl) => {
+                self.add_work_n(1);
+                self.stream(&Poly::constant(t.len() as i128 + *nl as i128), 1);
+                if !self.replay { self.io = true; }
+                Ok(())
+            }
             ExprKind::Index(arr, idx) => {
                 self.expr(idx)?;
                 self.add_work_n(1);
@@ -2706,7 +2714,7 @@ fn callees_expr(e: &Expr, out: &mut Vec<FuncId>) {
         ExprKind::StructLit(_, es) | ExprKind::ArrayVal(es) => for x in es { callees_expr(x, out); },
         ExprKind::If(c, t, els) => { callees_expr(c, out); callees_block(t, out); if let Some(b) = els { callees_block(b, out); } }
         ExprKind::Block(b) => callees_block(b, out),
-        ExprKind::Int(_) | ExprKind::Float(_) | ExprKind::Bool(_) | ExprKind::Byte(_) | ExprKind::Local(_) | ExprKind::Len(_) | ExprKind::Ref(..) => {}
+        ExprKind::Int(_) | ExprKind::Float(_) | ExprKind::Bool(_) | ExprKind::Byte(_) | ExprKind::Local(_) | ExprKind::Len(_) | ExprKind::Ref(..) | ExprKind::Text(..) => {}
     }
 }
 
@@ -2753,7 +2761,7 @@ impl Writes {
             ExprKind::StructLit(_, es) | ExprKind::ArrayVal(es) => for x in es { self.expr(x); },
             ExprKind::If(c, t, els) => { self.expr(c); self.block(t); if let Some(b) = els { self.block(b); } }
             ExprKind::Block(b) => self.block(b),
-            ExprKind::Int(_) | ExprKind::Float(_) | ExprKind::Bool(_) | ExprKind::Byte(_) | ExprKind::Local(_) | ExprKind::Len(_) | ExprKind::Ref(..) => {}
+            ExprKind::Int(_) | ExprKind::Float(_) | ExprKind::Bool(_) | ExprKind::Byte(_) | ExprKind::Local(_) | ExprKind::Len(_) | ExprKind::Ref(..) | ExprKind::Text(..) => {}
         }
     }
 }
@@ -2862,6 +2870,6 @@ fn stores_expr(e: &Expr, f: &Func, roots: &mut HashMap<LocalId, LocalId>, summ: 
         ExprKind::StructLit(_, es) | ExprKind::ArrayVal(es) => for x in es { stores_expr(x, f, roots, summ, hit); },
         ExprKind::If(c, t, els) => { stores_expr(c, f, roots, summ, hit); stores_block(t, f, roots, summ, hit); if let Some(b) = els { stores_block(b, f, roots, summ, hit); } }
         ExprKind::Block(b) => stores_block(b, f, roots, summ, hit),
-        ExprKind::Int(_) | ExprKind::Float(_) | ExprKind::Bool(_) | ExprKind::Byte(_) | ExprKind::Local(_) | ExprKind::Len(_) | ExprKind::Ref(..) => {}
+        ExprKind::Int(_) | ExprKind::Float(_) | ExprKind::Bool(_) | ExprKind::Byte(_) | ExprKind::Local(_) | ExprKind::Len(_) | ExprKind::Ref(..) | ExprKind::Text(..) => {}
     }
 }

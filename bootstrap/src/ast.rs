@@ -88,6 +88,8 @@ pub enum ExprKind {
     Byte(u8),
     /// `b"..."` — an array literal of bytes
     Bytes(Vec<u8>),
+    /// `"..."` outside an attribute: text for `print`/`println` only (docs/decisions.md §10)
+    Str(String),
     Var(String),
     Binary(BinOp, Box<Expr>, Box<Expr>),
     Unary(UnOp, Box<Expr>),
