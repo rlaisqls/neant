@@ -1,0 +1,5 @@
+count            work 6·s.len()                    moves s.len() + B                  exact
+                 footprint        s: [0, s.len())   resident after if s.len() < M
+same             work 6·a.len() + 3                moves 2·a.len() + 2·B              exact
+                 footprint        a: [0, a.len())  b: [0, a.len())   resident after if 2·a.len() < M
+main             work 238                          moves 10·B + 76                    exact, io

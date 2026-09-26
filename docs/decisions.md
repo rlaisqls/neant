@@ -4,6 +4,34 @@ Design decisions with the reasoning that produced them, so the reasoning is not 
 code is. Newest first. A decision is recorded when it was argued over, when it rejected
 alternatives worth remembering, or when a future reader would otherwise ask "why on earth".
 
+## 12 — A string literal is a `[u8]` value; a string is still not a type
+
+**Decided and implemented 2026-09-26.** §10 made a literal text for `print` and `println` and
+nothing else, and left a label as a value for later. A program that reads data compares what it
+read against a literal (a header, a keyword) and hands a literal to a parser, so the literal is
+now a value too, the one it already was as `b"…"`:
+
+- **`let s = "…";`** is a `[u8; n]` of the literal's bytes, as written — the same array, costed the
+  same, as `let s = b"…";`: work `n` (a store per byte) and moves `n`, a constant. `let mut` makes
+  it writable, `s.len()` is the literal `n`, and it is viewed with `&s` like any array.
+- **A literal where `&[u8]` is taken**, `count("mississippi", b's')`, is bound to a local of its own
+  just before the call and its view passed: the same `n` stores and `n` bytes, charged where the
+  call is. Where `&mut [u8]` or anything else is taken it is rejected with that reason, and so is a
+  literal handed to a function that returns an owned array (bind it first).
+- `print("…")` and `println("…")` are unchanged: the literal is written, not built.
+
+**What is still not a string, and why.** There is no string type: text is a `[u8]` and has what
+an array has — a length fixed where it is born, elements, views — and nothing more. There is no
+concatenation and no growth, because either makes a length that is not known where the value is
+born: every array in this language is sized once, and the calculus names that size (a literal, a
+parameter's length, an atom minted at a call) and never revises it. A growable text would be a
+buffer whose length changes under the loops that read it, which is the shape stage D's unknowns
+already come from. There is no `==` on texts of different lengths (a `[u8; 3]` and a `[u8; 4]` are
+different types; compare by walking, as `same` in `text_value.nt` does), no formatting of a value
+into text beyond `std/text.nt`'s functions, and no printing of a `[u8]` as text: `print` takes a
+literal, so a formatted buffer is printed a byte at a time. The literal keeps §10's lexing — no
+escapes, no `"` inside; `b"…"` is the form with escapes.
+
 ## 11 — A grid of rows is a row-major idiom the checker writes, not a nested array type
 
 **Decided and implemented 2026-09-26.** `let g = [[0.0; n]; n]` was rejected

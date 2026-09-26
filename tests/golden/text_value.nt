@@ -1,0 +1,33 @@
+// A string literal as a value: `let s = "…"` is a `[u8; n]` of its bytes, as `b"…"` is, and a
+// literal passed where `&[u8]` is taken is bound just before the call and its view passed. Either
+// costs what the array literal costs: n stores and n bytes, a constant.
+fn count(s: &[u8], c: u8) -> i64 {
+    let mut n = 0;
+    for i in 0..s.len() {
+        if s[i] == c { n += 1; }
+    }
+    n
+}
+
+fn same(a: &[u8], b: &[u8]) -> bool {
+    let mut eq = a.len() == b.len();
+    for i in 0..min(a.len(), b.len()) {
+        if a[i] != b[i] { eq = false; }
+    }
+    eq
+}
+
+fn main() {
+    let s = "banana";
+    println(s.len());
+    println(s[1]);
+    println(count(&s, b'a'));
+    println(count("mississippi", b's'));
+    println(same(&s, "banana"));
+    println(same("abc", "abd"));
+    let mut t = "cat";
+    t[0] = b'b';
+    println(same(&t, "bat"));
+    let e = "";
+    println(e.len());
+}
