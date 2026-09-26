@@ -141,8 +141,8 @@ holds; 19 when formatting) and stop storing at the first that does not belong, s
 constant — `parse_int` work 333, `format_int` 406 — and `skip_space`, which scans by what it reads,
 is charged the rest of the text, as its comment says. The libm declarations are bounds read off
 the implementations' common paths, not measured. `tests/golden/modules/std/` uses both modules
-from its own directory; its `main` is unknown, because printing a formatted buffer loops to the
-offset the formatter returned, which is data — printing a `[u8]` as text is not in the language
-(decisions §12). Left: `tests/corpus/lib/` still carries its own copies, to be replaced by `use
+from its own directory; its `main` was unknown, because printing a formatted buffer looped to
+the offset the formatter returned, which is data; since `print_bytes` (decisions §13) it prints the
+buffer in one call charged by the view, and `main` is exact. Left: `tests/corpus/lib/` still carries its own copies, to be replaced by `use
 "std/…"` once the corpus is re-pinned; a search path or a version of the library; the
 self-hosted loader.

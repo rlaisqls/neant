@@ -1,0 +1,6 @@
+digits           work 14·out.len()                 moves out.len() + B                exact
+                 lower bound      moves out.len()                    (footprint, every distinct element crosses once)   gap 1× at M = 2 MiB, B = 64
+                 footprint        out: [0, out.len())   resident after if out.len() < M
+main             work 508                          moves B + 100                      exact, io
+                 rests on         print_bytes (declared, extern)
+print_bytes      work ≤ s.len() + 60               moves ≤ s.len()                    declared, io

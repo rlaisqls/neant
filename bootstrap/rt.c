@@ -161,3 +161,10 @@ struct nt_arr_uint8_t nt_read_file(const uint8_t *path_p, int64_t path_n) {
     struct nt_arr_uint8_t a = { buf, (int64_t)n };
     return a;
 }
+
+// the first `n` bytes of `s`, as they are, to stdout (docs/decisions.md §13); `n` beyond the view
+// is a bounds failure, as an index past it is
+void nt_print_bytes(const uint8_t *s_p, int64_t s_n, int64_t n) {
+    if (n < 0 || n > s_n) { fprintf(stderr, "print_bytes of %lld bytes from a view of %lld\n", (long long)n, (long long)s_n); exit(101); }
+    fwrite(s_p, 1, (size_t)n, stdout);
+}

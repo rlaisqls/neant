@@ -25,6 +25,6 @@ log              work ≤ 80                         moves ≤ 0                
 sin              work ≤ 100                        moves ≤ 0                          declared
 cos              work ≤ 100                        moves ≤ 0                          declared
 pow              work ≤ 200                        moves ≤ 0                          declared
-main             unknown: loop bound is not a size expression (main.nt:33), io
-                 rests on         sqrt (declared, extern)
-print_byte       work 25                           moves 1                            exact, io
+main             work 6434                         moves 547·B + 321                  exact, io
+                 rests on         sqrt (declared, extern); print_bytes (declared, extern)
+print_bytes      work ≤ s.len() + 60               moves ≤ s.len()                    declared, io
