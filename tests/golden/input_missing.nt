@@ -1,0 +1,9 @@
+// A file that is not there: `file_size` says so with −1, which the program can test, and
+// `read_file` ends the program with the reason and exit code 101, as an index out of bounds does.
+
+fn main() {
+    let path = b"no_such_file.txt";
+    println(file_size(&path));
+    let data = read_file(&path);
+    println(data.len());
+}

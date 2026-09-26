@@ -1,5 +1,8 @@
 //! Every `tests/golden/*.nt` with a `.cost` file must also reproduce it under `neant cost`, and one with a `.scop` file its SCoP export. It either runs — stdout must equal `.out`, exit code must equal `.exit`
 //! (default 0) — or, when a `.err` file exists, must be rejected with an error containing it.
+//! A `.args` file holds the program's arguments, one per line: it is run as `neant run f.nt --
+//! args…` from `tests/golden`, so a path among them names a file there, and once more as the
+//! binary `neant build` wrote, given the same arguments directly.
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -63,9 +66,25 @@ fn golden() {
             .ok()
             .and_then(|s| s.trim().parse().ok())
             .unwrap_or(0);
-        let out = Command::new(neant()).arg("run").arg(nt).output().unwrap();
+        let args: Option<Vec<String>> = std::fs::read_to_string(stem.with_extension("args")).ok()
+            .map(|s| s.lines().map(String::from).collect());
+        let mut run = Command::new(neant());
+        run.arg("run").arg(nt);
+        if let Some(a) = &args { run.arg("--").args(a).current_dir(golden_dir()); }
+        let out = run.output().unwrap();
         let stdout = String::from_utf8_lossy(&out.stdout).to_string();
         let code = out.status.code().unwrap_or(-1);
+        if let Some(a) = &args {
+            let bin = std::env::temp_dir().join(format!("neant-golden-{}-{}", std::process::id(), stem.file_name().unwrap().to_string_lossy()));
+            let built = Command::new(neant()).arg("build").arg(nt).arg("-o").arg(&bin).output().unwrap();
+            let direct = Command::new(&bin).args(a).current_dir(golden_dir()).output();
+            let _ = std::fs::remove_file(&bin);
+            let _ = std::fs::remove_file(bin.with_extension("c"));
+            match direct {
+                Ok(d) if built.status.success() && d.stdout == out.stdout && d.status.code() == out.status.code() => {}
+                _ => failures.push(format!("{name}: the built binary, given its arguments directly, does not do what `neant run` did")),
+            }
+        }
         if stdout != want_out || code != want_exit {
             let stderr = String::from_utf8_lossy(&out.stderr);
             failures.push(format!(

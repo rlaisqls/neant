@@ -18,6 +18,7 @@ mod ast;
 mod cost;
 mod diag;
 mod emit_c;
+mod input;
 mod ir;
 mod lex;
 mod parse;
@@ -381,6 +382,8 @@ mod parsedump {
             ExprKind::Unary(_, a) => { o.push(67); expr(a, o) }
             ExprKind::Index(b, i) => { o.push(68); expr(b, o)?; expr(i, o) }
             ExprKind::Field(b, _) => { o.push(69); expr(b, o) }
+            // the input builtins (src/input.rs) are not in the self-hosted checker's table
+            ExprKind::Call(n, _) if crate::input::NAMES.contains(&n.as_str()) => Err(format!("a call to the builtin `{n}`")),
             ExprKind::Call(_, args) => { o.push(71); for a in args { expr(a, o)?; } Ok(()) }
             ExprKind::Ref(a, _) => { o.push(73); expr(a, o) }
             ExprKind::Cast(a, t) => { o.push(74); expr(a, o)?; ty(t, o) }
@@ -464,7 +467,9 @@ fn lex_kind_number(t: &lex::Tok) -> i32 {
 
 fn compile(src: &str) -> diag::Result<ir::Module> {
     let toks = lex::lex(src)?;
-    let prog = parse::parse(toks)?;
+    let used = input::called(&toks);
+    let mut prog = parse::parse(toks)?;
+    input::add(&mut prog, &used);
     types::check(&prog)
 }
 
@@ -479,7 +484,7 @@ fn cc(c: &str, out: &Path, src: &Path) -> Result<(), String> {
     // the self-hosting I/O bridge (docs/self-hosting-design.md §2): a fixed convention, not a
     // flag — bootstrap/rt.c is linked in whenever the generated C actually calls into it
     let rt_c = Path::new(env!("CARGO_MANIFEST_DIR")).join("rt.c");
-    if ["read_file(", "write_file(", "read_stdin(", "write_stdout(", "quit("].iter().any(|f| c.contains(f))
+    if ["read_file(", "write_file(", "read_stdin(", "write_stdout(", "quit(", "nt_arg", "nt_file_size("].iter().any(|f| c.contains(f))
         && rt_c.exists() { cmd.arg(&rt_c); }
     let status = cmd
         .arg("-o").arg(out)

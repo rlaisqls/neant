@@ -629,6 +629,19 @@ decided (`moves/BW` taken as a `max` with `work/P`), so the prediction reaches t
 and arrays by value, without which a domain corpus (stage C's control loops and kernels) cannot be
 written; and the editor surface the README describes, which does not exist.
 
+**Program input, 2026-09-26.** argv is done, with a named file (decisions.md §9): `arg(k)` and
+`read_file(&path)` return an owned `[u8]`, `arg_count()` and `file_size(&path)` an `i64` (−1 is
+the error value), all four `extern`s with a declared cost in a prelude the compiler adds when a
+program calls one. What it measured is a cost line, not a speed: a loop over an argument's bytes
+is exact in that argument's own atom, `a.len()`, free as a parameter's length is, because an
+extern returning an array may name its result's length and a caller mints an atom of its own
+for it (`tests/golden/input_args.cost`, `input_file.cost`); reading `n` bytes is priced as a
+sequential write of `n`. `neant run f.nt -- args` and the built binary were already the same
+program and are tested as such (`.args` files in `tests/golden`). What is left: input read inside
+a loop makes the caller unknown rather than a sum over the laps; the declarations are not yet
+confirmed by `neant measure`; the self-hosted compiler has none of it. Modules and arrays by value
+remain.
+
 ## M7 — the constant factor
 
 Prove the asymptote, search the constant. A micro-architectural cost line (what llvm-mca and uiCA
@@ -664,6 +677,7 @@ the choice is reopened with the number in hand.
 bootstrap/              everything that builds the compiler from nothing
   Cargo.toml, src/      the Rust compiler. Seed one. Frozen after self-hosting, never deleted.
     lex.rs  parse.rs  ast.rs  types.rs  ir.rs  emit_c.rs  main.rs
+    input.rs            the input builtins (arg, read_file, …) as externs with declared costs
     cost/
       size.rs           symbolic sizes and costs: rational polynomials over atoms, B and M
       piece.rs          piecewise costs: conditions, max, feasibility

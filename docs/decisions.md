@@ -4,6 +4,75 @@ Design decisions with the reasoning that produced them, so the reasoning is not 
 code is. Newest first. A decision is recorded when it was argued over, when it rejected
 alternatives worth remembering, or when a future reader would otherwise ask "why on earth".
 
+## 9 — Program input: arguments and a named file are externs that return `[u8]`
+
+**Decided and implemented 2026-09-26.** Until now a program's only input was stdin, read the way
+`compiler/main.nt` reads it: `extern fn read_stdin(buf: &mut [u8]) -> i64 uses io, unbounded`, a
+C function in `bootstrap/rt.c` filling a buffer the caller sized in advance, returning the count
+or −1. There was no argv (the emitted `main` was `main(void)`), and a file was `rt.c`'s
+`read_file(path, buf)` on the same convention: the size of the input was the size of the buffer,
+a constant, and the cost of reading it `unbounded`.
+
+**The surface.** Four builtins, each an ordinary `extern` declaration written in the language
+(`bootstrap/src/input.rs`) and added to a program that calls one without defining that name:
+
+```neant
+#[cost(work_at_most = "1", moves_at_most = "0")]
+extern fn arg_count() -> i64 uses io;
+#[cost(work_at_most = "result.len()", moves_at_most = "result.len()")]
+extern fn arg(k: i64) -> [u8] uses io;
+#[cost(work_at_most = "result.len() + path.len()", moves_at_most = "result.len() + path.len()")]
+extern fn read_file(path: &[u8]) -> [u8] uses io;
+#[cost(work_at_most = "path.len()", moves_at_most = "path.len()")]
+extern fn file_size(path: &[u8]) -> i64 uses io;
+```
+
+`args()` returning the list was the first idea, and there is no list of arrays to return: an
+array's elements are scalars or structs. `arg(k)` is one argument as an owned `[u8]`, `let a =
+arg(0);`, and `arg_count()` how many there are. `arg(0)` is the first argument after the
+program's name. A `k` out of range exits 101 with a message, as an index out of bounds does.
+
+**The error value.** The language has no `Result` and no `Option`; what it can express is an
+`i64` that is −1, which is `read_stdin`'s convention already. So `file_size(&path)` is the size
+or −1 when the file cannot be opened, and a program tests that. `read_file(&path)` on a file that
+cannot be read ends the program — `cannot read <path>: <reason>`, exit 101 — because an owned
+array has no −1 to be. A program that must survive a missing file calls `file_size` first.
+
+**Under `neant run` and in the emitted C.** They are the same thing here: `neant run` compiles
+the emitted C and runs the binary, passing it everything after `--` (it always had), so
+`neant run f.nt -- data.txt` and `neant build f.nt && ./f data.txt` do the same. A program that
+calls `arg` or `arg_count` gets `int main(int argc, char **argv)`, which hands argv to `rt.c`
+first; every other program keeps `main(void)`, so no emitted C changed. The four are
+`nt_arg_count`, `nt_arg`, `nt_read_file` and `nt_file_size` in `rt.c` — prefixed, because
+`read_file` is already `rt.c`'s older pair, and a program that declares its own `extern fn
+read_file(path, buf)` (the self-hosting tests do) keeps it: a builtin is added only under a name
+the program leaves free. An emitted builtin is told from a program's extern by line 0, which no
+function in a source has; that keeps `ir::Func` unchanged.
+
+**What the cost calculus sees.** The one new thing. An extern that returns an array names that
+array's length `result.len()` in its own declaration — an atom one past its parameters, so the
+declaration can price the read in it. At a call, an atom of the callee's that is none of its
+parameters is a new quantity: the caller gets an atom of its own for it, and the `let` names it
+after the local, `data.len()`. It is free the way a parameter's length is, and a loop over it is
+exact in it (`tests/golden/input_args.cost`: `main  work 6·b.len() + 6·a.len() + 13  moves
+2·b.len() + 2·a.len() + 2·B  exact, io`). The same rule carries it up through a function that
+reads and returns: `fn load(p: &[u8]) -> [u8] { let d = read_file(p); d }` hands its caller an
+atom of the caller's own. No new atom kind: it is `Atom::Var`, minted as a loop variable is, and
+`size.rs` and `piece.rs` are untouched. The price of a read is what the model charges for a
+sequential write of the same bytes — `[b'\0'; n]` is work `n`, moves `n` — because the bytes land
+in a fresh array once; the path is read once, the same way. The four are `declared`, so every
+caller's line says what it rests on: `rests on arg (declared, extern); read_file (declared,
+extern)`. The declaration is not confirmed by `neant measure` yet.
+
+**What is left.** A call that reads input inside a loop makes the caller unknown ("what it reads
+is a size of its own at every iteration"): each lap's input has a length of its own, and one atom
+for all of them would be a claim the calculus cannot check. So `for k in 0..2 { let a = arg(k); … }` is
+unknown, where the honest answer is a sum over `k`, or a bound by the largest; and `0..arg_count()`
+is unknown before that, because a count returned by a call is not a size (it could be an atom of
+its own the same way, and is not yet).
+The self-hosted compiler does not have the builtins; `neant parsedump` puts a program that calls
+one outside its slice, so the self-hosting comparisons skip it. And a path is at most 4095 bytes.
+
 ## 8 — a block-like expression in statement position ends at its block
 
 **Decided 2026-09-23, after the same parse bit three times while writing the compiler in itself.**

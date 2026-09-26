@@ -519,6 +519,9 @@ struct Fa<'a, 'b, 'c> {
     result_size: Option<Poly>,
     /// the size of the array the last call returned, for the `let` that binds it
     last_result: Option<Poly>,
+    /// when that size is an atom minted at the call for an extern's `result.len()` (program
+    /// input), so the `let` can name it after the local: `data.len()`
+    last_result_atom: Option<usize>,
     /// A scalar that a statement of the enclosing block stores into, or loads from, an array
     /// element (`c[i·n + j] = acc`): inside that block the scalar *is* that element's running
     /// value, and a statement using it references the element. Register promotion does not
@@ -583,7 +586,7 @@ struct Fa<'a, 'b, 'c> {
 impl<'a, 'b, 'c> Fa<'a, 'b, 'c> {
     fn new(an: &'b mut Analyzer<'a>, f: &'c Func, self_fid: Option<FuncId>) -> Self {
         let mut fa = Fa {
-            an, f, names: param_names(f), sites: vec![], loop_recs: vec![], bounds: vec![], images: HashMap::new(), result_size: None, last_result: None, scalar_alias: HashMap::new(), alias_scopes: vec![], notes: vec![], io: false, self_fid, rec_calls: vec![],
+            an, f, names: param_names(f), sites: vec![], loop_recs: vec![], bounds: vec![], images: HashMap::new(), result_size: None, last_result: None, last_result_atom: None, scalar_alias: HashMap::new(), alias_scopes: vec![], notes: vec![], io: false, self_fid, rec_calls: vec![],
             local_size: HashMap::new(), local_affine: HashMap::new(), initial: HashMap::new(), at_entry: false,
             loops: vec![], work: Cost::zero(), moves: Cost::zero(), span: Cost::zero(), saved: vec![], branch: vec![], next_if: 0,
             local_root: HashMap::new(), resident: vec![], call_moves: Cost::zero(), saved_calls: vec![], replay: false, has_call: vec![], rests_on: vec![],
@@ -602,6 +605,13 @@ impl<'a, 'b, 'c> Fa<'a, 'b, 'c> {
     }
 
     fn run(mut self) -> FuncCost {
+        // an extern that returns an array names that array's length `result.len()`, one atom past
+        // its parameters: its declaration may be written in it, and a caller gets an atom of its
+        // own for it (docs/decisions.md, "Program input")
+        if self.f.body.is_none() && matches!(self.f.ret, Ty::Array(..)) {
+            let a = self.new_atom("result.len()");
+            self.result_size = Some(Poly::var(a));
+        }
         // the declaration, parsed once: bounds and the size limits budgets are checked under
         let mut declared = Declared::default();
         let mut violations = Vec::new();
@@ -1691,6 +1701,7 @@ impl<'a, 'b, 'c> Fa<'a, 'b, 'c> {
                         // an owned array handed back by a call: the caller owns it, and its size
                         // is the callee's, in the caller's atoms
                         if let Some(sz) = self.last_result.take() { self.local_size.insert(*id, sz); }
+                        if let Some(a) = self.last_result_atom.take() { self.names[a] = format!("{}.len()", l.name); }
                         self.local_root.insert(*id, *id);
                         return Ok(());
                     }
@@ -2290,6 +2301,22 @@ impl<'a, 'b, 'c> Fa<'a, 'b, 'c> {
                             line,
                         ));
                     }
+                }
+                // an atom of the callee's that is none of its parameters — the length of what an
+                // extern returned, program input, reached here directly or through a callee that
+                // read it — is a new quantity at every call: this function gets an atom of its
+                // own for it, free the way a parameter's length is. Once per call, so not in a
+                // loop, where each lap would read an input of its own length
+                self.last_result_atom = None;
+                for k in cf.params.len()..callee.names.len() {
+                    let in_result = callee.result_size.as_ref().is_some_and(|p| p.mentions(k));
+                    if !(w.mentions(k) || mv.mentions(k) || sp.mentions(k) || in_result) { continue; }
+                    if !self.loops.is_empty() {
+                        return Err(Fail::Unknown(format!("calls `{}` in a loop: what it reads is a size of its own at every iteration, `{}`", callee.name, callee.names[k]), e.line));
+                    }
+                    let a = self.new_atom(&format!("{}.{}", callee.name, callee.names[k]));
+                    if callee.result_size == Some(Poly::var(k)) { self.last_result_atom = Some(a); }
+                    map.push((k, Poly::var(a)));
                 }
                 // the callee's reads are of the arrays this call passed it
                 let rename = |r: &Root| -> Root {
