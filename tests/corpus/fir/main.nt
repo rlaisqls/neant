@@ -1,0 +1,47 @@
+// A moving-average low-pass filter over a sampled signal: an 8-tap ring buffer held in a struct
+// and stepped by value, the samples a file of integers named on the command line. It prints the
+// filtered signal's energy and its last value, and how far the output lags the input's peak.
+
+use "../lib/parse.nt";
+
+struct Ring { taps: [f64; 8], pos: i64, sum: f64 }
+
+fn push(r: Ring, x: f64) -> Ring {
+    let mut n = r;
+    n.sum = r.sum - r.taps[r.pos] + x;
+    n.taps[r.pos] = x;
+    n.pos = (r.pos + 1) % n.taps.len();
+    n
+}
+
+fn average(r: Ring) -> f64 {
+    r.sum / r.taps.len() as f64
+}
+
+fn main() {
+    let path = arg(0);
+    let text = read_file(&path);
+    let n = count_ints(&text);
+    let mut xs = [0; n];
+    read_ints(&text, &mut xs);
+
+    let mut r = Ring { taps: [0.0; 8], pos: 0, sum: 0.0 };
+    let mut energy = 0.0;
+    let mut last = 0.0;
+    let mut in_peak = 0;
+    let mut out_peak = 0;
+    let mut best_in = -1.0e18;
+    let mut best_out = -1.0e18;
+    for k in 0..xs.len() {
+        let x = xs[k] as f64;
+        r = push(r, x);
+        let y = average(r);
+        energy += y * y;
+        last = y;
+        if x > best_in { best_in = x; in_peak = k; }
+        if y > best_out { best_out = y; out_peak = k; }
+    }
+    println(energy);
+    println(last);
+    println(out_peak - in_peak);
+}

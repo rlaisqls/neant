@@ -1,0 +1,54 @@
+// Heat on a plate: a 5-point Jacobi stencil on an n×n grid for a number of steps, both from the
+// command line. The edges are held at a fixed temperature; the result is the mean and the
+// temperature at the centre.
+
+use "../lib/parse.nt";
+
+fn sweep(src: &[f64], dst: &mut [f64], n: i64, alpha: f64) {
+    for i in 1..n - 1 {
+        for j in 1..n - 1 {
+            let c = src[i * n + j];
+            let lap = src[(i - 1) * n + j] + src[(i + 1) * n + j] + src[i * n + j - 1] + src[i * n + j + 1] - 4.0 * c;
+            dst[i * n + j] = c + alpha * lap;
+        }
+    }
+}
+
+fn edges(g: &mut [f64], n: i64, t: f64) {
+    for k in 0..n {
+        g[k] = t;
+        g[(n - 1) * n + k] = t;
+        g[k * n] = t;
+        g[k * n + n - 1] = t;
+    }
+}
+
+fn mean(g: &[f64]) -> f64 {
+    let mut s = 0.0;
+    for i in 0..g.len() {
+        s += g[i];
+    }
+    s / g.len() as f64
+}
+
+fn main() {
+    let a0 = arg(0);
+    let a1 = arg(1);
+    let n = parse_int(&a0);
+    let steps = parse_int(&a1);
+    let mut a = [0.0; n * n];
+    let mut b = [0.0; n * n];
+    edges(&mut a, n, 100.0);
+    edges(&mut b, n, 100.0);
+    for t in 0..steps {
+        if t % 2 == 0 {
+            sweep(&a, &mut b, n, 0.2);
+        } else {
+            sweep(&b, &mut a, n, 0.2);
+        }
+    }
+    let g = if steps % 2 == 0 { mean(&a) } else { mean(&b) };
+    println(g);
+    let c = (n / 2) * n + n / 2;
+    if steps % 2 == 0 { println(a[c]); } else { println(b[c]); }
+}

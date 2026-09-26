@@ -1,0 +1,8 @@
+// A 3-vector passed by value without a struct around it: a bare `[T; k]` parameter is a view.
+fn dot(a: [f64; 3], b: [f64; 3]) -> f64 {
+    a[0] * b[0] + a[1] * b[1] + a[2] * b[2]
+}
+fn main() {
+    let a = [1.0, 2.0, 3.0];
+    println(dot(a, a));
+}

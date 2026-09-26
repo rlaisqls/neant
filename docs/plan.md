@@ -695,6 +695,20 @@ control loop `x = apply(m, x, u)` whose `run` is exact at work `56·n + 2`, move
 reason (a third layout); a bare `[T; k]` parameter, `==` on arrays, nested fixed-size arrays and
 the self-hosted side are left.
 
+**The domain corpus, 2026-09-26** (docs/corpus.md). With argv, modules and arrays by value in, the
+count stage C asked for was taken on six programs of its domain — a PID loop over a trajectory
+file, a Jacobi stencil and a dense `matmul` sized by arguments, a CSV aggregator, a BFS over an
+edge-list file, a ring-buffer filter — written as one would write them, in `tests/corpus/` and
+pinned by `corpus.rs`. **14 of 24 functions exact, 58%**, against 33% on the compiler: every kernel
+and every controller step is exact. **0 of 6 `main`s are.** The eight unknowns are two shapes: a
+size parsed out of text, which is an `i64` returned by a call and so not a size (five `main`s), and
+a scan that advances by what it read (`next_int`, `count_ints`, the CSV row loop); with the parsed
+size replaced by an argument's length, the stencil's and `matmul`'s programs become exact, the
+filter's and the controller's stop at the parser loop, and BFS's at its worklist. What moves the
+number next is therefore an integer read from input as an atom for the run, as `arg_count()` is.
+Four shapes the corpus had to be written around are kept as rejected cases: string output, a grid
+of rows, an array of structs with array fields, a bare `[T; k]` parameter.
+
 ## M7 — the constant factor
 
 Prove the asymptote, search the constant. A micro-architectural cost line (what llvm-mca and uiCA
@@ -751,12 +765,14 @@ tests/
   golden/               .nt programs with expected output (.out, .exit), rejection (.err), cost report (.cost)
     modules/            multi-file programs, one directory each, rooted at main.nt
   hints/                what `neant hints` prints for some of golden/, one .json each
+  corpus/               the domain corpus (docs/corpus.md): one program per directory, rooted at main.nt, lib/ shared by `use`
   kernels/              the M1/M2 experiments: kernel templates and sweep.py, the perf harness; iolb.sh runs IOLB in docker
 docs/
   plan.md               this file
   cost-model.md         the calculus, as implemented
   experiments.md        what was measured against what prediction, and what it changed
   decisions.md          decisions with the reasoning that produced them
+  corpus.md             the domain corpus's tiers and what blocks the rest
 ```
 
 ## Validation harness notes

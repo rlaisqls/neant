@@ -1,0 +1,7 @@
+// Several plants under one supervisor: a struct with an array field is a value, never an array
+// element (docs/arrays-by-value-design.md §2).
+struct Plant { x: [f64; 2] }
+fn main() {
+    let ps = [Plant { x: [0.0; 2] }; 3];
+    println(ps.len());
+}

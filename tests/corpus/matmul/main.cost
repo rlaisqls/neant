@@ -1,0 +1,33 @@
+struct Num       layout AoS  the model does not decide: no function's moves differ
+is_digit         work 3                            moves 0                            exact
+next_int         unknown: `i` is assigned inside a loop before this one, so its entry value is not known (../lib/parse.nt:23)
+                 footprint        xs: [0, xs.len()) (whole array)   no residue claimed
+parse_int        work work[next_int](xs.len(), 0) + 2 moves moves[next_int](xs.len(), 0) modulo
+                 rests on         next_int (unknown)
+count_ints       unknown: `i` is compared in the `while` condition but is not stepped by a constant exactly once in the body; `while` has no measure the compiler can find; write `while cond decreasing <expr>` with an `i64` that goes down by at least one every iteration (../lib/parse.nt:41)
+read_ints        work out.len()·work[next_int](xs.len(), _) + 6·out.len() + 1 moves out.len()·moves[next_int](xs.len(), _) + 8·out.len() + B modulo
+                 lower bound      moves 8·out.len()                  (footprint, every distinct element crosses once)
+                 footprint        out: [0, 8·out.len())   resident after if 8·out.len() < M
+                 rests on         next_int (unknown)
+fill             work 11·n² + 2·n                  moves                              exact  (2 regimes)
+                                               moves 8·n² + B·n                   if ≈ 8·n < M
+                                               moves 8·n² + B·n                   if ≈ 8·n ≥ M
+                 lower bound      moves 8·n²                         (footprint, every distinct element crosses once)   gap 1× if ≈ 8·n < M; 1× if ≈ 8·n ≥ M at M = 2 MiB, B = 64
+                 footprint        m: [0, 8·n²)   resident after if 8·n² < M
+matmul           work 10·n³ + 5·n² + 2·n           moves                              exact  (3 regimes)
+                                               moves 24·n² + 2·B·n                if ≈ 8·n² < M
+                                               moves B·n³ + 8·n³ + 2·B·n²         if ≈ B·n + 8·n ≥ M
+                                               moves 8·n³ + 16·n² + 2·B·n         if ≈ B·n + 8·n < M and ≈ 8·n² ≥ M
+                 lower bound      moves 8·n³/√M − M                  (HBL, σ = 3/2, CDKSY 2013)   gap 13033× if ≈ B·n + 8·n ≥ M; 1448× if ≈ B·n + 8·n < M and ≈ 8·n² ≥ M at M = 2 MiB, B = 64
+                 lower bound      moves 24·n²                        (footprint, every distinct element crosses once)   gap 1× if ≈ 8·n² < M at M = 2 MiB, B = 64
+                 footprint        a: [0, 8·n²)  b: [0, 8·n²)  c: [0, 8·n²)   resident after if 24·n² < M
+                 `b` moves by 8·n bytes per iteration of the innermost loop: a new line every time (main.nt:19)
+                 tile T < 0.1443·√M (at M/2, leading term) work ≈ 76.2301·n³/√M + 240.1250·n³/M + 1664.0678·n³/M^(3/2) + 10·n³ moves ≈ 110.8801·n³/√M + 48.0250·B·n³/M if ≈ 8·n ≥ M [--apply matmul:tile=206]   gap 14× if ≈ 8·n ≥ M
+                 tile by 206      work ≈ 10.0633·n³                 moves ≈ 2.3565e-5·B·n³ + 0.0777·n³ if ≈ 8·n ≥ M | ≈ 0.0097·B·n² + 32·n² if ≈ 8·n² < M (+2 regimes) [--apply matmul:tile=206]   gap 14× if ≈ 8·n ≥ M; 14× if ≈ 8·n < M and ≈ B·n + 3296·n ≥ M; 7× if ≈ 8·n² ≥ M and ≈ B·n + 3296·n < M
+                 transpose the column operand work ≈ 10·n³                      moves ≈ 16·n³ if ≈ 16·n ≥ M | 48·n² + 4·B·n if ≈ 8·n² < M (+2 regimes) [--apply matmul:transpose]   gap 2896× if ≈ 16·n ≥ M; 1448× if ≈ B·n + 8·n ≥ M and ≈ 16·n < M; 1448× if ≈ B·n + 8·n < M and ≈ 8·n² ≥ M
+trace            work 6·n                          moves B·n                          exact
+                 lower bound      moves 8·n                          (footprint, every distinct element crosses once)   gap 8× at M = 2 MiB, B = 64
+                 footprint        m: [0, 8·n²)   resident after if 8·n² < M
+main             unknown: the length of `a` is not a size expression (main.nt:37), io
+                 rests on         arg (declared, extern); next_int (unknown)
+arg              work ≤ result.len()               moves ≤ result.len()               declared, io

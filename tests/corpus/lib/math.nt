@@ -1,0 +1,4 @@
+// libm through the C boundary: a declared cost, confirmed or not by `neant measure`.
+
+#[cost(work_at_most = "20", moves_at_most = "0")]
+extern fn sqrt(x: f64) -> f64;

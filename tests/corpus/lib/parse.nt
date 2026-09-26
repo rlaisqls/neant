@@ -1,0 +1,61 @@
+// Numbers in text: what every program here reads its input with. There are no strings, so a
+// file or an argument is a `[u8]` and a number is found by walking it.
+
+struct Num { v: i64, end: i64, ok: bool }
+
+fn is_digit(c: u8) -> bool {
+    c >= b'0' && c <= b'9'
+}
+
+// The next integer at or after `start`, and where it ends; `ok` is false when there is none left.
+fn next_int(xs: &[u8], start: i64) -> Num {
+    let mut i = start;
+    while i < xs.len() && !is_digit(xs[i]) && xs[i] != b'-' {
+        i += 1;
+    }
+    let mut neg = false;
+    if i < xs.len() && xs[i] == b'-' {
+        neg = true;
+        i += 1;
+    }
+    let first = i;
+    let mut v = 0;
+    while i < xs.len() && is_digit(xs[i]) {
+        v = v * 10 + (xs[i] - b'0') as i64;
+        i += 1;
+    }
+    if neg {
+        v = -v;
+    }
+    Num { v: v, end: i, ok: i > first }
+}
+
+fn parse_int(xs: &[u8]) -> i64 {
+    next_int(xs, 0).v
+}
+
+// How many integers the text holds, so an array can be made to take them.
+fn count_ints(xs: &[u8]) -> i64 {
+    let mut n = 0;
+    let mut i = 0;
+    while i < xs.len() {
+        let r = next_int(xs, i);
+        if r.ok {
+            n += 1;
+        }
+        i = r.end + 1;
+    }
+    n
+}
+
+// Every integer in the text, in order.
+fn read_ints(xs: &[u8], out: &mut [i64]) {
+    let mut i = 0;
+    let mut k = 0;
+    while k < out.len() {
+        let r = next_int(xs, i);
+        out[k] = r.v;
+        k += 1;
+        i = r.end + 1;
+    }
+}

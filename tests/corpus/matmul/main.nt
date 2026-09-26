@@ -1,0 +1,45 @@
+// Dense C = A·B for n×n matrices, n from the command line, the inputs made from a formula so
+// the run is reproducible; the result is checked by its trace and a checksum.
+
+use "../lib/parse.nt";
+
+fn fill(m: &mut [f64], n: i64, seed: i64) {
+    for i in 0..n {
+        for j in 0..n {
+            m[i * n + j] = ((i * seed + j * 7) % 11) as f64 - 5.0;
+        }
+    }
+}
+
+fn matmul(a: &[f64], b: &[f64], c: &mut [f64], n: i64) {
+    for i in 0..n {
+        for j in 0..n {
+            let mut s = 0.0;
+            for k in 0..n {
+                s += a[i * n + k] * b[k * n + j];
+            }
+            c[i * n + j] = s;
+        }
+    }
+}
+
+fn trace(m: &[f64], n: i64) -> f64 {
+    let mut t = 0.0;
+    for i in 0..n {
+        t += m[i * n + i];
+    }
+    t
+}
+
+fn main() {
+    let a0 = arg(0);
+    let n = parse_int(&a0);
+    let mut a = [0.0; n * n];
+    let mut b = [0.0; n * n];
+    let mut c = [0.0; n * n];
+    fill(&mut a, n, 3);
+    fill(&mut b, n, 5);
+    matmul(&a, &b, &mut c, n);
+    println(trace(&c, n));
+    println(c.iter().sum());
+}

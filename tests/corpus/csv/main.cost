@@ -1,0 +1,17 @@
+struct Num       layout AoS  the model does not decide: no function's moves differ
+is_digit         work 3                            moves 0                            exact
+next_int         unknown: `i` is assigned inside a loop before this one, so its entry value is not known (../lib/parse.nt:23)
+                 footprint        xs: [0, xs.len()) (whole array)   no residue claimed
+parse_int        work work[next_int](xs.len(), 0) + 2 moves moves[next_int](xs.len(), 0) modulo
+                 rests on         next_int (unknown)
+count_ints       unknown: `i` is compared in the `while` condition but is not stepped by a constant exactly once in the body; `while` has no measure the compiler can find; write `while cond decreasing <expr>` with an `i64` that goes down by at least one every iteration (../lib/parse.nt:41)
+read_ints        work out.len()·work[next_int](xs.len(), _) + 6·out.len() + 1 moves out.len()·moves[next_int](xs.len(), _) + 8·out.len() + B modulo
+                 lower bound      moves 8·out.len()                  (footprint, every distinct element crosses once)
+                 footprint        out: [0, 8·out.len())   resident after if 8·out.len() < M
+                 rests on         next_int (unknown)
+after_header     work 2·xs.len() + 5               moves xs.len() + 2·B               exact
+                 footprint        xs: [0, xs.len()) (whole array)   no residue claimed
+main             unknown: `i` is compared in the `while` condition but is not stepped by a constant exactly once in the body; `while` has no measure the compiler can find; write `while cond decreasing <expr>` with an `i64` that goes down by at least one every iteration (main.nt:25), io
+                 rests on         arg (declared, extern); read_file (declared, extern)
+arg              work ≤ result.len()               moves ≤ result.len()               declared, io
+read_file        work ≤ result.len() + path.len() + 2500 moves ≤ result.len() + path.len()  declared, io

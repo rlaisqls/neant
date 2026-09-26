@@ -1,0 +1,5 @@
+// A report with labels: there is no string value, so `println` of a literal is not an expression.
+fn main() {
+    println("mean error");
+    println(0.25);
+}
