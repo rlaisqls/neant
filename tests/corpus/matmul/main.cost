@@ -28,6 +28,13 @@ matmul           work 10·n³ + 5·n² + 2·n           moves                   
 trace            work 6·n                          moves B·n                          exact
                  lower bound      moves 8·n                          (footprint, every distinct element crosses once)   gap 8× at M = 2 MiB, B = 64
                  footprint        m: [0, 8·n²)   resident after if 8·n² < M
-main             unknown: the length of `a` is not a size expression (main.nt:37), io
+main             work ≈ 10·n³ + work[next_int](a0.len(), 0) moves                              modulo, io  (6 regimes)
+                                               moves ≈ B·n³ + 8·n³ + moves[next_int](a0.len(), 0) if ≈ 8·n ≥ M
+                                               moves ≈ 56·n² + moves[next_int](a0.len(), 0) if 24·n² < M
+                                               moves ≈ B·n³ + 8·n³ + moves[next_int](a0.len(), 0) if ≈ 8·n < M and ≈ B·n + 8·n ≥ M
+                                               moves ≈ 8·n³ + moves[next_int](a0.len(), 0) if ≈ 8·n² ≥ M and 8·n² < M
+                                               moves ≈ 8·n³ + moves[next_int](a0.len(), 0) if ≈ B·n + 8·n < M and 8·n² ≥ M
+                                               moves ≈ 64·n² + moves[next_int](a0.len(), 0) if ≈ 8·n² < M and 24·n² ≥ M
+                 in `matmul`: `b` moves by 8·n bytes per iteration of the innermost loop: a new line every time (main.nt:19)
                  rests on         arg (declared, extern); next_int (unknown)
 arg              work ≤ result.len()               moves ≤ result.len()               declared, io

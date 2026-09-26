@@ -9,7 +9,7 @@ read_ints        work out.len()·work[next_int](xs.len(), _) + 6·out.len() + 1 
                  lower bound      moves 8·out.len()                  (footprint, every distinct element crosses once)
                  footprint        out: [0, 8·out.len())   resident after if 8·out.len() < M
                  rests on         next_int (unknown)
-main             unknown: the length of `nums` is not a size expression (main.nt:11), io
-                 rests on         arg (declared, extern); read_file (declared, extern); count_ints (unknown)
+main             unknown: the bound of `head` is assigned inside the body; `while` has no measure the compiler can find; write `while cond decreasing <expr>` with an `i64` that goes down by at least one every iteration (main.nt:42), io
+                 rests on         arg (declared, extern); read_file (declared, extern); count_ints (unknown); next_int (unknown)
 arg              work ≤ result.len()               moves ≤ result.len()               declared, io
 read_file        work ≤ result.len() + path.len() + 2500 moves ≤ result.len() + path.len()  declared, io

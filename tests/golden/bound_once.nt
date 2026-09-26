@@ -1,0 +1,27 @@
+// A size bound once (docs/cost-model.md § A size bound once): `n` is an `i64` the calculus cannot
+// name — a call's result, here a sum of two elements — bound to an immutable local outside every
+// loop. It is fixed for the rest of the run, so it is an atom of its own, `n`, and the table sized
+// by it and the loops over it are exact in it. A caller sees the callee's atom as its own at the
+// call, `squares.n`.
+
+fn header(xs: &[i64]) -> i64 {
+    xs[0] + xs[1]
+}
+
+fn squares(xs: &[i64]) -> i64 {
+    let n = header(xs);
+    let mut t = [0; n];
+    for i in 0..n {
+        t[i] = i * i;
+    }
+    let mut s = 0;
+    for i in 0..t.len() {
+        s += t[i];
+    }
+    s
+}
+
+fn main() {
+    let data = [3, 4, 9];
+    println(squares(&data));
+}

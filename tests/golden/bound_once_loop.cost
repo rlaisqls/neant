@@ -1,0 +1,6 @@
+header           work 2                            moves B                            exact
+                 footprint        xs: [8·k, 8·k + 8)   resident after if 8 < M
+per_lap          unknown: the length of `t` is not a size expression (line 13)
+reassigned       unknown: loop bound is not a size expression (line 23)
+main             work work[reassigned](3) + work[per_lap](3) + 9 moves moves[reassigned](3) + moves[per_lap](3) + 24 modulo, io
+                 rests on         per_lap (unknown); reassigned (unknown)
