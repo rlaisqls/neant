@@ -1,0 +1,1 @@
+`first` takes `[i64; 2]` by value, moved from a variable; pass the array itself

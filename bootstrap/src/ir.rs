@@ -230,6 +230,9 @@ pub enum LValue {
     IndexField(LocalId, Expr, usize, u32),
     /// `v.f[i]`, `f` an array field of the struct local `v`: (v, i, f, line), in `IndexField`'s order
     FieldIndex(LocalId, Expr, usize, u32),
+    /// `xs[i].f[j]`, `f` an array field of an array of holders (docs/arrays-by-value-design.md
+    /// §9): (xs, i, f, j, line)
+    IndexFieldIndex(LocalId, Expr, usize, Expr, u32),
 }
 
 #[derive(Debug, Clone)]

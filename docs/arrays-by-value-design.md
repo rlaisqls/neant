@@ -1,6 +1,6 @@
 # Arrays by value, first slice
 
-**Written 2026-09-26, before the code; § 6 is what was done.** Plan § Stage D names "argv, modules and arrays by value"
+**Written 2026-09-26, before the code; § 6 is what was done, §§ 7–9 are part two.** Plan § Stage D names "argv, modules and arrays by value"
 as what a domain corpus cannot be written without. This says what the phrase has to mean here,
 what the first slice is, and what the calculus charges for it.
 
@@ -99,10 +99,10 @@ the self-hosted parser's slice, so the self-hosting corpus tests skip these gold
 
 ## 5 — Left
 
-Arrays of such structs (the layout question above); a fixed-size local array passed or returned
-by value without a struct around it (`fn f(x: [f64; 3])`), which is the same copy rule on a bare
-array and needs a decision on whether `let b = a` then copies or moves; `==` on arrays and
-structs; nested fixed-size arrays (`[[f64; 3]; 3]`, today written as `[f64; 9]` with `3·i + j`);
+Arrays of such structs (the layout question above; done in § 9); a fixed-size local array passed
+or returned by value without a struct around it (`fn f(x: [f64; 3])`), which is the same copy
+rule on a bare array and needs a decision on whether `let b = a` then copies or moves (§ 7);
+`==` on arrays and structs (§ 8); nested fixed-size arrays (`[[f64; 3]; 3]`, today written as `[f64; 9]` with `3·i + j`);
 the self-hosted compiler (`compiler/check.nt` would take the same field rule, `emit.nt` the same
 C member).
 
@@ -115,3 +115,111 @@ value and checks that the caller's copy is untouched (`step` exact at work 29, m
 `s.x[i]` exits 101 like any index. No existing golden changed. The report still prints a layout
 line for a struct that is never in an array ("the model does not decide"), as it did before for
 any such struct.
+
+## 7 — A bare `[T; k]`: moved, not copied
+
+**Written 2026-09-26, with part two.** § 5 left the decision open: when a fixed-size local array
+is passed or returned without a struct around it, does `let b = a` copy or move? **It moves**, as
+it does today for every array. `let ys = xs` on `xs: [f64; 3]` has been a move since M5 and is
+charged nothing; making a literal length turn it into a copy would change what existing programs
+mean and cost (a use after it, rejected today, would be accepted and charged `k` stores) for the
+sake of a distinction the type already draws elsewhere. A struct is a value and is copied; an
+array is a buffer and is moved — the literal length does not make it a struct. What the literal
+length buys is the signature:
+
+- **A parameter `x: [T; k]`**, `T` a scalar and `k` a literal ≥ 1, takes the array itself. The
+  argument must be a variable holding a `[T; k]` of the same length, and the call **moves** it:
+  using it afterwards is rejected at the call's line, as after `let b = a`, and so is moving one
+  born outside a loop from inside it. A view (`&a`) is rejected with what to write instead. The
+  callee owns the buffer: it may move it into a `let mut` and write it, or return it. In C it is
+  the pointer and length a view is, so passing it costs what passing a view costs — nothing — and
+  an argument that is moved is treated as written for the no-overlap rule, so `f(&a, a)` is
+  rejected.
+- **A return type `-> [T; k]`** is an owned array whose length is the literal: the body's array
+  must have exactly that length, and a caller's `let b = f(…)` has length `k`, not a size of its
+  own, so a loop over it stays exact with a constant trip count.
+- **`s = f(…, s, …)`**, `s` a `let mut [T; k]` and `f -> [T; k]`: the local takes the call's
+  array, as a `let` would. `s` is moved into the call and given a value again by the same
+  statement, so it may be done in a loop — this is the control loop over a bare state vector.
+  The old buffer's residue and read atoms are dropped: the analysis cannot tell whether the
+  callee handed back the same buffer or a new one.
+
+**Cost.** A move is free, as `let ys = xs` is: no copy, no bytes. The callee's reads and writes of
+its parameter are charged as reads and writes of any array it was handed — lines, not registers,
+unlike an array field (§3), because the buffer is not known to be resident. In `value_array_param`
+`scaled` is exact at work 15, moves `2·B`; in `value_array_rebind` a two-element state stepped `n`
+times is `14·n + 5` / `2·B·n + 2·B + 16`, exact, the `2·B` per lap being `step`'s own.
+
+**A bug this found.** An owned-array return of a literal (`let o = [a, b, c]; o` in a function
+`-> [f64]`) returned a pointer to its stack frame: the literal was a C array on the stack. The
+emitter now builds a literal on the heap when its buffer may leave the function — returned, or
+moved into a call whose result is returned, through any chain of `let`s, moves and rebindings —
+and on the stack otherwise, so no existing program's C changes but that one's. The charge is the
+literal's, as before.
+
+The self-hosted parser's slice (the `parsedump` table in `main.rs`) excludes a function with a
+by-value array parameter or return, as it excludes an array field, so the parity tests skip these
+goldens.
+
+## 8 — `==` and `!=` on a whole value
+
+A struct — every struct, since its fields are scalars and fixed-size arrays of scalars — and a
+fixed-size array of scalars held in a variable compare with `==` and `!=`, element by element and
+field by field, with each element's own `==`: `-0.0 == 0.0` holds and a `NaN` makes the whole
+comparison false, as it does for one `f64`. An array whose length is data (`[0; n]`), a view, and
+an array of structs are rejected with that reason; the two sides must have the same type, so two
+arrays of different literal lengths are rejected as any `==` between two types is.
+
+**Cost.** The comparison always looks at every element — the emitted C folds each element's
+result into one flag with no early exit — so it is a constant, and exact:
+
+- a fixed-size array: two loads and a compare per element, the conjunction folded into the
+  compare, so work `3·k`, and both arrays' element bytes read, moves `2·k·elem_bytes`;
+- a struct: one compare per scalar field, which is in a register, and two loads and a compare per
+  element of each array field, with no bytes — an element of a value array is resident while the
+  value is used (§3).
+
+In `value_eq`, `same` on two `[i64; 4]` is work 12, moves 64; `moved` on a `Pose { x: [f64; 3],
+id: i64 }` is work 10, moves 0, and the two struct arguments it is passed are charged as the
+copies §3 says they are, in `main`.
+
+## 9 — Arrays of holders: AoS only
+
+§2 rejected `[State; n]` and `&[State]` for a struct that holds an array field, because the
+layout would be a third case. It is now accepted, and the case is decided: **an array of holders
+is laid out AoS, and only AoS** — each element a C struct with its array inline (`struct nt_Body {
+double p[3]; double m; }`), the array of them one buffer.
+
+The reason is what SoA would have to be. Splitting `p: [f64; 3]` into columns gives either `k`
+columns, one per element index, which `xs[i].p[j]` with a variable `j` cannot name without an
+address computed across columns, or one `k·n` column indexed `j·n + i`, which is a strided walk
+for the loop that reads one element's array whole — the common one (`for d in 0..3 {
+bs[i].p[d] … }`) — and a 2-D access the site rule does not have. Both are new machinery in the
+emitter, the site rule and the chooser, for a layout that pays only when a loop reads one index of
+the array across all elements. AoS needs none of it: the value's array stays contiguous and is
+copied with it, as §3 already charges.
+
+- **What is accepted**: `[S { … }; n]` and `[S { … }, …]`, views `&[S]` and `&mut [S]`, a whole
+  element read (`let b = xs[i]`) or written (`xs[i] = b`), a scalar field (`xs[i].m`), an array
+  field's element read (`xs[i].p[j]`) and written (`xs[i].p[j] = e`, `op=`), and its length
+  (`xs[i].p.len()`, the literal).
+- **What is rejected**: `#[layout(soa)]` on a holder, with this reason (`err_value_array`, which
+  until now held the rejection of the array itself).
+- **The chooser** does not weigh SoA for a holder: it sets AoS and the report says so — `struct
+  Body layout AoS  AoS only: it holds an array field` — when the struct is in some array; a holder
+  that is never in one keeps the line it had, "the model does not decide".
+- **Cost.** `xs[i].p[j]` is one load and a site on field `p` of element `i`, as `xs[i].m` is a site
+  on `m`: it steps by the element and touches the whole field, `k·elem_bytes`, because which of its
+  elements a loop reads is not the site's to know — so `drift`, which reads and writes every
+  element of every `p`, has a footprint of the whole array, `32·bs.len()`, at its lower bound. A
+  whole element read or written is the load or store it was for a scalar struct plus one per array
+  element, `k`, its bytes being the site's.
+
+In `value_array_holders`, `drift` over `n` bodies is exact at `23·n` / `32·n + B`, `total_mass`
+at `4·n` / `32·n + B`; the element copy `bs[3] = bs[2]` and the `==` between elements are in
+`main`'s constant.
+
+**Left after part two:** nested fixed-size arrays (`[[f64; 3]; 3]`); a bare `[T; k]` of structs
+by value, and by-value arrays compared or passed out of an expression rather than a variable; SoA
+for holders, if a program ever wants one index of the array across all elements; the self-hosted
+compiler, which has none of §§ 2–9.

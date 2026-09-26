@@ -97,11 +97,12 @@ Rejected, each kept as a minimal case in `tests/corpus/rejected_*` with its erro
 |---|---|---|
 | `rejected_string` | `println("mean error")` — any labelled report | `expected an expression, found a string` |
 | `rejected_grid2d` | `let g = [[0.0; n]; n]` — a plate as rows | `an array literal can only initialise a let for now` |
-| `rejected_plants` | `[Plant { x: [0.0; 2] }; 3]` — several plants under one supervisor | `` `ps` in `main` is an array of `Plant`, which holds an array field `` |
-| `rejected_vecparam` | `fn dot(a: [f64; 3], b: [f64; 3])` — a 3-vector without a struct around it | `arrays are passed as views: write &[T] or &mut [T]` |
+| `rejected_vecparam` | `dot(a, a)` with `fn dot(a: [f64; 3], b: [f64; 3])` | ``arguments 1 and 2 are both views of `a` and one is `&mut` `` — since arrays by value part two the parameter is accepted and moved in, so this is a double move, and the message is wrong about why |
 
 The programs were written around them: output is bare numbers, the plate is flat (`i * n + j`),
 there is one plant, and every fixed-size vector sits in a struct. None of these changes a tier;
 they are the cost of writing the corpus, not of measuring it. `sqrt` is not in the list: an
 `extern` with `#[cost(work_at_most, moves_at_most)]` is enough, and `pid` crosses the boundary
 through it.
+
+**After arrays by value part two (2026-09-26).** `rejected_plants` is accepted now (arrays of holders, AoS only) and was removed; `rejected_vecparam` is rejected for a different reason, a double move, under a message that still speaks of views.

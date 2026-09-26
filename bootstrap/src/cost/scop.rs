@@ -250,7 +250,7 @@ impl<'a> Ex<'a> {
                 let target = match lv {
                     LValue::Var(l) => self.name(*l),
                     LValue::Index(a, i, _) => self.index(*a, i),
-                    LValue::Field(..) | LValue::IndexField(..) | LValue::FieldIndex(..) => return Err("a struct field is not an affine array reference the polyhedral model reads".into()),
+                    LValue::Field(..) | LValue::IndexField(..) | LValue::FieldIndex(..) | LValue::IndexFieldIndex(..) => return Err("a struct field is not an affine array reference the polyhedral model reads".into()),
                 };
                 self.line(&format!("{target} {o}= {v};"));
                 Ok(())

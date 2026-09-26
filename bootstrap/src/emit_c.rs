@@ -37,10 +37,13 @@ struct Emitter<'a> {
     out: String,
     indent: usize,
     tmp: usize,
+    /// array locals of the function being emitted whose buffer may leave it — returned, or moved
+    /// into something returned: a literal among them is built on the heap, not the stack
+    escaping: std::collections::HashSet<LocalId>,
 }
 
 pub fn emit(m: &Module, opts: &Options) -> String {
-    let mut e = Emitter { m, f: None, opts, out: String::new(), indent: 0, tmp: 0 };
+    let mut e = Emitter { m, f: None, opts, out: String::new(), indent: 0, tmp: 0, escaping: Default::default() };
     e.prelude();
     e.structs();
     e.arr_returns();
@@ -212,8 +215,9 @@ static void nt_println_f64(double v) {
             let l = &f.locals[p];
             let nm = self.local_name(p);
             match &l.ty {
-                Ty::Slice(_, m, _) => {
-                    let decls = self.arr_decls(&nm, &l.ty, !*m);
+                // a `[T; k]` parameter is a buffer moved in: the callee's own, to write or return
+                Ty::Slice(_, _, _) | Ty::Array(..) => {
+                    let decls = self.arr_decls(&nm, &l.ty, matches!(l.ty, Ty::Slice(_, false, _)));
                     for (ty, name) in &decls { let _ = write!(self.out, "{ty}restrict {name}, "); }
                     let _ = write!(self.out, "int64_t {nm}_n");
                 }
@@ -229,6 +233,7 @@ static void nt_println_f64(double v) {
         self.out.push_str(" {\n");
         self.indent = 1;
         self.tmp = 0;
+        self.escaping = escaping(f, body);
         let ret_scalar = f.ret != Ty::Unit;
         self.block_body(body, if ret_scalar { Target::Return } else { Target::Discard });
         self.out.push_str("}\n\n");
@@ -325,6 +330,13 @@ static void nt_println_f64(double v) {
                             let _ = k;
                         }
                     }
+                    // a literal whose buffer leaves the function: the stack frame would not outlive it
+                    None if self.escaping.contains(id) => {
+                        let vals: Vec<String> = elems.iter().map(|e| self.expr(e).scalar()).collect();
+                        let c = c_ty(self.m, &ty);
+                        self.line(&format!("{c} *{nm}_p = nt_alloc({n}, sizeof({c}));"));
+                        for (k, v) in vals.iter().enumerate() { self.line(&format!("{nm}_p[{k}] = {v};")); }
+                    }
                     None => {
                         let vals: Vec<String> = elems.iter().map(|e| self.expr(e).scalar()).collect();
                         self.line(&format!("{} {nm}_buf[{n}] = {{{}}};", c_ty(self.m, &ty), vals.join(", ")));
@@ -368,6 +380,14 @@ static void nt_println_f64(double v) {
                     None => format!("{nm}_p[{k}] = {k}v;"),
                 };
                 self.line(&format!("{{ {cty} {k}v = {v}; for (int64_t {k} = 0; {k} < {nm}_n; {k}++) {{ {stores} }} }}"));
+            }
+            // `s = f(…)`, `f -> [T; k]`: the local takes the returned buffer
+            Stmt::Assign(LValue::Var(id), None, e) if matches!(self.f.unwrap().locals[*id].ty, Ty::Array(..)) => {
+                let nm = self.local_name(*id);
+                let ty = self.f.unwrap().locals[*id].ty.clone();
+                let v = self.expr(e).scalar();
+                let t = self.fresh("a");
+                self.line(&format!("{{ {} {t} = {v}; {nm}_p = {t}.p; {nm}_n = {t}.n; }}", c_ret(self.m, &ty)));
             }
             Stmt::Assign(lv, op, e) => {
                 let v = self.expr(e).scalar();
@@ -415,6 +435,17 @@ static void nt_println_f64(double v) {
                         } else {
                             self.line(&format!("{nm}_p[nt_idx({i}, {nm}_n, {line})].{f} {opstr}= {v};"));
                         }
+                    }
+                    // an array of holders is AoS only (docs/arrays-by-value-design.md §9)
+                    LValue::IndexFieldIndex(id, idx, fi, j, line) => {
+                        let nm = self.local_name(*id);
+                        let ty = self.f.unwrap().locals[*id].ty.clone();
+                        let el = ty.elem().unwrap().clone();
+                        let n = self.field_len(&el, *fi);
+                        let f = self.field_name(el, *fi);
+                        let i = self.expr(idx).scalar();
+                        let jv = self.expr(j).scalar();
+                        self.line(&format!("{nm}_p[nt_idx({i}, {nm}_n, {line})].{f}[nt_idx({jv}, {n}, {line})] {opstr}= {v};"));
                     }
                 }
             }
@@ -512,6 +543,31 @@ static void nt_println_f64(double v) {
                 let nm = self.local_name(*id);
                 let ty = self.f.unwrap().locals[*id].ty.clone();
                 if ty.is_arrayish() { self.arr_val(&nm, &ty) } else { s(nm) }
+            }
+            // a whole value compared element by element, every element, so the cost has no
+            // early exit (docs/arrays-by-value-design.md §8)
+            ExprKind::Binary(op, a, b) if !a.ty.is_scalar() => {
+                let neg = if matches!(op, crate::ast::BinOp::Ne) { "!" } else { "" };
+                let r = self.fresh("eq");
+                match &a.ty {
+                    Ty::Array(_, Size::Const(k)) => {
+                        let (CVal::Arr(ap, _), CVal::Arr(bp, _)) = (self.expr(a), self.expr(b)) else { unreachable!("arrays compared are variables") };
+                        s(format!("({neg}({{ bool {r} = 1; for (int64_t {r}k = 0; {r}k < {k}; {r}k++) {r} &= ({ap}[{r}k] == {bp}[{r}k]); {r}; }}))"))
+                    }
+                    Ty::Struct(sid) => {
+                        let (av, bv) = (self.expr(a).scalar(), self.expr(b).scalar());
+                        let ct = c_ty(self.m, &a.ty);
+                        let mut body = format!("{ct} {r}a = {av}, {r}b = {bv}; bool {r} = 1;");
+                        for (f, ft) in &self.m.structs[*sid].fields {
+                            match ft {
+                                Ty::Array(_, Size::Const(k)) => body.push_str(&format!(" for (int64_t {r}k = 0; {r}k < {k}; {r}k++) {r} &= ({r}a.{f}[{r}k] == {r}b.{f}[{r}k]);")),
+                                _ => body.push_str(&format!(" {r} &= ({r}a.{f} == {r}b.{f});")),
+                            }
+                        }
+                        s(format!("({neg}({{ {body} {r}; }}))"))
+                    }
+                    t => unreachable!("`==` on `{t}`"),
+                }
             }
             ExprKind::Binary(op, a, b) => {
                 let av = self.expr(a).scalar();
@@ -705,4 +761,53 @@ enum Target {
     Return,
     Assign(String),
     Discard,
+}
+
+/// The array locals of `f` whose buffer may be returned: what a `return` or the tail names, what
+/// a call it returns was handed by value, and back through every `let`, move and rebinding that
+/// gave one of those its buffer.
+fn escaping(f: &Func, body: &Block) -> std::collections::HashSet<LocalId> {
+    fn names(e: &Expr, f: &Func, out: &mut Vec<LocalId>) {
+        match &e.kind {
+            ExprKind::Local(id) if matches!(f.locals[*id].ty, Ty::Array(..)) => out.push(*id),
+            ExprKind::Call(_, args) if matches!(e.ty, Ty::Array(..)) => for a in args { names(a, f, out); },
+            ExprKind::If(_, t, els) => for b in std::iter::once(t).chain(els.iter()) { if let Some(x) = &b.tail { names(x, f, out); } },
+            ExprKind::Block(b) => if let Some(x) = &b.tail { names(x, f, out); },
+            _ => {}
+        }
+    }
+    // (destination, the locals whose buffer it may take); `None` for what is returned
+    fn edges(b: &Block, f: &Func, out: &mut Vec<(Option<LocalId>, Vec<LocalId>)>) {
+        for s in &b.stmts {
+            match s {
+                Stmt::Let(id, e) | Stmt::Assign(LValue::Var(id), None, e) => { let mut v = vec![]; names(e, f, &mut v); out.push((Some(*id), v)); }
+                Stmt::Reassign(idx) => { let r = &f.reassigns[*idx]; out.push((Some(r.target), vec![r.src])); }
+                Stmt::Return(Some(e)) => { let mut v = vec![]; names(e, f, &mut v); out.push((None, v)); }
+                Stmt::For { body, .. } | Stmt::While { body, .. } | Stmt::ParFor { body, .. } => edges(body, f, out),
+                Stmt::Expr(e) => expr_edges(e, f, out),
+                _ => {}
+            }
+        }
+        if let Some(t) = &b.tail { expr_edges(t, f, out); }
+    }
+    fn expr_edges(e: &Expr, f: &Func, out: &mut Vec<(Option<LocalId>, Vec<LocalId>)>) {
+        match &e.kind {
+            ExprKind::If(_, t, els) => { edges(t, f, out); if let Some(b) = els { edges(b, f, out); } }
+            ExprKind::Block(b) => edges(b, f, out),
+            _ => {}
+        }
+    }
+    let mut es = Vec::new();
+    edges(body, f, &mut es);
+    let mut out = std::collections::HashSet::new();
+    let mut tail = vec![];
+    if let Some(t) = &body.tail { names(t, f, &mut tail); }
+    out.extend(tail);
+    loop {
+        let before = out.len();
+        for (dst, srcs) in &es {
+            if dst.is_none_or(|d| out.contains(&d)) { out.extend(srcs.iter().copied()); }
+        }
+        if out.len() == before { return out; }
+    }
 }

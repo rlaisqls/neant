@@ -353,6 +353,9 @@ mod parsedump {
             if !matches!(f.ret, TypeExpr::Unit) { ty(&f.ret, o)?; }
             return Ok(());
         }
+        // an array passed or returned by value (docs/arrays-by-value-design.md §7) is not in the
+        // self-hosted checker yet
+        if f.params.iter().any(|p| matches!(p.ty, TypeExpr::Array(..))) || matches!(f.ret, TypeExpr::Array(..)) { return Err("an array passed or returned by value".into()); }
         o.push(110);
         for p in &f.params { o.push(111); ty(&p.ty, o)?; }
         if !matches!(f.ret, TypeExpr::Unit) { ty(&f.ret, o)?; }

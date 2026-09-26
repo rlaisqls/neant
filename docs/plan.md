@@ -709,6 +709,23 @@ number next is therefore an integer read from input as an atom for the run, as `
 Four shapes the corpus had to be written around are kept as rejected cases: string output, a grid
 of rows, an array of structs with array fields, a bare `[T; k]` parameter.
 
+**Arrays by value, part two, 2026-09-26** (arrays-by-value-design.md §§ 7–9). A bare `[T; k]` is a
+parameter and a return type, and it is **moved**, not copied: `let b = a` was a move for every
+array and stays one, free, so a by-value argument is moved in the same way and the callee owns the
+buffer; `-> [T; k]` gives the caller the literal length, and `s = f(…, s, …)` rebinds a local to
+what comes back, so a control loop over a bare two-element state is exact at `14·n + 5` /
+`2·B·n + 2·B + 16`. `==` and `!=` compare a fixed-size array held in a variable, or any struct,
+element by element with no early exit — `3·k` work and `2·k·elem` bytes for an array, a compare
+per scalar field and three per array-field element with no bytes for a struct. An array of
+structs that hold an array is accepted and laid out AoS only; the chooser does not weigh SoA for
+it and says so, and `xs[i].p[j]` is a site on the whole field of element `i`, so an update of every
+element of every `p` is at its lower bound, `32·n`. It found a bug: an owned-array return of a
+literal pointed into its own stack frame; a literal whose buffer leaves the function is now built
+on the heap. `err_value_array`, which rejected the array of holders, now rejects `#[layout(soa)]`
+on one — the one golden whose expected output changed, because what it pinned is now accepted.
+Left: nested fixed-size arrays, a by-value array of structs, SoA for holders, and the self-hosted
+side of all of it.
+
 ## M7 — the constant factor
 
 Prove the asymptote, search the constant. A micro-architectural cost line (what llvm-mca and uiCA

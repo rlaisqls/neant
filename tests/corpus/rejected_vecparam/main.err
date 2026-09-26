@@ -1,1 +1,1 @@
-arrays are passed as views: write `&[T]` or `&mut [T]`
+are both views of `a` and one is `&mut`

@@ -1,0 +1,30 @@
+// A fixed-size array passed and returned by value: moved in, like `let b = a`, and handed back.
+fn scaled(x: [f64; 3], k: f64) -> [f64; 3] {
+    let mut y = x;
+    for i in 0..y.len() { y[i] = k * y[i]; }
+    y
+}
+
+fn origin() -> [f64; 3] {
+    let o = [0.5, 1.5, 2.5];
+    o
+}
+
+fn norm1(x: [f64; 3]) -> f64 {
+    let mut s = 0.0;
+    for i in 0..x.len() { s += x[i]; }
+    s
+}
+
+fn main() {
+    let a = [1.0, 2.0, 3.0];
+    let b = scaled(a, 2.0);
+    println(b[0]);
+    println(b[2]);
+    let c = b;
+    println(norm1(c));
+    let o = origin();
+    let p = scaled(o, 4.0);
+    println(p[1]);
+    println(p.len());
+}

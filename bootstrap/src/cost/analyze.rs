@@ -124,6 +124,8 @@ pub struct LayoutChoice {
     pub fixed: bool,
     /// functions whose moves differ between the layouts: (name, moves under the choice, under the other)
     pub decided_by: Vec<(String, String, String)>,
+    /// a layout the chooser did not weigh, and why
+    pub why: Option<&'static str>,
 }
 
 /// **The choice the compiler makes.** For each struct type the program has one layout, and it is
@@ -137,7 +139,15 @@ pub fn choose_layouts(m: &mut Module, machine: &Machine) -> Vec<LayoutChoice> {
     let mut out = Vec::new();
     for sid in 0..m.structs.len() {
         if m.structs[sid].fixed {
-            out.push(LayoutChoice { name: m.structs[sid].name.clone(), layout: m.structs[sid].layout, fixed: true, decided_by: vec![] });
+            out.push(LayoutChoice { name: m.structs[sid].name.clone(), layout: m.structs[sid].layout, fixed: true, decided_by: vec![], why: None });
+            continue;
+        }
+        // an array of holders is AoS only (docs/arrays-by-value-design.md §9): SoA is not weighed
+        if m.structs[sid].array_part().0 > 0 {
+            let in_array = m.funcs.iter().any(|f| f.locals.iter().any(|l| matches!(l.ty.elem(), Some(Ty::Struct(s)) if *s == sid)));
+            m.structs[sid].layout = Layout::Aos;
+            let why = in_array.then_some("AoS only: it holds an array field");
+            out.push(LayoutChoice { name: m.structs[sid].name.clone(), layout: Layout::Aos, fixed: false, decided_by: vec![], why });
             continue;
         }
         let mut totals = [0f64; 2];
@@ -177,7 +187,7 @@ pub fn choose_layouts(m: &mut Module, machine: &Machine) -> Vec<LayoutChoice> {
         let decided_by = decided_by.into_iter()
             .map(|(n, a, s)| if soa_wins { (n, s, a) } else { (n, a, s) })
             .collect();
-        out.push(LayoutChoice { name: m.structs[sid].name.clone(), layout, fixed: false, decided_by });
+        out.push(LayoutChoice { name: m.structs[sid].name.clone(), layout, fixed: false, decided_by, why: None });
     }
     out
 }
@@ -599,7 +609,9 @@ impl<'a, 'b, 'c> Fa<'a, 'b, 'c> {
         for (i, &p) in f.params.iter().enumerate() {
             let l = &f.locals[p];
             if l.ty.is_arrayish() {
-                fa.local_size.insert(p, Poly::var(i));
+                // `[T; k]` by value: its length is the literal (docs/arrays-by-value-design.md §7)
+                let n = match &l.ty { Ty::Array(_, Size::Const(k)) if *k >= 0 => Poly::constant(*k as i128), _ => Poly::var(i) };
+                fa.local_size.insert(p, n);
                 fa.local_root.insert(p, p);
             } else if l.ty == Ty::I64 {
                 fa.local_affine.insert(p, Affine::constant(Poly::var(i)));
@@ -1286,7 +1298,11 @@ impl<'a, 'b, 'c> Fa<'a, 'b, 'c> {
     /// What a site on `l` touches: one field's bytes, or the whole element.
     fn touch_bytes(&self, l: LocalId, field: Option<usize>) -> i128 {
         match (self.f.locals[l].ty.elem(), field) {
-            (Some(Ty::Struct(s)), Some(fi)) => self.an.m.structs[*s].fields[fi].1.elem_bytes(),
+            // an array field is touched whole: which element is read is not the site's (§9)
+            (Some(Ty::Struct(s)), Some(fi)) => match &self.an.m.structs[*s].fields[fi].1 {
+                Ty::Array(e, Size::Const(k)) => *k as i128 * e.elem_bytes(),
+                t => t.elem_bytes(),
+            },
             _ => self.elem_bytes(l),
         }
     }
@@ -1531,7 +1547,7 @@ impl<'a, 'b, 'c> Fa<'a, 'b, 'c> {
             Stmt::Assign(lv, _, e) => {
                 match lv {
                     LValue::Index(a, i, _) => refs.push((*a, i, None)),
-                    LValue::IndexField(a, i, fi, _) => refs.push((*a, i, Some(*fi))),
+                    LValue::IndexField(a, i, fi, _) | LValue::IndexFieldIndex(a, i, fi, _, _) => refs.push((*a, i, Some(*fi))),
                     _ => {}
                 }
                 collect_refs(e, &mut refs);
@@ -1670,6 +1686,27 @@ impl<'a, 'b, 'c> Fa<'a, 'b, 'c> {
         self.stream(&Poly::constant(bytes), 1);
     }
 
+    /// `a == b` on a whole value. A fixed-size array: two loads and a compare per element, the
+    /// conjunction folded into the compare, and both arrays' element bytes read. A struct: a
+    /// compare per scalar field, which is in a register, and per array-field element two loads
+    /// and a compare with no bytes, an element being resident as in §3.
+    fn compare_value(&mut self, t: &Ty) {
+        match t {
+            Ty::Array(e, Size::Const(k)) => {
+                let k = *k as i128;
+                self.add_work_n(3 * k);
+                self.stream(&Poly::constant(2 * k), e.elem_bytes());
+            }
+            Ty::Struct(sid) => {
+                let sd = &self.an.m.structs[*sid];
+                let (k, _) = sd.array_part();
+                let scalars = sd.fields.iter().filter(|(_, t)| t.is_scalar()).count() as i128;
+                self.add_work_n(scalars + 3 * k);
+            }
+            _ => self.add_work_n(1),
+        }
+    }
+
     fn stream(&mut self, n: &Poly, es: i128) {
         if !self.replay { self.moves = self.moves.add_poly(&n.scale(Rat::int(es))); }
     }
@@ -1803,6 +1840,17 @@ impl<'a, 'b, 'c> Fa<'a, 'b, 'c> {
                     }
                 }
                 if let (LValue::Var(_), ExprKind::Local(_)) = (lv, &e.kind) { self.copy_value(&e.ty); }
+                // `s = f(…)`, `f -> [T; k]`: a new buffer, as a `let` of the call gives one — what
+                // was read from the old one, or resident of it, is not of this one (§7)
+                if let LValue::Var(v) = lv {
+                    if self.f.locals[*v].ty.is_arrayish() {
+                        self.last_result = None;
+                        self.last_result_atom = None;
+                        self.wrote(*v);
+                        let root = self.local_root.get(v).copied().unwrap_or(*v);
+                        self.resident.retain(|r| r.root != root);
+                    }
+                }
                 match lv {
                     // a register: only the operation of `op=` costs
                     LValue::Var(_) => self.add_work_n(if op.is_some() { 1 } else { 0 }),
@@ -1810,6 +1858,8 @@ impl<'a, 'b, 'c> Fa<'a, 'b, 'c> {
                     LValue::Index(arr, idx, _) => {
                         self.expr(idx)?;
                         self.add_work_n(if op.is_some() { 3 } else { 1 });
+                        // a whole holder stored: a store per element of its array fields too (§9)
+                        if let Ty::Struct(sid) = e.ty { self.add_work_n(self.an.m.structs[sid].array_part().0); }
                         self.access(*arr, idx, None);
                         self.wrote(*arr);
                     }
@@ -1821,6 +1871,15 @@ impl<'a, 'b, 'c> Fa<'a, 'b, 'c> {
                     }
                     LValue::IndexField(arr, idx, fi, _) => {
                         self.expr(idx)?;
+                        self.add_work_n(if op.is_some() { 3 } else { 1 });
+                        self.access(*arr, idx, Some(*fi));
+                        self.wrote(*arr);
+                    }
+                    // `xs[i].f[j] = e`: a store into element `i`'s array field, a site on the
+                    // field as `xs[i].f` is (docs/arrays-by-value-design.md §9)
+                    LValue::IndexFieldIndex(arr, idx, fi, j, _) => {
+                        self.expr(idx)?;
+                        self.expr(j)?;
                         self.add_work_n(if op.is_some() { 3 } else { 1 });
                         self.access(*arr, idx, Some(*fi));
                         self.wrote(*arr);
@@ -2034,7 +2093,7 @@ impl<'a, 'b, 'c> Fa<'a, 'b, 'c> {
                     }
                     // a `.par()` chain's body cannot assign to anything outside it (its closures
                     // are already checked pure), so it can never touch the measure either
-                    Stmt::Assign(LValue::Var(_) | LValue::Index(..) | LValue::Field(..) | LValue::IndexField(..) | LValue::FieldIndex(..), _, _) | Stmt::Let(..) | Stmt::LetArray(..) | Stmt::LetRepeat(..) | Stmt::LetBuild { .. } | Stmt::Reassign(..) | Stmt::ParFor { .. } => {}
+                    Stmt::Assign(LValue::Var(_) | LValue::Index(..) | LValue::Field(..) | LValue::IndexField(..) | LValue::FieldIndex(..) | LValue::IndexFieldIndex(..), _, _) | Stmt::Let(..) | Stmt::LetArray(..) | Stmt::LetRepeat(..) | Stmt::LetBuild { .. } | Stmt::Reassign(..) | Stmt::ParFor { .. } => {}
                     Stmt::Expr(Expr { kind: ExprKind::If(_, t, e), .. }) => {
                         let bt = block(t, coef, f)?;
                         let be = match e { Some(e) => block(e, coef, f)?, None => Some(Rat::zero()) };
@@ -2164,6 +2223,8 @@ impl<'a, 'b, 'c> Fa<'a, 'b, 'c> {
         match &e.kind {
             ExprKind::Int(_) | ExprKind::Float(_) | ExprKind::Bool(_) | ExprKind::Byte(_) | ExprKind::Local(_) | ExprKind::Ref(..) => Ok(()),
             ExprKind::Len(_) => Ok(()), // the length is already in a register
+            // a whole value compared: element by element (docs/arrays-by-value-design.md §8)
+            ExprKind::Binary(_, a, b) if !a.ty.is_scalar() => { self.expr(a)?; self.expr(b)?; self.compare_value(&a.ty); Ok(()) }
             ExprKind::Binary(_, a, b) => { self.expr(a)?; self.expr(b)?; self.add_work_n(1); Ok(()) }
             ExprKind::MinMax(_, a, b) => { self.expr(a)?; self.expr(b)?; self.add_work_n(2); Ok(()) } // compare, select
             ExprKind::Unary(_, a) | ExprKind::Cast(a, _) => { self.expr(a)?; self.add_work_n(1); Ok(()) }
@@ -2171,6 +2232,8 @@ impl<'a, 'b, 'c> Fa<'a, 'b, 'c> {
             ExprKind::Index(arr, idx) => {
                 self.expr(idx)?;
                 self.add_work_n(1);
+                // a whole holder: a load per element of its array fields too (§9)
+                if let Ty::Struct(sid) = e.ty { self.add_work_n(self.an.m.structs[sid].array_part().0); }
                 self.access(*arr, idx, None);
                 Ok(())
             }
@@ -2189,6 +2252,15 @@ impl<'a, 'b, 'c> Fa<'a, 'b, 'c> {
             ExprKind::StructLit(_, vals) => { for v in vals { self.expr(v)?; } Ok(()) }
             // an element of a value array: a load, the bytes were charged when the value was
             // written (docs/arrays-by-value-design.md §3)
+            // `xs[i].f[j]` in an array of holders: one load, a site on the field of element `i` (§9)
+            ExprKind::FieldIndex(base, j, fi) if matches!(base.kind, ExprKind::Index(..)) => {
+                let ExprKind::Index(arr, idx) = &base.kind else { unreachable!() };
+                self.expr(idx)?;
+                self.expr(j)?;
+                self.add_work_n(1);
+                self.access(*arr, idx, Some(*fi));
+                Ok(())
+            }
             ExprKind::FieldIndex(base, idx, _) => { self.expr(base)?; self.expr(idx)?; self.add_work_n(1); Ok(()) }
             // a value array written: one store per element and a sequential write, as `[a, b, c]`
             ExprKind::ArrayVal(vals) => {
@@ -2544,6 +2616,12 @@ fn collect_refs<'e>(e: &'e Expr, out: &mut Vec<(LocalId, &'e Expr, Option<usize>
             ExprKind::Index(a, i) => { out.push((*a, i, Some(*fi))); collect_refs(i, out); }
             _ => collect_refs(base, out),
         },
+        ExprKind::FieldIndex(base, j, fi) if matches!(base.kind, ExprKind::Index(..)) => {
+            let ExprKind::Index(a, i) = &base.kind else { unreachable!() };
+            out.push((*a, i, Some(*fi)));
+            collect_refs(i, out);
+            collect_refs(j, out);
+        }
         ExprKind::StructLit(_, vals) | ExprKind::ArrayVal(vals) => for v in vals { collect_refs(v, out); },
         ExprKind::Binary(_, a, b) | ExprKind::MinMax(_, a, b) | ExprKind::FieldIndex(a, b, _) => { collect_refs(a, out); collect_refs(b, out); }
         ExprKind::Unary(_, a) | ExprKind::Cast(a, _) | ExprKind::Println(a) => collect_refs(a, out),
@@ -2604,7 +2682,7 @@ fn callees_block(b: &Block, out: &mut Vec<FuncId>) {
             Stmt::LetArray(_, es) => for e in es { callees_expr(e, out); },
             Stmt::LetBuild { len, body, .. } => { callees_expr(len, out); callees_block(body, out); }
             Stmt::Assign(lv, _, e) => {
-                match lv { LValue::Index(_, i, _) | LValue::IndexField(_, i, _, _) | LValue::FieldIndex(_, i, _, _) => callees_expr(i, out), _ => {} }
+                match lv { LValue::Index(_, i, _) | LValue::IndexField(_, i, _, _) | LValue::FieldIndex(_, i, _, _) => callees_expr(i, out), LValue::IndexFieldIndex(_, i, _, j, _) => { callees_expr(i, out); callees_expr(j, out); } _ => {} }
                 callees_expr(e, out);
             }
             Stmt::For { start, end, body, .. } => { callees_expr(start, out); callees_expr(end, out); callees_block(body, out); }
@@ -2650,6 +2728,7 @@ impl Writes {
                     match lv {
                         LValue::Var(v) | LValue::Field(v, _) => self.locals.push(*v),
                         LValue::Index(_, i, _) | LValue::IndexField(_, i, _, _) | LValue::FieldIndex(_, i, _, _) => self.expr(i),
+                        LValue::IndexFieldIndex(_, i, _, j, _) => { self.expr(i); self.expr(j); }
                     }
                     self.expr(e);
                 }
@@ -2737,8 +2816,11 @@ fn stores_block(b: &Block, f: &Func, roots: &mut HashMap<LocalId, LocalId>, summ
                 match lv {
                     LValue::Index(a, i, _) => { hit(roots.get(a).copied().unwrap_or(*a), None); stores_expr(i, f, roots, summ, hit); }
                     LValue::IndexField(a, i, fi, _) => { hit(roots.get(a).copied().unwrap_or(*a), Some(*fi)); stores_expr(i, f, roots, summ, hit); }
+                    // an array local rebound by a call is written whole
+                    LValue::Var(v) if f.locals[*v].ty.is_arrayish() => hit(roots.get(v).copied().unwrap_or(*v), None),
                     LValue::Var(_) | LValue::Field(..) => {}
                     LValue::FieldIndex(_, i, _, _) => stores_expr(i, f, roots, summ, hit),
+                    LValue::IndexFieldIndex(a, i, fi, j, _) => { hit(roots.get(a).copied().unwrap_or(*a), Some(*fi)); stores_expr(i, f, roots, summ, hit); stores_expr(j, f, roots, summ, hit); }
                 }
                 stores_expr(e, f, roots, summ, hit);
             }

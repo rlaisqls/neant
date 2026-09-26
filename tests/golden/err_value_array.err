@@ -1,1 +1,1 @@
-is an array of `State`, which holds an array field
+holds an array field, and an array of it is laid out AoS only
