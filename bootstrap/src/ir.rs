@@ -56,12 +56,21 @@ impl StructDef {
         for (_, t) in &self.fields {
             let sz = t.elem_bytes();
             off = (off + sz - 1) / sz * sz;
-            off += sz;
+            // an array field (docs/arrays-by-value-design.md) is `k` elements aligned to one
+            off += match t { Ty::Array(_, Size::Const(k)) => sz * *k as i128, _ => sz };
             align = align.max(sz);
         }
         (off + align - 1) / align * align
     }
     pub fn field(&self, name: &str) -> Option<usize> { self.fields.iter().position(|(f, _)| f == name) }
+    /// The array fields' elements and bytes, summed: what writing or copying the value costs
+    /// beyond its scalars, which live in registers (docs/arrays-by-value-design.md §3).
+    pub fn array_part(&self) -> (i128, i128) {
+        self.fields.iter().fold((0, 0), |(n, b), (_, t)| match t {
+            Ty::Array(e, Size::Const(k)) => (n + *k as i128, b + *k as i128 * e.elem_bytes()),
+            _ => (n, b),
+        })
+    }
 }
 
 impl Ty {
@@ -219,6 +228,8 @@ pub enum LValue {
     Field(LocalId, usize),
     /// `xs[i].f`
     IndexField(LocalId, Expr, usize, u32),
+    /// `v.f[i]`, `f` an array field of the struct local `v`: (v, i, f, line), in `IndexField`'s order
+    FieldIndex(LocalId, Expr, usize, u32),
 }
 
 #[derive(Debug, Clone)]
@@ -242,6 +253,10 @@ pub enum ExprKind {
     Field(Box<Expr>, usize),
     /// `S { … }` with every field, in declaration order
     StructLit(StructId, Vec<Expr>),
+    /// `e.f[i]`: an element of the array field `f` of the struct value `e`
+    FieldIndex(Box<Expr>, Box<Expr>, usize),
+    /// `[a, b, …]` as the value of an array field inside a struct literal, one per element
+    ArrayVal(Vec<Expr>),
     Call(FuncId, Vec<Expr>),
     Println(Box<Expr>),
     Len(LocalId),

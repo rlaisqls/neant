@@ -20,6 +20,15 @@ pub fn check(prog: &ast::Program) -> Result<Module> {
         for (f, t, fl, fc) in &sd.fields {
             if fields.iter().any(|(g, _)| g == f) { return err(*fl, *fc, format!("field `{f}` is declared twice")); }
             let ty = resolve_type(t, &struct_ids, *fl, *fc)?;
+            // a fixed-size array of scalars is a field too: part of the value, copied with it
+            // (docs/arrays-by-value-design.md)
+            if let Ty::Array(e, Size::Const(k)) = &ty {
+                if e.is_scalar() {
+                    if *k < 1 { return err(*fl, *fc, format!("an array field has at least one element; `{f}` has none")); }
+                    fields.push((f.clone(), ty));
+                    continue;
+                }
+            }
             if !ty.is_scalar() { return err(*fl, *fc, format!("a field is a scalar (`i64 f64 bool u8`); `{f}` is not")); }
             fields.push((f.clone(), ty));
         }
@@ -68,7 +77,26 @@ pub fn check(prog: &ast::Program) -> Result<Module> {
     for f in &prog.funcs {
         funcs.push(check_func(f, &sigs, &structs, &struct_ids)?);
     }
+    holders_not_in_arrays(&prog.funcs, &funcs, &structs)?;
     Ok(Module { funcs, structs })
+}
+
+/// A struct with an array field is a value, never an element: an array or view of one would be
+/// a third layout (docs/arrays-by-value-design.md §2). Checked over every local once the bodies
+/// are typed, where every array's element type is known.
+fn holders_not_in_arrays(afs: &[ast::Func], funcs: &[Func], structs: &[StructDef]) -> Result<()> {
+    for (af, f) in afs.iter().zip(funcs) {
+        for l in &f.locals {
+            if let Some(Ty::Struct(sid)) = l.ty.elem() {
+                if structs[*sid].array_part().0 > 0 {
+                    return err(af.line, af.col, format!(
+                        "`{}` in `{}` is an array of `{}`, which holds an array field; such a struct is a value, and arrays of it are not supported yet",
+                        l.name, af.name, structs[*sid].name));
+                }
+            }
+        }
+    }
+    Ok(())
 }
 
 /// Only the size-free part of a type expression; sizes are attached by the checker where a
@@ -215,6 +243,42 @@ impl<'a> Ctx<'a> {
         let id = self.locals.len() - 1;
         self.scopes.last_mut().unwrap().insert(name.to_string(), id);
         id
+    }
+    /// `inner.fname` where the field is an array: the base, the field, its element type, its
+    /// length (docs/arrays-by-value-design.md).
+    fn array_field(&mut self, inner: &ast::Expr, fname: &str, line: u32, col: u32) -> Result<(Expr, usize, Ty, i64)> {
+        let cb = self.expr(inner)?;
+        let Ty::Struct(sid) = cb.ty else { return err(line, col, format!("`.{fname}` on a `{}`, which is not a struct", cb.ty)) };
+        let Some(fi) = self.structs[sid].field(fname) else { return err(line, col, format!("`{}` has no field `{fname}`", self.structs[sid].name)) };
+        match &self.structs[sid].fields[fi].1 {
+            Ty::Array(el, Size::Const(k)) => Ok((cb, fi, (**el).clone(), *k)),
+            t => err(line, col, format!("cannot index a value of type `{t}`")),
+        }
+    }
+    /// An array field's value in a struct literal: `[a, b, …]` with exactly `k` elements, or
+    /// `[e; k]` with `e` free of effects, since it is written once per element.
+    fn array_value(&mut self, v: &ast::Expr, el: &Ty, k: i64, f: &str) -> Result<Expr> {
+        let elems: Vec<Expr> = match &v.kind {
+            ast::ExprKind::ArrayLit(es) => {
+                if es.len() as i64 != k { return err(v.line, v.col, format!("field `{f}` is `[{el}; {k}]`, given {} element(s)", es.len())); }
+                let mut out = Vec::new();
+                for x in es { out.push(self.expr(x)?); }
+                out
+            }
+            ast::ExprKind::ArrayRepeat(x, n) => {
+                if !matches!(n.kind, ast::ExprKind::Int(m) if m == k) { return err(n.line, n.col, format!("field `{f}` is `[{el}; {k}]`: the count is the literal `{k}`")); }
+                let cx = self.expr(x)?;
+                if !matches!(cx.kind, ExprKind::Int(_) | ExprKind::Float(_) | ExprKind::Bool(_) | ExprKind::Byte(_) | ExprKind::Local(_)) {
+                    return err(x.line, x.col, format!("`[e; {k}]` in a field writes `e` {k} times; give it a literal or a variable"));
+                }
+                vec![cx; k as usize]
+            }
+            _ => return err(v.line, v.col, format!("field `{f}` is `[{el}; {k}]`: give it `[a, b, …]` or `[e; {k}]`")),
+        };
+        for x in &elems {
+            if x.ty != *el { return err(v.line, v.col, format!("field `{f}` holds `{el}`, given `{}`", x.ty)); }
+        }
+        Ok(Expr { kind: ExprKind::ArrayVal(elems), ty: Ty::Array(Box::new(el.clone()), Size::Const(k)), line: v.line })
     }
     fn lookup(&self, name: &str) -> Option<LocalId> {
         self.scopes.iter().rev().find_map(|s| s.get(name).copied())
@@ -452,6 +516,17 @@ impl<'a> Ctx<'a> {
                         }
                         (LValue::Var(id), l.ty.clone())
                     }
+                    // `v.f[i] = e`
+                    ast::ExprKind::Index(base, idx) if matches!(&base.kind, ast::ExprKind::Field(inner, _) if matches!(inner.kind, ast::ExprKind::Var(_))) => {
+                        let ast::ExprKind::Field(inner, fname) = &base.kind else { unreachable!() };
+                        let ast::ExprKind::Var(n) = &inner.kind else { unreachable!() };
+                        let (cb, fi, elem, _) = self.array_field(inner, fname, base.line, base.col)?;
+                        let ExprKind::Local(id) = cb.kind else { unreachable!() };
+                        if !self.locals[id].mutable { return err(target.line, target.col, format!("`{n}` is not mutable; declare it with `let mut`")); }
+                        let ci = self.expr(idx)?;
+                        if ci.ty != Ty::I64 { return err(idx.line, idx.col, format!("index must be `i64`, found `{}`", ci.ty)); }
+                        (LValue::FieldIndex(id, ci, fi, target.line), elem)
+                    }
                     ast::ExprKind::Index(base, idx) => {
                         let id = self.local_by_expr(base, "the array being indexed")?;
                         let ci = self.expr(idx)?;
@@ -649,6 +724,16 @@ impl<'a> Ctx<'a> {
                 let ty = ca.ty.clone();
                 mk(ExprKind::Unary(*op, Box::new(ca)), ty)
             }
+            // `e.f[i]`: an element of an array field (docs/arrays-by-value-design.md)
+            ast::ExprKind::Index(base, idx) if matches!(base.kind, ast::ExprKind::Field(..)) => {
+                let ast::ExprKind::Field(inner, fname) = &base.kind else { unreachable!() };
+                let (cb, fi, elem, _) = self.array_field(inner, fname, base.line, base.col)?;
+                let ci = self.expr(idx)?;
+                if ci.ty != Ty::I64 {
+                    return err(idx.line, idx.col, format!("index must be `i64`, found `{}`", ci.ty));
+                }
+                mk(ExprKind::FieldIndex(Box::new(cb), Box::new(ci), fi), elem)
+            }
             ast::ExprKind::Index(base, idx) => {
                 let id = self.local_by_expr(base, "the array being indexed")?;
                 let ci = self.expr(idx)?;
@@ -666,6 +751,9 @@ impl<'a> Ctx<'a> {
                 let Ty::Struct(sid) = cb.ty else { return err(e.line, e.col, format!("`.{fname}` on a `{}`, which is not a struct", cb.ty)) };
                 let Some(fi) = self.structs[sid].field(fname) else { return err(e.line, e.col, format!("`{}` has no field `{fname}`", self.structs[sid].name)) };
                 let ty = self.structs[sid].fields[fi].1.clone();
+                if let Ty::Array(..) = ty {
+                    return err(e.line, e.col, format!("`.{fname}` is an array held in `{}` by value; read an element (`.{fname}[i]`) or its length (`.{fname}.len()`), or copy the whole struct", self.structs[sid].name));
+                }
                 mk(ExprKind::Field(Box::new(cb), fi), ty)
             }
             ast::ExprKind::StructLit(name, fields) => {
@@ -675,6 +763,11 @@ impl<'a> Ctx<'a> {
                 for (f, v) in fields {
                     let Some(fi) = def.field(f) else { return err(v.line, v.col, format!("`{name}` has no field `{f}`")) };
                     if vals[fi].is_some() { return err(v.line, v.col, format!("field `{f}` is given twice")); }
+                    if let Ty::Array(el, Size::Const(k)) = &def.fields[fi].1 {
+                        let cv = self.array_value(v, el, *k, f)?;
+                        vals[fi] = Some(cv);
+                        continue;
+                    }
                     let cv = self.expr(v)?;
                     if cv.ty != def.fields[fi].1 { return err(v.line, v.col, format!("field `{f}` is `{}`, given `{}`", def.fields[fi].1, cv.ty)); }
                     vals[fi] = Some(cv);
@@ -753,6 +846,11 @@ impl<'a> Ctx<'a> {
                 if name == "len" {
                     if !args.is_empty() {
                         return err(e.line, e.col, "`.len()` takes no arguments");
+                    }
+                    // an array field's length is its type's: a literal
+                    if let ast::ExprKind::Field(inner, fname) = &recv.kind {
+                        let (_, _, _, k) = self.array_field(inner, fname, recv.line, recv.col)?;
+                        return mk(ExprKind::Int(k), Ty::I64);
                     }
                     let id = self.local_by_expr(recv, "the receiver of `.len()`")?;
                     if !self.locals[id].ty.is_arrayish() {
@@ -1166,7 +1264,7 @@ fn last_uses_lvalue(lv: &LValue, line: u32, reassigns: &[Reassign], into: &mut H
         LValue::Var(_) => {}
         LValue::Index(id, idx, l) => { mark(*id, *l, into); last_uses_expr(idx, reassigns, into); }
         LValue::Field(id, _) => mark(*id, line, into),
-        LValue::IndexField(id, idx, _, l) => { mark(*id, *l, into); last_uses_expr(idx, reassigns, into); }
+        LValue::IndexField(id, idx, _, l) | LValue::FieldIndex(id, idx, _, l) => { mark(*id, *l, into); last_uses_expr(idx, reassigns, into); }
     }
 }
 
@@ -1174,9 +1272,9 @@ fn last_uses_expr(e: &Expr, reassigns: &[Reassign], into: &mut HashMap<LocalId, 
     match &e.kind {
         ExprKind::Local(id) | ExprKind::Len(id) | ExprKind::Ref(id, _) => mark(*id, e.line, into),
         ExprKind::Index(id, idx) => { mark(*id, e.line, into); last_uses_expr(idx, reassigns, into); }
-        ExprKind::Binary(_, a, b) | ExprKind::MinMax(_, a, b) => { last_uses_expr(a, reassigns, into); last_uses_expr(b, reassigns, into); }
+        ExprKind::Binary(_, a, b) | ExprKind::MinMax(_, a, b) | ExprKind::FieldIndex(a, b, _) => { last_uses_expr(a, reassigns, into); last_uses_expr(b, reassigns, into); }
         ExprKind::Unary(_, a) | ExprKind::Field(a, _) | ExprKind::Cast(a, _) | ExprKind::Println(a) => last_uses_expr(a, reassigns, into),
-        ExprKind::StructLit(_, es) => { for e2 in es { last_uses_expr(e2, reassigns, into); } }
+        ExprKind::StructLit(_, es) | ExprKind::ArrayVal(es) => { for e2 in es { last_uses_expr(e2, reassigns, into); } }
         ExprKind::Call(_, args) => { for a in args { last_uses_expr(a, reassigns, into); } }
         ExprKind::If(c, t, els) => {
             last_uses_expr(c, reassigns, into);

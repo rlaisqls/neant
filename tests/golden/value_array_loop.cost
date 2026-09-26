@@ -1,0 +1,5 @@
+struct Mat2      layout AoS  the model does not decide: no function's moves differ
+struct Vec2      layout AoS  the model does not decide: no function's moves differ
+apply            work 46                           moves 16                           exact
+run              work 56·n + 2                     moves 64·n + 16                    exact
+main             work 188                          moves 304                          exact, io

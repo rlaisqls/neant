@@ -668,7 +668,7 @@ for it (`tests/golden/input_args.cost`, `input_file.cost`); reading `n` bytes is
 sequential write of `n`. `neant run f.nt -- args` and the built binary were already the same
 program and are tested as such (`.args` files in `tests/golden`). What is left: input read inside
 a loop makes the caller unknown rather than a sum over the laps; the declarations are not yet
-confirmed by `neant measure`; the self-hosted compiler has none of it. Arrays by value remain.
+confirmed by `neant measure`; the self-hosted compiler has none of it.
 
 **Input in loops, and the input declarations measured, 2026-09-26** (cost-model.md § Program
 input). `arg_count()` is one atom for the run, so `for k in 0..arg_count()` is exact
@@ -682,6 +682,18 @@ With `10` and `+ 2500` added all four are confirmed; that changes the constant t
 declaration the sweep cannot evaluate is no longer reported as confirmed. What is left: a function
 that returns an argument, called per lap, is unknown, because a result's atom does not carry where
 it came from; the kernel's side of a read is not in the counter.
+
+**Arrays by value, 2026-09-26** (docs/arrays-by-value-design.md). What was missing was not a
+second kind of buffer but a small fixed-size aggregate that is a value: a struct field may now be
+`[T; k]`, `k` a literal, read and written by element (`s.x[i]`, `s.x.len()` the literal `k`), built
+by `[a, b, …]` or `[e; k]` in the literal, and copied with the struct — passed, returned, `let`.
+The calculus charges writing such a field as it charges `let xs = [a, b, c]`, `k` stores and
+`k·elem` bytes, and a copy the same, at `let t = s`, `t = s` and every by-value argument; an
+element is a load with no bytes. Two goldens pin it: a state vector stepped by value, and a 2×2
+control loop `x = apply(m, x, u)` whose `run` is exact at work `56·n + 2`, moves `64·n + 16` — the
+48 bytes a lap are the two argument copies. An array of such a struct is rejected with its
+reason (a third layout); a bare `[T; k]` parameter, `==` on arrays, nested fixed-size arrays and
+the self-hosted side are left.
 
 ## M7 — the constant factor
 

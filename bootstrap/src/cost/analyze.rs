@@ -1660,6 +1660,16 @@ impl<'a, 'b, 'c> Fa<'a, 'b, 'c> {
     }
 
     /// A sequential pass over `n` elements of `es` bytes, once per enclosing iteration.
+    /// A copy of a struct value costs its array fields as a write (docs/arrays-by-value-design.md
+    /// §3); scalars are registers and a struct without an array field costs nothing, as before.
+    fn copy_value(&mut self, t: &Ty) {
+        let Ty::Struct(sid) = t else { return };
+        let (k, bytes) = self.an.m.structs[*sid].array_part();
+        if k == 0 { return; }
+        self.add_work_n(k);
+        self.stream(&Poly::constant(bytes), 1);
+    }
+
     fn stream(&mut self, n: &Poly, es: i128) {
         if !self.replay { self.moves = self.moves.add_poly(&n.scale(Rat::int(es))); }
     }
@@ -1710,6 +1720,8 @@ impl<'a, 'b, 'c> Fa<'a, 'b, 'c> {
             Stmt::Let(id, e) => {
                 self.recognise(s);
                 self.expr(e)?;
+                // `let t = s`: a second place for a value that has one
+                if matches!(e.kind, ExprKind::Local(_)) { self.copy_value(&e.ty); }
                 let l = &self.f.locals[*id];
                 if l.ty.is_arrayish() {
                     if matches!(e.kind, ExprKind::Call(..)) {
@@ -1790,6 +1802,7 @@ impl<'a, 'b, 'c> Fa<'a, 'b, 'c> {
                         self.initial.insert(*v, val);
                     }
                 }
+                if let (LValue::Var(_), ExprKind::Local(_)) = (lv, &e.kind) { self.copy_value(&e.ty); }
                 match lv {
                     // a register: only the operation of `op=` costs
                     LValue::Var(_) => self.add_work_n(if op.is_some() { 1 } else { 0 }),
@@ -1801,6 +1814,11 @@ impl<'a, 'b, 'c> Fa<'a, 'b, 'c> {
                         self.wrote(*arr);
                     }
                     LValue::Field(..) => self.add_work_n(if op.is_some() { 1 } else { 0 }),
+                    // a store into a value array: resident, no bytes (§3)
+                    LValue::FieldIndex(_, idx, _, _) => {
+                        self.expr(idx)?;
+                        self.add_work_n(if op.is_some() { 3 } else { 1 });
+                    }
                     LValue::IndexField(arr, idx, fi, _) => {
                         self.expr(idx)?;
                         self.add_work_n(if op.is_some() { 3 } else { 1 });
@@ -2016,7 +2034,7 @@ impl<'a, 'b, 'c> Fa<'a, 'b, 'c> {
                     }
                     // a `.par()` chain's body cannot assign to anything outside it (its closures
                     // are already checked pure), so it can never touch the measure either
-                    Stmt::Assign(LValue::Var(_) | LValue::Index(..) | LValue::Field(..) | LValue::IndexField(..), _, _) | Stmt::Let(..) | Stmt::LetArray(..) | Stmt::LetRepeat(..) | Stmt::LetBuild { .. } | Stmt::Reassign(..) | Stmt::ParFor { .. } => {}
+                    Stmt::Assign(LValue::Var(_) | LValue::Index(..) | LValue::Field(..) | LValue::IndexField(..) | LValue::FieldIndex(..), _, _) | Stmt::Let(..) | Stmt::LetArray(..) | Stmt::LetRepeat(..) | Stmt::LetBuild { .. } | Stmt::Reassign(..) | Stmt::ParFor { .. } => {}
                     Stmt::Expr(Expr { kind: ExprKind::If(_, t, e), .. }) => {
                         let bt = block(t, coef, f)?;
                         let be = match e { Some(e) => block(e, coef, f)?, None => Some(Rat::zero()) };
@@ -2169,6 +2187,18 @@ impl<'a, 'b, 'c> Fa<'a, 'b, 'c> {
                 _ => self.expr(base),
             },
             ExprKind::StructLit(_, vals) => { for v in vals { self.expr(v)?; } Ok(()) }
+            // an element of a value array: a load, the bytes were charged when the value was
+            // written (docs/arrays-by-value-design.md §3)
+            ExprKind::FieldIndex(base, idx, _) => { self.expr(base)?; self.expr(idx)?; self.add_work_n(1); Ok(()) }
+            // a value array written: one store per element and a sequential write, as `[a, b, c]`
+            ExprKind::ArrayVal(vals) => {
+                for v in vals { self.expr(v)?; }
+                let k = vals.len() as i128;
+                self.add_work_n(k);
+                let es = e.ty.elem().map_or(8, |t| t.elem_bytes());
+                self.stream(&Poly::constant(k), es);
+                Ok(())
+            }
             ExprKind::If(c, t, els) => {
                 self.expr(c)?;
                 self.add_work_n(1);
@@ -2213,6 +2243,8 @@ impl<'a, 'b, 'c> Fa<'a, 'b, 'c> {
             ExprKind::Block(b) => self.block(b),
             ExprKind::Call(fid, args) => {
                 for a in args { self.expr(a)?; }
+                // every argument is passed by value: a struct with array fields is a copy
+                for a in args { self.copy_value(&a.ty); }
                 // an array handed over writable may come back changed, where the callee may
                 // store into it (`field_writes`)
                 for (i, a) in args.iter().enumerate() {
@@ -2497,7 +2529,7 @@ fn bound_mentions(e: &Expr, l: LocalId) -> bool {
     match &e.kind {
         ExprKind::Local(v) => *v == l,
         ExprKind::Len(v) => *v == l,
-        ExprKind::Binary(_, a, b) | ExprKind::MinMax(_, a, b) => bound_mentions(a, l) || bound_mentions(b, l),
+        ExprKind::Binary(_, a, b) | ExprKind::MinMax(_, a, b) | ExprKind::FieldIndex(a, b, _) => bound_mentions(a, l) || bound_mentions(b, l),
         ExprKind::Unary(_, a) | ExprKind::Cast(a, _) | ExprKind::Field(a, _) => bound_mentions(a, l),
         ExprKind::Index(_, i) => bound_mentions(i, l),
         _ => false,
@@ -2512,8 +2544,8 @@ fn collect_refs<'e>(e: &'e Expr, out: &mut Vec<(LocalId, &'e Expr, Option<usize>
             ExprKind::Index(a, i) => { out.push((*a, i, Some(*fi))); collect_refs(i, out); }
             _ => collect_refs(base, out),
         },
-        ExprKind::StructLit(_, vals) => for v in vals { collect_refs(v, out); },
-        ExprKind::Binary(_, a, b) | ExprKind::MinMax(_, a, b) => { collect_refs(a, out); collect_refs(b, out); }
+        ExprKind::StructLit(_, vals) | ExprKind::ArrayVal(vals) => for v in vals { collect_refs(v, out); },
+        ExprKind::Binary(_, a, b) | ExprKind::MinMax(_, a, b) | ExprKind::FieldIndex(a, b, _) => { collect_refs(a, out); collect_refs(b, out); }
         ExprKind::Unary(_, a) | ExprKind::Cast(a, _) | ExprKind::Println(a) => collect_refs(a, out),
         ExprKind::Call(_, args) => for a in args { collect_refs(a, out); },
         ExprKind::If(c, t, els) => {
@@ -2551,11 +2583,11 @@ fn collect_scalars(e: &Expr, out: &mut Vec<LocalId>) {
     match &e.kind {
         ExprKind::Local(v) => out.push(*v),
         ExprKind::Index(_, i) => collect_scalars(i, out),
-        ExprKind::Binary(_, a, b) | ExprKind::MinMax(_, a, b) => { collect_scalars(a, out); collect_scalars(b, out); }
+        ExprKind::Binary(_, a, b) | ExprKind::MinMax(_, a, b) | ExprKind::FieldIndex(a, b, _) => { collect_scalars(a, out); collect_scalars(b, out); }
         ExprKind::Unary(_, a) | ExprKind::Cast(a, _) | ExprKind::Println(a) => collect_scalars(a, out),
         ExprKind::Call(_, args) => for a in args { collect_scalars(a, out); },
         ExprKind::Field(base, _) => collect_scalars(base, out),
-        ExprKind::StructLit(_, vals) => for v in vals { collect_scalars(v, out); },
+        ExprKind::StructLit(_, vals) | ExprKind::ArrayVal(vals) => for v in vals { collect_scalars(v, out); },
         ExprKind::If(c, t, els) => { collect_scalars(c, out); for b in std::iter::once(t).chain(els.iter()) { if let Some(x) = &b.tail { collect_scalars(x, out); } } }
         ExprKind::Block(b) => { if let Some(x) = &b.tail { collect_scalars(x, out); } }
         _ => {}
@@ -2572,7 +2604,7 @@ fn callees_block(b: &Block, out: &mut Vec<FuncId>) {
             Stmt::LetArray(_, es) => for e in es { callees_expr(e, out); },
             Stmt::LetBuild { len, body, .. } => { callees_expr(len, out); callees_block(body, out); }
             Stmt::Assign(lv, _, e) => {
-                match lv { LValue::Index(_, i, _) | LValue::IndexField(_, i, _, _) => callees_expr(i, out), _ => {} }
+                match lv { LValue::Index(_, i, _) | LValue::IndexField(_, i, _, _) | LValue::FieldIndex(_, i, _, _) => callees_expr(i, out), _ => {} }
                 callees_expr(e, out);
             }
             Stmt::For { start, end, body, .. } => { callees_expr(start, out); callees_expr(end, out); callees_block(body, out); }
@@ -2591,9 +2623,9 @@ fn callees_block(b: &Block, out: &mut Vec<FuncId>) {
 fn callees_expr(e: &Expr, out: &mut Vec<FuncId>) {
     match &e.kind {
         ExprKind::Call(f, args) => { if !out.contains(f) { out.push(*f); } for a in args { callees_expr(a, out); } }
-        ExprKind::Binary(_, a, b) | ExprKind::MinMax(_, a, b) => { callees_expr(a, out); callees_expr(b, out); }
+        ExprKind::Binary(_, a, b) | ExprKind::MinMax(_, a, b) | ExprKind::FieldIndex(a, b, _) => { callees_expr(a, out); callees_expr(b, out); }
         ExprKind::Unary(_, a) | ExprKind::Field(a, _) | ExprKind::Println(a) | ExprKind::Cast(a, _) | ExprKind::Index(_, a) => callees_expr(a, out),
-        ExprKind::StructLit(_, es) => for x in es { callees_expr(x, out); },
+        ExprKind::StructLit(_, es) | ExprKind::ArrayVal(es) => for x in es { callees_expr(x, out); },
         ExprKind::If(c, t, els) => { callees_expr(c, out); callees_block(t, out); if let Some(b) = els { callees_block(b, out); } }
         ExprKind::Block(b) => callees_block(b, out),
         ExprKind::Int(_) | ExprKind::Float(_) | ExprKind::Bool(_) | ExprKind::Byte(_) | ExprKind::Local(_) | ExprKind::Len(_) | ExprKind::Ref(..) => {}
@@ -2617,7 +2649,7 @@ impl Writes {
                 Stmt::Assign(lv, _, e) => {
                     match lv {
                         LValue::Var(v) | LValue::Field(v, _) => self.locals.push(*v),
-                        LValue::Index(_, i, _) | LValue::IndexField(_, i, _, _) => self.expr(i),
+                        LValue::Index(_, i, _) | LValue::IndexField(_, i, _, _) | LValue::FieldIndex(_, i, _, _) => self.expr(i),
                     }
                     self.expr(e);
                 }
@@ -2637,9 +2669,9 @@ impl Writes {
     fn expr(&mut self, e: &Expr) {
         match &e.kind {
             ExprKind::Call(_, args) => for a in args { self.expr(a); },
-            ExprKind::Binary(_, a, b) | ExprKind::MinMax(_, a, b) => { self.expr(a); self.expr(b); }
+            ExprKind::Binary(_, a, b) | ExprKind::MinMax(_, a, b) | ExprKind::FieldIndex(a, b, _) => { self.expr(a); self.expr(b); }
             ExprKind::Unary(_, a) | ExprKind::Field(a, _) | ExprKind::Println(a) | ExprKind::Cast(a, _) | ExprKind::Index(_, a) => self.expr(a),
-            ExprKind::StructLit(_, es) => for x in es { self.expr(x); },
+            ExprKind::StructLit(_, es) | ExprKind::ArrayVal(es) => for x in es { self.expr(x); },
             ExprKind::If(c, t, els) => { self.expr(c); self.block(t); if let Some(b) = els { self.block(b); } }
             ExprKind::Block(b) => self.block(b),
             ExprKind::Int(_) | ExprKind::Float(_) | ExprKind::Bool(_) | ExprKind::Byte(_) | ExprKind::Local(_) | ExprKind::Len(_) | ExprKind::Ref(..) => {}
@@ -2706,6 +2738,7 @@ fn stores_block(b: &Block, f: &Func, roots: &mut HashMap<LocalId, LocalId>, summ
                     LValue::Index(a, i, _) => { hit(roots.get(a).copied().unwrap_or(*a), None); stores_expr(i, f, roots, summ, hit); }
                     LValue::IndexField(a, i, fi, _) => { hit(roots.get(a).copied().unwrap_or(*a), Some(*fi)); stores_expr(i, f, roots, summ, hit); }
                     LValue::Var(_) | LValue::Field(..) => {}
+                    LValue::FieldIndex(_, i, _, _) => stores_expr(i, f, roots, summ, hit),
                 }
                 stores_expr(e, f, roots, summ, hit);
             }
@@ -2742,9 +2775,9 @@ fn stores_expr(e: &Expr, f: &Func, roots: &mut HashMap<LocalId, LocalId>, summ: 
             }
             stores_expr(a, f, roots, summ, hit);
         },
-        ExprKind::Binary(_, a, b) | ExprKind::MinMax(_, a, b) => { stores_expr(a, f, roots, summ, hit); stores_expr(b, f, roots, summ, hit); }
+        ExprKind::Binary(_, a, b) | ExprKind::MinMax(_, a, b) | ExprKind::FieldIndex(a, b, _) => { stores_expr(a, f, roots, summ, hit); stores_expr(b, f, roots, summ, hit); }
         ExprKind::Unary(_, a) | ExprKind::Field(a, _) | ExprKind::Println(a) | ExprKind::Cast(a, _) | ExprKind::Index(_, a) => stores_expr(a, f, roots, summ, hit),
-        ExprKind::StructLit(_, es) => for x in es { stores_expr(x, f, roots, summ, hit); },
+        ExprKind::StructLit(_, es) | ExprKind::ArrayVal(es) => for x in es { stores_expr(x, f, roots, summ, hit); },
         ExprKind::If(c, t, els) => { stores_expr(c, f, roots, summ, hit); stores_block(t, f, roots, summ, hit); if let Some(b) = els { stores_block(b, f, roots, summ, hit); } }
         ExprKind::Block(b) => stores_block(b, f, roots, summ, hit),
         ExprKind::Int(_) | ExprKind::Float(_) | ExprKind::Bool(_) | ExprKind::Byte(_) | ExprKind::Local(_) | ExprKind::Len(_) | ExprKind::Ref(..) => {}

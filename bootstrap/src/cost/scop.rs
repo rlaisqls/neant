@@ -122,7 +122,7 @@ impl<'a> Ex<'a> {
             ExprKind::If(c, t, els) => { self.scan_expr(c)?; self.scan_block(t)?; if let Some(b) = els { self.scan_block(b)?; } Ok(()) }
             ExprKind::Block(b) => self.scan_block(b),
             ExprKind::Println(_) => Err("`println` is not part of a SCoP".into()),
-            ExprKind::Field(..) | ExprKind::StructLit(..) => Err("a struct is not part of a SCoP: the polyhedral model reads arrays of scalars".into()),
+            ExprKind::Field(..) | ExprKind::StructLit(..) | ExprKind::FieldIndex(..) | ExprKind::ArrayVal(..) => Err("a struct is not part of a SCoP: the polyhedral model reads arrays of scalars".into()),
             _ => Ok(()),
         }
     }
@@ -157,7 +157,7 @@ impl<'a> Ex<'a> {
     fn mentions_loop_var(&self, e: &Expr) -> bool {
         match &e.kind {
             ExprKind::Local(l) => self.loop_vars.contains(l),
-            ExprKind::Binary(_, a, b) | ExprKind::MinMax(_, a, b) => self.mentions_loop_var(a) || self.mentions_loop_var(b),
+            ExprKind::Binary(_, a, b) | ExprKind::MinMax(_, a, b) | ExprKind::FieldIndex(a, b, _) => self.mentions_loop_var(a) || self.mentions_loop_var(b),
             ExprKind::Unary(_, a) | ExprKind::Cast(a, _) => self.mentions_loop_var(a),
             _ => false,
         }
@@ -223,7 +223,7 @@ impl<'a> Ex<'a> {
     fn mentions(&self, e: &Expr, v: LocalId) -> bool {
         match &e.kind {
             ExprKind::Local(l) => *l == v,
-            ExprKind::Binary(_, a, b) | ExprKind::MinMax(_, a, b) => self.mentions(a, v) || self.mentions(b, v),
+            ExprKind::Binary(_, a, b) | ExprKind::MinMax(_, a, b) | ExprKind::FieldIndex(a, b, _) => self.mentions(a, v) || self.mentions(b, v),
             ExprKind::Unary(_, a) | ExprKind::Cast(a, _) | ExprKind::Println(a) => self.mentions(a, v),
             ExprKind::Index(_, i) => self.mentions(i, v),
             ExprKind::Call(_, args) => args.iter().any(|a| self.mentions(a, v)),
@@ -250,7 +250,7 @@ impl<'a> Ex<'a> {
                 let target = match lv {
                     LValue::Var(l) => self.name(*l),
                     LValue::Index(a, i, _) => self.index(*a, i),
-                    LValue::Field(..) | LValue::IndexField(..) => return Err("a struct field is not an affine array reference the polyhedral model reads".into()),
+                    LValue::Field(..) | LValue::IndexField(..) | LValue::FieldIndex(..) => return Err("a struct field is not an affine array reference the polyhedral model reads".into()),
                 };
                 self.line(&format!("{target} {o}= {v};"));
                 Ok(())
@@ -313,7 +313,7 @@ impl<'a> Ex<'a> {
             ExprKind::If(c, t, els) => format!("({} ? {} : {})", self.expr(c), t.tail.as_ref().map_or("0".to_string(), |x| self.expr(x)), els.as_ref().and_then(|b| b.tail.as_ref()).map_or("0".to_string(), |x| self.expr(x))),
             ExprKind::Block(b) => b.tail.as_ref().map_or("0".to_string(), |x| self.expr(x)),
             ExprKind::Ref(a, _) => self.f.locals[*a].name.clone(),
-            ExprKind::Call(..) | ExprKind::Println(_) | ExprKind::Field(..) | ExprKind::StructLit(..) => "0".into(),
+            ExprKind::Call(..) | ExprKind::Println(_) | ExprKind::Field(..) | ExprKind::StructLit(..) | ExprKind::FieldIndex(..) | ExprKind::ArrayVal(..) => "0".into(),
         }
     }
 }

@@ -182,6 +182,13 @@ living in registers, costing nothing to move. What costs is an array of them, an
 that array is the compiler's, because nothing in the language can hold an address into it — there
 is no `&ps[i]` and no `&p.x`, only `ps[i]` and `p.x`, which are values.
 
+A field may be a fixed-size array `[T; k]` (docs/arrays-by-value-design.md), and then the value
+is not all registers: writing the field — `[a, b, …]` or `[e; k]` in a literal — costs `k` stores
+and `k·elem` bytes, as `let xs = [a, b, c]` does, and so does every copy of the struct where the
+program names a second place for it (`let t = s`, `t = s`, a by-value argument); `s.x[i]` is a
+load with no bytes, the value being resident. A struct with an array field is never an array
+element.
+
 **A site touches one thing and steps by another.** An access site records the bytes it reads or
 writes (`es`) and the bytes its address moves per unit of the index (`stride`). For a scalar array
 they are the same number. For one field of a struct array they are not, and the difference is
