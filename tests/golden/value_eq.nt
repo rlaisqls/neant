@@ -1,0 +1,31 @@
+// `==` and `!=` on a whole value: a fixed-size array compared element by element, and a struct
+// made of scalars and a fixed array, field by field.
+struct Pose { x: [f64; 3], id: i64 }
+
+fn same(a: [i64; 4], b: [i64; 4]) -> bool {
+    a == b
+}
+
+fn moved(p: Pose, q: Pose) -> bool {
+    p != q
+}
+
+fn main() {
+    let a = [1, 2, 3, 4];
+    let b = [1, 2, 3, 4];
+    let c = [1, 2, 0, 4];
+    println(a == b);
+    println(a != c);
+    println(same(b, c));
+    let p = Pose { x: [0.0, 1.0, 2.0], id: 7 };
+    let q = Pose { x: [0.0, 1.0, 2.0], id: 7 };
+    let r = Pose { x: [0.0, 1.5, 2.0], id: 7 };
+    println(p == q);
+    println(moved(p, r));
+    let mut n = q;
+    n.id = 8;
+    println(n == q);
+    let z = [0.0, -0.0];
+    let w = [-0.0, 0.0];
+    println(z == w);
+}

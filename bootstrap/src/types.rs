@@ -742,6 +742,22 @@ impl<'a> Ctx<'a> {
                     }
                     ca.ty.clone()
                 } else if op.is_cmp() {
+                    // `==`/`!=` on a whole value: a struct, or a fixed-size array of scalars held in
+                    // a variable, element by element (docs/arrays-by-value-design.md §8)
+                    if matches!(op, BinOp::Eq | BinOp::Ne) && !ca.ty.is_scalar() {
+                        match &ca.ty {
+                            Ty::Struct(_) => {}
+                            Ty::Array(el, Size::Const(k)) if *k >= 0 && el.is_scalar() => {
+                                if !matches!(ca.kind, ExprKind::Local(_)) || !matches!(cb.kind, ExprKind::Local(_)) {
+                                    return err(e.line, e.col, format!("`{}` on arrays compares two variables", op.c_str()));
+                                }
+                            }
+                            Ty::Array(..) | Ty::Slice(..) => return err(e.line, e.col, format!(
+                                "`{}` on `{}`: arrays compare whole only when their length is a literal and their elements are scalars", op.c_str(), ca.ty)),
+                            _ => return err(e.line, e.col, format!("`{}` on `{}`", op.c_str(), ca.ty)),
+                        }
+                        return mk(ExprKind::Binary(*op, Box::new(ca), Box::new(cb)), Ty::Bool);
+                    }
                     if !ca.ty.is_scalar() {
                         return err(e.line, e.col, format!("`{}` on `{}`", op.c_str(), ca.ty));
                     }

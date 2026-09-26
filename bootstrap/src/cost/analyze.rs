@@ -1672,6 +1672,27 @@ impl<'a, 'b, 'c> Fa<'a, 'b, 'c> {
         self.stream(&Poly::constant(bytes), 1);
     }
 
+    /// `a == b` on a whole value. A fixed-size array: two loads and a compare per element, the
+    /// conjunction folded into the compare, and both arrays' element bytes read. A struct: a
+    /// compare per scalar field, which is in a register, and per array-field element two loads
+    /// and a compare with no bytes, an element being resident as in §3.
+    fn compare_value(&mut self, t: &Ty) {
+        match t {
+            Ty::Array(e, Size::Const(k)) => {
+                let k = *k as i128;
+                self.add_work_n(3 * k);
+                self.stream(&Poly::constant(2 * k), e.elem_bytes());
+            }
+            Ty::Struct(sid) => {
+                let sd = &self.an.m.structs[*sid];
+                let (k, _) = sd.array_part();
+                let scalars = sd.fields.iter().filter(|(_, t)| t.is_scalar()).count() as i128;
+                self.add_work_n(scalars + 3 * k);
+            }
+            _ => self.add_work_n(1),
+        }
+    }
+
     fn stream(&mut self, n: &Poly, es: i128) {
         if !self.replay { self.moves = self.moves.add_poly(&n.scale(Rat::int(es))); }
     }
@@ -2177,6 +2198,8 @@ impl<'a, 'b, 'c> Fa<'a, 'b, 'c> {
         match &e.kind {
             ExprKind::Int(_) | ExprKind::Float(_) | ExprKind::Bool(_) | ExprKind::Byte(_) | ExprKind::Local(_) | ExprKind::Ref(..) => Ok(()),
             ExprKind::Len(_) => Ok(()), // the length is already in a register
+            // a whole value compared: element by element (docs/arrays-by-value-design.md §8)
+            ExprKind::Binary(_, a, b) if !a.ty.is_scalar() => { self.expr(a)?; self.expr(b)?; self.compare_value(&a.ty); Ok(()) }
             ExprKind::Binary(_, a, b) => { self.expr(a)?; self.expr(b)?; self.add_work_n(1); Ok(()) }
             ExprKind::MinMax(_, a, b) => { self.expr(a)?; self.expr(b)?; self.add_work_n(2); Ok(()) } // compare, select
             ExprKind::Unary(_, a) | ExprKind::Cast(a, _) => { self.expr(a)?; self.add_work_n(1); Ok(()) }

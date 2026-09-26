@@ -160,3 +160,25 @@ literal's, as before.
 The self-hosted parser's slice (the `parsedump` table in `main.rs`) excludes a function with a
 by-value array parameter or return, as it excludes an array field, so the parity tests skip these
 goldens.
+
+## 8 — `==` and `!=` on a whole value
+
+A struct — every struct, since its fields are scalars and fixed-size arrays of scalars — and a
+fixed-size array of scalars held in a variable compare with `==` and `!=`, element by element and
+field by field, with each element's own `==`: `-0.0 == 0.0` holds and a `NaN` makes the whole
+comparison false, as it does for one `f64`. An array whose length is data (`[0; n]`), a view, and
+an array of structs are rejected with that reason; the two sides must have the same type, so two
+arrays of different literal lengths are rejected as any `==` between two types is.
+
+**Cost.** The comparison always looks at every element — the emitted C folds each element's
+result into one flag with no early exit — so it is a constant, and exact:
+
+- a fixed-size array: two loads and a compare per element, the conjunction folded into the
+  compare, so work `3·k`, and both arrays' element bytes read, moves `2·k·elem_bytes`;
+- a struct: one compare per scalar field, which is in a register, and two loads and a compare per
+  element of each array field, with no bytes — an element of a value array is resident while the
+  value is used (§3).
+
+In `value_eq`, `same` on two `[i64; 4]` is work 12, moves 64; `moved` on a `Pose { x: [f64; 3],
+id: i64 }` is work 10, moves 0, and the two struct arguments it is passed are charged as the
+copies §3 says they are, in `main`.

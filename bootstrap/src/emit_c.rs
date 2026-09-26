@@ -533,6 +533,31 @@ static void nt_println_f64(double v) {
                 let ty = self.f.unwrap().locals[*id].ty.clone();
                 if ty.is_arrayish() { self.arr_val(&nm, &ty) } else { s(nm) }
             }
+            // a whole value compared element by element, every element, so the cost has no
+            // early exit (docs/arrays-by-value-design.md §8)
+            ExprKind::Binary(op, a, b) if !a.ty.is_scalar() => {
+                let neg = if matches!(op, crate::ast::BinOp::Ne) { "!" } else { "" };
+                let r = self.fresh("eq");
+                match &a.ty {
+                    Ty::Array(_, Size::Const(k)) => {
+                        let (CVal::Arr(ap, _), CVal::Arr(bp, _)) = (self.expr(a), self.expr(b)) else { unreachable!("arrays compared are variables") };
+                        s(format!("({neg}({{ bool {r} = 1; for (int64_t {r}k = 0; {r}k < {k}; {r}k++) {r} &= ({ap}[{r}k] == {bp}[{r}k]); {r}; }}))"))
+                    }
+                    Ty::Struct(sid) => {
+                        let (av, bv) = (self.expr(a).scalar(), self.expr(b).scalar());
+                        let ct = c_ty(self.m, &a.ty);
+                        let mut body = format!("{ct} {r}a = {av}, {r}b = {bv}; bool {r} = 1;");
+                        for (f, ft) in &self.m.structs[*sid].fields {
+                            match ft {
+                                Ty::Array(_, Size::Const(k)) => body.push_str(&format!(" for (int64_t {r}k = 0; {r}k < {k}; {r}k++) {r} &= ({r}a.{f}[{r}k] == {r}b.{f}[{r}k]);")),
+                                _ => body.push_str(&format!(" {r} &= ({r}a.{f} == {r}b.{f});")),
+                            }
+                        }
+                        s(format!("({neg}({{ {body} {r}; }}))"))
+                    }
+                    t => unreachable!("`==` on `{t}`"),
+                }
+            }
             ExprKind::Binary(op, a, b) => {
                 let av = self.expr(a).scalar();
                 let bv = self.expr(b).scalar();
