@@ -1,0 +1,33 @@
+// Where a size bound once is refused: `n` bound inside a loop is a new value every lap, so it is
+// no atom, and the array it sizes has no size the calculus can name; `m`, bound with `let mut`,
+// may change after it is bound, and stays no size either.
+
+fn header(xs: &[i64], k: i64) -> i64 {
+    xs[k] + 1
+}
+
+fn per_lap(xs: &[i64]) -> i64 {
+    let mut s = 0;
+    for k in 0..xs.len() {
+        let n = header(xs, k);
+        let t = [1; n];
+        s += t.len();
+    }
+    s
+}
+
+fn reassigned(xs: &[i64]) -> i64 {
+    let mut m = header(xs, 0);
+    m += 1;
+    let mut s = 0;
+    for i in 0..m {
+        s += i;
+    }
+    s
+}
+
+fn main() {
+    let data = [2, 5, 1];
+    println(per_lap(&data));
+    println(reassigned(&data));
+}

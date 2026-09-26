@@ -15,8 +15,9 @@ Or it gets one sentence saying why not, with a line number. It never gets nothin
 ## Size variables
 
 A function's atoms are its parameters, in order: a slice parameter `a: &[T]` contributes
-`a.len()`, an `i64` parameter `n` contributes `n`. The one other kind of atom is a value read
-from memory (§ A size read from memory) — every size inside the body must reduce to these and
+`a.len()`, an `i64` parameter `n` contributes `n`. The other kinds of atom are a value read from
+memory (§ A size read from memory), a value bound once to an immutable local (§ A size bound
+once), and program input (§ Program input) — every size inside the body must reduce to these and
 constants, or the function's cost is unknown.
 
 An `i64` expression is a **size expression** when it is built from integer literals, size
@@ -457,6 +458,39 @@ own array stays as `f.xs[…]`, a value the caller cannot name any better.
 What the atom is not yet: the expression the value was written from. `let k = n; xs[0] = k` then
 a loop to `xs[0]` is a loop to the atom `xs[0]`, not to `n` — following a store to its load is
 what plan § Stage D (2) left for later.
+
+## A size bound once
+
+**Added 2026-09-26.** An `i64` bound by `let n = e` — immutable, outside every loop — where `e` is
+nothing the calculus can name (a call's result, `parse_int(&a)`, `count_ints(&text)`, a division
+by a variable) is an atom of its own for the rest of the function, named after the local: `n`.
+Nothing is known of its value, so a cost in it is exact in it the way a cost in a parameter is.
+An array `[e; n]` has it as its length, and a loop to it has it as its trip
+(`bound_once.cost`: `squares  work 9·n + 5  exact`).
+
+**Why it is sound.** The local cannot be assigned, so it names one value for the rest of the
+run. That is all a parameter is to the calculus: a number fixed on entry and never known.
+The atom is minted where the `let` is and stands only for what follows it.
+
+**Where it is refused.**
+- **Bound inside a loop**: it is a new value every lap and stays no size (`bound_once_loop.cost`:
+  "the length of `t` is not a size expression").
+- **`let mut`**: it may change after it is bound, so it stays no size, as a mutable local always
+  has ("loop bound is not a size expression").
+- A value the calculus *can* name is left as it was: a size expression, an element read
+  (§ A size read from memory), an argument's or a file's length (§ Program input).
+
+**A negative value** is not ruled out, any more than for an `i64` parameter. A line is read for
+the atom at `0` or more. A negative `n` as a length never gets past the allocation, which exits
+101 ("negative array length"). A loop `0..n` with `n < 0` runs no lap, so it costs less than the
+line's constant.
+
+**At a call** the callee's atom is a new quantity at every call, so the caller gets an atom of its
+own for it, named `callee.local`: `main  work 9·squares.n + 11`. This is the rule § Program input
+gave `first_len.a.len()`. Inside a loop of the caller, a callee's atom used as a size is refused
+("calls `f` in a loop: `n`, a size it binds once, is a new value at every iteration"). One that
+only indexes an element the callee reads, `pols[nb].n_term`, is widened as a variable summed away
+is, to `max(pols[_].n_term)`, and the line is a bound. An unknown callee's argument is shown as `_`.
 
 ## Program input
 

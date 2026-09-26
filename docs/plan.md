@@ -709,6 +709,28 @@ number next is therefore an integer read from input as an atom for the run, as `
 Four shapes the corpus had to be written around are kept as rejected cases: string output, a grid
 of rows, an array of structs with array fields, a bare `[T; k]` parameter.
 
+**A size bound once, 2026-09-26** (cost-model § A size bound once). The first of the corpus's two
+gaps is closed. An `i64` bound to an immutable local outside every loop, from anything the
+calculus cannot name, is now an atom of its own named after the local. A caller gets it at the
+call as `callee.local`. Inside a caller's loop it is refused when used as a size, and widened to
+`max(xs[_])` when it only indexes a read. `bound_once.nt` pins the rule and `bound_once_loop.nt`
+the two refusals: bound in a loop, and `let mut`.
+
+On the corpus, 4 of the 6 `main`s gain a cost and become modulo: `heat` `≈ 31·n²·steps`, `matmul`
+`≈ 10·n³`, and `pid` and `fir` linear in the sample count. Each rests on the parser's
+`next_int`, whose loop has no measure. BFS's `main` now stops at its worklist. The share of
+exact functions is unchanged at 14 of 24.
+
+On the compiler, `compiler/costs.lock` goes from 92 exact, 47 modulo, 32 bound, 105 unknown to
+**92, 49, 32, 103**. `site_top` and `w_func` move from unknown to modulo, and eight more move within
+their tier. A handle bound once (`nb = pol_scale(..)`) makes `pols[nb].n_term` an element, not
+`max(pols[_].n_term)`. Without the widening at a caller's loop, three functions fell from modulo
+to unknown; with it, none falls. The self-hosted cost pass does not have the rule. On the two new
+goldens it declines `squares` and the `main`s rather than disagreeing, and `self_host_cost.rs`'s
+counts grow only by the functions it matches: work and moves 99 → 101, footprint 117 → 124,
+bound 120 → 127. Left: the scan that steps by what it read, the worklist, and the rule on the
+self-hosted side.
+
 ## M7 — the constant factor
 
 Prove the asymptote, search the constant. A micro-architectural cost line (what llvm-mca and uiCA

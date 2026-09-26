@@ -20,6 +20,8 @@ edges            work 13·n                         moves 2·B·n + 16·n + 2·B
 mean             work 4·g.len() + 2                moves 8·g.len() + B                exact
                  lower bound      moves 8·g.len()                    (footprint, every distinct element crosses once)   gap 1× at M = 2 MiB, B = 64
                  footprint        g: [0, 8·g.len())   resident after if 8·g.len() < M
-main             unknown: the length of `a` is not a size expression (main.nt:39), io
+main             work ≈ 31·n²·steps + work[next_int](a1.len(), 0) + work[next_int](a0.len(), 0) moves                              modulo, io  (2 regimes)
+                                               moves ≈ 96·n²·steps + moves[next_int](a1.len(), 0) + moves[next_int](a0.len(), 0) if ≈ 48·n < M
+                                               moves ≈ 96·n²·steps + moves[next_int](a1.len(), 0) + moves[next_int](a0.len(), 0) if ≈ 48·n ≥ M
                  rests on         arg (declared, extern); next_int (unknown)
 arg              work ≤ result.len()               moves ≤ result.len()               declared, io

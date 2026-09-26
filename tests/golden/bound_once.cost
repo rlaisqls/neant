@@ -1,0 +1,4 @@
+header           work 3                            moves 2·B                          exact
+                 footprint        xs: [0, 16)   resident after if 16 < M
+squares          work 9·n + 5                      moves 24·n + 4·B                   exact
+main             work 9·squares.n + 11             moves 24·squares.n + 4·B + 24      exact, io

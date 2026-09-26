@@ -16,7 +16,7 @@ plant_step       work 50                           moves 64                     
 pid_step         work 2                            moves 0                            exact
 pid_out          work 9                            moves 0                            exact
 abs              work 3                            moves 0                            exact
-main             unknown: the length of `sp` is not a size expression (main.nt:43), io
-                 rests on         arg (declared, extern); read_file (declared, extern); count_ints (unknown)
+main             work ≈ n·work[next_int](text.len(), _) + 99·n + text.len() + 2·path.len() + work[count_ints](text.len()) moves ≈ n·moves[next_int](text.len(), _) + 152·n + text.len() + 2·path.len() + moves[count_ints](text.len()) modulo, io
+                 rests on         arg (declared, extern); read_file (declared, extern); count_ints (unknown); next_int (unknown); sqrt (declared, extern)
 arg              work ≤ result.len()               moves ≤ result.len()               declared, io
 read_file        work ≤ result.len() + path.len() + 2500 moves ≤ result.len() + path.len()  declared, io

@@ -22,7 +22,7 @@ fir        count_ints       unknown
 fir        read_ints        modulo
 fir        push             exact
 fir        average          exact
-fir        main             unknown
+fir        main             modulo
 fir        arg              declared
 fir        read_file        declared
 heat       is_digit         exact
@@ -33,7 +33,7 @@ heat       read_ints        modulo
 heat       sweep            exact
 heat       edges            exact
 heat       mean             exact
-heat       main             unknown
+heat       main             modulo
 heat       arg              declared
 matmul     is_digit         exact
 matmul     next_int         unknown
@@ -43,7 +43,7 @@ matmul     read_ints        modulo
 matmul     fill             exact
 matmul     matmul           exact
 matmul     trace            exact
-matmul     main             unknown
+matmul     main             modulo
 matmul     arg              declared
 pid        is_digit         exact
 pid        next_int         unknown
@@ -55,6 +55,6 @@ pid        plant_step       exact
 pid        pid_step         exact
 pid        pid_out          exact
 pid        abs              exact
-pid        main             unknown
+pid        main             modulo
 pid        arg              declared
 pid        read_file        declared

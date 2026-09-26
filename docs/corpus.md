@@ -89,6 +89,44 @@ and the probe says that alone makes the two kernels' programs exact. The second 
 shape the compiler corpus already showed (`tok_text_eq`, the lexer), met again here from the
 other side; `decreasing` would state it by hand. The worklist is the third and is where it was.
 
+## Re-counted after a size bound once, 2026-09-26
+
+The first gap named above is closed in the calculus (cost-model § A size bound once): an `i64`
+bound once to an immutable local outside every loop is an atom of its own. No program changed;
+five reports moved (`tiers.txt` and the `.cost` pins are the new ones).
+
+| program | exact | modulo | bound | unknown | functions |
+|---|---|---|---|---|---|
+| pid | 5 | 3 | 0 | 2 | 10 |
+| heat | 4 | 3 | 0 | 2 | 9 |
+| matmul | 4 | 3 | 0 | 2 | 9 |
+| csv | 2 | 2 | 0 | 3 | 7 |
+| bfs | 1 | 2 | 0 | 3 | 6 |
+| fir | 3 | 3 | 0 | 2 | 8 |
+| **distinct functions** | **14** | **6** | **0** | **4** | **24** |
+
+**Still 14 of 24 exact, but 4 of the 6 `main`s now have a cost**, where none had one. The parsed
+size is an atom: `heat` is `≈ 31·n²·steps` in work and `≈ 96·n²·steps` in moves while a row fits,
+and `matmul` is `≈ 10·n³` with its six regimes. `pid` and `fir` are linear in `n`, the number of
+samples `count_ints` found. They are modulo and not exact because each still calls the parser to
+get the number: `work[next_int](a0.len(), 0)` is a term in `heat`'s line, and `count_ints`'s cost
+is one in `pid`'s. The probe above replaced the parse with an argument's length, which costs
+nothing, so it said exact; the real program pays for the parse, whose loop has no measure. The
+causes left:
+
+| function | tier | cause |
+|---|---|---|
+| `next_int` (lib) | unknown | unchanged: `i`'s entry value is set in an earlier loop |
+| `count_ints` (lib) | unknown | unchanged: `i` is not stepped by a constant |
+| `parse_int`, `read_ints` (lib) | modulo | rest on `next_int` |
+| `pid`, `heat`, `matmul`, `fir` `main` | modulo | rest on `next_int`, and `pid`/`fir` on `count_ints` |
+| `csv` `main` | unknown | unchanged: the row loop steps by what it read |
+| `bfs` `main` | unknown | now its second cause: `` the bound of `head` is assigned inside the body `` (main.nt:42), the worklist |
+
+So what stands between these programs and an exact cost is now one shape and one old hole. The
+shape is a scan that steps by what it read, which is all of the parser. The hole is the worklist.
+Both were named in plan § Stage D before the corpus existed.
+
 ## What the corpus could not say, and could not be written
 
 Rejected, each kept as a minimal case in `tests/corpus/rejected_*` with its error pinned:

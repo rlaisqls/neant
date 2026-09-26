@@ -1741,7 +1741,17 @@ impl<'a, 'b, 'c> Fa<'a, 'b, 'c> {
                     match self.affine(e) {
                         Some(a) => { self.local_affine.insert(*id, a); }
                         // a value read from memory: a size, though not an affine one
-                        None => if let Some(p) = self.exact_size(e) { self.local_affine.insert(*id, Affine::constant(p)); },
+                        None => if let Some(p) = self.exact_size(e) { self.local_affine.insert(*id, Affine::constant(p)); }
+                        // a value the calculus cannot name — a call's result, a parse of input —
+                        // bound once outside every loop: immutable, so fixed for the rest of the
+                        // run, and an atom of its own named after the local, as a parameter is
+                        // (docs/cost-model.md § A size bound once). Inside a loop it would be a
+                        // new value every lap, and stays no size
+                        else if self.loops.is_empty() {
+                            let name = self.f.locals[*id].name.clone();
+                            let a = self.new_atom(&name);
+                            self.local_affine.insert(*id, Affine::constant(Poly::var(a)));
+                        },
                     }
                 } else if l.ty == Ty::I64 {
                     let v = self.exact_size(e).map(|p| vec![p]);
@@ -2369,6 +2379,19 @@ impl<'a, 'b, 'c> Fa<'a, 'b, 'c> {
                         if crate::input::is_builtin(cf) && cf.name == "arg" && callee.result_size == Some(Poly::var(k)) {
                             map.push((k, longest_arg()));
                             continue;
+                        }
+                        // an atom the callee bound once (§ A size bound once) that only indexes an
+                        // element it reads, or is an unknown callee's argument, is widened as a
+                        // variable summed away is: `max(xs[_])`, `_`. Used as a size it is refused
+                        let hide = |p: &Poly| p.mentions(k);
+                        let (w2, mv2, sp2) = (w.hide_args(&hide), mv.hide_args(&hide), sp.hide_args(&hide));
+                        let in_feet = callee.footprint.iter().any(|f| f.lo.mentions(k) || f.hi.mentions(k));
+                        if !in_result && !in_feet && !(w2.mentions(k) || mv2.mentions(k) || sp2.mentions(k)) {
+                            (w, mv, sp) = (w2, mv2, sp2);
+                            continue;
+                        }
+                        if !callee.names[k].ends_with(".len()") {
+                            return Err(Fail::Unknown(format!("calls `{}` in a loop: `{}`, a size it binds once, is a new value at every iteration", callee.name, callee.names[k]), e.line));
                         }
                         return Err(Fail::Unknown(format!("calls `{}` in a loop: what it reads is a size of its own at every iteration, `{}`", callee.name, callee.names[k]), e.line));
                     }
