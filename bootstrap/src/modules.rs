@@ -99,7 +99,11 @@ pub fn load(root: &Path, src: &str) -> Result<(Program, Sources), String> {
     }
     sources.multi = true;
     let mut l = Loader { sources, parsed: Vec::new(), prog: Program { funcs: Vec::new(), structs: Vec::new() }, next: 0, done: HashSet::new(), stack: Vec::new(), std_dirs: HashMap::new() };
-    let canon = std::fs::canonicalize(root).map_err(|e| format!("{root_name}: {e}"))?;
+    // a buffer not yet saved (`--stdin`) has no file of its own yet: it is where it will be
+    let canon = std::fs::canonicalize(root).or_else(|e| match (root.parent(), root.file_name()) {
+        (Some(d), Some(n)) => std::fs::canonicalize(if d.as_os_str().is_empty() { Path::new(".") } else { d }).map(|d| d.join(n)),
+        _ => Err(e),
+    }).map_err(|e| format!("{root_name}: {e}"))?;
     l.visit(root_name, canon, src, toks, uses)?;
     // every file's struct names, so a struct literal may name one defined in any file
     let known: Vec<String> = l.parsed.iter()

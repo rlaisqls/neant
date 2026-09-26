@@ -44,6 +44,11 @@
           "default": "decoration",
           "description": "How each function's cost is shown: grey text after the `fn` line, a VS Code inlay hint there, or not at all (diagnostics are still reported)."
         },
+        "neant.hints.debounceMs": {
+          "type": "number",
+          "default": 500,
+          "description": "After an edit, wait this long without another and run `neant hints --stdin` on the unsaved buffer; 0 runs only on open and save."
+        },
         "neant.hints.maxLength": {
           "type": "number",
           "default": 120,

@@ -1,0 +1,7 @@
+{
+  "file": "tests/golden/modules/two/not_yet.nt",
+  "diagnostics": [
+    {"line": 2, "col": 15, "severity": "error", "message": "`+` between `i64` and `bool`; no implicit conversion, use `as`"}
+  ],
+  "functions": []
+}

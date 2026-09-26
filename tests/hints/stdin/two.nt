@@ -1,0 +1,12 @@
+use "geometry.nt";
+
+// the buffer an editor holds for tests/golden/modules/two/main.nt, edited and not saved: a new
+// function, and `main` calling it, which the file on disk has neither of
+fn norm2(p: Point) -> i64 {
+    dot(p, p)
+}
+
+fn main() {
+    let p = Point { x: 3, y: 4 };
+    println(norm2(p));
+}

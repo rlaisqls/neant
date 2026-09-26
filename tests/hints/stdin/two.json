@@ -1,0 +1,9 @@
+{
+  "file": "tests/golden/modules/two/main.nt",
+  "diagnostics": [],
+  "functions": [
+    {"name": "dot", "file": "tests/golden/modules/two/geometry.nt", "line": 4, "tier": "exact", "hint": "work 3   moves 0   exact", "work": "3", "moves": "0", "span": null, "regimes": [], "declared_work": null, "declared_moves": null, "effects": [], "bounds": [], "footprint": null, "rests_on": [], "cause": null, "cause_line": null, "violations": [], "report": []},
+    {"name": "norm2", "file": "tests/golden/modules/two/main.nt", "line": 5, "tier": "exact", "hint": "work 5   moves 0   exact", "work": "5", "moves": "0", "span": null, "regimes": [], "declared_work": null, "declared_moves": null, "effects": [], "bounds": [], "footprint": null, "rests_on": [], "cause": null, "cause_line": null, "violations": [], "report": []},
+    {"name": "main", "file": "tests/golden/modules/two/main.nt", "line": 9, "tier": "exact", "hint": "work 8   moves 0   exact, io", "work": "8", "moves": "0", "span": null, "regimes": [], "declared_work": null, "declared_moves": null, "effects": ["io"], "bounds": [], "footprint": null, "rests_on": [], "cause": null, "cause_line": null, "violations": [], "report": []}
+  ]
+}

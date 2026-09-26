@@ -771,6 +771,19 @@ is taken is bound before the call — `n` stores and `n` bytes, a constant. Stil
 type, no concatenation, no growth, no printing of a `[u8]` as text. Left: the corpus adopting std,
 printing a buffer, and the self-hosted loader.
 
+**Printing bytes, the declarations measured, hints as you type, 2026-09-26** (decisions § 13,
+experiments.md § The standard library's declarations, editors/README.md). `print_bytes(&s, n)`
+writes a view's first `n` bytes, a builtin extern declared in the view's length so that printing
+what a formatter produced stays exact: `modules/std`'s `main` went from unknown to exact. Measuring
+the declarations found the driver measuring nothing — it passed `1.0`, and gcc folded every libm
+call — so an `f64` argument now varies per call; then `sin` and `cos` were under-declared (119 and
+123 against 100), the others over-declared up to 5×, and `print_bytes` about 140 a call against
+60, and each is redeclared at its measurement and confirmed on the X925. `neant hints --stdin
+<path>` reads an unsaved buffer and resolves `use` from `<path>`, and the extension sends the live
+buffer after a pause in typing, keeping save as the fallback; the hints were for the saved file,
+and are now for what is on the screen. Left: the whole-file analysis on every pause, which on a
+large file wants a cache keyed by function.
+
 ## M7 — the constant factor
 
 Prove the asymptote, search the constant. A micro-architectural cost line (what llvm-mca and uiCA
