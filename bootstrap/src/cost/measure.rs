@@ -48,6 +48,14 @@ fn driver_with(m: &Module, fid: FuncId, n: i64, repeat: i64, shapes: &[Shape], w
     };
     let int = |v: i64| Expr { kind: ExprKind::Int(v), ty: Ty::I64, line };
     let mut args: Vec<Expr> = Vec::new();
+    // the repeat loop's variable, made first: an `f64` argument varies with it, or the C compiler
+    // folds a call to a function it knows (`sqrt(1.0)`, libm's) and the sweep measures nothing
+    let r = new_local(&mut locals, "r", Ty::I64, false);
+    let rv = Expr { kind: ExprKind::Local(r), ty: Ty::I64, line };
+    let varying = Expr { kind: ExprKind::Binary(BinOp::Add, Box::new(Expr { kind: ExprKind::Binary(BinOp::Mul,
+        Box::new(Expr { kind: ExprKind::Cast(Box::new(rv), Ty::F64), ty: Ty::F64, line }),
+        Box::new(Expr { kind: ExprKind::Float(0.001), ty: Ty::F64, line })), ty: Ty::F64, line }),
+        Box::new(Expr { kind: ExprKind::Float(0.5), ty: Ty::F64, line })), ty: Ty::F64, line };
     for (k, &p) in f.params.iter().enumerate() {
         let pl = &f.locals[p];
         let size = shapes.get(k).map_or(n, |s| s.at(n));
@@ -70,15 +78,15 @@ fn driver_with(m: &Module, fid: FuncId, n: i64, repeat: i64, shapes: &[Shape], w
                 args.push(Expr { kind: ExprKind::Ref(arr, *mutable), ty: Ty::Slice(Box::new(elem), *mutable, Size::Const(size)), line });
             }
             Ty::I64 => args.push(int(size)),
-            Ty::F64 => args.push(Expr { kind: ExprKind::Float(1.0), ty: Ty::F64, line }),
+            Ty::F64 => args.push(varying.clone()),
             Ty::U8 => args.push(Expr { kind: ExprKind::Byte(1), ty: Ty::U8, line }),
             Ty::Bool => args.push(Expr { kind: ExprKind::Bool(true), ty: Ty::Bool, line }),
             _ => {}
         }
     }
-    // the repeat loop, accumulating the result into something printed
-    let r = new_local(&mut locals, "r", Ty::I64, false);
-    let call = if with_call { Expr { kind: ExprKind::Call(fid, args), ty: f.ret.clone(), line } } else {
+    // the repeat loop, accumulating the result into something printed; without the call, an `f64`
+    // result is replaced by the varying argument itself, so the baseline computes it too
+    let call = if with_call { Expr { kind: ExprKind::Call(fid, args), ty: f.ret.clone(), line } } else if f.ret == Ty::F64 { varying.clone() } else {
         Expr { kind: match f.ret { Ty::F64 => ExprKind::Float(1.0), Ty::Bool => ExprKind::Bool(true), Ty::U8 => ExprKind::Byte(1), Ty::Unit => ExprKind::Bool(true), _ => ExprKind::Local(r) }, ty: if f.ret == Ty::Unit { Ty::Bool } else { f.ret.clone() }, line }
     };
     let ret_ty = if with_call { f.ret.clone() } else if f.ret == Ty::Unit { Ty::Bool } else { f.ret.clone() };

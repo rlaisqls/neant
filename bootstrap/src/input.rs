@@ -26,7 +26,7 @@ extern fn arg(k: i64) -> [u8] uses io;
 extern fn read_file(path: &[u8]) -> [u8] uses io;
 #[cost(work_at_most = "path.len() + 2500", moves_at_most = "path.len()")]
 extern fn file_size(path: &[u8]) -> i64 uses io;
-#[cost(work_at_most = "s.len() + 60", moves_at_most = "s.len()")]
+#[cost(work_at_most = "s.len() + 200", moves_at_most = "s.len()")]
 extern fn print_bytes(s: &[u8], n: i64) uses io;
 "#;
 

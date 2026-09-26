@@ -15,12 +15,12 @@ a declared cost, added to a program that calls it the way the input builtins are
 `n` outside `0..=s.len()` ends the program with exit 101, as an index past the view does.
 
 **What it is charged, and why not by `n`.** The declaration is in the view's length:
-`work ≤ s.len() + c`, `moves ≤ s.len()` (the constant `c` is `neant measure`'s, experiments.md).
+`work ≤ s.len() + c`, `moves ≤ s.len()` (`c` is 200, `neant measure`'s: about 140 instructions a call at one byte, experiments.md).
 `n` is almost always where a formatter stopped — an offset the program computed from data, not a
 size expression — and a cost in `n` would make every caller that prints what it formatted unknown,
 which is the thing this is for. The view's length is a size the caller always names, and `n ≤
 s.len()` is checked, so the view bounds the write from above: `std`'s `main` is exact at work
-`6434`, the 64-byte buffer charged whole. A caller that wants the tight number passes a view of
+`6559`, the 64-byte buffer charged whole. A caller that wants the tight number passes a view of
 exactly what it prints.
 
 Rejected: `print(&s)` overloading `print` on a `[u8]` view, which would make `print` of a literal
