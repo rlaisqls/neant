@@ -1,0 +1,9 @@
+{
+  "file": "tests/golden/fib.nt",
+  "diagnostics": [],
+  "functions": [
+    {"name": "fib", "file": "tests/golden/fib.nt", "line": 1, "tier": "unknown", "hint": "unknown: 2 recursive calls each shrinking `n` by a constant: exponential", "work": null, "moves": null, "span": null, "regimes": [], "declared_work": null, "declared_moves": null, "effects": [], "bounds": [], "footprint": null, "rests_on": [], "cause": "2 recursive calls each shrinking `n` by a constant: exponential", "cause_line": 3, "violations": [], "report": []},
+    {"name": "fact", "file": "tests/golden/fib.nt", "line": 6, "tier": "recurrence", "hint": "work 6·n + 6   moves 0   recurrence", "work": "6·n + 6", "moves": "0", "span": null, "regimes": [], "declared_work": null, "declared_moves": null, "effects": [], "bounds": [], "footprint": null, "rests_on": [], "cause": null, "cause_line": null, "violations": [], "report": []},
+    {"name": "main", "file": "tests/golden/fib.nt", "line": 10, "tier": "modulo", "hint": "work work[fib](20) + 102   moves moves[fib](20)   modulo, io", "work": "work[fib](20) + 102", "moves": "moves[fib](20)", "span": null, "regimes": [], "declared_work": null, "declared_moves": null, "effects": ["io"], "bounds": [], "footprint": null, "rests_on": ["fib (unknown)"], "cause": null, "cause_line": null, "violations": [], "report": ["rests on         fib (unknown)"]}
+  ]
+}

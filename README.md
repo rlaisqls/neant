@@ -16,7 +16,8 @@ fn score(events: &[Event]) -> f64 {          // work n·c(weight)   moves n/B   
 
 The grey text is the compiler's. It is not written by hand, it appears in the editor next to the
 signature, it is recorded in a lockfile that shows up in code review, and it changes when the code
-does. Nobody computed it.
+does. Nobody computed it. (`neant hints` prints it for an editor; editors/ has a VS Code extension that shows
+it.)
 
 ## Two facts the theory knows and no language reflects
 
