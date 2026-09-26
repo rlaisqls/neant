@@ -640,6 +640,18 @@ and keyed by name, so it does not say which file a function is in. Left: the sel
 (the loader in `compiler/*.nt` and `build.sh`'s `cat` replaced by a root file that `use`s the
 others), and a file index in positions so that no text is rewritten.
 
+**Arrays by value, 2026-09-26** (docs/arrays-by-value-design.md). What was missing was not a
+second kind of buffer but a small fixed-size aggregate that is a value: a struct field may now be
+`[T; k]`, `k` a literal, read and written by element (`s.x[i]`, `s.x.len()` the literal `k`), built
+by `[a, b, …]` or `[e; k]` in the literal, and copied with the struct — passed, returned, `let`.
+The calculus charges writing such a field as it charges `let xs = [a, b, c]`, `k` stores and
+`k·elem` bytes, and a copy the same, at `let t = s`, `t = s` and every by-value argument; an
+element is a load with no bytes. Two goldens pin it: a state vector stepped by value, and a 2×2
+control loop `x = apply(m, x, u)` whose `run` is exact at work `56·n + 2`, moves `64·n + 16` — the
+48 bytes a lap are the two argument copies. An array of such a struct is rejected with its
+reason (a third layout); a bare `[T; k]` parameter, `==` on arrays, nested fixed-size arrays and
+the self-hosted side are left.
+
 ## M7 — the constant factor
 
 Prove the asymptote, search the constant. A micro-architectural cost line (what llvm-mca and uiCA

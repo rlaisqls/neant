@@ -1,0 +1,29 @@
+// a control loop over a 2-state system: x' = A x + b u, the matrix and the state both values
+struct Mat2 { a: [f64; 4] }
+struct Vec2 { v: [f64; 2] }
+
+fn apply(m: Mat2, x: Vec2, u: f64) -> Vec2 {
+    let mut y = Vec2 { v: [u; 2] };
+    for i in 0..2 {
+        for j in 0..2 {
+            y.v[i] += m.a[2 * i + j] * x.v[j];
+        }
+    }
+    y
+}
+
+// the copy of `x` per lap is a constant, so the loop stays exact: linear in `n`
+fn run(m: Mat2, x0: Vec2, n: i64) -> Vec2 {
+    let mut x = x0;
+    for k in 0..n {
+        x = apply(m, x, 0.25);
+    }
+    x
+}
+
+fn main() {
+    let m = Mat2 { a: [0.5, 0.25, 0.0, 0.5] };
+    let x = run(m, Vec2 { v: [1.0, 1.0] }, 3);
+    println(x.v[0]);
+    println(x.v[1]);
+}

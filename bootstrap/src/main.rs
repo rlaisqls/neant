@@ -321,6 +321,8 @@ mod parsedump {
     }
     fn strukt(d: &StructDef, o: &mut Vec<i32>) -> Result<(), String> {
         if d.layout.is_some() { return Err("a `#[layout(...)]` attribute".into()); }
+        // an array field (docs/arrays-by-value-design.md) is not in the self-hosted checker yet
+        if d.fields.iter().any(|(_, t, _, _)| matches!(t, TypeExpr::Array(..))) { return Err("an array field".into()); }
         o.push(112);
         for (_, t, _, _) in &d.fields { o.push(113); ty(t, o)?; }
         Ok(())

@@ -149,7 +149,10 @@ static void nt_println_f64(double v) {
         for sd in &self.m.structs {
             let _ = writeln!(self.out, "struct nt_{} {{", sd.name);
             for (f, t) in &sd.fields {
-                let _ = writeln!(self.out, "    {} {f};", c_ty(self.m, t));
+                match t {
+                    Ty::Array(_, Size::Const(k)) => { let _ = writeln!(self.out, "    {} {f}[{k}];", c_ty(self.m, t)); }
+                    _ => { let _ = writeln!(self.out, "    {} {f};", c_ty(self.m, t)); }
+                }
             }
             self.out.push_str("};\n");
         }
@@ -386,6 +389,14 @@ static void nt_println_f64(double v) {
                         let f = self.field_name(self.f.unwrap().locals[*id].ty.clone(), *fi);
                         self.line(&format!("{nm}.{f} {opstr}= {v};"));
                     }
+                    LValue::FieldIndex(id, idx, fi, line) => {
+                        let nm = self.local_name(*id);
+                        let ty = self.f.unwrap().locals[*id].ty.clone();
+                        let n = self.field_len(&ty, *fi);
+                        let f = self.field_name(ty, *fi);
+                        let i = self.expr(idx).scalar();
+                        self.line(&format!("{nm}.{f}[nt_idx({i}, {n}, {line})] {opstr}= {v};"));
+                    }
                     LValue::IndexField(id, idx, fi, line) => {
                         let nm = self.local_name(*id);
                         let ty = self.f.unwrap().locals[*id].ty.clone();
@@ -533,6 +544,18 @@ static void nt_println_f64(double v) {
                 let b = self.expr(base).scalar();
                 s(format!("({b}).{f}"))
             }
+            // an array field is a C array member: C's struct copy is the value's copy
+            ExprKind::FieldIndex(base, idx, fi) => {
+                let n = self.field_len(&base.ty, *fi);
+                let f = self.field_name(base.ty.clone(), *fi);
+                let b = self.expr(base).scalar();
+                let i = self.expr(idx).scalar();
+                s(format!("({b}).{f}[nt_idx({i}, {n}, {})]", e.line))
+            }
+            ExprKind::ArrayVal(vals) => {
+                let parts: Vec<String> = vals.iter().map(|v| self.expr(v).scalar()).collect();
+                s(format!("{{{}}}", parts.join(", ")))
+            }
             ExprKind::StructLit(sid, vals) => {
                 let parts: Vec<String> = self.m.structs[*sid].fields.iter().map(|(f, _)| f.clone())
                     .zip(vals.iter().map(|v| self.expr(v).scalar())).map(|(f, v)| format!(".{f} = {v}")).collect();
@@ -645,6 +668,11 @@ static void nt_println_f64(double v) {
     }
 
     /// The C name of field `fi` of a struct type (or of a struct array's element type).
+    /// The length of array field `fi` of struct type `t`.
+    fn field_len(&self, t: &Ty, fi: usize) -> i64 {
+        match t { Ty::Struct(i) => match &self.m.structs[*i].fields[fi].1 { Ty::Array(_, Size::Const(k)) => *k, _ => unreachable!("not an array field") }, _ => unreachable!("field of a non-struct") }
+    }
+
     fn field_name(&self, t: Ty, fi: usize) -> String {
         let t = match t { Ty::Array(e, _) | Ty::Slice(e, _, _) => *e, t => t };
         match t { Ty::Struct(i) => self.m.structs[i].fields[fi].0.clone(), _ => unreachable!("field of a non-struct") }

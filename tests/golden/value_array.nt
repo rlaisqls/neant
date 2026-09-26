@@ -1,0 +1,34 @@
+// a small state vector held in a struct and passed by value (docs/arrays-by-value-design.md)
+struct State { x: [f64; 4], t: i64 }
+
+// a copy in, a new value out: the caller's state is not touched
+fn step(s: State, u: f64) -> State {
+    let mut n = s;
+    for i in 0..n.x.len() {
+        n.x[i] = 0.5 * s.x[i] + u;
+    }
+    n.t = s.t + 1;
+    n
+}
+
+fn norm1(s: State) -> f64 {
+    let mut a = 0.0;
+    for i in 0..s.x.len() {
+        a += s.x[i];
+    }
+    a
+}
+
+fn main() {
+    let s0 = State { x: [1.0, 2.0, 3.0, 4.0], t: 0 };
+    let s1 = step(s0, 1.0);
+    println(s1.x[0]);
+    println(s1.x[3]);
+    println(s1.t);
+    // s0 is a value: step copied it
+    println(s0.x[0]);
+    let mut s = State { x: [0.0; 4], t: 0 };
+    s.x[2] += 8.0;
+    println(norm1(s));
+    println(s.x.len());
+}
