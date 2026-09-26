@@ -1,1 +1,1 @@
-are both views of `a` and one is `&mut`
+argument 2 moves `a` into `dot`, which argument 1 already moved; an array passed by value is passed once

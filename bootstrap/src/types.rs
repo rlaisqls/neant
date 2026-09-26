@@ -167,6 +167,8 @@ struct Ctx<'a> {
     /// the array local being rebound by `s = f(…, s, …)`: moving it into the call is not a move
     /// out of the loop, since the same statement gives it a value again
     rebinding: Option<LocalId>,
+    /// a move into a call's by-value parameter, as the error names it: "into argument 2 of `f`"
+    moved_into: HashMap<LocalId, String>,
 }
 
 fn check_func(f: &ast::Func, sigs: &HashMap<String, (FuncId, Vec<Ty>, Ty)>, structs: &[StructDef], struct_ids: &HashMap<String, StructId>) -> Result<Func> {
@@ -175,7 +177,7 @@ fn check_func(f: &ast::Func, sigs: &HashMap<String, (FuncId, Vec<Ty>, Ty)>, stru
         sigs, structs, struct_ids, locals: vec![], scopes: vec![HashMap::new()], sizes: vec![], ret: ret.clone(),
         in_loop: 0, in_closure: 0, fresh: 0, pending_lets: vec![], root: HashMap::new(), moved: HashMap::new(),
         loop_start: vec![], let_moves: vec![], reassigns: vec![], reassign_pending: vec![], size_of_local: HashMap::new(),
-        rebinding: None,
+        rebinding: None, moved_into: HashMap::new(),
     };
     let mut params = Vec::new();
     for (p, ty) in f.params.iter().zip(ptys) {
@@ -304,7 +306,8 @@ impl<'a> Ctx<'a> {
 
     fn check_moved(&self, id: LocalId, line: u32, col: u32) -> Result<()> {
         if let Some(&at) = self.moved.get(&id) {
-            return err(line, col, format!("`{}` was moved at line {at}; using it again is an error", self.locals[id].name));
+            let how = self.moved_into.get(&id).map_or(String::new(), |h| format!(" {h}"));
+            return err(line, col, format!("`{}` was moved{how} at line {at}; using it again is an error", self.locals[id].name));
         }
         Ok(())
     }
@@ -473,6 +476,7 @@ impl<'a> Ctx<'a> {
                             self.check_declared(&declared, &ce.ty, *line, *col)?;
                             let id = self.declare(name, ce.ty.clone(), *mutable);
                             self.moved.insert(src, *line);
+                            self.moved_into.remove(&src);
                             self.let_moves.push((src, *line));
                             self.root.insert(id, id);
                             return Ok(Stmt::Let(id, ce));
@@ -522,6 +526,7 @@ impl<'a> Ctx<'a> {
                                         if !forced_loop { self.reassign_pending.push(idx); }
                                         self.moved.remove(&id);
                                         self.moved.insert(src, *line);
+                                        self.moved_into.remove(&src);
                                         // `ys` denotes a value disjoint from anything else now,
                                         // in place or not: `xs` is dead either way (§3), so no
                                         // future code can observe whether the buffer is shared
@@ -889,9 +894,17 @@ impl<'a> Ctx<'a> {
                     let mutable = by_value || explicit_mut.unwrap_or(matches!(self.locals[id].ty, Ty::Slice(_, true, _)));
                     let r = self.root_of(id);
                     if let Some((_, _, k2)) = roots.iter().find(|(r2, m2, _)| *r2 == r && (mutable || *m2)) {
-                        return err(a.line, a.col, format!(
-                            "arguments {} and {} are both views of `{}` and one is `&mut`; a function's parameters must not overlap",
-                            k2 + 1, k + 1, self.locals[r].name));
+                        // a by-value argument is a move, not a view: say which argument moved what
+                        let moves = |j: usize| explicit_mut.is_none() && j == k && by_value
+                            || matches!(ptys.get(j), Some(Ty::Array(..))) && matches!(args[j].kind, ast::ExprKind::Var(_));
+                        let nm = &self.locals[r].name;
+                        let msg = match (moves(*k2), moves(k)) {
+                            (true, true) => format!("argument {} moves `{nm}` into `{name}`, which argument {} already moved; an array passed by value is passed once", k + 1, k2 + 1),
+                            (true, false) => format!("argument {} is a view of `{nm}`, which argument {} moves into `{name}`", k + 1, k2 + 1),
+                            (false, true) => format!("argument {} moves `{nm}` into `{name}` while argument {} is a view of it", k + 1, k2 + 1),
+                            (false, false) => format!("arguments {} and {} are both views of `{nm}` and one is `&mut`; a function's parameters must not overlap", k2 + 1, k + 1),
+                        };
+                        return err(a.line, a.col, msg);
                     }
                     roots.push((r, mutable, k));
                 }
@@ -912,6 +925,7 @@ impl<'a> Ctx<'a> {
                                 }
                             }
                             self.moved.insert(src, a.line);
+                            self.moved_into.insert(src, format!("into argument {} of `{name}`", cargs.len() + 1));
                             self.let_moves.push((src, a.line));
                             true
                         }

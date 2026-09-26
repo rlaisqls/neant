@@ -97,7 +97,7 @@ Rejected, each kept as a minimal case in `tests/corpus/rejected_*` with its erro
 |---|---|---|
 | `rejected_string` | `println("mean error")` — any labelled report | `expected an expression, found a string` |
 | `rejected_grid2d` | `let g = [[0.0; n]; n]` — a plate as rows | `an array literal can only initialise a let for now` |
-| `rejected_vecparam` | `dot(a, a)` with `fn dot(a: [f64; 3], b: [f64; 3])` | ``arguments 1 and 2 are both views of `a` and one is `&mut` `` — since arrays by value part two the parameter is accepted and moved in, so this is a double move, and the message is wrong about why |
+| `rejected_vecparam` | `dot(a, a)` with `fn dot(a: [f64; 3], b: [f64; 3])` | ``argument 2 moves `a` into `dot`, which argument 1 already moved`` — a double move, rejected rightly; until 2026-09-26 the message spoke of views and `&mut` |
 
 The programs were written around them: output is bare numbers, the plate is flat (`i * n + j`),
 there is one plant, and every fixed-size vector sits in a struct. None of these changes a tier;

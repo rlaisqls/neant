@@ -1,5 +1,5 @@
 // A 3-vector passed by value twice: since arrays by value part two a bare `[T; k]` parameter is
-// moved in, so `dot(a, a)` moves `a` twice; the error still speaks of views (a diagnostic to fix).
+// moved in, so `dot(a, a)` moves `a` twice, and the error says so.
 fn dot(a: [f64; 3], b: [f64; 3]) -> f64 {
     a[0] * b[0] + a[1] * b[1] + a[2] * b[2]
 }
