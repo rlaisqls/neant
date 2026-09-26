@@ -98,7 +98,7 @@ pub fn load(root: &Path, src: &str) -> Result<(Program, Sources), String> {
         return Ok((prog, sources));
     }
     sources.multi = true;
-    let mut l = Loader { sources, parsed: Vec::new(), prog: Program { funcs: Vec::new(), structs: Vec::new() }, next: 0, done: HashSet::new(), stack: Vec::new() };
+    let mut l = Loader { sources, parsed: Vec::new(), prog: Program { funcs: Vec::new(), structs: Vec::new() }, next: 0, done: HashSet::new(), stack: Vec::new(), std_dirs: HashMap::new() };
     let canon = std::fs::canonicalize(root).map_err(|e| format!("{root_name}: {e}"))?;
     l.visit(root_name, canon, src, toks, uses)?;
     // every file's struct names, so a struct literal may name one defined in any file
@@ -128,15 +128,37 @@ struct Loader {
     next: u32,
     done: HashSet<PathBuf>,
     stack: Vec<(PathBuf, String)>,
+    /// the directory a standard-library file's own `use`s resolve against, by its printed name
+    std_dirs: HashMap<String, PathBuf>,
+}
+
+/// Where `use "std/…"` looks (docs/modules-design.md § 8): `$NEANT_STD` when it is set, else the
+/// `std/` directory of the repository this compiler was built from.
+pub fn std_root() -> PathBuf {
+    match std::env::var_os("NEANT_STD") {
+        Some(d) => PathBuf::from(d),
+        None => Path::new(env!("CARGO_MANIFEST_DIR")).join("../std"),
+    }
 }
 
 impl Loader {
     fn visit(&mut self, name: String, canon: PathBuf, src: &str, mut toks: Vec<Token>, uses: Vec<Use>) -> Result<(), String> {
         self.stack.push((canon.clone(), name.clone()));
-        let dir = Path::new(&name).parent().map(Path::to_path_buf).unwrap_or_default();
+        let dir = self.std_dirs.get(&name).cloned().unwrap_or_else(|| Path::new(&name).parent().map(Path::to_path_buf).unwrap_or_default());
         for u in uses {
-            let target = if Path::new(&u.path).is_absolute() { PathBuf::from(&u.path) } else { dir.join(&u.path) };
-            let tname = target.display().to_string();
+            // `std/…` is the standard library wherever the program is, and prints as written
+            let (target, tname) = match u.path.strip_prefix("std/") {
+                Some(rest) => {
+                    let t = std_root().join(rest);
+                    if let Some(p) = t.parent() { self.std_dirs.insert(u.path.clone(), p.to_path_buf()); }
+                    (t, u.path.clone())
+                }
+                None => {
+                    let t = if Path::new(&u.path).is_absolute() { PathBuf::from(&u.path) } else { dir.join(&u.path) };
+                    let n = t.display().to_string();
+                    (t, n)
+                }
+            };
             let here = format!("{name}:{}:{}", u.line, u.col);
             let tcanon = std::fs::canonicalize(&target).map_err(|e| format!("{here}: cannot read `{tname}`: {e}"))?;
             if let Some(i) = self.stack.iter().position(|(c, _)| *c == tcanon) {

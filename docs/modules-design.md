@@ -118,3 +118,31 @@ files. No existing golden changed. What the struct-name rule showed: parsing a f
 free in this grammar — its parse depends on names defined elsewhere — so a later `use` that is
 more than concatenation (visibility, qualification) has to give the parser a program-wide view
 first, as this one does.
+
+## 8 — The standard library, 2026-09-26
+
+`use "std/…";` names the standard library, wherever the program is: a path whose first component
+is `std` is resolved in `$NEANT_STD` when that is set, and otherwise in the `std/` directory at the
+root of the repository the compiler was built from (`bootstrap/`'s parent, fixed when `cargo build`
+ran). Every other `use` is resolved as § 1 says, relative to the naming file, so a program with a
+directory of its own called `std` has to reach it as `./std/…`. A standard-library file prints as
+it is named — `std/text.nt:23` — not as the absolute path it was read from, so a report or a
+diagnostic that mentions one is the same on every machine; its own `use`s resolve against the
+library's directory, and one library file uses another as `std/…` too. Identity is still the
+canonical path, so `std/math.nt` reached from two files is loaded once.
+
+The first two modules: **`std/text.nt`** — `is_digit`, `is_space`, `skip_space`, `parse_int` and
+`parse_float` at an offset (returning the value, the offset after it and whether there was one),
+`format_int` and `format_float` into a `&mut [u8]` at an offset — and **`std/math.nt`** —
+`abs_f64`, `abs_i64`, `clamp_f64`, `clamp_i64`, `sign_f64` in neant, and `sqrt`, `floor`, `ceil`,
+`exp`, `log`, `sin`, `cos`, `pow` as libm externs with declared costs. Every function is exact or
+declared: the parsers and formatters walk a fixed number of places (18 digits, which an `i64`
+holds; 19 when formatting) and stop storing at the first that does not belong, so each is a
+constant — `parse_int` work 333, `format_int` 406 — and `skip_space`, which scans by what it reads,
+is charged the rest of the text, as its comment says. The libm declarations are bounds read off
+the implementations' common paths, not measured. `tests/golden/modules/std/` uses both modules
+from its own directory; its `main` is unknown, because printing a formatted buffer loops to the
+offset the formatter returned, which is data — printing a `[u8]` as text is not in the language
+(decisions §12). Left: `tests/corpus/lib/` still carries its own copies, to be replaced by `use
+"std/…"` once the corpus is re-pinned; a search path or a version of the library; the
+self-hosted loader.

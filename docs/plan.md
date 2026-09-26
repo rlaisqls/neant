@@ -737,6 +737,18 @@ A grid of rows is the row-major idiom written by the checker rather than a neste
 the flat idiom costs term for term — `corpus/rows`, a plate relaxed as rows, exact. Left: a string
 value, a nested array type, and the self-hosted side of all three.
 
+**A standard library, and text as a value, 2026-09-26** (modules-design § 8, decisions § 12).
+Every corpus program carried its own number parsing and math; now `use "std/text.nt";` and `use
+"std/math.nt";` find the library wherever the program is (`$NEANT_STD`, else the repository's
+`std/`), and it prints as `std/…`. Every function in it is exact or declared: the parsers and
+formatters walk a fixed 18 or 19 places, so `parse_int` is 333 and `format_int` 406, constants;
+`skip_space` scans by what it reads and is charged the rest of the text; libm's `sqrt`, `exp`, `log`,
+`sin`, `cos`, `pow`, `floor`, `ceil` are externs with declared, unmeasured bounds. A string literal
+is now also a value: `let s = "…"` is a `[u8; n]` as `b"…"` is, and a literal passed where `&[u8]`
+is taken is bound before the call — `n` stores and `n` bytes, a constant. Still not a string: no
+type, no concatenation, no growth, no printing of a `[u8]` as text. Left: the corpus adopting std,
+printing a buffer, and the self-hosted loader.
+
 ## M7 — the constant factor
 
 Prove the asymptote, search the constant. A micro-architectural cost line (what llvm-mca and uiCA
@@ -788,6 +800,7 @@ bootstrap/              everything that builds the compiler from nothing
       lock.rs           costs.lock and the report
   neant.c               compiler/ compiled by itself. Seed two. (self-hosting)
 compiler/               the compiler in neant. Empty until self-hosting.
+std/                    the standard library, `use "std/…"`: text.nt (numbers in text), math.nt
 editors/                the grey text in an editor: vscode/ (grammar, hints, diagnostics); README.md
 tests/
   golden/               .nt programs with expected output (.out, .exit), rejection (.err), cost report (.cost)
