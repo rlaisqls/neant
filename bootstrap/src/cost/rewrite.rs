@@ -213,7 +213,7 @@ fn strided_in(idx: &Expr, k: LocalId) -> bool {
 fn collect_locals(e: &Expr, out: &mut Vec<LocalId>) {
     match &e.kind {
         ExprKind::Local(l) => { if !out.contains(l) { out.push(*l); } }
-        ExprKind::Binary(_, a, b) | ExprKind::MinMax(_, a, b) | ExprKind::FieldIndex(a, b, _) => { collect_locals(a, out); collect_locals(b, out); }
+        ExprKind::Binary(_, a, b) | ExprKind::MinMax(_, a, b) | ExprKind::FieldIndex(a, b, _) | ExprKind::InRow(a, b) => { collect_locals(a, out); collect_locals(b, out); }
         ExprKind::Unary(_, a) | ExprKind::Cast(a, _) => collect_locals(a, out),
         _ => {}
     }
@@ -224,7 +224,7 @@ fn subst_locals(e: &Expr, map: &[(LocalId, LocalId)]) -> Expr {
     fn go(e: &mut Expr, map: &[(LocalId, LocalId)]) {
         match &mut e.kind {
             ExprKind::Local(l) => { if let Some((_, to)) = map.iter().find(|(from, _)| from == l) { *l = *to; } }
-            ExprKind::Binary(_, a, b) | ExprKind::MinMax(_, a, b) | ExprKind::FieldIndex(a, b, _) => { go(a, map); go(b, map); }
+            ExprKind::Binary(_, a, b) | ExprKind::MinMax(_, a, b) | ExprKind::FieldIndex(a, b, _) | ExprKind::InRow(a, b) => { go(a, map); go(b, map); }
             ExprKind::Unary(_, a) | ExprKind::Cast(a, _) => go(a, map),
             _ => {}
         }

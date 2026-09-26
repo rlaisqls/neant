@@ -1,0 +1,6 @@
+transpose_sum    work ≈ 15·m·n                     moves                              exact  (4 regimes)
+                                               moves B·m·n + 16·m·n + B·m         if ≈ 8·n < M and B·m ≥ M
+                                               moves B·m·n + 16·m·n + B·m         if ≈ 8·n ≥ M and B·m ≥ M
+                                               moves 24·m·n + B·m                 if ≈ 8·n < M and B·m < M
+                                               moves 24·m·n + B·m                 if ≈ 8·n ≥ M and B·m < M
+main             work 276                          moves 5·B + 456                    exact, io

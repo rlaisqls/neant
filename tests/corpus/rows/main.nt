@@ -1,0 +1,24 @@
+// A plate as rows: `[[e; n]; m]` is a grid stored flat and row-major, `g[i][j]` is `g[i·n + j]`
+// with `j` checked against the row (docs/decisions.md §11). Once rejected as rejected_grid2d; heat/
+// is the same stencil written flat, and costs the same.
+fn relax(n: i64, steps: i64) -> f64 {
+    let mut g = [[0.0; n]; n];
+    for k in 0..n { g[0][k] = 100.0; }
+    for t in 0..steps {
+        for i in 1..g.len() - 1 {
+            for j in 1..g[i].len() - 1 {
+                g[i][j] = 0.25 * (g[i - 1][j] + g[i + 1][j] + g[i][j - 1] + g[i][j + 1]);
+            }
+        }
+    }
+    g[n / 2][n / 2]
+}
+
+fn main() {
+    let n = 6;
+    let g = [[0.0; n]; n];
+    print("g[1][2] = ");
+    println(g[1][2]);
+    print("centre after 20 sweeps = ");
+    println(relax(9, 20));
+}

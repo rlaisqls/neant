@@ -116,7 +116,7 @@ impl<'a> Ex<'a> {
     fn scan_expr(&mut self, e: &Expr) -> Result<(), String> {
         match &e.kind {
             ExprKind::Index(a, i) => { self.note(*a, i)?; self.scan_expr(i) }
-            ExprKind::Binary(_, x, y) | ExprKind::MinMax(_, x, y) => { self.scan_expr(x)?; self.scan_expr(y) }
+            ExprKind::Binary(_, x, y) | ExprKind::MinMax(_, x, y) | ExprKind::InRow(x, y) => { self.scan_expr(x)?; self.scan_expr(y) }
             ExprKind::Unary(_, x) | ExprKind::Cast(x, _) => self.scan_expr(x),
             ExprKind::Call(fid, _) => Err(format!("a call to `{}` is not part of a SCoP", self.m.funcs[*fid].name)),
             ExprKind::If(c, t, els) => { self.scan_expr(c)?; self.scan_block(t)?; if let Some(b) = els { self.scan_block(b)?; } Ok(()) }
@@ -157,7 +157,7 @@ impl<'a> Ex<'a> {
     fn mentions_loop_var(&self, e: &Expr) -> bool {
         match &e.kind {
             ExprKind::Local(l) => self.loop_vars.contains(l),
-            ExprKind::Binary(_, a, b) | ExprKind::MinMax(_, a, b) | ExprKind::FieldIndex(a, b, _) => self.mentions_loop_var(a) || self.mentions_loop_var(b),
+            ExprKind::Binary(_, a, b) | ExprKind::MinMax(_, a, b) | ExprKind::FieldIndex(a, b, _) | ExprKind::InRow(a, b) => self.mentions_loop_var(a) || self.mentions_loop_var(b),
             ExprKind::Unary(_, a) | ExprKind::Cast(a, _) => self.mentions_loop_var(a),
             _ => false,
         }
@@ -223,7 +223,7 @@ impl<'a> Ex<'a> {
     fn mentions(&self, e: &Expr, v: LocalId) -> bool {
         match &e.kind {
             ExprKind::Local(l) => *l == v,
-            ExprKind::Binary(_, a, b) | ExprKind::MinMax(_, a, b) | ExprKind::FieldIndex(a, b, _) => self.mentions(a, v) || self.mentions(b, v),
+            ExprKind::Binary(_, a, b) | ExprKind::MinMax(_, a, b) | ExprKind::FieldIndex(a, b, _) | ExprKind::InRow(a, b) => self.mentions(a, v) || self.mentions(b, v),
             ExprKind::Unary(_, a) | ExprKind::Cast(a, _) | ExprKind::Println(a) => self.mentions(a, v),
             ExprKind::Index(_, i) => self.mentions(i, v),
             ExprKind::Call(_, args) => args.iter().any(|a| self.mentions(a, v)),
@@ -309,6 +309,8 @@ impl<'a> Ex<'a> {
             ExprKind::Cast(a, t) => format!("(({})({}))", c_ty(t), self.expr(a)),
             ExprKind::Index(a, i) => self.index(*a, i),
             ExprKind::Len(a) => format!("{}_n", self.f.locals[*a].name),
+            // the row check is the program's, not the polyhedral model's
+            ExprKind::InRow(j, _) => self.expr(j),
             ExprKind::MinMax(is_min, a, b) => format!("({} {} {} ? {} : {})", self.expr(a), if *is_min { "<" } else { ">" }, self.expr(b), self.expr(a), self.expr(b)),
             ExprKind::If(c, t, els) => format!("({} ? {} : {})", self.expr(c), t.tail.as_ref().map_or("0".to_string(), |x| self.expr(x)), els.as_ref().and_then(|b| b.tail.as_ref()).map_or("0".to_string(), |x| self.expr(x))),
             ExprKind::Block(b) => b.tail.as_ref().map_or("0".to_string(), |x| self.expr(x)),

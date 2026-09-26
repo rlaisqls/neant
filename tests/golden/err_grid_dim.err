@@ -1,0 +1,1 @@
+a grid's dimensions are literals, immutable `i64`s or lengths

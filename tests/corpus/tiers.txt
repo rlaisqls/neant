@@ -60,3 +60,5 @@ pid        arg              declared
 pid        read_file        declared
 report     mean_abs_error   exact
 report     main             exact
+rows       relax            exact
+rows       main             exact

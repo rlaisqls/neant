@@ -169,6 +169,9 @@ struct Ctx<'a> {
     rebinding: Option<LocalId>,
     /// a move into a call's by-value parameter, as the error names it: "into argument 2 of `f`"
     moved_into: HashMap<LocalId, String>,
+    /// a grid of rows, `let g = [[e; n]; m]` (docs/decisions.md §11): the flat `[T; m·n]` local
+    /// and its row length `n` and row count `m`, each a literal, an immutable `i64` or a length
+    rows: HashMap<LocalId, (Expr, Expr)>,
 }
 
 fn check_func(f: &ast::Func, sigs: &HashMap<String, (FuncId, Vec<Ty>, Ty)>, structs: &[StructDef], struct_ids: &HashMap<String, StructId>) -> Result<Func> {
@@ -177,7 +180,7 @@ fn check_func(f: &ast::Func, sigs: &HashMap<String, (FuncId, Vec<Ty>, Ty)>, stru
         sigs, structs, struct_ids, locals: vec![], scopes: vec![HashMap::new()], sizes: vec![], ret: ret.clone(),
         in_loop: 0, in_closure: 0, fresh: 0, pending_lets: vec![], root: HashMap::new(), moved: HashMap::new(),
         loop_start: vec![], let_moves: vec![], reassigns: vec![], reassign_pending: vec![], size_of_local: HashMap::new(),
-        rebinding: None, moved_into: HashMap::new(),
+        rebinding: None, moved_into: HashMap::new(), rows: HashMap::new(),
     };
     let mut params = Vec::new();
     for (p, ty) in f.params.iter().zip(ptys) {
@@ -290,6 +293,39 @@ impl<'a> Ctx<'a> {
         }
         Ok(Expr { kind: ExprKind::ArrayVal(elems), ty: Ty::Array(Box::new(el.clone()), Size::Const(k)), line: v.line })
     }
+    /// A grid dimension: a literal, an immutable `i64` or a length — the same number at every
+    /// use, so the flat index built from it is the one the grid was sized by.
+    fn grid_dim(&mut self, d: &ast::Expr) -> Result<Expr> {
+        let c = self.expr(d)?;
+        let pure = match &c.kind {
+            ExprKind::Int(k) => *k >= 0,
+            ExprKind::Local(l) => c.ty == Ty::I64 && !self.locals[*l].mutable,
+            ExprKind::Len(_) => true,
+            _ => false,
+        };
+        if !pure { return err(d.line, d.col, "a grid's dimensions are literals, immutable `i64`s or lengths"); }
+        Ok(c)
+    }
+    /// `base` of `base[j]` when it is `g[i]`, `g` a grid of rows: `g`.
+    fn grid_of(&self, base: &ast::Expr) -> Option<LocalId> {
+        let ast::ExprKind::Index(g, _) = &base.kind else { return None };
+        let ast::ExprKind::Var(n) = &g.kind else { return None };
+        self.lookup(n).filter(|id| self.rows.contains_key(id))
+    }
+    /// `g[i][j]` as the flat index `i·n + j`, `j` checked below `n`: (g, index).
+    fn grid_index(&mut self, base: &ast::Expr, jdx: &ast::Expr) -> Result<(LocalId, Expr)> {
+        let ast::ExprKind::Index(g, idx) = &base.kind else { unreachable!() };
+        let id = self.local_by_expr(g, "the grid being indexed")?;
+        let (ci, cj) = (self.expr(idx)?, self.expr(jdx)?);
+        for (c, a) in [(&ci, &**idx), (&cj, jdx)] {
+            if c.ty != Ty::I64 { return err(a.line, a.col, format!("index must be `i64`, found `{}`", c.ty)); }
+        }
+        let n = self.rows[&id].0.clone();
+        let line = jdx.line;
+        let b = |k, x: Expr, y: Expr| Expr { kind: ExprKind::Binary(k, Box::new(x), Box::new(y)), ty: Ty::I64, line };
+        let j = Expr { kind: ExprKind::InRow(Box::new(cj), Box::new(n.clone())), ty: Ty::I64, line };
+        Ok((id, b(BinOp::Add, b(BinOp::Mul, ci, n), j)))
+    }
     fn lookup(&self, name: &str) -> Option<LocalId> {
         self.scopes.iter().rev().find_map(|s| s.get(name).copied())
     }
@@ -396,6 +432,23 @@ impl<'a> Ctx<'a> {
                         self.check_declared(&declared, &ty, *line, *col)?;
                         let id = self.declare(name, ty, *mutable);
                         Ok(Stmt::LetBuild { id, len, var: k, body })
+                    }
+                    // `[[e; n]; m]`: a grid of rows, stored flat and row-major (§11)
+                    ast::ExprKind::ArrayRepeat(row, m) if matches!(row.kind, ast::ExprKind::ArrayRepeat(..)) => {
+                        let ast::ExprKind::ArrayRepeat(e, n) = &row.kind else { unreachable!() };
+                        if matches!(e.kind, ast::ExprKind::ArrayRepeat(..)) {
+                            return err(e.line, e.col, "a grid has two dimensions; write a third as a flat index");
+                        }
+                        let ce = self.expr(e)?;
+                        if !ce.ty.is_scalar() { return err(e.line, e.col, "a grid's elements are scalars"); }
+                        let (cn, cm) = (self.grid_dim(n)?, self.grid_dim(m)?);
+                        let flat = Expr { kind: ExprKind::Binary(BinOp::Mul, Box::new(cm.clone()), Box::new(cn.clone())), ty: Ty::I64, line: init.line };
+                        let k = self.sizes.len();
+                        let ty = Ty::Array(Box::new(ce.ty.clone()), Size::Var(self.new_size(format!("{name}.len()#{k}"))));
+                        if declared.is_some() { return err(*line, *col, "a grid's type is not written; it is `[[T; n]; m]` by its literal"); }
+                        let id = self.declare(name, ty, *mutable);
+                        self.rows.insert(id, (cn, cm));
+                        Ok(Stmt::LetRepeat(id, ce, flat))
                     }
                     ast::ExprKind::ArrayRepeat(e, n) => {
                         let ce = self.expr(e)?;
@@ -577,6 +630,13 @@ impl<'a> Ctx<'a> {
                         let cj = self.expr(jdx)?;
                         if cj.ty != Ty::I64 { return err(jdx.line, jdx.col, format!("index must be `i64`, found `{}`", cj.ty)); }
                         (LValue::IndexFieldIndex(id, ci, fi, cj, target.line), *fel)
+                    }
+                    // `g[i][j] = e` in a grid of rows: `g[i·n + j]`, `j` checked against `n` (§11)
+                    ast::ExprKind::Index(base, jdx) if self.grid_of(base).is_some() => {
+                        let (id, flat) = self.grid_index(base, jdx)?;
+                        let l = &self.locals[id];
+                        if !l.mutable { return err(target.line, target.col, format!("`{}` is not mutable; declare it with `let mut`", l.name)); }
+                        (LValue::Index(id, flat, target.line), l.ty.elem().unwrap().clone())
                     }
                     ast::ExprKind::Index(base, idx) => {
                         let id = self.local_by_expr(base, "the array being indexed")?;
@@ -805,6 +865,12 @@ impl<'a> Ctx<'a> {
                 }
                 mk(ExprKind::FieldIndex(Box::new(cb), Box::new(ci), fi), elem)
             }
+            // `g[i][j]` in a grid of rows (§11)
+            ast::ExprKind::Index(base, jdx) if self.grid_of(base).is_some() => {
+                let (id, flat) = self.grid_index(base, jdx)?;
+                let elem = self.locals[id].ty.elem().unwrap().clone();
+                mk(ExprKind::Index(id, Box::new(flat)), elem)
+            }
             ast::ExprKind::Index(base, idx) => {
                 let id = self.local_by_expr(base, "the array being indexed")?;
                 let ci = self.expr(idx)?;
@@ -959,6 +1025,19 @@ impl<'a> Ctx<'a> {
                     if let ast::ExprKind::Field(inner, fname) = &recv.kind {
                         let (_, _, _, k) = self.array_field(inner, fname, recv.line, recv.col)?;
                         return mk(ExprKind::Int(k), Ty::I64);
+                    }
+                    // a grid's `g.len()` is its row count, `g[i].len()` its row length (§11)
+                    if let Some(id) = self.grid_of(recv) {
+                        let ast::ExprKind::Index(_, i) = &recv.kind else { unreachable!() };
+                        let ci = self.expr(i)?;
+                        if ci.ty != Ty::I64 { return err(i.line, i.col, format!("index must be `i64`, found `{}`", ci.ty)); }
+                        return Ok(self.rows[&id].0.clone());
+                    }
+                    if let ast::ExprKind::Var(n) = &recv.kind {
+                        if let Some(id) = self.lookup(n).filter(|id| self.rows.contains_key(id)) {
+                            self.check_moved(id, recv.line, recv.col)?;
+                            return Ok(self.rows[&id].1.clone());
+                        }
                     }
                     let id = self.local_by_expr(recv, "the receiver of `.len()`")?;
                     if !self.locals[id].ty.is_arrayish() {
@@ -1381,7 +1460,7 @@ fn last_uses_expr(e: &Expr, reassigns: &[Reassign], into: &mut HashMap<LocalId, 
     match &e.kind {
         ExprKind::Local(id) | ExprKind::Len(id) | ExprKind::Ref(id, _) => mark(*id, e.line, into),
         ExprKind::Index(id, idx) => { mark(*id, e.line, into); last_uses_expr(idx, reassigns, into); }
-        ExprKind::Binary(_, a, b) | ExprKind::MinMax(_, a, b) | ExprKind::FieldIndex(a, b, _) => { last_uses_expr(a, reassigns, into); last_uses_expr(b, reassigns, into); }
+        ExprKind::Binary(_, a, b) | ExprKind::MinMax(_, a, b) | ExprKind::FieldIndex(a, b, _) | ExprKind::InRow(a, b) => { last_uses_expr(a, reassigns, into); last_uses_expr(b, reassigns, into); }
         ExprKind::Unary(_, a) | ExprKind::Field(a, _) | ExprKind::Cast(a, _) | ExprKind::Println(a) => last_uses_expr(a, reassigns, into),
         ExprKind::StructLit(_, es) | ExprKind::ArrayVal(es) => { for e2 in es { last_uses_expr(e2, reassigns, into); } }
         ExprKind::Call(_, args) => { for a in args { last_uses_expr(a, reassigns, into); } }

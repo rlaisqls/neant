@@ -453,6 +453,8 @@ mod parsedump {
                 for e in es { expr(e, o)?; }
                 Ok(())
             }
+            // a grid of rows (docs/decisions.md §11) is not in the self-hosted checker yet
+            ExprKind::ArrayRepeat(e, _) if matches!(e.kind, ExprKind::ArrayRepeat(..)) => Err("a grid of rows".into()),
             ExprKind::ArrayRepeat(e, n) => {
                 o.push(78);
                 expr(e, o)?;

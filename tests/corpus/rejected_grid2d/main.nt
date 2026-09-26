@@ -1,7 +1,0 @@
-// A grid as an array of rows: nested arrays are not a type, so the plate is written flat instead
-// (heat/ indexes `i * n + j`).
-fn main() {
-    let n = 4;
-    let g = [[0.0; n]; n];
-    println(g[1][2]);
-}

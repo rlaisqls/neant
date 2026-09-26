@@ -262,6 +262,9 @@ pub enum ExprKind {
     ArrayVal(Vec<Expr>),
     Call(FuncId, Vec<Expr>),
     Println(Box<Expr>),
+    /// `j` of `g[i][j]` in a grid of rows (docs/decisions.md §11): `j`, checked to be below the
+    /// row length `n`; the flat index `i·n + j` is built around it
+    InRow(Box<Expr>, Box<Expr>),
     /// `print("…")` / `println("…")`: a literal written to the output, with a newline for `println`
     Text(String, bool),
     Len(LocalId),

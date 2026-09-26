@@ -96,7 +96,7 @@ Rejected, each kept as a minimal case in `tests/corpus/rejected_*` with its erro
 | case | what one would write | error |
 |---|---|---|
 | `rejected_string` | `println("mean error")` — any labelled report | accepted since 2026-09-26 (decisions §10): `print("…")` and `println("…")` write a literal; the case is now `tests/corpus/report` |
-| `rejected_grid2d` | `let g = [[0.0; n]; n]` — a plate as rows | `an array literal can only initialise a let for now` |
+| `rejected_grid2d` | `let g = [[0.0; n]; n]` — a plate as rows | accepted since 2026-09-26 (decisions §11): a grid of rows, stored flat and row-major and costed as the flat idiom; the case is now `tests/corpus/rows` |
 | `rejected_vecparam` | `dot(a, a)` with `fn dot(a: [f64; 3], b: [f64; 3])` | ``argument 2 moves `a` into `dot`, which argument 1 already moved`` — a double move, rejected rightly; until 2026-09-26 the message spoke of views and `&mut` |
 
 The programs were written around them: output is bare numbers, the plate is flat (`i * n + j`),
@@ -104,5 +104,7 @@ there is one plant, and every fixed-size vector sits in a struct. None of these 
 they are the cost of writing the corpus, not of measuring it. `sqrt` is not in the list: an
 `extern` with `#[cost(work_at_most, moves_at_most)]` is enough, and `pid` crosses the boundary
 through it.
+
+**After strings and rows (2026-09-26).** `rejected_string` is `report/` and `rejected_grid2d` is `rows/`, both accepted and exact; `rejected_vecparam` stays rejected, as a double move, and now says so.
 
 **After arrays by value part two (2026-09-26).** `rejected_plants` is accepted now (arrays of holders, AoS only) and was removed; `rejected_vecparam` is rejected for a different reason, a double move, under a message that still speaks of views.

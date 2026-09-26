@@ -1,0 +1,7 @@
+// the row is checked: `g[1][4]` in a grid of rows of 4 is out of bounds, though `1·4 + 4` is not
+fn main() {
+    let g = [[0; 4]; 3];
+    println(g[0][3]);
+    let j = 4;
+    println(g[1][j]);
+}

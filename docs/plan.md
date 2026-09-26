@@ -726,6 +726,17 @@ on one — the one golden whose expected output changed, because what it pinned 
 Left: nested fixed-size arrays, a by-value array of structs, SoA for holders, and the self-hosted
 side of all of it.
 
+**What the corpus could not write, 2026-09-26** (decisions §§ 10–11, corpus.md). Three of the
+corpus's rejected cases. A by-value array passed twice, `dot(a, a)`, is a double move and now says
+so — "argument 2 moves `a` into `dot`, which argument 1 already moved" — where it spoke of views
+and `&mut`, and a use after a move into a call names the call. Text output is a literal: a string
+is the argument of `print` or `println` and nothing else, written byte for byte, costing one call
+and its `n` bytes, a constant, so `rejected_string` is `corpus/report`, a labelled report, exact.
+A grid of rows is the row-major idiom written by the checker rather than a nested type:
+`[[e; n]; m]` is a flat buffer, `g[i][j]` is `g[i·n + j]` with the row checked, and it costs what
+the flat idiom costs term for term — `corpus/rows`, a plate relaxed as rows, exact. Left: a string
+value, a nested array type, and the self-hosted side of all three.
+
 ## M7 — the constant factor
 
 Prove the asymptote, search the constant. A micro-architectural cost line (what llvm-mca and uiCA

@@ -4,6 +4,43 @@ Design decisions with the reasoning that produced them, so the reasoning is not 
 code is. Newest first. A decision is recorded when it was argued over, when it rejected
 alternatives worth remembering, or when a future reader would otherwise ask "why on earth".
 
+## 11 — A grid of rows is a row-major idiom the checker writes, not a nested array type
+
+**Decided and implemented 2026-09-26.** `let g = [[0.0; n]; n]` was rejected
+(`rejected_grid2d`), and the corpus wrote its plate flat, `g[i * n + j]` — which the calculus
+already costs exactly, since `i·n + j` is an affine index whose coefficient is a size. Two ways to
+let the program say rows:
+
+- **A nested array type**, `[[T; n]; m]` as a type: an array whose elements are arrays. Every rule
+  of the calculus is written over an array of scalars or structs — sites, footprints, residue, the
+  slide rule, the layout chooser — so it needs an element that is itself a buffer: a size per
+  element or a proof that all rows share one, a view of a row (`&g[i]`, an address into a buffer,
+  which views of elements are not), a type for a parameter that takes a grid and the size atoms it
+  carries into the callee, a copy rule for `g[i] = r`, and an emitter representation for each.
+  That is a stage, not a change.
+- **The row-major idiom, written by the checker.** `[[e; n]; m]` in a `let` is one flat buffer of
+  `m·n` elements; `g[i][j]` is `g[i·n + j]`; the grid is rectangular by construction, which is
+  all a plate is.
+
+**The idiom is what is built.** `let g = [[e; n]; m]`, `e` a scalar, `n` and `m` each a literal, an
+immutable `i64` or a length — the same number at every use, so the flat index is the one the
+buffer was sized by — declares a flat `[T; m·n]` local and remembers its row length and count.
+`g[i][j]` reads and `g[i][j] = e` (and `op=`) writes `g[i·n + j]`, with `j` checked against `n`
+before the flat index is checked against `m·n`, so `g[1][4]` in rows of 4 exits 101 as any index
+out of bounds does, though `1·4 + 4` is inside the buffer. `g.len()` is `m` and `g[i].len()` is
+`n`. Everything else about `g` is the flat array's: `&g` is a `&[T]` of `m·n` elements (a callee
+indexes it flat), `let h = g` moves it and `h` is flat. A third dimension, a grid of structs, a
+declared type on the `let`, and a mutable dimension are rejected with that reason.
+
+**What the calculus charges**: what the flat idiom costs, term for term — the index is the flat
+one, and the row check is a bounds check, which no index is charged for. The same stencil written
+both ways costs `26·n² − 97·n + 101` either way; `grid.nt` walks a grid by columns and gets the
+`B·m·n` regime a column walk earns when a column does not fit. `tests/corpus/rows` is
+`rejected_grid2d` turned into a plate relaxed as rows, exact.
+
+**Left**: the nested type, when something needs rows that differ in length, a view of one row, or a
+grid passed to a function as a grid rather than flat.
+
 ## 10 — Text output is a literal written by `print` and `println`, not a string value
 
 **Decided and implemented 2026-09-26.** The corpus could not label a number (`rejected_string`):

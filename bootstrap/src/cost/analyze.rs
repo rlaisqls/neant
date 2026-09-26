@@ -1147,6 +1147,7 @@ impl<'a, 'b, 'c> Fa<'a, 'b, 'c> {
             ExprKind::Call(fid, _) if self.is_argc(*fid) => self.argc_atom.map(Poly::var),
             ExprKind::Cast(inner, Ty::I64) => self.size_of(inner, bound),
             // min is bounded above by either argument, max below by either: the first that is a size
+            ExprKind::InRow(j, _) => self.size_of(j, bound),
             ExprKind::MinMax(true, a, b) if bound == Dir::Upper => self.size_of(a, bound).or_else(|| self.size_of(b, bound)),
             ExprKind::MinMax(false, a, b) if bound == Dir::Lower => self.size_of(a, bound).or_else(|| self.size_of(b, bound)),
             ExprKind::Binary(BinOp::Add, a, b) => Some(self.size_of(a, bound)?.add(&self.size_of(b, bound)?)),
@@ -1245,6 +1246,7 @@ impl<'a, 'b, 'c> Fa<'a, 'b, 'c> {
             ExprKind::Cast(inner, Ty::I64) => self.affine(inner),
             // `min(ii*T + T, n)` as a loop end: the tile bound, the rectangular hull of the rest
             ExprKind::MinMax(true, a, _) => self.affine(a),
+            ExprKind::InRow(j, _) => self.affine(j),
             ExprKind::Binary(BinOp::Div, a, b) => {
                 let pb = self.affine(b)?;
                 if !pb.is_const() { return None; }
@@ -2227,6 +2229,8 @@ impl<'a, 'b, 'c> Fa<'a, 'b, 'c> {
             ExprKind::Binary(_, a, b) if !a.ty.is_scalar() => { self.expr(a)?; self.expr(b)?; self.compare_value(&a.ty); Ok(()) }
             ExprKind::Binary(_, a, b) => { self.expr(a)?; self.expr(b)?; self.add_work_n(1); Ok(()) }
             ExprKind::MinMax(_, a, b) => { self.expr(a)?; self.expr(b)?; self.add_work_n(2); Ok(()) } // compare, select
+            // a row's bound check is a bounds check, which no index is charged for
+            ExprKind::InRow(j, n) => { self.expr(j)?; self.expr(n) }
             ExprKind::Unary(_, a) | ExprKind::Cast(a, _) => { self.expr(a)?; self.add_work_n(1); Ok(()) }
             ExprKind::Println(a) => { self.expr(a)?; self.add_work_n(1); if !self.replay { self.io = true; } Ok(()) }
             // a literal of n bytes written out: one call, and its n bytes (the newline one more)
@@ -2609,7 +2613,7 @@ fn bound_mentions(e: &Expr, l: LocalId) -> bool {
     match &e.kind {
         ExprKind::Local(v) => *v == l,
         ExprKind::Len(v) => *v == l,
-        ExprKind::Binary(_, a, b) | ExprKind::MinMax(_, a, b) | ExprKind::FieldIndex(a, b, _) => bound_mentions(a, l) || bound_mentions(b, l),
+        ExprKind::Binary(_, a, b) | ExprKind::MinMax(_, a, b) | ExprKind::FieldIndex(a, b, _) | ExprKind::InRow(a, b) => bound_mentions(a, l) || bound_mentions(b, l),
         ExprKind::Unary(_, a) | ExprKind::Cast(a, _) | ExprKind::Field(a, _) => bound_mentions(a, l),
         ExprKind::Index(_, i) => bound_mentions(i, l),
         _ => false,
@@ -2631,7 +2635,7 @@ fn collect_refs<'e>(e: &'e Expr, out: &mut Vec<(LocalId, &'e Expr, Option<usize>
             collect_refs(j, out);
         }
         ExprKind::StructLit(_, vals) | ExprKind::ArrayVal(vals) => for v in vals { collect_refs(v, out); },
-        ExprKind::Binary(_, a, b) | ExprKind::MinMax(_, a, b) | ExprKind::FieldIndex(a, b, _) => { collect_refs(a, out); collect_refs(b, out); }
+        ExprKind::Binary(_, a, b) | ExprKind::MinMax(_, a, b) | ExprKind::FieldIndex(a, b, _) | ExprKind::InRow(a, b) => { collect_refs(a, out); collect_refs(b, out); }
         ExprKind::Unary(_, a) | ExprKind::Cast(a, _) | ExprKind::Println(a) => collect_refs(a, out),
         ExprKind::Call(_, args) => for a in args { collect_refs(a, out); },
         ExprKind::If(c, t, els) => {
@@ -2658,6 +2662,7 @@ fn idx_key(e: &Expr) -> Option<String> {
         ExprKind::Unary(op, a) => format!("({op:?} {})", idx_key(a)?),
         ExprKind::Cast(a, t) => format!("({} as {t})", idx_key(a)?),
         ExprKind::MinMax(m, a, b) => format!("({} {m} {})", idx_key(a)?, idx_key(b)?),
+        ExprKind::InRow(j, _) => idx_key(j)?,
         ExprKind::Index(arr, i) => format!("a{arr}[{}]", idx_key(i)?),
         ExprKind::Field(b, f) => format!("{}.{f}", idx_key(b)?),
         _ => return None,
@@ -2669,7 +2674,7 @@ fn collect_scalars(e: &Expr, out: &mut Vec<LocalId>) {
     match &e.kind {
         ExprKind::Local(v) => out.push(*v),
         ExprKind::Index(_, i) => collect_scalars(i, out),
-        ExprKind::Binary(_, a, b) | ExprKind::MinMax(_, a, b) | ExprKind::FieldIndex(a, b, _) => { collect_scalars(a, out); collect_scalars(b, out); }
+        ExprKind::Binary(_, a, b) | ExprKind::MinMax(_, a, b) | ExprKind::FieldIndex(a, b, _) | ExprKind::InRow(a, b) => { collect_scalars(a, out); collect_scalars(b, out); }
         ExprKind::Unary(_, a) | ExprKind::Cast(a, _) | ExprKind::Println(a) => collect_scalars(a, out),
         ExprKind::Call(_, args) => for a in args { collect_scalars(a, out); },
         ExprKind::Field(base, _) => collect_scalars(base, out),
@@ -2709,7 +2714,7 @@ fn callees_block(b: &Block, out: &mut Vec<FuncId>) {
 fn callees_expr(e: &Expr, out: &mut Vec<FuncId>) {
     match &e.kind {
         ExprKind::Call(f, args) => { if !out.contains(f) { out.push(*f); } for a in args { callees_expr(a, out); } }
-        ExprKind::Binary(_, a, b) | ExprKind::MinMax(_, a, b) | ExprKind::FieldIndex(a, b, _) => { callees_expr(a, out); callees_expr(b, out); }
+        ExprKind::Binary(_, a, b) | ExprKind::MinMax(_, a, b) | ExprKind::FieldIndex(a, b, _) | ExprKind::InRow(a, b) => { callees_expr(a, out); callees_expr(b, out); }
         ExprKind::Unary(_, a) | ExprKind::Field(a, _) | ExprKind::Println(a) | ExprKind::Cast(a, _) | ExprKind::Index(_, a) => callees_expr(a, out),
         ExprKind::StructLit(_, es) | ExprKind::ArrayVal(es) => for x in es { callees_expr(x, out); },
         ExprKind::If(c, t, els) => { callees_expr(c, out); callees_block(t, out); if let Some(b) = els { callees_block(b, out); } }
@@ -2756,7 +2761,7 @@ impl Writes {
     fn expr(&mut self, e: &Expr) {
         match &e.kind {
             ExprKind::Call(_, args) => for a in args { self.expr(a); },
-            ExprKind::Binary(_, a, b) | ExprKind::MinMax(_, a, b) | ExprKind::FieldIndex(a, b, _) => { self.expr(a); self.expr(b); }
+            ExprKind::Binary(_, a, b) | ExprKind::MinMax(_, a, b) | ExprKind::FieldIndex(a, b, _) | ExprKind::InRow(a, b) => { self.expr(a); self.expr(b); }
             ExprKind::Unary(_, a) | ExprKind::Field(a, _) | ExprKind::Println(a) | ExprKind::Cast(a, _) | ExprKind::Index(_, a) => self.expr(a),
             ExprKind::StructLit(_, es) | ExprKind::ArrayVal(es) => for x in es { self.expr(x); },
             ExprKind::If(c, t, els) => { self.expr(c); self.block(t); if let Some(b) = els { self.block(b); } }
@@ -2865,7 +2870,7 @@ fn stores_expr(e: &Expr, f: &Func, roots: &mut HashMap<LocalId, LocalId>, summ: 
             }
             stores_expr(a, f, roots, summ, hit);
         },
-        ExprKind::Binary(_, a, b) | ExprKind::MinMax(_, a, b) | ExprKind::FieldIndex(a, b, _) => { stores_expr(a, f, roots, summ, hit); stores_expr(b, f, roots, summ, hit); }
+        ExprKind::Binary(_, a, b) | ExprKind::MinMax(_, a, b) | ExprKind::FieldIndex(a, b, _) | ExprKind::InRow(a, b) => { stores_expr(a, f, roots, summ, hit); stores_expr(b, f, roots, summ, hit); }
         ExprKind::Unary(_, a) | ExprKind::Field(a, _) | ExprKind::Println(a) | ExprKind::Cast(a, _) | ExprKind::Index(_, a) => stores_expr(a, f, roots, summ, hit),
         ExprKind::StructLit(_, es) | ExprKind::ArrayVal(es) => for x in es { stores_expr(x, f, roots, summ, hit); },
         ExprKind::If(c, t, els) => { stores_expr(c, f, roots, summ, hit); stores_block(t, f, roots, summ, hit); if let Some(b) = els { stores_block(b, f, roots, summ, hit); } }

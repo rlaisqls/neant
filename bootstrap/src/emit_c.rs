@@ -655,6 +655,10 @@ static void nt_println_f64(double v) {
                 let v = self.expr(a).scalar();
                 s(format!("(({})({v}))", c_ty(self.m, ty)))
             }
+            ExprKind::InRow(j, n) => {
+                let (jv, nv) = (self.expr(j).scalar(), self.expr(n).scalar());
+                s(format!("nt_idx({jv}, {nv}, {})", e.line))
+            }
             ExprKind::MinMax(is_min, a, b) => {
                 let (av, bv) = (self.expr(a).scalar(), self.expr(b).scalar());
                 let t = c_ty(self.m, &e.ty);
