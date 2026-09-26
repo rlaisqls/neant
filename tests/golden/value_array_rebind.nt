@@ -1,0 +1,22 @@
+// A control loop over a bare `[f64; 2]` state: `s = step(s, u)` moves `s` into the call and
+// rebinds it to what comes back, every lap.
+fn step(s: [f64; 2], u: f64) -> [f64; 2] {
+    let mut n = s;
+    let x = n[0];
+    n[0] = 0.9 * x + 0.1 * n[1];
+    n[1] = 0.5 * n[1] + u;
+    n
+}
+
+fn run(n: i64) -> f64 {
+    let mut s = [1.0, 0.0];
+    for t in 0..n {
+        s = step(s, 1.0);
+    }
+    s[0] + s[1]
+}
+
+fn main() {
+    println(run(3));
+    println(run(100));
+}

@@ -599,7 +599,9 @@ impl<'a, 'b, 'c> Fa<'a, 'b, 'c> {
         for (i, &p) in f.params.iter().enumerate() {
             let l = &f.locals[p];
             if l.ty.is_arrayish() {
-                fa.local_size.insert(p, Poly::var(i));
+                // `[T; k]` by value: its length is the literal (docs/arrays-by-value-design.md §7)
+                let n = match &l.ty { Ty::Array(_, Size::Const(k)) if *k >= 0 => Poly::constant(*k as i128), _ => Poly::var(i) };
+                fa.local_size.insert(p, n);
                 fa.local_root.insert(p, p);
             } else if l.ty == Ty::I64 {
                 fa.local_affine.insert(p, Affine::constant(Poly::var(i)));
@@ -1803,6 +1805,17 @@ impl<'a, 'b, 'c> Fa<'a, 'b, 'c> {
                     }
                 }
                 if let (LValue::Var(_), ExprKind::Local(_)) = (lv, &e.kind) { self.copy_value(&e.ty); }
+                // `s = f(…)`, `f -> [T; k]`: a new buffer, as a `let` of the call gives one — what
+                // was read from the old one, or resident of it, is not of this one (§7)
+                if let LValue::Var(v) = lv {
+                    if self.f.locals[*v].ty.is_arrayish() {
+                        self.last_result = None;
+                        self.last_result_atom = None;
+                        self.wrote(*v);
+                        let root = self.local_root.get(v).copied().unwrap_or(*v);
+                        self.resident.retain(|r| r.root != root);
+                    }
+                }
                 match lv {
                     // a register: only the operation of `op=` costs
                     LValue::Var(_) => self.add_work_n(if op.is_some() { 1 } else { 0 }),
@@ -2737,6 +2750,8 @@ fn stores_block(b: &Block, f: &Func, roots: &mut HashMap<LocalId, LocalId>, summ
                 match lv {
                     LValue::Index(a, i, _) => { hit(roots.get(a).copied().unwrap_or(*a), None); stores_expr(i, f, roots, summ, hit); }
                     LValue::IndexField(a, i, fi, _) => { hit(roots.get(a).copied().unwrap_or(*a), Some(*fi)); stores_expr(i, f, roots, summ, hit); }
+                    // an array local rebound by a call is written whole
+                    LValue::Var(v) if f.locals[*v].ty.is_arrayish() => hit(roots.get(v).copied().unwrap_or(*v), None),
                     LValue::Var(_) | LValue::Field(..) => {}
                     LValue::FieldIndex(_, i, _, _) => stores_expr(i, f, roots, summ, hit),
                 }

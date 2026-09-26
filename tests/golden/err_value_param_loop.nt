@@ -1,0 +1,5 @@
+fn first(x: [i64; 2]) -> i64 { x[0] }
+fn main() {
+    let a = [1, 2];
+    for i in 0..3 { println(first(a) + i); }
+}

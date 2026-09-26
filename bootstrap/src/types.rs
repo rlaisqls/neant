@@ -50,6 +50,9 @@ pub fn check(prog: &ast::Program) -> Result<Module> {
         for p in &f.params {
             let ty = resolve_type(&p.ty, &struct_ids, p.line, p.col)?;
             match ty {
+                // a fixed-size array of scalars is moved in whole (docs/arrays-by-value-design.md §7)
+                Ty::Array(ref e, Size::Const(k)) if k >= 1 && e.is_scalar() => ptys.push(ty),
+                Ty::Array(_, Size::Const(k)) if k >= 1 => return err(p.line, p.col, "an array passed by value holds scalars for now; pass a view: `&[T]` or `&mut [T]`"),
                 Ty::Array(..) => return err(p.line, p.col, "arrays are passed as views: write `&[T]` or `&mut [T]`"),
                 _ => ptys.push(ty),
             }
@@ -57,6 +60,11 @@ pub fn check(prog: &ast::Program) -> Result<Module> {
         let ret = resolve_type(&f.ret, &struct_ids, f.line, f.col)?;
         if matches!(ret, Ty::Slice(..)) {
             return err(f.line, f.col, "a function returns a value, not a view: write `[T]` for an owned array");
+        }
+        if let Ty::Array(e, Size::Const(k)) = &ret {
+            if *k >= 0 && (!e.is_scalar() || *k < 1) {
+                return err(f.line, f.col, "an array returned by value holds at least one scalar: `[T; k]`, `T` one of `i64 f64 bool u8`");
+            }
         }
         sigs.insert(f.name.clone(), (i, ptys, ret));
     }
@@ -171,6 +179,9 @@ struct Ctx<'a> {
     /// agree at runtime. A mutable local gets a fresh atom at every use instead (it may have
     /// changed between them), which is why this is keyed and not just "the local's own size".
     size_of_local: HashMap<LocalId, SizeVar>,
+    /// the array local being rebound by `s = f(…, s, …)`: moving it into the call is not a move
+    /// out of the loop, since the same statement gives it a value again
+    rebinding: Option<LocalId>,
 }
 
 fn check_func(f: &ast::Func, sigs: &HashMap<String, (FuncId, Vec<Ty>, Ty)>, structs: &[StructDef], struct_ids: &HashMap<String, StructId>) -> Result<Func> {
@@ -179,6 +190,7 @@ fn check_func(f: &ast::Func, sigs: &HashMap<String, (FuncId, Vec<Ty>, Ty)>, stru
         sigs, structs, struct_ids, locals: vec![], scopes: vec![HashMap::new()], sizes: vec![], ret: ret.clone(),
         in_loop: 0, in_closure: 0, fresh: 0, pending_lets: vec![], root: HashMap::new(), moved: HashMap::new(),
         loop_start: vec![], let_moves: vec![], reassigns: vec![], reassign_pending: vec![], size_of_local: HashMap::new(),
+        rebinding: None,
     };
     let mut params = Vec::new();
     for (p, ty) in f.params.iter().zip(ptys) {
@@ -218,6 +230,17 @@ fn check_func(f: &ast::Func, sigs: &HashMap<String, (FuncId, Vec<Ty>, Ty)>, stru
     // an owned array return carries the size of what is actually returned, so a caller can cost
     // its loops over the result
     let mut ret = ret.clone();
+    // `-> [T; k]`: what is returned has exactly `k` elements, and the signature is what callers see
+    if let Ty::Array(_, Size::Const(k)) = &ret {
+        if *k >= 0 {
+            if let Some(t) = &body.tail {
+                if t.ty.size() != Some(&Size::Const(*k)) {
+                    return err(t.line, 0, format!("`{}` returns `{ret}`, but its body's array does not have the literal length {k}", f.name));
+                }
+            }
+            return Ok(Func { name: f.name.clone(), params, ret, locals: cx.locals, sizes: cx.sizes, body: Some(body), uses: vec![], asserts: f.asserts.clone(), line: f.line, reassigns: cx.reassigns });
+        }
+    }
     if let Ty::Array(_, _) = &ret {
         let returned = body.tail.as_ref().map(|t| t.ty.clone())
             .or_else(|| body.stmts.iter().rev().find_map(|s| match s { Stmt::Return(Some(e)) => Some(e.ty.clone()), _ => None }));
@@ -438,10 +461,13 @@ impl<'a> Ctx<'a> {
                         let ce = self.expr(init)?;
                         // a call that returns an owned array: the caller owns it, under a size of
                         // its own named after the call
-                        if let (Ty::Array(elem, _), ExprKind::Call(fid, _)) = (&ce.ty, &ce.kind) {
-                            let nm = format!("{name}.len()");
-                            let sv = self.new_size(nm);
-                            let ty = Ty::Array(elem.clone(), Size::Var(sv));
+                        if let (Ty::Array(elem, sz), ExprKind::Call(fid, _)) = (&ce.ty, &ce.kind) {
+                            // `-> [T; k]` says how many: the literal, not a size of its own
+                            let ty = if matches!(sz, Size::Const(k) if *k >= 0) { ce.ty.clone() } else {
+                                let nm = format!("{name}.len()");
+                                let sv = self.new_size(nm);
+                                Ty::Array(elem.clone(), Size::Var(sv))
+                            };
                             self.check_declared(&declared, &ty, *line, *col)?;
                             let id = self.declare(name, ty, *mutable);
                             self.root.insert(id, id);
@@ -482,7 +508,14 @@ impl<'a> Ctx<'a> {
                 if self.in_closure > 0 {
                     return err(*line, *col, "a closure in a chain cannot assign; it must be a pure function of its arguments");
                 }
-                let val = self.expr(value)?;
+                let rebind = match &target.kind {
+                    ast::ExprKind::Var(n) if op.is_none() => self.lookup(n).filter(|&id| matches!(self.locals[id].ty, Ty::Array(_, Size::Const(k)) if k >= 0)),
+                    _ => None,
+                };
+                let saved = std::mem::replace(&mut self.rebinding, rebind);
+                let val = self.expr(value);
+                self.rebinding = saved;
+                let val = val?;
                 let (lv, tty) = match &target.kind {
                     ast::ExprKind::Var(n) => {
                         let id = self.lookup(n).map_or_else(|| err(target.line, target.col, format!("unknown variable `{n}`")), Ok)?;
@@ -511,6 +544,13 @@ impl<'a> Ctx<'a> {
                                         return Ok(Stmt::Reassign(idx));
                                     }
                                 }
+                            }
+                            // `s = f(…)` with `f -> [T; k]`: the local takes the call's array, as a
+                            // `let` does (docs/arrays-by-value-design.md §7)
+                            if op.is_none() && matches!(val.kind, ExprKind::Call(..)) && matches!(l.ty, Ty::Array(_, Size::Const(k)) if k >= 0) && val.ty == l.ty {
+                                self.moved.remove(&id);
+                                self.root.insert(id, id);
+                                return Ok(Stmt::Assign(LValue::Var(id), None, val));
                             }
                             return err(target.line, target.col, "cannot assign a whole array or view; assign elements");
                         }
@@ -647,7 +687,10 @@ impl<'a> Ctx<'a> {
                     None => None,
                 };
                 let ty = ce.as_ref().map_or(Ty::Unit, |e| e.ty.clone());
-                if let (Ty::Array(a, _), Ty::Array(b, _)) = (&ty, &self.ret) {
+                if let (Ty::Array(a, sz), Ty::Array(b, rsz)) = (&ty, &self.ret) {
+                    if matches!(rsz, Size::Const(k) if *k >= 0) && sz != rsz {
+                        return err(*line, *col, format!("returning `{ty}` from a function that returns `{}`: the length must be the literal one", self.ret));
+                    }
                     if a == b { return Ok(Stmt::Return(ce)); }
                 }
                 if !ty.same_shape(&self.ret) {
@@ -819,7 +862,9 @@ impl<'a> Ctx<'a> {
                     };
                     let Some(id) = (match &target.kind { ast::ExprKind::Var(n) => self.lookup(n), _ => None }) else { continue };
                     if !self.locals[id].ty.is_arrayish() { continue; }
-                    let mutable = explicit_mut.unwrap_or(matches!(self.locals[id].ty, Ty::Slice(_, true, _)));
+                    // an array moved in by value is the callee's to write
+                    let by_value = explicit_mut.is_none() && matches!(ptys.get(k), Some(Ty::Array(..)));
+                    let mutable = by_value || explicit_mut.unwrap_or(matches!(self.locals[id].ty, Ty::Slice(_, true, _)));
                     let r = self.root_of(id);
                     if let Some((_, _, k2)) = roots.iter().find(|(r2, m2, _)| *r2 == r && (mutable || *m2)) {
                         return err(a.line, a.col, format!(
@@ -831,6 +876,23 @@ impl<'a> Ctx<'a> {
                 for (a, pty) in args.iter().zip(&ptys) {
                     let ca = self.expr(a)?;
                     let ok = match (&ca.ty, pty) {
+                        // `[T; k]` by value: the argument is moved in, as by `let` (§7)
+                        (_, Ty::Array(ep, Size::Const(k))) => {
+                            let ExprKind::Local(src) = ca.kind else {
+                                return err(a.line, a.col, format!("`{name}` takes `{pty}` by value, moved from a variable; pass the array itself"));
+                            };
+                            if !matches!(&ca.ty, Ty::Array(ea, sz) if ea == ep && *sz == Size::Const(*k)) {
+                                return err(a.line, a.col, format!("`{name}` takes `{pty}` by value; `{}` is `{}`", self.locals[src].name, ca.ty));
+                            }
+                            if let Some(&start) = self.loop_start.last() {
+                                if src < start && self.rebinding != Some(src) {
+                                    return err(a.line, a.col, format!("moving `{}` inside a loop would move it again on the next lap", self.locals[src].name));
+                                }
+                            }
+                            self.moved.insert(src, a.line);
+                            self.let_moves.push((src, a.line));
+                            true
+                        }
                         (Ty::Slice(ea, ma, _), Ty::Slice(ep, mp, _)) => ea == ep && (*ma || !*mp),
                         (Ty::Array(..), Ty::Slice(..)) => return err(a.line, a.col, "pass a view of the array: `&name` or `&mut name`"),
                         (a, b) => a == b,

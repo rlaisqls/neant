@@ -115,3 +115,48 @@ value and checks that the caller's copy is untouched (`step` exact at work 29, m
 `s.x[i]` exits 101 like any index. No existing golden changed. The report still prints a layout
 line for a struct that is never in an array ("the model does not decide"), as it did before for
 any such struct.
+
+## 7 — A bare `[T; k]`: moved, not copied
+
+**Written 2026-09-26, with part two.** § 5 left the decision open: when a fixed-size local array
+is passed or returned without a struct around it, does `let b = a` copy or move? **It moves**, as
+it does today for every array. `let ys = xs` on `xs: [f64; 3]` has been a move since M5 and is
+charged nothing; making a literal length turn it into a copy would change what existing programs
+mean and cost (a use after it, rejected today, would be accepted and charged `k` stores) for the
+sake of a distinction the type already draws elsewhere. A struct is a value and is copied; an
+array is a buffer and is moved — the literal length does not make it a struct. What the literal
+length buys is the signature:
+
+- **A parameter `x: [T; k]`**, `T` a scalar and `k` a literal ≥ 1, takes the array itself. The
+  argument must be a variable holding a `[T; k]` of the same length, and the call **moves** it:
+  using it afterwards is rejected at the call's line, as after `let b = a`, and so is moving one
+  born outside a loop from inside it. A view (`&a`) is rejected with what to write instead. The
+  callee owns the buffer: it may move it into a `let mut` and write it, or return it. In C it is
+  the pointer and length a view is, so passing it costs what passing a view costs — nothing — and
+  an argument that is moved is treated as written for the no-overlap rule, so `f(&a, a)` is
+  rejected.
+- **A return type `-> [T; k]`** is an owned array whose length is the literal: the body's array
+  must have exactly that length, and a caller's `let b = f(…)` has length `k`, not a size of its
+  own, so a loop over it stays exact with a constant trip count.
+- **`s = f(…, s, …)`**, `s` a `let mut [T; k]` and `f -> [T; k]`: the local takes the call's
+  array, as a `let` would. `s` is moved into the call and given a value again by the same
+  statement, so it may be done in a loop — this is the control loop over a bare state vector.
+  The old buffer's residue and read atoms are dropped: the analysis cannot tell whether the
+  callee handed back the same buffer or a new one.
+
+**Cost.** A move is free, as `let ys = xs` is: no copy, no bytes. The callee's reads and writes of
+its parameter are charged as reads and writes of any array it was handed — lines, not registers,
+unlike an array field (§3), because the buffer is not known to be resident. In `value_array_param`
+`scaled` is exact at work 15, moves `2·B`; in `value_array_rebind` a two-element state stepped `n`
+times is `14·n + 5` / `2·B·n + 2·B + 16`, exact, the `2·B` per lap being `step`'s own.
+
+**A bug this found.** An owned-array return of a literal (`let o = [a, b, c]; o` in a function
+`-> [f64]`) returned a pointer to its stack frame: the literal was a C array on the stack. The
+emitter now builds a literal on the heap when its buffer may leave the function — returned, or
+moved into a call whose result is returned, through any chain of `let`s, moves and rebindings —
+and on the stack otherwise, so no existing program's C changes but that one's. The charge is the
+literal's, as before.
+
+The self-hosted parser's slice (the `parsedump` table in `main.rs`) excludes a function with a
+by-value array parameter or return, as it excludes an array field, so the parity tests skip these
+goldens.
