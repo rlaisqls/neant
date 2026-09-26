@@ -127,6 +127,50 @@ So what stands between these programs and an exact cost is now one shape and one
 shape is a scan that steps by what it read, which is all of the parser. The hole is the worklist.
 Both were named in plan § Stage D before the corpus existed.
 
+## Re-counted after a scan, 2026-09-26
+
+The second gap is closed in the calculus too (cost-model § A scan). A `while i < e` whose index
+grows by at least `d` along every path through the body runs at most `(e − i₀)/d` times. The
+growth is proved by a walk over the body, with each function's summary of what it returns
+(`next_int`'s `end ≥ start`), and the line is `bound`, with a note saying which loop. The corpus
+now has eight programs; `report` and `rows` came in with strings and grids of rows.
+
+| program | exact | modulo | bound | unknown | functions |
+|---|---|---|---|---|---|
+| pid | 5 | 0 | 5 | 0 | 10 |
+| heat | 4 | 0 | 5 | 0 | 9 |
+| matmul | 4 | 0 | 5 | 0 | 9 |
+| csv | 2 | 0 | 5 | 0 | 7 |
+| bfs | 1 | 0 | 4 | 1 | 6 |
+| fir | 3 | 0 | 5 | 0 | 8 |
+| report | 2 | 0 | 0 | 0 | 2 |
+| rows | 2 | 0 | 0 | 0 | 2 |
+| **distinct functions** | **18** | **0** | **9** | **1** | **28** |
+
+**27 of 28 functions have a cost, and 7 of the 8 `main`s do**: `report`'s and `rows`' are exact,
+the other five are bounds. The one unknown is BFS's worklist, `` the bound of `head` is assigned
+inside the body ``. Nothing is modulo any more: every parser function has a cost of its own.
+
+The bounds are sound and not all of them are tight, and the report says which is which:
+
+- **The scans themselves are tight.** `next_int`'s two loops run at most `xs.len() − start` times
+  between them, and the CSV row loop at most `text.len()/3` rows, since a row is three numbers.
+- **A scan that calls a scan is not.** `count_ints` calls `next_int(xs, i)` once a lap, and each
+  call is charged the rest of the text, `xs.len() − i`. With `i` taken at its least, `0`, that is
+  `xs.len()` a call, so `count_ints` is `9·xs.len()²`. The real cost is linear: the calls
+  together read the text once. That is amortisation, a potential that the calls pay down between
+  them, and the calculus has no such argument. `read_ints`, the CSV `main`, and `pid`'s and
+  `fir`'s `main`s inherit the square.
+- **Where the parse is not the leading term, the bound is the kernel's.** `heat` is `≈ 31·n²·steps`
+  and `matmul` `≈ 10·n³`. The parse's quadratic in the length of an argument is dominated, and
+  the `≈` says terms were dropped. The parse's own regimes (`a0.len() ≥ M`) still fork the line:
+  `matmul` reports 22 regimes that differ only below the leading term.
+
+So on its own domain the language now gives every program but one a cost. It is a bound, not a
+count, and for text it is a square where the truth is linear. The next lever is plain: the
+amortised scan, a loop that calls a scan starting where the last call ended. The worklist
+remains, as in the compiler.
+
 ## What the corpus could not say, and could not be written
 
 Rejected, each kept as a minimal case in `tests/corpus/rejected_*` with its error pinned:

@@ -327,6 +327,81 @@ no later than either conjunct would, so the first conjunct that has a trip count
 The condition is evaluated once more than the body runs, and the memory it reads is charged each
 time; its work is the loop's compare-and-branch, as it always was.
 
+## A scan
+
+**Written 2026-09-26, before the code.** Text is read by a loop whose index advances by what it
+read:
+
+```neant
+while i < xs.len() {
+    let r = next_int(xs, i);      // r.end is at least i
+    …
+    i = r.end + 1;                // so i grows by at least 1 a lap
+}
+```
+
+and by a loop that steps by one but starts where an earlier loop left off, the second loop of
+`next_int`. Neither is an induction variable (§ Loops without a range). The first is not stepped by
+a constant, and the second has no known entry value. Both are bounded all the same, by the same
+argument a `decreasing` measure is.
+
+**The rule.** `while i < e` or `while i <= e` runs at most `(e − i₀)/d` times (`+ 1` for `<=`)
+when three things hold:
+- `e` is a size expression the body does not assign;
+- along every path through the body that comes back to the condition, `i` grows by at least `d`,
+  with `d ≥ 1`;
+- `i₀` is a lower bound on `i` at entry.
+
+It is the `decreasing e − i` argument, proved rather than promised. If `i₀` is `i`'s one entry
+value, it is that. If not, and every assignment to `i` in the whole function is an increase, `i` is
+at least what it was first bound to, and that is `i₀`: `let mut i = start` gives `start`.
+
+**What "grows by at least `d`" means.** The body is walked once, path by path, as the check on a
+`decreasing` measure is. What the walk accepts:
+- `i += c` and `i = i + c` grow `i` by `c`. `i -= c` shrinks it.
+- `i = x + c` grows it by `c + k` when `x` is known to be at least `i + k` at that point.
+- An `if` takes its smaller branch. A `break` or `return` leaves, and a path that leaves need not
+  grow `i`.
+- A nested loop may run zero times, so it counts `0` and must not shrink `i`.
+- Any other assignment to `i`, or one inside an expression the walk does not open, and the rule
+  does not apply.
+
+"`x` is at least `i + k`" comes from:
+- `let x = e`, immutable, with `e` built from `i`, constants and `+`;
+- a field `r.f` of `let r = g(…)`, from `g`'s summary.
+
+A fact about `i` stops holding at the next assignment to `i`.
+
+**The summary.** For every function it lists what it guarantees about what it returns: the
+result, or a field of the struct it returns, is at least one of its `i64` parameters plus a
+constant, or at least a constant. It is read off the returned expression, the body's tail, in a
+function with no `return`:
+- a parameter, a constant, or `+ c` of either;
+- a mutable local whose every assignment is an increase, which is at least what it was bound to;
+- a field of a callee's result, by the callee's summary.
+
+`next_int` returns `Num { …, end: i }` with `let mut i = start` and every assignment to `i` a `+= 1`,
+so its summary is `end ≥ start`. `after_header` returns `i + 1` from `let mut i = 0`, so it
+returns at least 1. Summaries depend on callees' summaries, so they are computed to a fixed point
+over the call graph, from nothing, as the fields a call may write are (§ A walk down a list).
+A cycle only ever adds facts that hold.
+
+**What the report says.** The loop's trip is an upper bound reached by an argument about values,
+not a count. So the line is `bound`, not `exact`, and a note says which loop and why: ``scan: `i` grows by at least 1 a lap, so the `while` at line 41 runs at most xs.len() times``. A caller whose
+cost rests on such a line is `bound` too, and its line says `rests on next_int (bound, a scan)`.
+The scan's index is not an induction variable, so its accesses are charged as not affine: a line
+each (§ Moves). That is an upper bound too.
+
+**Where it refuses.**
+- `!=`, where a step larger than one can jump the bound.
+- A descending scan.
+- A bound the body assigns.
+- An assignment to `i` the walk cannot follow: `i = xs[k]`, `i = f(i)` with no summary.
+- A path that can come back without growing `i`: "`i` does not grow on every path through the
+  body".
+- An entry value that is neither known nor bounded below because some assignment to `i` shrinks
+  it: "`i`'s entry value is not known and `i` is not only increased".
+
 ## Recursion
 
 A function that calls itself is a recurrence. The body's own cost `f` is computed with the

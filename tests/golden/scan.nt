@@ -1,0 +1,46 @@
+// A scan (docs/cost-model.md § A scan): text read by an index that advances by what it read.
+// `word_end` returns where the word at `start` ends, never before `start` — its summary is
+// `result ≥ start` — so `i = word_end(xs, i) + 1` grows `i` by at least 1 a lap and the loop in
+// `words` runs at most `xs.len()` times. `skip_spaces` steps by one from wherever it is handed,
+// and the second loop of `trimmed` starts where the first stopped: its entry value is not known,
+// but `i` is only ever increased, from 0, so it is at least 0.
+
+fn word_end(xs: &[u8], start: i64) -> i64 {
+    let mut i = start;
+    while i < xs.len() && xs[i] != b' ' {
+        i += 1;
+    }
+    i
+}
+
+fn words(xs: &[u8]) -> i64 {
+    let mut n = 0;
+    let mut i = 0;
+    while i < xs.len() {
+        let e = word_end(xs, i);
+        if e > i {
+            n += 1;
+        }
+        i = e + 1;
+    }
+    n
+}
+
+fn trimmed(xs: &[u8]) -> i64 {
+    let mut i = 0;
+    while i < xs.len() && xs[i] == b' ' {
+        i += 1;
+    }
+    let mut n = 0;
+    while i < xs.len() && xs[i] != b' ' {
+        n += 1;
+        i += 1;
+    }
+    n
+}
+
+fn main() {
+    let s = b"  the quick  brown fox";
+    println(words(&s));
+    println(trimmed(&s));
+}

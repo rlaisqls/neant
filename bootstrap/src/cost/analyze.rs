@@ -37,6 +37,21 @@ pub enum CostResult {
     Unknown { reason: String, line: u32 },
 }
 
+/// How a line that rests on a callee bounded by a scan names it (docs/cost-model.md § A scan).
+const SCAN_TAG: &str = "(bound, a scan)";
+
+/// Whether `c` only falls as the atom `k` grows: every term in it is `−c·k·(sizes)` with `k` to
+/// the first power, `k` in no condition and inside no read or unknown callee's argument.
+fn falls_in(c: &Cost, k: usize) -> bool {
+    c.pieces.iter().all(|pc| {
+        !pc.conds.iter().any(|cd| cd.ws.mentions(k)) && pc.poly.terms.iter().all(|(m, coef)| {
+            let direct = m.factors.get(&Atom::Var(k));
+            let inner = m.factors.keys().any(|a| !matches!(a, Atom::Var(_)) && Poly::atom(a.clone()).mentions(k));
+            !inner && match direct { None => true, Some(e) => *e == Rat::one() && *coef < Rat::zero() }
+        })
+    })
+}
+
 #[derive(Debug, Clone)]
 pub struct FuncCost {
     pub name: String,
@@ -355,6 +370,9 @@ struct Analyzer<'a> {
     /// `field_writes[f][i]`: the fields of the array `f`'s `i`th parameter that `f` may write,
     /// itself or through its callees — what a list walk in a caller needs left alone
     field_writes: Vec<Vec<FieldWrites>>,
+    /// what each function guarantees about what it returns (`end ≥ start`), for a scan
+    /// (docs/cost-model.md § A scan)
+    scan_summ: Vec<Vec<super::scan::Ge>>,
 }
 
 impl<'a> Analyzer<'a> {
@@ -375,7 +393,7 @@ impl<'a> Analyzer<'a> {
             }
             seen
         }).collect();
-        Analyzer { m, machine: *machine, done: vec![None; n], active: vec![false; n], reach, field_writes: field_writes(m) }
+        Analyzer { m, machine: *machine, done: vec![None; n], active: vec![false; n], reach, field_writes: field_writes(m), scan_summ: super::scan::summaries(m) }
     }
     /// Two distinct functions that call each other, however indirectly: a cost of either is a
     /// system of recurrences, and neither can stand as a named term in the other.
@@ -595,6 +613,8 @@ struct Fa<'a, 'b, 'c> {
     /// for each open loop, the arrays its body writes: a read of one of them is a different value
     /// every iteration, and not a size
     loop_writes: Vec<Vec<LocalId>>,
+    /// the scans this function's loops are bounded by, as notes (docs/cost-model.md § A scan)
+    scans: std::cell::RefCell<Vec<String>>,
 }
 
 impl<'a, 'b, 'c> Fa<'a, 'b, 'c> {
@@ -604,7 +624,7 @@ impl<'a, 'b, 'c> Fa<'a, 'b, 'c> {
             local_size: HashMap::new(), local_affine: HashMap::new(), initial: HashMap::new(), at_entry: false,
             loops: vec![], work: Cost::zero(), moves: Cost::zero(), span: Cost::zero(), saved: vec![], branch: vec![], next_if: 0,
             local_root: HashMap::new(), resident: vec![], call_moves: Cost::zero(), saved_calls: vec![], replay: false, has_call: vec![], rests_on: vec![],
-            reads: Default::default(), loop_writes: vec![],
+            reads: Default::default(), loop_writes: vec![], scans: Default::default(),
         };
         for (i, &p) in f.params.iter().enumerate() {
             let l = &f.locals[p];
@@ -721,6 +741,12 @@ impl<'a, 'b, 'c> Fa<'a, 'b, 'c> {
             if let CostResult::Exact { work, moves, .. } = &result {
                 if work.has_loose_read() || moves.has_loose_read() { tier = "bound"; }
             }
+        }
+        // so does a loop bounded by a scan, here or in a callee (§ A scan)
+        let scans = self.scans.take();
+        if matches!(result, CostResult::Exact { .. }) {
+            if tier == "exact" && (!scans.is_empty() || self.rests_on.iter().any(|r| r.ends_with(SCAN_TAG))) { tier = "bound"; }
+            for n in scans { if !self.notes.contains(&n) { self.notes.push(n); } }
         }
         // `#[cost(...)]`: the inferred cost must stay within the declaration. Without `sizes`,
         // by asymptotic dominance in every regime; with `sizes`, as numbers at those bounds and
@@ -2182,6 +2208,72 @@ impl<'a, 'b, 'c> Fa<'a, 'b, 'c> {
         Ok(Poly::atom(Atom::Read(Box::new(Read { id: 0, root: root_ref, index: None, field: fname, least: false, walk: true }))))
     }
 
+    /// `while i < e` bounded as a scan (docs/cost-model.md § A scan): `i` grows by at least `d`
+    /// along every path through the body, from at least `i₀`, so the loop runs at most
+    /// `(e − i₀)/d` times. `Err(None)`: the rule does not apply and the caller's own reason
+    /// stands; `Err(Some(why))`: it applies as far as `why`. `step` is the constant step when there
+    /// is one and only the entry value was missing.
+    fn scan_trip(&self, cond: &Expr, var: LocalId, bound: &Expr, op: &BinOp, body: &Block, step: Option<i128>) -> Result<(Poly, Option<(LocalId, Poly, i128)>), Option<String>> {
+        use super::scan::{least_growth, only_increased, Base};
+        if !matches!(op, BinOp::Lt | BinOp::Le) || !matches!(&cond.kind, ExprKind::Binary(_, l, _) if matches!(l.kind, ExprKind::Local(v) if v == var)) { return Err(None); }
+        let name = self.f.locals[var].name.clone();
+        let d = match step {
+            Some(c) if c >= 1 => Rat::int(c),
+            Some(_) => return Err(None),
+            None => match least_growth(self.f, &self.an.scan_summ, body, var) {
+                Some(Some(d)) if d >= Rat::one() => d,
+                Some(Some(_)) => return Err(Some(format!("`{name}` does not grow on every path through the body, so this is not a scan"))),
+                Some(None) => Rat::one(),
+                None => return Err(None),
+            },
+        };
+        let mut w = Writes::default();
+        w.block(body);
+        if w.locals.iter().any(|&l| l != var && bound_mentions(bound, l)) { return Err(None); }
+        let Some(e) = self.size_of(bound, Dir::Upper) else { return Err(None) };
+        // at least `i₀` on entry: its one entry value, else what it was first bound to when
+        // nothing ever makes it smaller
+        let i0 = match self.initial.get(&var) {
+            Some(Some(vs)) if vs.len() == 1 => vs[0].clone(),
+            _ => {
+                let Some(lbs) = only_increased(self.f, &self.an.scan_summ, var) else {
+                    return Err(Some(format!("`{name}`'s entry value is not known and `{name}` is not only increased")));
+                };
+                let as_poly = |(b, c): &(Base, Rat)| -> Option<Poly> {
+                    let base = match b {
+                        Base::Zero => Poly::zero(),
+                        Base::Param(p) => self.local_affine.get(&self.f.params[*p]).filter(|a| a.is_const())?.konst.clone(),
+                        Base::Cur => return None,
+                    };
+                    Some(base.add(&Poly::from_rat(*c)))
+                };
+                match lbs.iter().find_map(as_poly) {
+                    Some(p) => p,
+                    None => return Err(Some(format!("`{name}`'s entry value is not known and nothing bounds it below"))),
+                }
+            }
+        };
+        let span = e.sub(&i0);
+        let span = if matches!(op, BinOp::Le) { span.add(&Poly::from_rat(d)) } else { span };
+        let trip = span.scale(Rat::new(d.d, d.n));
+        self.scans.borrow_mut().push(format!("scan: `{name}` grows by at least {} a lap, so the `while` at line {} runs at most {} times",
+            d.to_f64(), cond.line, trip.display(&self.names)));
+        Ok((trip, None))
+    }
+
+    /// The least an `i64` argument can be, as a size (§ A scan).
+    fn least_of(&self, a: &Expr) -> Option<Poly> {
+        use super::scan::{least, Base};
+        least(self.f, &self.an.scan_summ, a).iter().find_map(|(b, d)| {
+            let base = match b {
+                Base::Zero => Poly::zero(),
+                Base::Param(p) => self.local_affine.get(&self.f.params[*p]).filter(|a| a.is_const())?.konst.clone(),
+                Base::Cur => return None,
+            };
+            Some(base.add(&Poly::from_rat(*d)))
+        })
+    }
+
     fn induction_trip(&self, cond: &Expr, body: &Block) -> Result<(Poly, Option<(LocalId, Poly, i128)>), String> {
         let ask = "`while` has no measure the compiler can find; write `while cond decreasing <expr>` with an `i64` that goes down by at least one every iteration".to_string();
         // `a && b` stops no later than either: the first conjunct with a trip bounds the loop, as
@@ -2212,7 +2304,10 @@ impl<'a, 'b, 'c> Fa<'a, 'b, 'c> {
                 Err(None) => {}
             }
         }
-        let Some(step) = single_step(body, var) else { return Err(format!("`{name}` is compared in the `while` condition but is not stepped by a constant exactly once in the body; {ask}")) };
+        let Some(step) = single_step(body, var) else {
+            let not_stepped = format!("`{name}` is compared in the `while` condition but is not stepped by a constant exactly once in the body; {ask}");
+            return self.scan_trip(cond, var, bound, op, body, None).map_err(|why| why.unwrap_or(not_stepped));
+        };
         if (asc && step <= 0) || (!asc && step >= 0) { return Err(format!("`{name}` steps away from its bound; {ask}")); }
         let mut w = Writes::default();
         w.block(body);
@@ -2221,7 +2316,11 @@ impl<'a, 'b, 'c> Fa<'a, 'b, 'c> {
         let i0 = match self.initial.get(&var) {
             Some(Some(vs)) if vs.len() == 1 => vs[0].clone(),
             Some(Some(vs)) => return Err(format!("`{name}` may hold any of {} values on entry, one per path that defines it; a single value is needed until `max` is in the cost algebra", vs.len())),
-            _ => return Err(format!("`{name}` is assigned inside a loop before this one, so its entry value is not known")),
+            _ => {
+                let unknown_entry = format!("`{name}` is assigned inside a loop before this one, so its entry value is not known");
+                if !asc { return Err(unknown_entry); }
+                return self.scan_trip(cond, var, bound, op, body, Some(step as i128)).map_err(|why| why.unwrap_or(unknown_entry));
+            }
         };
         let span = if asc { e.sub(&i0) } else { i0.sub(&e) };
         // `<=` and `>=` run the bound itself too: `i >= 0` from `n − 1` is `n` iterations, not `n − 1`
@@ -2407,6 +2506,11 @@ impl<'a, 'b, 'c> Fa<'a, 'b, 'c> {
                         if !self.rests_on.contains(&tag) { self.rests_on.push(tag); }
                     }
                     for r in &callee.rests_on { if !self.rests_on.contains(r) { self.rests_on.push(r.clone()); } }
+                    // a callee bounded by a scan of its own (§ A scan)
+                    if callee.notes.iter().any(|n| n.starts_with("scan: ")) {
+                        let tag = format!("{} {SCAN_TAG}", callee.name);
+                        if !self.rests_on.contains(&tag) { self.rests_on.push(tag); }
+                    }
                 }
                 let mut map: Vec<(usize, Poly)> = Vec::new();
                 let mut roots: Vec<Option<LocalId>> = Vec::new();
@@ -2419,6 +2523,15 @@ impl<'a, 'b, 'c> Fa<'a, 'b, 'c> {
                         }
                     } else { (self.size_of(a, Dir::Upper), None) };
                     roots.push(root);
+                    // an `i64` the call cannot name, where the callee's cost only falls as it grows:
+                        // at its least it is an upper bound (docs/cost-model.md § A scan)
+                        let by = by.or_else(|| {
+                            if cf.locals[p].ty != Ty::I64 || ![&w, &mv, &sp].iter().any(|c| c.mentions(i)) || ![&w, &mv, &sp].iter().all(|c| falls_in(c, i)) { return None; }
+                            let lb = self.least_of(a)?;
+                            self.scans.borrow_mut().push(format!("scan: argument {} to `{}` is taken at its least, {}, and `{}`'s cost falls as it grows",
+                                i + 1, callee.name, lb.display(&self.names), callee.name));
+                            Some(lb)
+                        });
                     match by {
                         Some(b) => map.push((i, b)),
                         None => unnamed.push((i, a.line)),
