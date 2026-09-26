@@ -1,0 +1,7 @@
+use "left.nt";
+use "right.nt";
+
+fn main() {
+    println(left(10));
+    println(right(10));
+}

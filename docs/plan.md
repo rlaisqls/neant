@@ -629,6 +629,17 @@ decided (`moves/BW` taken as a `max` with `work/P`), so the prediction reaches t
 and arrays by value, without which a domain corpus (stage C's control loops and kernels) cannot be
 written; and the editor surface the README describes, which does not exist.
 
+**Modules, 2026-09-26** (docs/modules-design.md). A program can span files in seed one: a top-level
+`use "path.nt";` resolved from the naming file's directory, each file loaded once, a cycle
+rejected with its chain, one flat namespace with a name defined twice rejected naming both files
+and lines. The files share one line space, numbered through the concatenation, so the checker,
+the cost pass and the emitter are unchanged; the driver maps every line that leaves the compiler
+back to `path:N`, including the emitted bounds check. A single-file program takes the old path
+and no golden moved; eight new cases in `tests/golden/modules/`. The lockfile is one per program
+and keyed by name, so it does not say which file a function is in. Left: the self-hosted side
+(the loader in `compiler/*.nt` and `build.sh`'s `cat` replaced by a root file that `use`s the
+others), and a file index in positions so that no text is rewritten.
+
 ## M7 — the constant factor
 
 Prove the asymptote, search the constant. A micro-architectural cost line (what llvm-mca and uiCA
@@ -664,6 +675,7 @@ the choice is reopened with the number in hand.
 bootstrap/              everything that builds the compiler from nothing
   Cargo.toml, src/      the Rust compiler. Seed one. Frozen after self-hosting, never deleted.
     lex.rs  parse.rs  ast.rs  types.rs  ir.rs  emit_c.rs  main.rs
+    modules.rs          `use "file.nt"`: loads a program's files into one line space, maps lines back
     cost/
       size.rs           symbolic sizes and costs: rational polynomials over atoms, B and M
       piece.rs          piecewise costs: conditions, max, feasibility
@@ -679,6 +691,7 @@ bootstrap/              everything that builds the compiler from nothing
 compiler/               the compiler in neant. Empty until self-hosting.
 tests/
   golden/               .nt programs with expected output (.out, .exit), rejection (.err), cost report (.cost)
+    modules/            multi-file programs, one directory each, rooted at main.nt
   kernels/              the M1/M2 experiments: kernel templates and sweep.py, the perf harness; iolb.sh runs IOLB in docker
 docs/
   plan.md               this file

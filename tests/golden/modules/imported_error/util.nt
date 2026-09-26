@@ -1,0 +1,5 @@
+// the error is on line 5 of this file, which is line 10 of the concatenation
+
+fn ok(a: i64) -> i64 { a }
+
+fn inc(a: i64) -> i64 { ok(a, 1) }

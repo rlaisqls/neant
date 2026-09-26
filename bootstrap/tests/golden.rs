@@ -77,3 +77,64 @@ fn golden() {
         panic!("{} of {} golden programs failed:\n\n{}", failures.len(), files.len(), failures.join("\n"));
     }
 }
+
+/// `tests/golden/modules/<case>/`: a program over several files (docs/modules-design.md), rooted
+/// at `main.nt` and run from the case's own directory so paths print as a reader writes them.
+/// `main.err`, `.out`, `.exit`, `.cost` as above; `main.stderr` must appear in a run's stderr, and
+/// a `costs.lock` must be up to date under `neant lock --check`.
+#[test]
+fn modules() {
+    let mut cases: Vec<PathBuf> = std::fs::read_dir(golden_dir().join("modules"))
+        .unwrap()
+        .filter_map(|e| e.ok().map(|e| e.path()))
+        .filter(|p| p.join("main.nt").exists())
+        .collect();
+    cases.sort();
+    assert!(!cases.is_empty(), "no multi-file programs found");
+
+    let run = |dir: &Path, args: &[&str]| Command::new(neant()).args(args).current_dir(dir).output().unwrap();
+    let mut failures = Vec::new();
+    for dir in &cases {
+        let name = dir.file_name().unwrap().to_string_lossy().to_string();
+        let read = |f: &str| std::fs::read_to_string(dir.join(f)).ok();
+        if let Some(want) = read("main.err") {
+            let want = want.trim();
+            let out = run(dir, &["check", "main.nt"]);
+            let stderr = String::from_utf8_lossy(&out.stderr);
+            if out.status.success() {
+                failures.push(format!("{name}: expected rejection containing `{want}`, but it was accepted"));
+            } else if !stderr.contains(want) {
+                failures.push(format!("{name}: expected error containing `{want}`, got:\n{stderr}"));
+            }
+            continue;
+        }
+        if let Some(want) = read("main.cost") {
+            let got = String::from_utf8_lossy(&run(dir, &["cost", "main.nt"]).stdout).to_string();
+            if got != want {
+                failures.push(format!("{name}: cost report differs\n--- got ---\n{got}--- want ---\n{want}"));
+            }
+        }
+        if dir.join("costs.lock").exists() {
+            let out = run(dir, &["lock", "--check", "main.nt"]);
+            if !out.status.success() {
+                failures.push(format!("{name}: costs.lock is stale:\n{}", String::from_utf8_lossy(&out.stdout)));
+            }
+        }
+        let want_out = read("main.out").unwrap_or_default();
+        let want_exit: i32 = read("main.exit").and_then(|s| s.trim().parse().ok()).unwrap_or(0);
+        let out = run(dir, &["run", "main.nt"]);
+        let stdout = String::from_utf8_lossy(&out.stdout).to_string();
+        let stderr = String::from_utf8_lossy(&out.stderr).to_string();
+        let code = out.status.code().unwrap_or(-1);
+        let want_err = read("main.stderr").map(|s| s.trim().to_string());
+        if stdout != want_out || code != want_exit || want_err.as_ref().is_some_and(|w| !stderr.contains(w.as_str())) {
+            failures.push(format!(
+                "{name}: exit {code} (want {want_exit})\n--- stdout ---\n{stdout}--- want ---\n{want_out}--- stderr ---\n{stderr}--- want in stderr ---\n{}\n",
+                want_err.unwrap_or_default()
+            ));
+        }
+    }
+    if !failures.is_empty() {
+        panic!("{} of {} multi-file programs failed:\n\n{}", failures.len(), cases.len(), failures.join("\n"));
+    }
+}

@@ -20,6 +20,7 @@ mod diag;
 mod emit_c;
 mod ir;
 mod lex;
+mod modules;
 mod parse;
 mod types;
 
@@ -101,12 +102,17 @@ fn main() {
         }
         return;
     }
-    let mut module = match compile(&src) {
+    // the root and every file it `use`s, in one line space (docs/modules-design.md)
+    let (prog, sources) = match modules::load(&file, &src) {
+        Ok(p) => p,
+        Err(e) => { eprintln!("{e}"); process::exit(1); }
+    };
+    let mut module = match types::check(&prog) {
         Ok(m) => m,
-        Err(e) => { eprintln!("{}:{e}", file.display()); process::exit(1); }
+        Err(e) => { eprintln!("{}", sources.error(&e)); process::exit(1); }
     };
     if let Err(e) = cost::analyze::apply_rewrites(&mut module, &applies, &machine) {
-        eprintln!("{e}");
+        eprintln!("{}", sources.relabel(&e));
         process::exit(1);
     }
     // the layout of every struct array, chosen before anything is costed or emitted
@@ -117,7 +123,7 @@ fn main() {
         let costs = cost::analyze(&module, &machine);
         let bad: Vec<&String> = costs.iter().flat_map(|c| c.violations.iter()).collect();
         if !bad.is_empty() {
-            for v in bad { eprintln!("{}:{v}", file.display()); }
+            for v in bad { eprintln!("{}", sources.violation(v)); }
             process::exit(1);
         }
     }
@@ -128,7 +134,7 @@ fn main() {
             let mut costs = cost::analyze(&module, &machine);
             if use_iolb { iolb_bounds(&module, &mut costs, &machine); }
             for c in &costs {
-                print!("{}", cost::lock::report(c, &machine));
+                print!("{}", sources.relabel(&cost::lock::report(c, &machine)));
                 if let (Some(ev), cost::CostResult::Exact { work, moves, span }) = (&eval, &c.result) {
                     if let Some((w, m)) = evaluate(c, work, moves, ev, &machine) {
                         print!("{:<16}   at {ev}: work {w:.0}  moves {m:.0} bytes", "");
@@ -149,7 +155,7 @@ fn main() {
             let costs = cost::analyze(&module, &machine);
             let path = file.parent().unwrap_or(Path::new(".")).join("costs.lock");
             let existing = std::fs::read_to_string(&path).unwrap_or_default();
-            let rendered = cost::lock::render_with(&file.file_name().unwrap().to_string_lossy(), &costs, &existing, &layouts);
+            let rendered = sources.relabel(&cost::lock::render_with(&file.file_name().unwrap().to_string_lossy(), &costs, &existing, &layouts));
             if lock_check {
                 let old = std::fs::read_to_string(&path).unwrap_or_default();
                 let d = cost::lock::diff(&old, &rendered);
@@ -171,18 +177,18 @@ fn main() {
                 let Some(f) = module.funcs.iter().find(|f| f.name == *name) else { eprintln!("no function `{name}`"); process::exit(2); };
                 match cost::scop::export(&module, f) {
                     Ok((c, assumptions)) => { print!("{c}"); for a in assumptions { eprintln!("assumes {a}"); } }
-                    Err(e) => { eprintln!("{}: `{name}` is not a SCoP: {e}", file.display()); process::exit(1); }
+                    Err(e) => { eprintln!("{}: `{name}` is not a SCoP: {}", file.display(), sources.relabel(&e.to_string())); process::exit(1); }
                 }
             }
-            None => print!("{}", emit_c::emit(&module, &opts)),
+            None => print!("{}", sources.patch_c(&emit_c::emit(&module, &opts))),
         },
         "build" => {
             let out = out.unwrap_or_else(|| file.with_extension(""));
-            let c = emit_c::emit(&module, &opts);
+            let c = sources.patch_c(&emit_c::emit(&module, &opts));
             if let Err(e) = cc(&c, &out, &file) { eprintln!("{e}"); process::exit(1); }
         }
         "run" => {
-            let c = emit_c::emit(&module, &opts);
+            let c = sources.patch_c(&emit_c::emit(&module, &opts));
             let dir = std::env::temp_dir().join(format!("neant-{}", process::id()));
             let _ = std::fs::create_dir_all(&dir);
             let bin = dir.join("a.out");
@@ -206,7 +212,7 @@ fn main() {
             }
             let costs = cost::analyze(&module, &machine);
             let fc = &costs[fid];
-            println!("{}", cost::lock::line(fc));
+            println!("{}", sources.relabel(&cost::lock::line(fc)));
             let declared = fc.declared.work.is_some() && fc.declared.moves.is_some();
             // a declaration is confirmed per call: repeat enough for process noise to divide away
             let m_repeat = if declared && m_repeat == 1 { 10000 } else { m_repeat };
@@ -460,12 +466,6 @@ fn lex_kind_number(t: &lex::Tok) -> i32 {
         Amp => 51, AmpAmp => 52, Pipe => 53, PipePipe => 54, Bang => 55, Hash => 56,
         Eof => 57,
     }
-}
-
-fn compile(src: &str) -> diag::Result<ir::Module> {
-    let toks = lex::lex(src)?;
-    let prog = parse::parse(toks)?;
-    types::check(&prog)
 }
 
 fn cc(c: &str, out: &Path, src: &Path) -> Result<(), String> {

@@ -1,0 +1,6 @@
+use "geometry.nt";
+
+fn main() {
+    let p = Point { x: 3, y: 4 };
+    println(dot(p, p));
+}
