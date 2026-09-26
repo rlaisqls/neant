@@ -224,11 +224,11 @@ fn main() {
             // the driver's own setup and loop are measured without the call and subtracted
             let head = if declared { "declared work / moves, per call" } else { "predicted work / moves" };
             println!("  {:>10} {:>16} {:>16}   {head}", "n", "instructions", "L2 bytes");
-            let run_perf = |bin: &Path| -> (u64, u64) {
+            let run_perf = |bin: &Path, args: &[String]| -> (u64, u64) {
                 let mut best: Option<(u64, u64)> = None;
                 for _ in 0..3 {
                     let mut cmd = if let Some(cpu) = m_cpu { let mut c = Command::new("taskset"); c.arg("-c").arg(cpu.to_string()).arg("perf"); c } else { Command::new("perf") };
-                    let out = cmd.args(["stat", "-x,", "-e", "instructions,l2d_cache_refill"]).arg(bin).output();
+                    let out = cmd.args(["stat", "-x,", "-e", "instructions,l2d_cache_refill"]).arg(bin).args(args).output();
                     let Ok(out) = out else { eprintln!("could not run perf"); process::exit(1) };
                     let err = String::from_utf8_lossy(&out.stderr);
                     let (Some(ins), Some(ref_)) = (cost::measure::perf_count(&err, "instructions"), cost::measure::perf_count(&err, "l2d_cache_refill")) else {
@@ -239,13 +239,23 @@ fn main() {
                 best.unwrap()
             };
             for &n in &m_sizes {
-                let drv = cost::measure::driver(&module, fid, n, m_repeat, &shapes);
-                let base = cost::measure::baseline(&module, fid, n, m_repeat, &shapes);
+                // an input builtin is measured on a real input of `n` bytes (src/input.rs `probe`)
+                let probed = if input::is_builtin(f) {
+                    match (input::probe(&name, n, m_repeat, true, &dir), input::probe(&name, n, m_repeat, false, &dir)) {
+                        (Ok(p), Ok(b)) => Some((p, b)),
+                        (Err(e), _) | (_, Err(e)) => { eprintln!("{e}"); process::exit(1) }
+                    }
+                } else { None };
+                let (drv, base) = match &probed {
+                    Some((p, b)) => (p.module.clone(), b.module.clone()),
+                    None => (cost::measure::driver(&module, fid, n, m_repeat, &shapes), cost::measure::baseline(&module, fid, n, m_repeat, &shapes)),
+                };
+                let run_args: Vec<String> = probed.as_ref().map_or(vec![], |(p, _)| p.args.clone());
                 let bin = dir.join(format!("m{n}")); let bbin = dir.join(format!("b{n}"));
                 if let Err(e) = cc(&emit_c::emit(&drv, &emit_c::Options { checked: false }), &bin, &file) { eprintln!("{e}"); process::exit(1); }
                 if let Err(e) = cc(&emit_c::emit(&base, &emit_c::Options { checked: false }), &bbin, &file) { eprintln!("{e}"); process::exit(1); }
-                let (ins, ref_) = run_perf(&bin);
-                let (bins, bref) = run_perf(&bbin);
+                let (ins, ref_) = run_perf(&bin, &run_args);
+                let (bins, bref) = run_perf(&bbin, &run_args);
                 let ins = ins.saturating_sub(bins); let ref_ = ref_.saturating_sub(bref);
                 let bytes = ref_ * machine.b_bytes as u64;
                 let ev: Vec<String> = f.params.iter().zip(&shapes).map(|(&p, s)| {
@@ -253,6 +263,7 @@ fn main() {
                     let nm = if l.ty.is_arrayish() { format!("{}.len()", l.name) } else { l.name.clone() };
                     format!("{nm}={}", s.at(n))
                 }).collect();
+                let ev: Vec<String> = match &probed { Some((p, _)) => vec![p.ev.clone()], None => ev };
                 let pred = if declared {
                     let (w, mv) = (cost::Cost::poly(fc.declared.work.clone().unwrap()), cost::Cost::poly(fc.declared.moves.clone().unwrap()));
                     match evaluate(fc, &w, &mv, &ev.join(","), &machine) {
@@ -264,7 +275,8 @@ fn main() {
                             if !ok { confirmed = false; }
                             format!("{w:.0} / {m:.0}   measured {pw:.1} / {pm:.1} per call   {}", if ok { "✓" } else { "✗ exceeds" })
                         }
-                        None => String::new(),
+                        // a declaration the sweep cannot evaluate is not confirmed by it
+                        None => { confirmed = false; "the declaration cannot be evaluated at these sizes".to_string() }
                     }
                 } else {
                     match &fc.result {

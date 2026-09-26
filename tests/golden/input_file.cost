@@ -1,7 +1,7 @@
 lines            work 6·xs.len()                   moves xs.len() + B                 exact
                  footprint        xs: [0, xs.len())   resident after if xs.len() < M
-main             work 7·data.len() + 3·path.len() + 13 moves 2·data.len() + 3·path.len() + 2·B exact, io
+main             work 7·data.len() + 3·path.len() + 5013 moves 2·data.len() + 3·path.len() + 2·B exact, io
                  rests on         arg (declared, extern); file_size (declared, extern); read_file (declared, extern)
 arg              work ≤ result.len()               moves ≤ result.len()               declared, io
-read_file        work ≤ result.len() + path.len()  moves ≤ result.len() + path.len()  declared, io
-file_size        work ≤ path.len()                 moves ≤ path.len()                 declared, io
+read_file        work ≤ result.len() + path.len() + 2500 moves ≤ result.len() + path.len()  declared, io
+file_size        work ≤ path.len() + 2500          moves ≤ path.len()                 declared, io

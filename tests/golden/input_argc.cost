@@ -1,0 +1,5 @@
+count_twice      work 3·arg_count() + 12           moves 0                            exact, io
+                 rests on         arg_count (declared, extern)
+main             work 6·arg_count() + 28           moves 0                            exact, io
+                 rests on         arg_count (declared, extern)
+arg_count        work ≤ 10                         moves ≤ 0                          declared, io

@@ -64,14 +64,12 @@ in a fresh array once; the path is read once, the same way. The four are `declar
 caller's line says what it rests on: `rests on arg (declared, extern); read_file (declared,
 extern)`. The declaration is not confirmed by `neant measure` yet.
 
-**What is left.** A call that reads input inside a loop makes the caller unknown ("what it reads
-is a size of its own at every iteration"): each lap's input has a length of its own, and one atom
-for all of them would be a claim the calculus cannot check. So `for k in 0..2 { let a = arg(k); … }` is
-unknown, where the honest answer is a sum over `k`, or a bound by the largest; and `0..arg_count()`
-is unknown before that, because a count returned by a call is not a size (it could be an atom of
-its own the same way, and is not yet).
-The self-hosted compiler does not have the builtins; `neant parsedump` puts a program that calls
-one outside its slice, so the self-hosting comparisons skip it. And a path is at most 4095 bytes.
+**What is left.** Input inside a loop and the measured declarations were taken up on
+2026-09-26 (cost-model.md § Program input): `arg_count()` is an exact atom, `arg(k)` per lap a
+bound in `max(arg[_].len())`, a file per lap still unknown, and the four declarations are confirmed
+by `neant measure` after gaining the constants it found. The self-hosted compiler does not have
+the builtins; `neant parsedump` puts a program that calls one outside its slice, so the
+self-hosting comparisons skip it. A path is at most 4095 bytes.
 
 ## 8 — a block-like expression in statement position ends at its block
 

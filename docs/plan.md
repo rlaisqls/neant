@@ -652,6 +652,19 @@ program and are tested as such (`.args` files in `tests/golden`). What is left: 
 a loop makes the caller unknown rather than a sum over the laps; the declarations are not yet
 confirmed by `neant measure`; the self-hosted compiler has none of it. Arrays by value remain.
 
+**Input in loops, and the input declarations measured, 2026-09-26** (cost-model.md § Program
+input). `arg_count()` is one atom for the run, so `for k in 0..arg_count()` is exact
+(`input_argc`); `arg(k)` read per lap is at most the longest argument, `max(arg[_].len())`, and
+the line is a bound (`input_perlap`); `read_file` per lap stays unknown and says why
+(`input_perlap_file`). `neant measure` now takes the four builtins, on a real argument or file of
+`n` bytes: `arg` was confirmed as declared, and the other three were exceeded by a constant their
+declarations lacked — 12.5 instructions for a call to `arg_count`, about 2000 for opening a file.
+With `10` and `+ 2500` added all four are confirmed; that changes the constant term of
+`input_args.cost`, `input_file.cost` and `modules/input/main.cost` and nothing else in them. A
+declaration the sweep cannot evaluate is no longer reported as confirmed. What is left: a function
+that returns an argument, called per lap, is unknown, because a result's atom does not carry where
+it came from; the kernel's side of a read is not in the counter.
+
 ## M7 — the constant factor
 
 Prove the asymptote, search the constant. A micro-architectural cost line (what llvm-mca and uiCA

@@ -1,0 +1,14 @@
+// An argument read per lap: `arg(k)` inside a loop has a length of its own every iteration, an atom
+// that does not survive the lap, so it is at most the longest argument, `max(arg[_].len())`, and
+// the line is a bound — as `max(xs[_])` is for a size read from memory with no element.
+
+fn main() {
+    let mut total = 0;
+    for k in 0..arg_count() {
+        let a = arg(k);
+        for i in 0..a.len() {
+            total += a[i] as i64;
+        }
+    }
+    println(total);
+}
