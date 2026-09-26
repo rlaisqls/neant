@@ -1,4 +1,5 @@
-// an array of a struct that holds an array field is not supported yet
+// an array of a struct that holds an array field is AoS only: `#[layout(soa)]` is rejected
+#[layout(soa)]
 struct State { x: [f64; 2] }
 fn main() {
     let ss = [State { x: [0.0; 2] }; 4];

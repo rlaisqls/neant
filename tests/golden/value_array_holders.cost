@@ -1,0 +1,11 @@
+struct Body      layout AoS  AoS only: it holds an array field
+total_mass       work 4·bs.len()                   moves 32·bs.len() + B              exact
+                 lower bound      moves 8·bs.len()                   (footprint, every distinct element crosses once)   gap 4× at M = 2 MiB, B = 64
+                 footprint        bs: [0, 32·bs.len() − 24)   resident after if ≈ 32·bs.len() < M
+drift            work 23·bs.len()                  moves 32·bs.len() + B              exact
+                 lower bound      moves 32·bs.len()                  (footprint, every distinct element crosses once)   gap 1× at M = 2 MiB, B = 64
+                 footprint        bs: [0, 32·bs.len())   resident after if 32·bs.len() < M
+height           work 5·bs.len()                   moves 32·bs.len() + B              exact
+                 lower bound      moves 24·bs.len()                  (footprint, every distinct element crosses once)   gap 1× at M = 2 MiB, B = 64
+                 footprint        bs: [0, 32·bs.len() − 8)   resident after if ≈ 32·bs.len() < M
+main             work 195                          moves 7·B + 328                    exact, io

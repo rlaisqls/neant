@@ -93,6 +93,7 @@ pub fn layout_report(choices: &[super::analyze::LayoutChoice]) -> String {
     for c in choices {
         let l = match c.layout { Layout::Aos => "AoS", Layout::Soa => "SoA" };
         let how = if c.fixed { "  fixed by #[layout]".to_string() }
+            else if let Some(w) = c.why { format!("  {w}") }
             else if c.decided_by.is_empty() { "  the model does not decide: no function's moves differ".to_string() }
             else {
                 let other = match c.layout { Layout::Aos => "SoA", Layout::Soa => "AoS" };

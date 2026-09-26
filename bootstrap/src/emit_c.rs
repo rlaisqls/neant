@@ -436,6 +436,17 @@ static void nt_println_f64(double v) {
                             self.line(&format!("{nm}_p[nt_idx({i}, {nm}_n, {line})].{f} {opstr}= {v};"));
                         }
                     }
+                    // an array of holders is AoS only (docs/arrays-by-value-design.md §9)
+                    LValue::IndexFieldIndex(id, idx, fi, j, line) => {
+                        let nm = self.local_name(*id);
+                        let ty = self.f.unwrap().locals[*id].ty.clone();
+                        let el = ty.elem().unwrap().clone();
+                        let n = self.field_len(&el, *fi);
+                        let f = self.field_name(el, *fi);
+                        let i = self.expr(idx).scalar();
+                        let jv = self.expr(j).scalar();
+                        self.line(&format!("{nm}_p[nt_idx({i}, {nm}_n, {line})].{f}[nt_idx({jv}, {n}, {line})] {opstr}= {v};"));
+                    }
                 }
             }
             Stmt::For { var, start, end, body } => {

@@ -34,6 +34,10 @@ pub fn check(prog: &ast::Program) -> Result<Module> {
         }
         if fields.is_empty() { return err(sd.line, sd.col, format!("struct `{}` has no fields", sd.name)); }
         let (layout, fixed) = match sd.layout.as_deref() { Some("soa") => (Layout::Soa, true), Some(_) => (Layout::Aos, true), None => (Layout::Aos, false) };
+        // an array of a struct that holds an array field is laid out AoS only (§9)
+        if layout == Layout::Soa && fields.iter().any(|(_, t)| matches!(t, Ty::Array(..))) {
+            return err(sd.line, sd.col, format!("`{}` holds an array field, and an array of it is laid out AoS only; drop `#[layout(soa)]`", sd.name));
+        }
         struct_ids.insert(sd.name.clone(), structs.len());
         structs.push(StructDef { name: sd.name.clone(), fields, layout, fixed });
     }
@@ -85,26 +89,7 @@ pub fn check(prog: &ast::Program) -> Result<Module> {
     for f in &prog.funcs {
         funcs.push(check_func(f, &sigs, &structs, &struct_ids)?);
     }
-    holders_not_in_arrays(&prog.funcs, &funcs, &structs)?;
     Ok(Module { funcs, structs })
-}
-
-/// A struct with an array field is a value, never an element: an array or view of one would be
-/// a third layout (docs/arrays-by-value-design.md §2). Checked over every local once the bodies
-/// are typed, where every array's element type is known.
-fn holders_not_in_arrays(afs: &[ast::Func], funcs: &[Func], structs: &[StructDef]) -> Result<()> {
-    for (af, f) in afs.iter().zip(funcs) {
-        for l in &f.locals {
-            if let Some(Ty::Struct(sid)) = l.ty.elem() {
-                if structs[*sid].array_part().0 > 0 {
-                    return err(af.line, af.col, format!(
-                        "`{}` in `{}` is an array of `{}`, which holds an array field; such a struct is a value, and arrays of it are not supported yet",
-                        l.name, af.name, structs[*sid].name));
-                }
-            }
-        }
-    }
-    Ok(())
 }
 
 /// Only the size-free part of a type expression; sizes are attached by the checker where a
@@ -566,6 +551,27 @@ impl<'a> Ctx<'a> {
                         let ci = self.expr(idx)?;
                         if ci.ty != Ty::I64 { return err(idx.line, idx.col, format!("index must be `i64`, found `{}`", ci.ty)); }
                         (LValue::FieldIndex(id, ci, fi, target.line), elem)
+                    }
+                    // `xs[i].f[j] = e`, `xs` an array of holders (docs/arrays-by-value-design.md §9)
+                    ast::ExprKind::Index(base, jdx) if matches!(&base.kind, ast::ExprKind::Field(inner, _) if matches!(inner.kind, ast::ExprKind::Index(..))) => {
+                        let ast::ExprKind::Field(inner, fname) = &base.kind else { unreachable!() };
+                        let ast::ExprKind::Index(arr, idx) = &inner.kind else { unreachable!() };
+                        let id = self.local_by_expr(arr, "the array being indexed")?;
+                        let ci = self.expr(idx)?;
+                        if ci.ty != Ty::I64 { return err(idx.line, idx.col, format!("index must be `i64`, found `{}`", ci.ty)); }
+                        let l = &self.locals[id];
+                        let elem = match &l.ty {
+                            Ty::Array(e, _) => { if !l.mutable { return err(target.line, target.col, format!("`{}` is not mutable; declare it with `let mut`", l.name)); } (**e).clone() }
+                            Ty::Slice(e, true, _) => (**e).clone(),
+                            Ty::Slice(_, false, _) => return err(target.line, target.col, format!("`{}` is a `&[T]` view; writing needs `&mut [T]`", l.name)),
+                            t => return err(target.line, target.col, format!("cannot index a value of type `{t}`")),
+                        };
+                        let Ty::Struct(sid) = elem else { return err(target.line, target.col, format!("elements of `{}` are not structs; there is no field `{fname}`", l.name)) };
+                        let Some(fi) = self.structs[sid].field(fname) else { return err(target.line, target.col, format!("`{}` has no field `{fname}`", self.structs[sid].name)) };
+                        let Ty::Array(fel, _) = self.structs[sid].fields[fi].1.clone() else { return err(target.line, target.col, format!("`{fname}` is not an array field; write `xs[i].{fname} = …`")) };
+                        let cj = self.expr(jdx)?;
+                        if cj.ty != Ty::I64 { return err(jdx.line, jdx.col, format!("index must be `i64`, found `{}`", cj.ty)); }
+                        (LValue::IndexFieldIndex(id, ci, fi, cj, target.line), *fel)
                     }
                     ast::ExprKind::Index(base, idx) => {
                         let id = self.local_by_expr(base, "the array being indexed")?;
@@ -1343,6 +1349,7 @@ fn last_uses_lvalue(lv: &LValue, line: u32, reassigns: &[Reassign], into: &mut H
         LValue::Index(id, idx, l) => { mark(*id, *l, into); last_uses_expr(idx, reassigns, into); }
         LValue::Field(id, _) => mark(*id, line, into),
         LValue::IndexField(id, idx, _, l) | LValue::FieldIndex(id, idx, _, l) => { mark(*id, *l, into); last_uses_expr(idx, reassigns, into); }
+        LValue::IndexFieldIndex(id, idx, _, j, l) => { mark(*id, *l, into); last_uses_expr(idx, reassigns, into); last_uses_expr(j, reassigns, into); }
     }
 }
 

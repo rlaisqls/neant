@@ -1,6 +1,6 @@
 # Arrays by value, first slice
 
-**Written 2026-09-26, before the code; § 6 is what was done.** Plan § Stage D names "argv, modules and arrays by value"
+**Written 2026-09-26, before the code; § 6 is what was done, §§ 7–9 are part two.** Plan § Stage D names "argv, modules and arrays by value"
 as what a domain corpus cannot be written without. This says what the phrase has to mean here,
 what the first slice is, and what the calculus charges for it.
 
@@ -99,10 +99,10 @@ the self-hosted parser's slice, so the self-hosting corpus tests skip these gold
 
 ## 5 — Left
 
-Arrays of such structs (the layout question above); a fixed-size local array passed or returned
-by value without a struct around it (`fn f(x: [f64; 3])`), which is the same copy rule on a bare
-array and needs a decision on whether `let b = a` then copies or moves; `==` on arrays and
-structs; nested fixed-size arrays (`[[f64; 3]; 3]`, today written as `[f64; 9]` with `3·i + j`);
+Arrays of such structs (the layout question above; done in § 9); a fixed-size local array passed
+or returned by value without a struct around it (`fn f(x: [f64; 3])`), which is the same copy
+rule on a bare array and needs a decision on whether `let b = a` then copies or moves (§ 7);
+`==` on arrays and structs (§ 8); nested fixed-size arrays (`[[f64; 3]; 3]`, today written as `[f64; 9]` with `3·i + j`);
 the self-hosted compiler (`compiler/check.nt` would take the same field rule, `emit.nt` the same
 C member).
 
@@ -182,3 +182,44 @@ result into one flag with no early exit — so it is a constant, and exact:
 In `value_eq`, `same` on two `[i64; 4]` is work 12, moves 64; `moved` on a `Pose { x: [f64; 3],
 id: i64 }` is work 10, moves 0, and the two struct arguments it is passed are charged as the
 copies §3 says they are, in `main`.
+
+## 9 — Arrays of holders: AoS only
+
+§2 rejected `[State; n]` and `&[State]` for a struct that holds an array field, because the
+layout would be a third case. It is now accepted, and the case is decided: **an array of holders
+is laid out AoS, and only AoS** — each element a C struct with its array inline (`struct nt_Body {
+double p[3]; double m; }`), the array of them one buffer.
+
+The reason is what SoA would have to be. Splitting `p: [f64; 3]` into columns gives either `k`
+columns, one per element index, which `xs[i].p[j]` with a variable `j` cannot name without an
+address computed across columns, or one `k·n` column indexed `j·n + i`, which is a strided walk
+for the loop that reads one element's array whole — the common one (`for d in 0..3 {
+bs[i].p[d] … }`) — and a 2-D access the site rule does not have. Both are new machinery in the
+emitter, the site rule and the chooser, for a layout that pays only when a loop reads one index of
+the array across all elements. AoS needs none of it: the value's array stays contiguous and is
+copied with it, as §3 already charges.
+
+- **What is accepted**: `[S { … }; n]` and `[S { … }, …]`, views `&[S]` and `&mut [S]`, a whole
+  element read (`let b = xs[i]`) or written (`xs[i] = b`), a scalar field (`xs[i].m`), an array
+  field's element read (`xs[i].p[j]`) and written (`xs[i].p[j] = e`, `op=`), and its length
+  (`xs[i].p.len()`, the literal).
+- **What is rejected**: `#[layout(soa)]` on a holder, with this reason (`err_value_array`, which
+  until now held the rejection of the array itself).
+- **The chooser** does not weigh SoA for a holder: it sets AoS and the report says so — `struct
+  Body layout AoS  AoS only: it holds an array field` — when the struct is in some array; a holder
+  that is never in one keeps the line it had, "the model does not decide".
+- **Cost.** `xs[i].p[j]` is one load and a site on field `p` of element `i`, as `xs[i].m` is a site
+  on `m`: it steps by the element and touches the whole field, `k·elem_bytes`, because which of its
+  elements a loop reads is not the site's to know — so `drift`, which reads and writes every
+  element of every `p`, has a footprint of the whole array, `32·bs.len()`, at its lower bound. A
+  whole element read or written is the load or store it was for a scalar struct plus one per array
+  element, `k`, its bytes being the site's.
+
+In `value_array_holders`, `drift` over `n` bodies is exact at `23·n` / `32·n + B`, `total_mass`
+at `4·n` / `32·n + B`; the element copy `bs[3] = bs[2]` and the `==` between elements are in
+`main`'s constant.
+
+**Left after part two:** nested fixed-size arrays (`[[f64; 3]; 3]`); a bare `[T; k]` of structs
+by value, and by-value arrays compared or passed out of an expression rather than a variable; SoA
+for holders, if a program ever wants one index of the array across all elements; the self-hosted
+compiler, which has none of §§ 2–9.

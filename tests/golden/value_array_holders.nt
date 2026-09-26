@@ -1,0 +1,38 @@
+// An array of structs that hold a fixed-size array: laid out AoS, the array inline in each
+// element. `xs[i].p[d]` reads and writes one element of one element's field.
+struct Body { p: [f64; 3], m: f64 }
+
+fn total_mass(bs: &[Body]) -> f64 {
+    let mut s = 0.0;
+    for i in 0..bs.len() { s += bs[i].m; }
+    s
+}
+
+fn drift(bs: &mut [Body], dt: f64) {
+    for i in 0..bs.len() {
+        for d in 0..bs[i].p.len() {
+            bs[i].p[d] += dt * bs[i].m;
+        }
+    }
+}
+
+fn height(bs: &[Body]) -> f64 {
+    let mut h = 0.0;
+    for i in 0..bs.len() { h = max(h, bs[i].p[1]); }
+    h
+}
+
+fn main() {
+    let mut bs = [Body { p: [0.0; 3], m: 1.0 }; 4];
+    bs[1].m = 2.0;
+    bs[2].p[1] = 5.0;
+    let b = bs[2];
+    bs[3] = b;
+    println(bs[3] == bs[2]);
+    println(bs[0] == bs[1]);
+    drift(&mut bs, 0.5);
+    println(total_mass(&bs));
+    println(height(&bs));
+    println(bs[1].p[0]);
+    println(b.p[1]);
+}
