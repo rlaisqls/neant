@@ -56,7 +56,7 @@ def predict(nt, env):
     lines = out.splitlines()
     start = next((i for i, l in enumerate(lines) if l.startswith("main")), None)
     for l in lines[(start or 0) + 1:]:
-        m = re.search(r"at .*?: work (\S+)\s+moves (\S+) bytes\s+time (\S+) s \((\w+)-bound\)", l)
+        m = re.search(r"at .*?: work (\S+)\s+moves (\S+) bytes.*?\s+time (\S+) s \((\w+)-bound\)", l)
         if m: return float(m.group(1)), float(m.group(2)), float(m.group(3)), m.group(4)
         if l and not l.startswith(" "): break
     return None

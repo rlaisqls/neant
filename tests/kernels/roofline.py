@@ -21,6 +21,7 @@ FIT = {
     "sum":    (12_800_000, 20),       # 100 MB, far past L3
     "arena":  (4_194_304, 3),         # 64 MB of nodes in a random cycle: one dependent miss a step
     "transpose": (2000, 5),           # a column walk: every line on a page of its own
+    "logistic": (1_000_000, 20),      # x ← r·x·(1 − x): each lap waits for the last
     # the second level, the cache outside M (L3, 16 MiB): a stream that fits in it, a chase that does
     "sum3":   (800_000, 100),         # 6.4 MB
     "arena3": (524_288, 1),           # 8 MB, one walk: a repeat would find it in L3, which the model does not credit across calls
@@ -120,6 +121,15 @@ def main():
         t = wall(b, a.cpu, a.runs) - base
         lat = (t - (mv - ch) / (bw * 1e9)) / (ch / 64) * 1e9
         print(f"arena n={n} R={r}: moves {mv:.3e}  of them a chase {ch:.3e}  time {t*1e3:.1f} ms  →  L = {lat:.1f} ns a chased line")
+        # serial work: a chain each lap waits on, nothing in memory
+        n, r = FIT["logistic"]
+        nt, b = build((HERE / "logistic.nt.in").read_text(), "logistic", n, r, work)
+        out = run([str(NEANT), "cost", str(nt), "--eval", "B=64"]).stdout
+        ser = float(re.search(r"serial (\S+)", out.split("\nmain")[1]).group(1))
+        w, _, _, _ = predict(nt)
+        t = wall(b, a.cpu, a.runs) - base
+        taus = (t - (w - ser) * tau * 1e-9) / ser * 1e9
+        print(f"logistic n={n} R={r}: serial {ser:.3e} of work {w:.3e}  time {t*1e3:.1f} ms  →  τs = {taus:.4f} ns a unit of serial work")
         # pages: what a transpose takes beyond the rest of its predicted time, over its paged lines
         n, r = FIT["transpose"]
         nt, b = build((HERE / "transpose.nt.in").read_text(), "transpose", n, r, work)
@@ -146,7 +156,7 @@ def main():
         dt = wall(b2, a.cpu, a.runs) - wall(b1, a.cpu, a.runs)
         lat3 = dt / n * 1e9
         print(f"arena n={n}: a second walk takes {dt*1e3:.1f} ms  →  L3 = {lat3:.1f} ns a chased line from L3")
-        print(f"\nneant cost --tau {tau:.4f} --bw {bw:.2f} --lat {lat:.1f} --tlb {tlb:.1f} --bw2 {bw2:.2f} --lat3 {lat3:.1f}")
+        print(f"\nneant cost --tau {tau:.4f} --bw {bw:.2f} --lat {lat:.1f} --tlb {tlb:.1f} --taus {taus:.4f} --bw2 {bw2:.2f} --lat3 {lat3:.1f}")
         return
     extra = []
     if a.tau is not None: extra += ["--tau", str(a.tau)]

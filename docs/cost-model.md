@@ -857,6 +857,16 @@ with `L` the nanoseconds a chased line waits, fitted on a chase over a 64 MB are
 cycle: **L = 112 ns**. `chase` is only ever read by a time: no bound, tier or report line changes,
 and `--eval` prints it when it is not zero.
 
+**Serial work (2026-09-28).** `τ` is a throughput: the rate of a loop whose laps overlap in the
+pipelines, fitted on a polynomial over an array. A loop whose body carries a scalar from one lap to
+the next through a multiply or a divide — `x ← r·x·(1 − x)`, mandelbrot's `z ← z² + c`, a digit
+loop's `v ← 10·v + d` — cannot overlap its laps: each waits for the last one's multiply. Such a loop's
+work (its whole body's, nested loops' included) is counted as `serial`, composed through calls as work
+is, and the compute term becomes `(work − serial)·τ + serial·τ_s`, with `τ_s` fitted on the logistic
+map: **τ_s = 0.155 ns**, nine times `τ`. A reduction, `s += f(x[i])`, carries only an add and is not
+serial. Mandelbrot goes from 4.2× too fast to 0.50, the half an upper bound's: its 50 laps are the most
+a point can take. Only a time reads `serial`.
+
 **Pages, tried (2026-09-27).** Lines fetched by an access that moves a page or more a lap of its
 innermost loop are counted as `paged`, and `--tlb ns` charges each of them a TLB walk. Fitted on a
 transpose it is 9 ns; held fixed, it over-charges naive matmul fourfold, whose column walk reuses

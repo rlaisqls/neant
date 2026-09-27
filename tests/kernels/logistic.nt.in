@@ -1,0 +1,18 @@
+// latency-bound on one core: the logistic map x ← r·x·(1 − x), each lap's x the last lap's, so the
+// multiplies cannot overlap and the C compiler cannot vectorise; nothing in memory. Its time fits the
+// nanoseconds a unit of work takes on a dependency chain (the roofline's serial work).
+fn orbit(x0: f64, r: f64, n: i64) -> f64 {
+    let mut x = x0;
+    for k in 0..n {
+        x = r * x * (1.0 - x);
+    }
+    x
+}
+
+fn main() {
+    let mut t = 0.0;
+    for rep in 0..@R@ {
+        t += orbit(0.3 + rep as f64 * 0.000001, 3.7, @N@);
+    }
+    println(t);
+}

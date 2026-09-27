@@ -773,6 +773,14 @@ constants are not, and each constant is off for a reason:
   is each call charged cold, since seven SoA fields make one inexact footprint and no residue is
   credited across calls.
 
+**Serial work, the same day** (cost-model § Time, serial work). Work in a loop that carries a scalar
+through a multiply is charged `τ_s`, fitted on a logistic map that is not one of these programs:
+**τ_s = 0.155 ns**. Mandelbrot, never used in any fit, goes from 3.6 / 4.3 / 4.2 to **0.53 / 0.51 /
+0.50** — the remaining half is its escape loop's trip, 50 laps as an upper bound where most points
+leave sooner — and the geometric mean over the three programs is 0.64, range 0.26 to 1.93. The corpus
+and the kernels do not move (their loops carry only adds). Spectral-norm's 1.9× is its divide, which is
+not on a chain: a throughput for division is what is left there.
+
 ## The compiler's cost model, on the compiler — and the machine's answer
 
 The self-hosted cost reporter (`compiler/costdump.nt`, compiled by the self-hosted compiler) was

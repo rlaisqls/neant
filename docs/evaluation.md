@@ -46,9 +46,10 @@ cost-model § Time, experiments.md § The roofline, § The corpus against the cl
 `time = max(span·τ, work·τ/P, moves/BW)`, with `τ = 0.0176 ns` per unit of work and
 `BW = 20.8 GB/s`, fitted once — `τ` on a polynomial in L1, `BW` on a 100 MB stream — and then held
 fixed for everything else; and a latency term, `chase/B · L` in place of `chase/BW` for the lines a
-pointer chase fetches, with `L = 112 ns` fitted on a chase over 64 MB. The geometric mean of
-measured over predicted over the kernels' 31 runs is 1.14 (it was 1.56 before the latency term, when
-`arena` was 5–31× too low).
+pointer chase fetches, with `L = 112 ns` fitted on a chase over 64 MB; and serial work, `τ_s = 0.155
+ns` for work on a chain each lap waits on, fitted on a logistic map. Four constants in all, each
+fitted on one kernel written for it and then held fixed. The geometric mean of measured over predicted
+over the kernels' 31 runs is 1.12 (1.56 before the latency term, when `arena` was 5–31× too low).
 
 **Kernels** (31 runs, `tests/kernels/roofline.py`):
 
@@ -73,8 +74,18 @@ changes the first timing forced (cost-model § A scan's accesses):
 | `matmul` (n = 100–600) | 1.36 – 2.66 |
 | `heat` (n = 300–900, 50 steps) | 0.48 – 0.51 |
 
-Every program is within **0.10 to 2.7** of its measured time; the geometric mean was 0.41 before the
-stencil's neighbouring sites were grouped and `heat` moved from 0.13 to 0.50. Before the scan's
+Every program is within **0.16 to 2.7** of its measured time, geometric mean 0.56 (0.41 before the
+stencil's neighbouring sites were grouped and `heat` moved from 0.13 to 0.50).
+
+**The Benchmarks Game's programs** (`tests/bench/timing.py`, experiments.md), none used in a fit:
+
+| program | measured / predicted |
+|---|---|
+| `nbody` (10⁵–5·10⁶ steps) | 0.26 – 0.27 |
+| `spectral_norm` (n = 200–2000) | 1.89 – 1.94 |
+| `mandelbrot` (n = 200–2000) | 0.50 – 0.53 |
+
+Geometric mean 0.64, range 0.26 to 1.94. Before the scan's
 accesses were charged as a stream, the text readers were 10³ to 10⁶ too high — a bound, and a
 useless time; the first timing is kept in experiments.md because it is what found that.
 
@@ -158,12 +169,12 @@ constant to tune:
   is not independent code, and eight programs are few. Five Benchmarks Game programs, ported with
   their published structure (`tests/bench`, experiments.md), are 11 of 15 functions exact — the
   unknowns an exponential recurrence, a tree recursion and data-driven permutation loops — and
-  their times are 0.15–4.3 of the predicted, geometric mean 1.02: the shapes carry over, the
-  constants do not, and why is named (work's latency; a triangular loop's moves).
+  their times are within 0.26–1.93 of the predicted (0.15–4.3 before a triangle's moves and serial
+  work were charged, each found by these programs and fitted elsewhere).
 - **Generated inputs.** Uniform random integers and rows; real data with long lines or skew would
   move the parse's constants.
-- **Bounds err high by design.** A geometric mean of 0.41 is a bound behaving as one; it is also a
-  factor of two and a half of slack at the median.
+- **Bounds err high by design.** A geometric mean of 0.56 on the corpus is a bound behaving as one; it is also a
+  factor of about two of slack at the median.
 - **Wall-clock, minimum of three to five runs,** on a machine shared at times with other sessions;
   the kernels' table was taken idle.
 
@@ -172,7 +183,8 @@ constant to tune:
 On its own domain the claim holds in the form plan § Who switches set for it: every program in the
 corpus has a cost the compiler inferred, the kernels' costs predict bytes to within the ideal-cache
 model's known limits and time to within about 30% where one term dominates, and the programs' costs
-predict their time within a small factor, erring high. What it does not yet do is reach the larger
+predict their time within a small factor, erring high — and so do five programs the project did not
+write, with constants fitted on none of them (0.26–1.94). What it does not yet do is reach the larger
 part of ordinary code *exactly* — the compiler is a third exact, a third stated as a bound or modulo
 a callee, a third unknown — and every place it is loose is a named term or shape, each with the
 measurement that found it.
