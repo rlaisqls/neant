@@ -20,6 +20,7 @@ FIT = {
     "horner": (3_000, 20_000),        # 24 KB, in L1; 6·10⁷ evaluations
     "sum":    (12_800_000, 20),       # 100 MB, far past L3
     "arena":  (4_194_304, 3),         # 64 MB of nodes in a random cycle: one dependent miss a step
+    "transpose": (2000, 5),           # a column walk: every line on a page of its own
     # the second level, the cache outside M (L3, 16 MiB): a stream that fits in it, a chase that does
     "sum3":   (800_000, 100),         # 6.4 MB
     "arena3": (524_288, 1),           # 8 MB, one walk: a repeat would find it in L3, which the model does not credit across calls
@@ -47,8 +48,8 @@ def predict(nt, extra=()):
     lines = out.splitlines()
     start = next((i for i, l in enumerate(lines) if l.startswith("main")), None)
     for l in lines[(start or 0) + 1:]:
-        m = re.search(r"at .*?: work (\S+)\s+moves (\S+) bytes(?:\s+chase (\S+) bytes)?(?:\s+time (\S+) s)?", l)
-        if m: return float(m.group(1)), float(m.group(2)), (float(m.group(4)) if m.group(4) else None), float(m.group(3) or 0)
+        m = re.search(r"at .*?: work (\S+)\s+moves (\S+) bytes(?:\s+chase (\S+) bytes)?(?:\s+paged (\S+) bytes)?(?:\s+time (\S+) s)?", l)
+        if m: return float(m.group(1)), float(m.group(2)), (float(m.group(5)) if m.group(5) else None), float(m.group(3) or 0)
         if l and not l.startswith(" "): break
     sys.exit("could not read prediction from:\n" + out)
 
@@ -119,6 +120,15 @@ def main():
         t = wall(b, a.cpu, a.runs) - base
         lat = (t - (mv - ch) / (bw * 1e9)) / (ch / 64) * 1e9
         print(f"arena n={n} R={r}: moves {mv:.3e}  of them a chase {ch:.3e}  time {t*1e3:.1f} ms  →  L = {lat:.1f} ns a chased line")
+        # pages: what a transpose takes beyond the rest of its predicted time, over its paged lines
+        n, r = FIT["transpose"]
+        nt, b = build((HERE / "transpose.nt.in").read_text(), "transpose", n, r, work)
+        out = run([str(NEANT), "cost", str(nt), "--eval", "B=64", "--tau", str(tau), "--bw", str(bw), "--lat", str(lat), "--tlb", "0"]).stdout
+        pg = float(re.search(r"paged (\S+) bytes", out.split("\nmain")[1]).group(1))
+        _, _, t0, _ = predict(nt, ["--tau", str(tau), "--bw", str(bw), "--lat", str(lat), "--tlb", "0"])
+        t = wall(b, a.cpu, a.runs) - base
+        tlb = (t - t0) / (pg / 64) * 1e9
+        print(f"transpose n={n} R={r}: paged {pg:.3e} of the moves, predicted {t0*1e3:.1f} ms without pages, measured {t*1e3:.1f} ms  →  TLB = {tlb:.1f} ns a paged line")
         # the second level, by differences, so that what the model believes about the first touch
         # does not enter: R more repeats of a stream that fits in L3 are R·n·8 bytes from L3, and a
         # second walk of an arena that fits in L3 is n dependent lines from L3
@@ -136,7 +146,7 @@ def main():
         dt = wall(b2, a.cpu, a.runs) - wall(b1, a.cpu, a.runs)
         lat3 = dt / n * 1e9
         print(f"arena n={n}: a second walk takes {dt*1e3:.1f} ms  →  L3 = {lat3:.1f} ns a chased line from L3")
-        print(f"\nneant cost --tau {tau:.4f} --bw {bw:.2f} --lat {lat:.1f} --bw2 {bw2:.2f} --lat3 {lat3:.1f}")
+        print(f"\nneant cost --tau {tau:.4f} --bw {bw:.2f} --lat {lat:.1f} --tlb {tlb:.1f} --bw2 {bw2:.2f} --lat3 {lat3:.1f}")
         return
     extra = []
     if a.tau is not None: extra += ["--tau", str(a.tau)]

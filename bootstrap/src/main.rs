@@ -4,7 +4,7 @@
 //!   neant run   f.nt [--unchecked] [-- args]  build to a temp file and run it
 //!   neant emit  f.nt [--unchecked]            print the generated C
 //!   neant check f.nt                          parse and type-check only
-//!   neant cost  f.nt [-M bytes] [-B bytes] [-P cores] [--tau ns] [--bw GB/s] [--lat ns] [--M3 bytes] [--bw2 GB/s] [--lat3 ns] [--eval n=..,..]
+//!   neant cost  f.nt [-M bytes] [-B bytes] [-P cores] [--tau ns] [--bw GB/s] [--lat ns] [--tlb ns] [--M3 bytes] [--bw2 GB/s] [--lat3 ns] [--eval n=..,..]
 //!                                             infer work, moves and span for every function
 //!   neant lock  f.nt [--check]                write costs.lock next to the source, or diff it
 //!   neant measure f.nt --fn name [--sizes 1000,4000,...] [--shape p=n*n,...] [--repeat k] [--cpu 5] [--lock]
@@ -44,7 +44,9 @@ fn main() {
     let mut checked = true;
     let mut passthrough: Vec<String> = Vec::new();
     let default_p = std::thread::available_parallelism().map(|n| n.get() as i128).unwrap_or(4);
-    let mut machine = cost::Machine { m_bytes: 2 << 20, b_bytes: 64, p_cores: default_p, ns_per_work: 0.0176, bytes_per_ns: 20.8, ns_per_miss: 112.3 };
+    let mut machine = cost::Machine { m_bytes: 2 << 20, b_bytes: 64, p_cores: default_p, ns_per_work: 0.0176, bytes_per_ns: 20.8, ns_per_miss: 112.3, ns_per_page: 0.0 };
+    // `ns_per_page` is off (0) unless `--tlb` is given: a TLB walk per paged line fits transpose and
+    // over-charges naive matmul fourfold (docs/experiments.md § The roofline, pages)
     // the cache outside `M`, for a time only (docs/cost-model.md § Time, a second level): its size,
     // the bytes per nanosecond it serves `M` with, and what a chased line that hits it waits
     // off unless `--M3` is given: measured, it moves the error between kernels rather than
@@ -75,6 +77,7 @@ fn main() {
             "-P" => { i += 1; machine.p_cores = args.get(i).and_then(|s| s.parse().ok()).unwrap_or(machine.p_cores); }
             "--tau" => { i += 1; machine.ns_per_work = args.get(i).and_then(|s| s.parse().ok()).unwrap_or(machine.ns_per_work); }
             "--bw" => { i += 1; machine.bytes_per_ns = args.get(i).and_then(|s| s.parse().ok()).unwrap_or(machine.bytes_per_ns); }
+            "--tlb" => { i += 1; machine.ns_per_page = args.get(i).and_then(|s| s.parse().ok()).unwrap_or(machine.ns_per_page); }
             "--lat" => { i += 1; machine.ns_per_miss = args.get(i).and_then(|s| s.parse().ok()).unwrap_or(machine.ns_per_miss); }
             "--M3" => { i += 1; outer.bytes = parse_bytes(args.get(i)); outer.on = true; }
             "--bw2" => { i += 1; outer.bytes_per_ns = args.get(i).and_then(|s| s.parse().ok()).unwrap_or(outer.bytes_per_ns); }
@@ -210,8 +213,11 @@ fn main() {
                         let b = machine.b_bytes as f64;
                         let from_outer = ((m - m3) - (ch - ch3)).max(0.0) / outer.bytes_per_ns + (ch - ch3) / b * outer.ns_per_miss;
                         let from_memory = (m3 - ch3) / machine.bytes_per_ns + ch3 / b * machine.ns_per_miss;
-                        let tm = from_outer + from_memory;
+                        // a line on a page of its own waits for the TLB walk first
+                        let pg = if c.paged.pieces.is_empty() { 0.0 } else { eval_one(c, &c.paged, ev, &machine).unwrap_or(0.0) }.min(m - ch).max(0.0);
+                        let tm = from_outer + from_memory + pg / b * machine.ns_per_page;
                         if ch > 0.0 { print!("  chase {ch:.0} bytes"); }
+                        if pg > 0.0 { print!("  paged {pg:.0} bytes"); }
                         print!("  time {:.3e} s ({}-bound)", tw.max(tm) / 1e9, if tw >= tm { "work" } else { "moves" });
                         if span != work {
                             if let Some(s) = eval_one(c, span, ev, &machine) {

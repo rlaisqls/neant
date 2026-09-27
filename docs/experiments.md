@@ -656,6 +656,16 @@ column walk slower than a stream), and the geometric mean goes from 1.14 to 1.16
 bandwidth depends on the access pattern is what that asks for, which is the TLB row's question
 too.
 
+**Pages, tried the same day, and not made the default.** An access that moves a page or more a lap
+of its innermost loop has each of its lines counted as `paged`, charged `--tlb` nanoseconds for the
+TLB walk; fitted on `transpose` at 2000 it is **9.0 ns** a line. `transpose` then comes to 0.85 /
+1.06 / 1.28 (from 1.9–3.0), but `matmul_naive` past the cache goes to 0.24 / 0.30 (from 0.94 /
+1.16): its column walk reuses its 832 pages column after column, within TLB reach, and each of its
+lines is a miss to memory the walk overlaps with. The transpose's lines are hits, reused while the
+column slides, and it is there the walk shows. A per-line charge cannot tell the two apart; it is
+off (`--tlb 0`), and the question it leaves is which lines are hits — the same reuse the model
+already computes for moves, asked of pages.
+
 **What changed.** The `--eval` line prints the time and its bound (`work-bound` / `moves-bound`);
 `--tau` and `--bw` set the constants, defaulting to the fit above. Nothing in any report without
 `--eval` changed, and no golden moved. Next: the same comparison on the corpus's programs, which

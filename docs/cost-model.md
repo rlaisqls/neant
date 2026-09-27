@@ -821,6 +821,13 @@ with `L` the nanoseconds a chased line waits, fitted on a chase over a 64 MB are
 cycle: **L = 112 ns**. `chase` is only ever read by a time: no bound, tier or report line changes,
 and `--eval` prints it when it is not zero.
 
+**Pages, tried (2026-09-27).** Lines fetched by an access that moves a page or more a lap of its
+innermost loop are counted as `paged`, and `--tlb ns` charges each of them a TLB walk. Fitted on a
+transpose it is 9 ns; held fixed, it over-charges naive matmul fourfold, whose column walk reuses
+the same pages column after column and whose misses hide the walk. So it is off by default
+(experiments.md § The roofline, pages): a page walk costs something only where the line itself
+does not, which a count of paged lines cannot see.
+
 **A second level, tried (2026-09-27).** With `--M3 bytes` the whole analysis runs a second time with
 `M` the outer cache's size — a size known at analysis time decides its regime there, so a cost at
 one `M` cannot be re-read at another — and what crosses `M` but not the outer boundary is charged

@@ -931,6 +931,8 @@ lock line moves and the self-hosted pass, without the rule, is listed as chargin
 (`NEIGHBOURS_INSTEAD`). A second cache level for the time (`--M3`, the analysis run again at
 `M` = L3, BW₂ and L₃ fitted by differences) was measured and left off by default: it moves the error
 between kernels (streams better, strided access worse) and the geometric mean from 1.14 to 1.16.
+A TLB charge per line of a page-strided access (`--tlb`, 9 ns fitted on transpose) was measured the
+same way and is off too: transpose 2–3× → 0.85–1.28, naive matmul 1.0 → 0.24–0.30.
 
 ## M7 — the constant factor
 

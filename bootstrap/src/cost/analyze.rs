@@ -37,6 +37,9 @@ pub struct Machine {
     /// Nanoseconds a line fetched by a pointer chase costs, the miss it waits for: the roofline's
     /// latency term (cost-model § Time), fitted on a chase over an arena past the last cache.
     pub ns_per_miss: f64,
+    /// Nanoseconds a line on a page of its own adds, the TLB walk before it (cost-model § Time,
+    /// pages), fitted on a transpose.
+    pub ns_per_page: f64,
 }
 
 #[derive(Debug, Clone)]
@@ -71,6 +74,10 @@ pub struct FuncCost {
     /// iteration produced — a pointer chase — part of `moves` that cannot overlap. Only a time
     /// reads it (cost-model § Time, latency); bounds and tiers never do.
     pub chase: Cost,
+    /// Bytes of lines fetched by an access that moves a page or more per lap of its innermost
+    /// loop — a column walk — each line on a page of its own, which a TLB walk precedes. Like
+    /// `chase`, read only by a time (cost-model § Time, pages).
+    pub paged: Cost,
     /// Lower bounds the catalogue recognised in this function's body.
     pub bounds: Vec<Bound>,
     /// What the bound's operands do in the innermost loop, when it is worth saying.
@@ -423,7 +430,7 @@ impl<'a> Analyzer<'a> {
                 self.done[fid] = Some(FuncCost {
                     name: f.name.clone(),
                     names: param_names(f),
-                    result: CostResult::Unknown { reason: "mutually recursive with another function; only self-recursion is solved".into(), line: f.line }, chase: Cost::zero(),
+                    result: CostResult::Unknown { reason: "mutually recursive with another function; only self-recursion is solved".into(), line: f.line }, chase: Cost::zero(), paged: Cost::zero(),
                     bounds: vec![], notes: vec![], suggestions: vec![], effects: vec![], violations: vec![], tier: "unknown", result_size: None,
                     footprint: vec![], resident: None, declared: Declared::default(), rests_on: vec![],
                 });
@@ -510,6 +517,8 @@ enum Fail {
 struct Site {
     /// the index is a local a loop loads: each access waits for the one before (§ Time)
     dep: bool,
+    /// the address moves a page or more per lap of the innermost loop (§ Time, pages)
+    paged: bool,
     arr: LocalId,
     aff: Option<Affine>,
     /// bytes the site actually touches: the element's size, or one field's under AoS
@@ -654,6 +663,9 @@ struct Fa<'a, 'b, 'c> {
     /// the pointer chase accumulated in the open frame, framed like `work` (cost-model § Time)
     chase: Cost,
     chase_saved: Vec<Cost>,
+    /// the paged lines, framed the same way
+    paged: Cost,
+    paged_saved: Vec<Cost>,
     /// locals a loop assigns from a load: an index made of one is the next hop of a chase
     chase_vars: Vec<LocalId>,
 }
@@ -665,7 +677,7 @@ impl<'a, 'b, 'c> Fa<'a, 'b, 'c> {
             local_size: HashMap::new(), local_affine: HashMap::new(), initial: HashMap::new(), at_entry: false,
             loops: vec![], work: Cost::zero(), moves: Cost::zero(), span: Cost::zero(), saved: vec![], branch: vec![], next_if: 0,
             local_root: HashMap::new(), resident: vec![], call_moves: Cost::zero(), saved_calls: vec![], replay: false, has_call: vec![], rests_on: vec![],
-            reads: Default::default(), loop_writes: vec![], scans: Default::default(), amort: vec![], scan_ind: Default::default(), chase: Cost::zero(), chase_saved: vec![], chase_vars: vec![],
+            reads: Default::default(), loop_writes: vec![], scans: Default::default(), amort: vec![], scan_ind: Default::default(), chase: Cost::zero(), chase_saved: vec![], chase_vars: vec![], paged: Cost::zero(), paged_saved: vec![],
         };
         for (i, &p) in f.params.iter().enumerate() {
             let l = &f.locals[p];
@@ -727,7 +739,7 @@ impl<'a, 'b, 'c> Fa<'a, 'b, 'c> {
                 _ if effects.contains(&"unbounded") => CostResult::Unknown { reason: "declared unbounded".into(), line: self.f.line },
                 _ => CostResult::Unknown { reason: "an extern needs `#[cost(work_at_most = …, moves_at_most = …)]` or `uses unbounded`".into(), line: self.f.line },
             };
-            return FuncCost { name: self.f.name.clone(), names: self.names, result, chase: Cost::zero(), bounds: vec![], notes: vec![], suggestions: vec![], effects, violations, tier: "declared", footprint: vec![], resident: None, declared, rests_on: vec![], result_size: self.result_size.clone() };
+            return FuncCost { name: self.f.name.clone(), names: self.names, result, chase: Cost::zero(), paged: Cost::zero(), bounds: vec![], notes: vec![], suggestions: vec![], effects, violations, tier: "declared", footprint: vec![], resident: None, declared, rests_on: vec![], result_size: self.result_size.clone() };
         };
         let mut tier = "exact";
         self.chase_vars = loaded_in_loops(body);
@@ -846,7 +858,8 @@ impl<'a, 'b, 'c> Fa<'a, 'b, 'c> {
         self.bounds.retain(|b| b.moves.vars().iter().all(|&v| v < np));
         bounds::strongest_first(&mut self.bounds, &m);
         let chase = if matches!(result, CostResult::Exact { .. }) { self.chase.clone() } else { Cost::zero() };
-        FuncCost { name: self.f.name.clone(), names: self.names, result, chase, bounds: self.bounds, notes: self.notes, suggestions: vec![], effects, violations, tier, footprint, resident, declared, rests_on: self.rests_on, result_size: self.result_size.clone() }
+        let paged = if matches!(result, CostResult::Exact { .. }) { self.paged.clone() } else { Cost::zero() };
+        FuncCost { name: self.f.name.clone(), names: self.names, result, chase, paged, bounds: self.bounds, notes: self.notes, suggestions: vec![], effects, violations, tier, footprint, resident, declared, rests_on: self.rests_on, result_size: self.result_size.clone() }
     }
 
     /// The byte range one access site covers over its loop nest, from its affine index and the
@@ -1088,19 +1101,22 @@ impl<'a, 'b, 'c> Fa<'a, 'b, 'c> {
         self.saved.push((std::mem::replace(&mut self.work, Cost::zero()), std::mem::replace(&mut self.moves, Cost::zero()), std::mem::replace(&mut self.span, Cost::zero())));
         self.saved_calls.push(std::mem::replace(&mut self.call_moves, Cost::zero()));
         self.chase_saved.push(std::mem::replace(&mut self.chase, Cost::zero()));
+        self.paged_saved.push(std::mem::replace(&mut self.paged, Cost::zero()));
         self.has_call.push(false);
     }
     /// Pop a frame (an `if` branch). Its calls' moves are handed back with the rest, not added to
     /// the frame below: the two branches are alternatives, and the caller takes the larger.
-    fn pop_frame(&mut self) -> (Cost, Cost, Cost, Cost, Cost) {
+    fn pop_frame(&mut self) -> (Cost, Cost, Cost, Cost, Cost, Cost) {
         let (pw, pm, psp) = self.saved.pop().unwrap();
         let pc = self.saved_calls.pop().unwrap();
         let pch = self.chase_saved.pop().unwrap();
         let ch = std::mem::replace(&mut self.chase, pch);
+        let ppg = self.paged_saved.pop().unwrap();
+        let pg = std::mem::replace(&mut self.paged, ppg);
         let had = self.has_call.pop().unwrap_or(false);
         if let Some(h) = self.has_call.last_mut() { *h |= had; }
         let calls = std::mem::replace(&mut self.call_moves, pc);
-        (std::mem::replace(&mut self.work, pw), std::mem::replace(&mut self.moves, pm), std::mem::replace(&mut self.span, psp), ch, calls)
+        (std::mem::replace(&mut self.work, pw), std::mem::replace(&mut self.moves, pm), std::mem::replace(&mut self.span, psp), ch, calls, pg)
     }
     /// Leave a loop. The body frame is summed over the loop variable. Calls in the body are costed
     /// twice: as walked (cold, the first iteration) and again with the residue the first iteration
@@ -1112,6 +1128,8 @@ impl<'a, 'b, 'c> Fa<'a, 'b, 'c> {
         let pc = self.saved_calls.pop().unwrap();
         let pch = self.chase_saved.pop().unwrap();
         let body_chase = std::mem::replace(&mut self.chase, pch);
+        let ppg = self.paged_saved.pop().unwrap();
+        let body_paged = std::mem::replace(&mut self.paged, ppg);
         let had_call = self.has_call.pop().unwrap_or(false);
         let cold_calls = std::mem::replace(&mut self.call_moves, pc);
         let (w, m) = (std::mem::replace(&mut self.work, pw), std::mem::replace(&mut self.moves, pm));
@@ -1120,6 +1138,7 @@ impl<'a, 'b, 'c> Fa<'a, 'b, 'c> {
         self.work = self.work.add(&rec.sum_cost(&w));
         self.moves = self.moves.add(&rec.sum_cost(&m));
         self.chase = self.chase.add(&rec.sum_cost(&body_chase));
+        self.paged = self.paged.add(&rec.sum_cost(&body_paged));
         // an ordinary loop is sequential: its span sums the same way work does
         self.span = self.span.add(&rec.sum_cost(&sp));
         if had_call {
@@ -1148,6 +1167,7 @@ impl<'a, 'b, 'c> Fa<'a, 'b, 'c> {
                 let (pw, pm, psp) = self.saved.pop().unwrap();
                 let pc = self.saved_calls.pop().unwrap();
                 self.chase = self.chase_saved.pop().unwrap();
+                self.paged = self.paged_saved.pop().unwrap();
                 self.has_call.pop();
                 let warm_body = std::mem::replace(&mut self.call_moves, pc);
                 self.work = pw;
@@ -1177,6 +1197,8 @@ impl<'a, 'b, 'c> Fa<'a, 'b, 'c> {
         let pc = self.saved_calls.pop().unwrap();
         let pch = self.chase_saved.pop().unwrap();
         let body_chase = std::mem::replace(&mut self.chase, pch);
+        let ppg = self.paged_saved.pop().unwrap();
+        let body_paged = std::mem::replace(&mut self.paged, ppg);
         let had_call = self.has_call.pop().unwrap_or(false);
         let cold_calls = std::mem::replace(&mut self.call_moves, pc);
         let (w, m) = (std::mem::replace(&mut self.work, pw), std::mem::replace(&mut self.moves, pm));
@@ -1185,6 +1207,7 @@ impl<'a, 'b, 'c> Fa<'a, 'b, 'c> {
         self.work = self.work.add(&rec.sum_cost(&w));
         self.moves = self.moves.add(&rec.sum_cost(&m));
         self.chase = self.chase.add(&rec.sum_cost(&body_chase));
+        self.paged = self.paged.add(&rec.sum_cost(&body_paged));
         let depth = Cost::poly(Poly::atom(Atom::Log(Box::new(trip.clone()))));
         self.span = self.span.add(&w.add(&depth));
         if had_call {
@@ -1435,7 +1458,16 @@ impl<'a, 'b, 'c> Fa<'a, 'b, 'c> {
             return;
         }
         let dep = !self.loops.is_empty() && matches!(&idx.kind, ExprKind::Local(l) if self.chase_vars.contains(l));
-        self.sites.push(Site { dep, arr, aff, es, stride, field, base, key, path, branch: self.branch.clone() });
+        // a page or more a lap of the innermost loop: a number at least a page, or a stride in a
+        // size (a row of a grid), which for any size worth timing is a page or more
+        let paged = match (self.loops.last(), &aff) {
+            (Some(lp), Some(a)) if !lp.monotone => lp.var.and_then(|v| a.coeffs.get(&v)).is_some_and(|k| {
+                let bytes = k.scale(Rat::int(stride * lp.step.abs()));
+                match self.numeric(&bytes) { Some(x) => x.abs() >= 4096.0, None => !bytes.is_zero() && bytes.terms.keys().any(|m| !m.factors.is_empty()) }
+            }),
+            _ => false,
+        };
+        self.sites.push(Site { dep, paged, arr, aff, es, stride, field, base, key, path, branch: self.branch.clone() });
     }
 
     /// The access sites of loop `lid` that read one array at offsets the loop carries into each
@@ -1715,6 +1747,8 @@ impl<'a, 'b, 'c> Fa<'a, 'b, 'c> {
         // the part of those lines a chase fetches, one waiting on the last (cost-model § Time)
         let dep: Vec<usize> = all.iter().copied().filter(|&s| self.sites[s].dep).collect();
         if !dep.is_empty() { self.chase = self.chase.add(&group(&dep, 0, &self.sites, &top).mul_poly(&Poly::atom(Atom::B))); }
+        let pg: Vec<usize> = all.iter().copied().filter(|&s| self.sites[s].paged && !self.sites[s].dep).collect();
+        if !pg.is_empty() { self.paged = self.paged.add(&group(&pg, 0, &self.sites, &top).mul_poly(&Poly::atom(Atom::B))); }
     }
 
     /// The native lower bound for the statement's nest (`bounds.rs`): every array reference in
@@ -2697,20 +2731,21 @@ impl<'a, 'b, 'c> Fa<'a, 'b, 'c> {
                 self.branch.push((if_id, true));
                 self.push_frame();
                 self.block(t)?;
-                let (wt, mt, spt, cht, callt) = self.pop_frame();
+                let (wt, mt, spt, cht, callt, pgt) = self.pop_frame();
                 self.branch.pop();
                 let then_calls: Vec<_> = self.rec_calls.drain(before..).collect();
                 let then_init = std::mem::replace(&mut self.initial, entry_init);
                 self.branch.push((if_id, false));
                 self.push_frame();
                 if let Some(b) = els { self.block(b)?; }
-                let (we, me, spe, che, calle) = self.pop_frame();
+                let (we, me, spe, che, calle, pge) = self.pop_frame();
                 self.branch.pop();
                 // the two branches are alternatives: the cost is the larger, not the sum
                 self.work = self.work.add(&wt.max(&we));
                 self.moves = self.moves.add(&mt.max(&me));
                 self.span = self.span.add(&spt.max(&spe));
                 self.chase = self.chase.add(&cht.max(&che));
+                self.paged = self.paged.add(&branch_max(&pgt, &pge));
                 // and the calls' moves: the larger where that is cheap to know, else both, which
                 // bounds it too — a `max` of piecewise costs multiplies regimes under nested `if`s
                 self.call_moves = self.call_moves.add(&branch_max(&callt, &calle));
@@ -3005,6 +3040,11 @@ impl<'a, 'b, 'c> Fa<'a, 'b, 'c> {
                         let hide = |p: &Poly| unnamed.iter().any(|(i, _)| p.mentions(*i));
                         let c = callee.chase.hide_args(&hide);
                         if !c.pieces.iter().any(|pc| hide(&pc.poly)) { self.chase = self.chase.add(&c.rename_roots(&rename).subst_many(&map)); }
+                    }
+                    if !declared_only && !opaque && !callee.paged.pieces.is_empty() {
+                        let hide = |p: &Poly| unnamed.iter().any(|(i, _)| p.mentions(*i));
+                        let c = callee.paged.hide_args(&hide);
+                        if !c.pieces.iter().any(|pc| hide(&pc.poly)) { self.paged = self.paged.add(&c.rename_roots(&rename).subst_many(&map)); }
                     }
                 }
                 self.call_moves = self.call_moves.add(&mv);

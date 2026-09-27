@@ -171,7 +171,8 @@ a callee, a third unknown — and every place it is loose is a named term or sha
 measurement that found it.
 
 A second cache level was tried (`--M3`, experiments.md): it helps mid-size streams and hurts strided
-access in equal measure, so it is not the default. Next, in the order they would change these
+access in equal measure, so it is not the default. A TLB charge per paged line (`--tlb`) fits
+`transpose` and over-charges naive matmul fourfold, so it is off too. Next, in the order they would change these
 numbers: a bandwidth that depends on the access pattern (a stride, the number of streams) at each
 level (the small sizes, and a chase inside L3), the parse's per-call constants (`csv`),
 a second machine for `τ`, `BW` and `L`, and, for reach, recursion over an arena tree.
