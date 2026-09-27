@@ -954,7 +954,9 @@ cost time at 0.15–4.3 of the predicted. The two constants' failures are named:
 once while they fit (cost-model § Moves, a triangle), n-body 0.15 → 0.27, golden `tri`'s `pairs`
 `4·n²` → `32·n + …`; one compiler lock line moves, the count does not. And the first: work in a loop
 that carries a scalar through a multiply is `serial`, charged `τ_s = 0.155 ns` fitted on a logistic map
-(cost-model § Time, serial work); mandelbrot 4.2× → 0.50, the benchmarks within 0.26–1.93.
+(cost-model § Time, serial work); mandelbrot 4.2× → 0.50, the benchmarks within 0.26–1.93. Then
+divisions counted apart and charged `τ_div = 0.148 ns` more (a sum of reciprocals): spectral-norm
+1.9 → 1.27, the benchmarks within 0.26–1.28.
 
 ## M7 — the constant factor
 

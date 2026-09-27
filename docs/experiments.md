@@ -779,7 +779,10 @@ through a multiply is charged `τ_s`, fitted on a logistic map that is not one o
 0.50** — the remaining half is its escape loop's trip, 50 laps as an upper bound where most points
 leave sooner — and the geometric mean over the three programs is 0.64, range 0.26 to 1.93. The corpus
 and the kernels do not move (their loops carry only adds). Spectral-norm's 1.9× is its divide, which is
-not on a chain: a throughput for division is what is left there.
+not on a chain: a throughput for division is what is left there. **Divisions, counted apart** and
+charged `τ_div = 0.148 ns` beyond a unit of work, fitted on a sum of reciprocals (cost-model § Time,
+divisions): spectral-norm 1.89–1.94 → **1.26–1.28**, the three programs within **0.26–1.28**,
+geometric mean 0.57; the kernels (1.15) and the corpus (0.60) are where they were.
 
 ## The compiler's cost model, on the compiler — and the machine's answer
 

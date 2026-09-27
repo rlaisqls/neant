@@ -43,6 +43,9 @@ pub struct Machine {
     /// Nanoseconds a unit of serial work takes — work on a chain each lap waits on — fitted on a
     /// logistic map (cost-model § Time, serial work).
     pub ns_per_serial: f64,
+    /// Nanoseconds an f64 division takes beyond an ordinary unit of work, its lower throughput,
+    /// fitted on a sum of reciprocals (cost-model § Time, divisions).
+    pub ns_per_div: f64,
 }
 
 #[derive(Debug, Clone)]
@@ -86,6 +89,9 @@ pub struct FuncCost {
     /// an operation's latency, not the pipelines' throughput. Read only by a time (cost-model
     /// § Time, serial work).
     pub serial: Cost,
+    /// How many `f64` divisions `work` holds: a division's throughput is a fraction of an add's,
+    /// so a time charges each more (cost-model § Time, divisions). Read only by a time.
+    pub divs: Cost,
     /// Lower bounds the catalogue recognised in this function's body.
     pub bounds: Vec<Bound>,
     /// What the bound's operands do in the innermost loop, when it is worth saying.
@@ -438,7 +444,7 @@ impl<'a> Analyzer<'a> {
                 self.done[fid] = Some(FuncCost {
                     name: f.name.clone(),
                     names: param_names(f),
-                    result: CostResult::Unknown { reason: "mutually recursive with another function; only self-recursion is solved".into(), line: f.line }, chase: Cost::zero(), paged: Cost::zero(), serial: Cost::zero(),
+                    result: CostResult::Unknown { reason: "mutually recursive with another function; only self-recursion is solved".into(), line: f.line }, chase: Cost::zero(), paged: Cost::zero(), serial: Cost::zero(), divs: Cost::zero(),
                     bounds: vec![], notes: vec![], suggestions: vec![], effects: vec![], violations: vec![], tier: "unknown", result_size: None,
                     footprint: vec![], resident: None, declared: Declared::default(), rests_on: vec![],
                 });
@@ -674,6 +680,9 @@ struct Fa<'a, 'b, 'c> {
     /// the paged lines, framed the same way
     paged: Cost,
     paged_saved: Vec<Cost>,
+    /// the divisions, framed the same way
+    divs: Cost,
+    divs_saved: Vec<Cost>,
     /// the serial work, framed the same way
     serial: Cost,
     serial_saved: Vec<Cost>,
@@ -688,7 +697,7 @@ impl<'a, 'b, 'c> Fa<'a, 'b, 'c> {
             local_size: HashMap::new(), local_affine: HashMap::new(), initial: HashMap::new(), at_entry: false,
             loops: vec![], work: Cost::zero(), moves: Cost::zero(), span: Cost::zero(), saved: vec![], branch: vec![], next_if: 0,
             local_root: HashMap::new(), resident: vec![], call_moves: Cost::zero(), saved_calls: vec![], replay: false, has_call: vec![], rests_on: vec![],
-            reads: Default::default(), loop_writes: vec![], scans: Default::default(), amort: vec![], scan_ind: Default::default(), chase: Cost::zero(), chase_saved: vec![], chase_vars: vec![], paged: Cost::zero(), paged_saved: vec![], serial: Cost::zero(), serial_saved: vec![],
+            reads: Default::default(), loop_writes: vec![], scans: Default::default(), amort: vec![], scan_ind: Default::default(), chase: Cost::zero(), chase_saved: vec![], chase_vars: vec![], paged: Cost::zero(), paged_saved: vec![], divs: Cost::zero(), divs_saved: vec![], serial: Cost::zero(), serial_saved: vec![],
         };
         for (i, &p) in f.params.iter().enumerate() {
             let l = &f.locals[p];
@@ -750,7 +759,7 @@ impl<'a, 'b, 'c> Fa<'a, 'b, 'c> {
                 _ if effects.contains(&"unbounded") => CostResult::Unknown { reason: "declared unbounded".into(), line: self.f.line },
                 _ => CostResult::Unknown { reason: "an extern needs `#[cost(work_at_most = …, moves_at_most = …)]` or `uses unbounded`".into(), line: self.f.line },
             };
-            return FuncCost { name: self.f.name.clone(), names: self.names, result, chase: Cost::zero(), paged: Cost::zero(), serial: Cost::zero(), bounds: vec![], notes: vec![], suggestions: vec![], effects, violations, tier: "declared", footprint: vec![], resident: None, declared, rests_on: vec![], result_size: self.result_size.clone() };
+            return FuncCost { name: self.f.name.clone(), names: self.names, result, chase: Cost::zero(), paged: Cost::zero(), serial: Cost::zero(), divs: Cost::zero(), bounds: vec![], notes: vec![], suggestions: vec![], effects, violations, tier: "declared", footprint: vec![], resident: None, declared, rests_on: vec![], result_size: self.result_size.clone() };
         };
         let mut tier = "exact";
         self.chase_vars = loaded_in_loops(body);
@@ -871,7 +880,8 @@ impl<'a, 'b, 'c> Fa<'a, 'b, 'c> {
         let chase = if matches!(result, CostResult::Exact { .. }) { self.chase.clone() } else { Cost::zero() };
         let paged = if matches!(result, CostResult::Exact { .. }) { self.paged.clone() } else { Cost::zero() };
         let serial = if matches!(result, CostResult::Exact { .. }) { self.serial.clone() } else { Cost::zero() };
-        FuncCost { name: self.f.name.clone(), names: self.names, result, chase, paged, serial, bounds: self.bounds, notes: self.notes, suggestions: vec![], effects, violations, tier, footprint, resident, declared, rests_on: self.rests_on, result_size: self.result_size.clone() }
+        let divs = if matches!(result, CostResult::Exact { .. }) { self.divs.clone() } else { Cost::zero() };
+        FuncCost { name: self.f.name.clone(), names: self.names, result, chase, paged, serial, divs, bounds: self.bounds, notes: self.notes, suggestions: vec![], effects, violations, tier, footprint, resident, declared, rests_on: self.rests_on, result_size: self.result_size.clone() }
     }
 
     /// The byte range one access site covers over its loop nest, from its affine index and the
@@ -1114,24 +1124,27 @@ impl<'a, 'b, 'c> Fa<'a, 'b, 'c> {
         self.saved_calls.push(std::mem::replace(&mut self.call_moves, Cost::zero()));
         self.chase_saved.push(std::mem::replace(&mut self.chase, Cost::zero()));
         self.paged_saved.push(std::mem::replace(&mut self.paged, Cost::zero()));
+        self.divs_saved.push(std::mem::replace(&mut self.divs, Cost::zero()));
         self.serial_saved.push(std::mem::replace(&mut self.serial, Cost::zero()));
         self.has_call.push(false);
     }
     /// Pop a frame (an `if` branch). Its calls' moves are handed back with the rest, not added to
     /// the frame below: the two branches are alternatives, and the caller takes the larger.
-    fn pop_frame(&mut self) -> (Cost, Cost, Cost, Cost, Cost, Cost, Cost) {
+    fn pop_frame(&mut self) -> (Cost, Cost, Cost, Cost, Cost, Cost, Cost, Cost) {
         let (pw, pm, psp) = self.saved.pop().unwrap();
         let pc = self.saved_calls.pop().unwrap();
         let pch = self.chase_saved.pop().unwrap();
         let ch = std::mem::replace(&mut self.chase, pch);
         let ppg = self.paged_saved.pop().unwrap();
         let pg = std::mem::replace(&mut self.paged, ppg);
+        let pdv = self.divs_saved.pop().unwrap();
+        let dv = std::mem::replace(&mut self.divs, pdv);
         let pse = self.serial_saved.pop().unwrap();
         let se = std::mem::replace(&mut self.serial, pse);
         let had = self.has_call.pop().unwrap_or(false);
         if let Some(h) = self.has_call.last_mut() { *h |= had; }
         let calls = std::mem::replace(&mut self.call_moves, pc);
-        (std::mem::replace(&mut self.work, pw), std::mem::replace(&mut self.moves, pm), std::mem::replace(&mut self.span, psp), ch, calls, pg, se)
+        (std::mem::replace(&mut self.work, pw), std::mem::replace(&mut self.moves, pm), std::mem::replace(&mut self.span, psp), ch, calls, pg, se, dv)
     }
     /// Leave a loop. The body frame is summed over the loop variable. Calls in the body are costed
     /// twice: as walked (cold, the first iteration) and again with the residue the first iteration
@@ -1145,6 +1158,8 @@ impl<'a, 'b, 'c> Fa<'a, 'b, 'c> {
         let body_chase = std::mem::replace(&mut self.chase, pch);
         let ppg = self.paged_saved.pop().unwrap();
         let body_paged = std::mem::replace(&mut self.paged, ppg);
+        let pdv = self.divs_saved.pop().unwrap();
+        let body_divs = std::mem::replace(&mut self.divs, pdv);
         let pse = self.serial_saved.pop().unwrap();
         let body_serial = std::mem::replace(&mut self.serial, pse);
         let had_call = self.has_call.pop().unwrap_or(false);
@@ -1156,6 +1171,7 @@ impl<'a, 'b, 'c> Fa<'a, 'b, 'c> {
         self.moves = self.moves.add(&rec.sum_cost(&m));
         self.chase = self.chase.add(&rec.sum_cost(&body_chase));
         self.paged = self.paged.add(&rec.sum_cost(&body_paged));
+        self.divs = self.divs.add(&rec.sum_cost(&body_divs));
         // a loop whose lap waits on the last one: all its work is serial, nested loops' included
         self.serial = self.serial.add(&rec.sum_cost(if carried_chain(body) { &w } else { &body_serial }));
         // an ordinary loop is sequential: its span sums the same way work does
@@ -1187,6 +1203,7 @@ impl<'a, 'b, 'c> Fa<'a, 'b, 'c> {
                 let pc = self.saved_calls.pop().unwrap();
                 self.chase = self.chase_saved.pop().unwrap();
                 self.paged = self.paged_saved.pop().unwrap();
+                self.divs = self.divs_saved.pop().unwrap();
                 self.serial = self.serial_saved.pop().unwrap();
                 self.has_call.pop();
                 let warm_body = std::mem::replace(&mut self.call_moves, pc);
@@ -1219,6 +1236,8 @@ impl<'a, 'b, 'c> Fa<'a, 'b, 'c> {
         let body_chase = std::mem::replace(&mut self.chase, pch);
         let ppg = self.paged_saved.pop().unwrap();
         let body_paged = std::mem::replace(&mut self.paged, ppg);
+        let pdv = self.divs_saved.pop().unwrap();
+        let body_divs = std::mem::replace(&mut self.divs, pdv);
         let pse = self.serial_saved.pop().unwrap();
         let body_serial = std::mem::replace(&mut self.serial, pse);
         let had_call = self.has_call.pop().unwrap_or(false);
@@ -1230,6 +1249,7 @@ impl<'a, 'b, 'c> Fa<'a, 'b, 'c> {
         self.moves = self.moves.add(&rec.sum_cost(&m));
         self.chase = self.chase.add(&rec.sum_cost(&body_chase));
         self.paged = self.paged.add(&rec.sum_cost(&body_paged));
+        self.divs = self.divs.add(&rec.sum_cost(&body_divs));
         self.serial = self.serial.add(&rec.sum_cost(&body_serial));
         let depth = Cost::poly(Poly::atom(Atom::Log(Box::new(trip.clone()))));
         self.span = self.span.add(&w.add(&depth));
@@ -2725,7 +2745,12 @@ impl<'a, 'b, 'c> Fa<'a, 'b, 'c> {
             ExprKind::Len(_) => Ok(()), // the length is already in a register
             // a whole value compared: element by element (docs/arrays-by-value-design.md §8)
             ExprKind::Binary(_, a, b) if !a.ty.is_scalar() => { self.expr(a)?; self.expr(b)?; self.compare_value(&a.ty); Ok(()) }
-            ExprKind::Binary(_, a, b) => { self.expr(a)?; self.expr(b)?; self.add_work_n(1); Ok(()) }
+            ExprKind::Binary(op, a, b) => {
+                self.expr(a)?; self.expr(b)?; self.add_work_n(1);
+                // an f64 division, counted apart for a time (cost-model § Time, divisions)
+                if matches!(op, BinOp::Div) && e.ty == Ty::F64 && !self.replay { self.divs = self.divs.add_poly(&Poly::constant(1)); }
+                Ok(())
+            }
             ExprKind::MinMax(_, a, b) => { self.expr(a)?; self.expr(b)?; self.add_work_n(2); Ok(()) } // compare, select
             // a row's bound check is a bounds check, which no index is charged for
             ExprKind::InRow(j, n) => { self.expr(j)?; self.expr(n) }
@@ -2794,14 +2819,14 @@ impl<'a, 'b, 'c> Fa<'a, 'b, 'c> {
                 self.branch.push((if_id, true));
                 self.push_frame();
                 self.block(t)?;
-                let (wt, mt, spt, cht, callt, pgt, set) = self.pop_frame();
+                let (wt, mt, spt, cht, callt, pgt, set, dvt) = self.pop_frame();
                 self.branch.pop();
                 let then_calls: Vec<_> = self.rec_calls.drain(before..).collect();
                 let then_init = std::mem::replace(&mut self.initial, entry_init);
                 self.branch.push((if_id, false));
                 self.push_frame();
                 if let Some(b) = els { self.block(b)?; }
-                let (we, me, spe, che, calle, pge, see) = self.pop_frame();
+                let (we, me, spe, che, calle, pge, see, dve) = self.pop_frame();
                 self.branch.pop();
                 // the two branches are alternatives: the cost is the larger, not the sum
                 self.work = self.work.add(&wt.max(&we));
@@ -2809,6 +2834,7 @@ impl<'a, 'b, 'c> Fa<'a, 'b, 'c> {
                 self.span = self.span.add(&spt.max(&spe));
                 self.chase = self.chase.add(&cht.max(&che));
                 self.paged = self.paged.add(&branch_max(&pgt, &pge));
+                self.divs = self.divs.add(&branch_max(&dvt, &dve));
                 self.serial = self.serial.add(&branch_max(&set, &see));
                 // and the calls' moves: the larger where that is cheap to know, else both, which
                 // bounds it too — a `max` of piecewise costs multiplies regimes under nested `if`s
@@ -3109,6 +3135,11 @@ impl<'a, 'b, 'c> Fa<'a, 'b, 'c> {
                         let hide = |p: &Poly| unnamed.iter().any(|(i, _)| p.mentions(*i));
                         let c = callee.serial.hide_args(&hide);
                         if !c.pieces.iter().any(|pc| hide(&pc.poly)) { self.serial = self.serial.add(&c.rename_roots(&rename).subst_many(&map)); }
+                    }
+                    if !declared_only && !opaque && !callee.divs.pieces.is_empty() {
+                        let hide = |p: &Poly| unnamed.iter().any(|(i, _)| p.mentions(*i));
+                        let c = callee.divs.hide_args(&hide);
+                        if !c.pieces.iter().any(|pc| hide(&pc.poly)) { self.divs = self.divs.add(&c.rename_roots(&rename).subst_many(&map)); }
                     }
                     if !declared_only && !opaque && !callee.paged.pieces.is_empty() {
                         let hide = |p: &Poly| unnamed.iter().any(|(i, _)| p.mentions(*i));

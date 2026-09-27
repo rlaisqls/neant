@@ -1,0 +1,23 @@
+// throughput-bound on divisions: one f64 division per element of an array that stays in L1, the
+// divisions independent of each other (a reduction's add is the only chain). Its time fits the
+// nanoseconds a division takes beyond an ordinary unit of work (the roofline's division rate).
+fn recips(xs: &[f64]) -> f64 {
+    let mut s = 0.0;
+    for i in 0..xs.len() {
+        s += 1.0 / (xs[i] + 1.0);
+    }
+    s
+}
+
+fn main() {
+    let n = @N@;
+    let mut xs = [0.0; n];
+    for i in 0..n {
+        xs[i] = (i % 97) as f64 * 0.01;
+    }
+    let mut t = 0.0;
+    for r in 0..@R@ {
+        t += recips(&xs);
+    }
+    println(t);
+}

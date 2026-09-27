@@ -867,6 +867,12 @@ map: **τ_s = 0.155 ns**, nine times `τ`. A reduction, `s += f(x[i])`, carries 
 serial. Mandelbrot goes from 4.2× too fast to 0.50, the half an upper bound's: its 50 laps are the most
 a point can take. Only a time reads `serial`.
 
+**Divisions (2026-09-28).** An `f64` division is one unit of work to the calculus and several to
+the machine: its throughput is a fraction of an add's. Divisions are counted apart as `divs`,
+composed as work is, and charged `τ_div = 0.148 ns` each beyond their unit, fitted on a sum of
+reciprocals over an array in L1. Spectral-norm, whose inner loop divides, goes from 1.9 to 1.27.
+Only a time reads `divs`.
+
 **Pages, tried (2026-09-27).** Lines fetched by an access that moves a page or more a lap of its
 innermost loop are counted as `paged`, and `--tlb ns` charges each of them a TLB walk. Fitted on a
 transpose it is 9 ns; held fixed, it over-charges naive matmul fourfold, whose column walk reuses

@@ -4,7 +4,7 @@
 //!   neant run   f.nt [--unchecked] [-- args]  build to a temp file and run it
 //!   neant emit  f.nt [--unchecked]            print the generated C
 //!   neant check f.nt                          parse and type-check only
-//!   neant cost  f.nt [-M bytes] [-B bytes] [-P cores] [--tau ns] [--bw GB/s] [--lat ns] [--tlb ns] [--taus ns] [--M3 bytes] [--bw2 GB/s] [--lat3 ns] [--eval n=..,..]
+//!   neant cost  f.nt [-M bytes] [-B bytes] [-P cores] [--tau ns] [--bw GB/s] [--lat ns] [--tlb ns] [--taus ns] [--tdiv ns] [--M3 bytes] [--bw2 GB/s] [--lat3 ns] [--eval n=..,..]
 //!                                             infer work, moves and span for every function
 //!   neant lock  f.nt [--check]                write costs.lock next to the source, or diff it
 //!   neant measure f.nt --fn name [--sizes 1000,4000,...] [--shape p=n*n,...] [--repeat k] [--cpu 5] [--lock]
@@ -44,7 +44,7 @@ fn main() {
     let mut checked = true;
     let mut passthrough: Vec<String> = Vec::new();
     let default_p = std::thread::available_parallelism().map(|n| n.get() as i128).unwrap_or(4);
-    let mut machine = cost::Machine { m_bytes: 2 << 20, b_bytes: 64, p_cores: default_p, ns_per_work: 0.0176, bytes_per_ns: 20.8, ns_per_miss: 112.3, ns_per_page: 0.0, ns_per_serial: 0.1554 };
+    let mut machine = cost::Machine { m_bytes: 2 << 20, b_bytes: 64, p_cores: default_p, ns_per_work: 0.0176, bytes_per_ns: 20.8, ns_per_miss: 112.3, ns_per_page: 0.0, ns_per_serial: 0.1554, ns_per_div: 0.1484 };
     // `ns_per_page` is off (0) unless `--tlb` is given: a TLB walk per paged line fits transpose and
     // over-charges naive matmul fourfold (docs/experiments.md § The roofline, pages)
     // the cache outside `M`, for a time only (docs/cost-model.md § Time, a second level): its size,
@@ -77,6 +77,7 @@ fn main() {
             "-P" => { i += 1; machine.p_cores = args.get(i).and_then(|s| s.parse().ok()).unwrap_or(machine.p_cores); }
             "--tau" => { i += 1; machine.ns_per_work = args.get(i).and_then(|s| s.parse().ok()).unwrap_or(machine.ns_per_work); }
             "--bw" => { i += 1; machine.bytes_per_ns = args.get(i).and_then(|s| s.parse().ok()).unwrap_or(machine.bytes_per_ns); }
+            "--tdiv" => { i += 1; machine.ns_per_div = args.get(i).and_then(|s| s.parse().ok()).unwrap_or(machine.ns_per_div); }
             "--taus" => { i += 1; machine.ns_per_serial = args.get(i).and_then(|s| s.parse().ok()).unwrap_or(machine.ns_per_serial); }
             "--tlb" => { i += 1; machine.ns_per_page = args.get(i).and_then(|s| s.parse().ok()).unwrap_or(machine.ns_per_page); }
             "--lat" => { i += 1; machine.ns_per_miss = args.get(i).and_then(|s| s.parse().ok()).unwrap_or(machine.ns_per_miss); }
@@ -198,7 +199,8 @@ fn main() {
                         let sv = if span != work { eval_one(c, span, ev, &machine).unwrap_or(w) } else { w };
                         // work on a chain each lap waits on runs at its own, slower rate
                         let ser = if c.serial.pieces.is_empty() { 0.0 } else { eval_one(c, &c.serial, ev, &machine).unwrap_or(0.0) }.min(w).max(0.0);
-                        let tw = if span != work { sv.max(w / p) * machine.ns_per_work } else { (w - ser) * machine.ns_per_work + ser * machine.ns_per_serial };
+                        let dv = if c.divs.pieces.is_empty() { 0.0 } else { eval_one(c, &c.divs, ev, &machine).unwrap_or(0.0) }.max(0.0);
+                        let tw = if span != work { sv.max(w / p) * machine.ns_per_work } else { (w - ser) * machine.ns_per_work + ser * machine.ns_per_serial + dv * machine.ns_per_div };
                         // a chase's lines wait one on the last: latency, not bandwidth
                         let ch = if c.chase.pieces.is_empty() { 0.0 } else { eval_one(c, &c.chase, ev, &machine).unwrap_or(0.0) }.min(m);
                         // the same cost across the boundary of the cache outside `M`: what crosses
@@ -222,6 +224,7 @@ fn main() {
                         if ch > 0.0 { print!("  chase {ch:.0} bytes"); }
                         if pg > 0.0 { print!("  paged {pg:.0} bytes"); }
                         if ser > 0.0 { print!("  serial {ser:.0}"); }
+                        if dv > 0.0 { print!("  divs {dv:.0}"); }
                         print!("  time {:.3e} s ({}-bound)", tw.max(tm) / 1e9, if tw >= tm { "work" } else { "moves" });
                         if span != work {
                             if let Some(s) = eval_one(c, span, ev, &machine) {
