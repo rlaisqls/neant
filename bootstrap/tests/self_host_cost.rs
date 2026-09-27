@@ -39,6 +39,13 @@ fn repo(sub: &str) -> PathBuf {
 /// deliberate divergence should land here and be argued, not absorbed.
 const COPIES_INSTEAD: &[(&str, &str)] = &[];
 
+/// `(file, function)` where the self-hosted `moves` are higher because it counts neighbouring
+/// sites as separate streams: `stencil`'s five reads of `src` share three rows, which the Rust
+/// charges once (cost-model § Moves, neighbouring sites, 2026-09-27) and this pass, which has no
+/// such rule, charges as five. A deliberate divergence, argued here as the list above asks: the
+/// self-hosted pass states more, never less, and `main` inherits it through the call.
+const NEIGHBOURS_INSTEAD: &[(&str, &str)] = &[("stencil.nt", "stencil"), ("stencil.nt", "main")];
+
 /// Functions whose **footprint** this pass states more narrowly than `neant cost`: it reports none,
 /// or fewer arrays, where the Rust reports one. A narrowing, not a disagreement — the two never state *different*
 /// footprints, and a missing one only costs a caller a credit it could have had.
@@ -122,7 +129,7 @@ const EXACT: usize = 102;
 /// **Nothing is declined.** Every `moves` column either matches or is one of the four in
 /// `COPIES_INSTEAD` — a footprint is a range now, so a callee that reads two fields of a four-field
 /// particle leaves half the array resident and the next call over the other half pays in full.
-const EXACT_MOVES: usize = 102;
+const EXACT_MOVES: usize = 100;
 
 /// The same for the **footprint**: one entry per array parameter and the condition under which the
 /// whole of it is resident on return, whitespace-normalised so the report's column padding is not
@@ -398,7 +405,8 @@ fn self_hosted_work_agrees_with_bootstrap() {
             // the only reason a `moves` column still differs: the emitter copies a whole-array
             // assignment the Rust proves is in place. The layout family is gone — the self-hosted
             // compiler chooses AoS or SoA for itself now (docs/self-hosting-layout-design.md).
-            let listed = COPIES_INSTEAD.contains(&(name.as_str(), fname.as_str()));
+            let listed = COPIES_INSTEAD.contains(&(name.as_str(), fname.as_str()))
+                || NEIGHBOURS_INSTEAD.contains(&(name.as_str(), fname.as_str()));
             if g == mw {
                 exact_moves += 1;
 

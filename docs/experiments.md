@@ -707,8 +707,10 @@ bound and errs high. What remains is the same short list, each a place the bound
   larger taken (when it is cheap to know — the same cost, or one dominating regime by regime; the
   sum otherwise, which a plain `max` of piecewise costs had turned into a regime blow-up on the
   compiler), `heat` is **0.21 / 0.26** at n = 300 / 900, five of the compiler's lock lines drop and its
-  count does not move. The other 3× is the stencil's five reads counted as more streams than the
-  three rows they share, a reuse between neighbouring sites § Moves does not yet see.
+  count does not move. The other 3× was the stencil's five reads counted as five streams; with
+  neighbouring sites grouped (cost-model § Neighbouring sites) it is three, `24·n²` a sweep against
+  a lower bound of `16·n²`, and `heat` is **0.48 / 0.51** at n = 300 / 900. Measured refills × 64
+  stay below the prediction (0.05 and 0.34 of it), as a bound's should.
 - `matmul`: 1.4–2.7× low where it is work-bound at small `n`: its inner loop's `work·τ` uses a `τ`
   fitted on a vectorised polynomial, and a strided dot product vectorises worse.
 

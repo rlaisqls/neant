@@ -71,9 +71,10 @@ changes the first timing forced (cost-model § A scan's accesses):
 | `fir`, `pid` (read 10⁴–10⁶ integers, filter / control loop) | 0.41 – 0.53 |
 | `csv` (10³–10⁵ rows) | 0.10 – 0.22 |
 | `matmul` (n = 100–600) | 1.36 – 2.66 |
-| `heat` (n = 300–900, 50 steps) | 0.21 – 0.26 |
+| `heat` (n = 300–900, 50 steps) | 0.48 – 0.51 |
 
-Every program is within **0.10 to 2.7** of its measured time, geometric mean 0.41. Before the scan's
+Every program is within **0.10 to 2.7** of its measured time; the geometric mean was 0.41 before the
+stencil's neighbouring sites were grouped and `heat` moved from 0.13 to 0.50. Before the scan's
 accesses were charged as a stream, the text readers were 10³ to 10⁶ too high — a bound, and a
 useless time; the first timing is kept in experiments.md because it is what found that.
 
@@ -134,9 +135,9 @@ constant to tune:
   0.28–0.58 there). The latency term closed the chase's gap past the last cache (5–31× → 1.00).
 - **Strides and the TLB** (`transpose`, 2–3×), and **bandwidth that grows with the number of
   streams** (`dot`, 0.6×).
-- **Reuse between neighbouring sites.** A stencil's five reads are counted as more streams than the
-  three rows they share (`heat`, 4× high; it was 8× until calls in both branches of an `if` were
-  charged the larger rather than the sum).
+- **Reuse between neighbouring sites, in part.** A stencil's five reads are three streams now, not
+  five (cost-model § Neighbouring sites); the centre row is still counted apart from the rows it
+  shares with its neighbours (`heat`, 2× high, from 8×).
 - **Per-call constants in a parse.** `3·B` of partly used lines at each end of a call, which
   consecutive calls share (`csv`, 5–10× high).
 - **A `τ` for code that vectorises worse** than the polynomial it was fitted on (`matmul` at small
@@ -169,6 +170,5 @@ part of ordinary code *exactly* — the compiler is a third exact, a third state
 a callee, a third unknown — and every place it is loose is a named term or shape, each with the
 measurement that found it.
 
-Next, in the order they would change these numbers: reuse between neighbouring sites (`heat`), a
-second cache level (the small sizes, and a chase inside L3), the parse's per-call constants (`csv`),
+Next, in the order they would change these numbers: a second cache level (the small sizes, and a chase inside L3), the parse's per-call constants (`csv`),
 a second machine for `τ`, `BW` and `L`, and, for reach, recursion over an arena tree.

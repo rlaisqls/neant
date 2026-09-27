@@ -1,9 +1,10 @@
-stencil          work 25·n² − 97·n + 95            moves                              exact  (2 regimes)
-                                               moves ≈ 40·n²                      if ≈ 40·n < M
-                                               moves ≈ 40·n²                      if ≈ 40·n ≥ M
-                 lower bound      moves 16·n² − 64·n + 64            (footprint, every distinct element crosses once)   gap 2× if ≈ 40·n < M; 2× if ≈ 40·n ≥ M at M = 2 MiB, B = 64
+stencil          work 25·n² − 97·n + 95            moves                              exact  (3 regimes)
+                                               moves ≈ 32·n²                      if ≈ 32·n ≥ M
+                                               moves ≈ 24·n²                      if ≈ 32·n < M and ≈ 96·n < M
+                                               moves ≈ 32·n²                      if ≈ 32·n < M and ≈ 96·n ≥ M
+                 lower bound      moves 16·n² − 64·n + 64            (footprint, every distinct element crosses once)   gap 2× if ≈ 32·n ≥ M; 2× if ≈ 32·n < M and ≈ 96·n < M; 2× if ≈ 32·n < M and ≈ 96·n ≥ M at M = 2 MiB, B = 64
                  footprint        src: [0, 8·src.len()) (whole array)  dst: [8·n + 8, 8·n² − 8·n − 8)   no residue claimed
 total            work 4·g.len()                    moves 8·g.len() + B                exact
                  lower bound      moves 8·g.len()                    (footprint, every distinct element crosses once)   gap 1× at M = 2 MiB, B = 64
                  footprint        g: [0, 8·g.len())   resident after if 8·g.len() < M
-main             work 1628                         moves 32·B + 3488                  exact, io
+main             work 1628                         moves 34·B + 3008                  exact, io

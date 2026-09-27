@@ -21,7 +21,7 @@ layout Img        aos
 add_level        unknown: calls `primary`, whose cost is unknown (`while` has no measure the compiler can find; write `while cond decreasing <expr>` with an `i64` that goes down by at least one every iteration)
 alloc            work 16                           moves 2·B                          exact
 and_level        unknown: calls `primary`, whose cost is unknown (`while` has no measure the compiler can find; write `while cond decreasing <expr>` with an `i64` that goes down by at least one every iteration)
-arena_first      work 10·mi·max(toks[_].len) + 54·mi + 3 moves 2·B·mi·max(toks[_].len) + 2·B·toks[sites[sc[24576]].arr].len + 11·B·mi + 16·mi − 2·B·max(toks[_].len) + 6·B bound
+arena_first      work 10·mi·max(toks[_].len) + 54·mi + 3 moves 2·B·mi·max(toks[_].len) + 2·B·toks[sites[sc[24576]].arr].len + 11·B·mi + 8·mi − 2·B·max(toks[_].len) + 4101·B bound
 arg_is_mut       work 10·max(toks[_].len)·cst[1] + 25·cst[1] + 25 moves 2·B·max(toks[_].len)·cst[1] + 32·cst[1] + 4·B·cst[1] + 2·B·toks[syms[cst[1] − 1].name].len − 2·B·max(toks[_].len) + 6·B bound
 arg_len          work 10·max(toks[_].len)·wst[0] + 25·wst[0] + 17 moves 2·B·max(toks[_].len)·wst[0] + 32·wst[0] + 4·B·wst[0] + 2·B·toks[env[wst[0] − 1].name].len − 2·B·max(toks[_].len) + 4·B bound
 arg_len_of       work 10·max(toks[_].len)·wst[0] + 25·wst[0] + 10 moves 2·B·max(toks[_].len)·wst[0] + 32·wst[0] + 4·B·wst[0] + 2·B·toks[env[wst[0] − 1].name].len − 2·B·max(toks[_].len) + 3·B bound

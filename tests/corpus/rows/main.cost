@@ -1,6 +1,8 @@
-relax            work ≈ 25·n²·steps                moves                              exact  (4 regimes)
-                                               moves ≈ 48·n²                      if ≈ 40·n² < M and ≈ 40·n < M
-                                               moves ≈ 48·n²                      if ≈ 40·n² < M and ≈ 40·n ≥ M
-                                               moves ≈ 40·n²·steps                if ≈ 40·n² ≥ M and ≈ 40·n < M
-                                               moves ≈ 40·n²·steps                if ≈ 40·n² ≥ M and ≈ 40·n ≥ M
-main             work 25158                        moves 38·B + 3003                  exact, io
+relax            work ≈ 25·n²·steps                moves                              exact  (6 regimes)
+                                               moves ≈ 32·n²                      if ≈ 24·n² < M and ≈ 24·n ≥ M
+                                               moves ≈ 24·n²·steps                if ≈ 24·n² ≥ M and ≈ 24·n ≥ M
+                                               moves ≈ 24·n²                      if ≈ 16·n² < M and ≈ 24·n < M and ≈ 72·n < M
+                                               moves ≈ 32·n²                      if ≈ 24·n² < M and ≈ 24·n < M and ≈ 72·n ≥ M
+                                               moves ≈ 24·n²·steps                if ≈ 24·n² ≥ M and ≈ 24·n < M and ≈ 72·n ≥ M
+                                               moves ≈ 16·n²·steps                if ≈ 16·n² ≥ M and ≈ 24·n < M and ≈ 72·n < M
+main             work 25158                        moves 33·B + 1939                  exact, io

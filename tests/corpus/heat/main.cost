@@ -17,10 +17,11 @@ read_ints        work 35·out.len() + 9·xs.len() + 1 moves ≈ 3·B·out.len() 
                  in `next_int`: scan: `i` grows by at least 1 a lap, so the `while` at ../lib/parse.nt:23 runs at most xs.len() − start times
                  scan: the calls to `next_int` at ../lib/parse.nt:56 are amortised: `i` only moves on through where `next_int` stopped in `xs`, so together they are charged 9·xs.len() once, not a scan of `xs` a lap
                  rests on         next_int (bound, a scan)
-sweep            work 31·n² − 121·n + 119          moves                              exact  (2 regimes)
-                                               moves ≈ 48·n²                      if ≈ 48·n < M
-                                               moves ≈ 48·n²                      if ≈ 48·n ≥ M
-                 lower bound      moves 16·n² − 64·n + 64            (footprint, every distinct element crosses once)   gap 3× if ≈ 48·n < M; 3× if ≈ 48·n ≥ M at M = 2 MiB, B = 64
+sweep            work 31·n² − 121·n + 119          moves                              exact  (3 regimes)
+                                               moves ≈ 32·n²                      if ≈ 32·n ≥ M
+                                               moves ≈ 24·n²                      if ≈ 32·n < M and ≈ 96·n < M
+                                               moves ≈ 32·n²                      if ≈ 32·n < M and ≈ 96·n ≥ M
+                 lower bound      moves 16·n² − 64·n + 64            (footprint, every distinct element crosses once)   gap 2× if ≈ 32·n ≥ M; 2× if ≈ 32·n < M and ≈ 96·n < M; 2× if ≈ 32·n < M and ≈ 96·n ≥ M at M = 2 MiB, B = 64
                  footprint        src: [0, 8·src.len()) (whole array)  dst: [8·n + 8, 8·n² − 8·n − 8)   no residue claimed
 edges            work 13·n                         moves 2·B·n + 16·n + 2·B           exact
                  lower bound      moves 8·n                          (footprint, every distinct element crosses once)   gap 18× at M = 2 MiB, B = 64
@@ -28,9 +29,10 @@ edges            work 13·n                         moves 2·B·n + 16·n + 2·B
 mean             work 4·g.len() + 2                moves 8·g.len() + B                exact
                  lower bound      moves 8·g.len()                    (footprint, every distinct element crosses once)   gap 1× at M = 2 MiB, B = 64
                  footprint        g: [0, 8·g.len())   resident after if 8·g.len() < M
-main             work ≈ 31·n²·steps                moves                              bound, io  (2 regimes)
-                                               moves ≈ 48·n²·steps                if ≈ 48·n < M
-                                               moves ≈ 48·n²·steps                if ≈ 48·n ≥ M
+main             work ≈ 31·n²·steps                moves                              bound, io  (3 regimes)
+                                               moves ≈ 32·n²·steps                if ≈ 32·n ≥ M
+                                               moves ≈ 32·n²·steps                if ≈ 32·n < M and ≈ 96·n ≥ M
+                                               moves ≈ 24·n²·steps                if ≈ 32·n < M and ≈ 96·n < M
                  in `parse_int`: in `next_int`: scan: `i` grows by at least 1 a lap, so the `while` at ../lib/parse.nt:23 runs at most xs.len() − start times
                  rests on         arg (declared, extern); next_int (bound, a scan)
 arg              work ≤ result.len()               moves ≤ result.len()               declared, io

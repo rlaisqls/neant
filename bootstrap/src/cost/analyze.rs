@@ -1438,6 +1438,62 @@ impl<'a, 'b, 'c> Fa<'a, 'b, 'c> {
         self.sites.push(Site { dep, arr, aff, es, stride, field, base, key, path, branch: self.branch.clone() });
     }
 
+    /// The access sites of loop `lid` that read one array at offsets the loop carries into each
+    /// other: the same array, field and nest, the same coefficient on every loop variable, and
+    /// constant parts that differ by whole laps of this loop — `src[(i − 1)·n + j]`, `src[i·n + j]`,
+    /// `src[(i + 1)·n + j]` at `i` — and by less than one lap of the loop outside it, so a group is
+    /// found at the loop that moves it and not again further in. Each group lists `(member, laps
+    /// ahead of the one behind)`, sorted, with at least two members a lap or more apart.
+    fn reuse_groups(&self, lid: usize, members: &[(usize, usize)], grouped: &[bool]) -> Vec<Vec<(usize, i128)>> {
+        let rec = &self.loop_recs[lid];
+        let Some(var) = rec.var else { return vec![] };
+        if rec.monotone || rec.atom.is_none() { return vec![]; }
+        let mut groups: Vec<Vec<(usize, i128)>> = Vec::new();
+        let mut used = vec![false; members.len()];
+        for a in 0..members.len() {
+            if used[a] || grouped[members[a].0] { continue; }
+            let sa = &self.sites[members[a].0];
+            let Some(aa) = &sa.aff else { continue };
+            let Some(k) = aa.coeffs.get(&var) else { continue };
+            let unit = k.scale(Rat::int(rec.step));
+            if unit.is_zero() { continue; }
+            // one lap of the loop outside, in index units, when there is one
+            let pos = members[a].1;
+            let outer = if pos > 0 {
+                let o = &self.loop_recs[sa.path[pos - 1]];
+                match o.var.and_then(|ov| aa.coeffs.get(&ov)) { Some(ko) => Some(ko.scale(Rat::int(o.step.abs()))), None => None }
+            } else { None };
+            let mut g: Vec<(usize, Rat)> = vec![(a, Rat::zero())];
+            for b in a + 1..members.len() {
+                if used[b] || grouped[members[b].0] { continue; }
+                let sb = &self.sites[members[b].0];
+                let Some(ab) = &sb.aff else { continue };
+                if sb.arr != sa.arr || sb.field != sa.field || sb.stride != sa.stride || sb.path != sa.path || sb.branch != sa.branch || ab.coeffs != aa.coeffs { continue; }
+                let delta = ab.konst.sub(&aa.konst);
+                // laps: `delta` as a rational multiple of one lap's move
+                let Some((m0, k0)) = unit.terms.iter().next() else { continue };
+                let r = match delta.terms.get(m0) { Some(dk) => dk.mul(Rat::new(k0.d, k0.n)), None if delta.is_zero() => Rat::zero(), None => continue };
+                if unit.scale(r) != delta || !r.is_int() { continue; }
+                // less than one lap of the loop outside, both ways, where both are numbers: an
+                // offset in a size (`2·n`) is never a whole number of laps of a loop moving by one
+                if let (true, Some(ko)) = (pos > 0, &outer) {
+                    if let (Some(d), Some(o)) = (self.numeric(&delta), self.numeric(ko)) {
+                        if d.abs() >= o.abs() { continue; }
+                    }
+                }
+                g.push((b, r));
+            }
+            if g.len() < 2 { continue; }
+            let lo = g.iter().map(|(_, r)| r.n).min().unwrap();
+            let mut g: Vec<(usize, i128)> = g.into_iter().map(|(m, r)| (m, r.n - lo)).collect();
+            g.sort_by_key(|&(_, c)| c);
+            if g[g.len() - 1].1 < 1 { continue; }
+            for &(m, _) in &g { used[m] = true; }
+            groups.push(g);
+        }
+        groups
+    }
+
     /// Lines touched by every access site over its loop nest, times B, added to moves. Level by
     /// level from the innermost loop out, for all sites at once:
     ///
@@ -1473,6 +1529,8 @@ impl<'a, 'b, 'c> Fa<'a, 'b, 'c> {
         };
         let mut ids: Vec<usize> = (0..self.loop_recs.len()).collect();
         ids.sort_unstable_by(|a, b| b.cmp(a));
+        // a site already charged less by a group further in is not a member of another
+        let mut grouped = vec![false; nsites];
         for lid in ids {
             let members: Vec<(usize, usize)> = (0..nsites)
                 .filter_map(|s| self.sites[s].path.iter().position(|&l| l == lid).map(|pos| (s, pos)))
@@ -1481,6 +1539,11 @@ impl<'a, 'b, 'c> Fa<'a, 'b, 'c> {
             let rec = &self.loop_recs[lid];
             let inners: Vec<Vec<LP>> = members.iter().map(|&(s, pos)| inner(&table, s, &self.sites[s].path, pos)).collect();
             let mut out: Vec<Vec<LP>> = vec![Vec::new(); members.len()];
+            // neighbouring sites (cost-model § Moves, neighbouring sites): per group, each member
+            // and its offset in laps of this loop, the one furthest ahead last
+            let groups = self.reuse_groups(lid, &members, &grouped);
+            for g in &groups { for &(m, _) in g { grouped[members[m].0] = true; } }
+            let group_of = |i: usize| groups.iter().find(|g| g.iter().any(|&(m, _)| m == i));
             // every feasible choice of one alternative per site is a working set to test
             let mut choice = vec![0usize; members.len()];
             loop {
@@ -1580,7 +1643,34 @@ impl<'a, 'b, 'c> Fa<'a, 'b, 'c> {
                                 }
                             };
                             let np = LP { conds: conds.clone(), lines: total, contig };
-                            if !out[i].iter().any(|x| x.conds == np.conds && x.lines == np.lines && x.contig == np.contig) { out[i].push(np); }
+                            // a member of a group whose window fits: the first is charged in full,
+                            // the one furthest ahead the lines of the laps between them, the rest
+                            // nothing — they read what those two already brought in
+                            let grouped = match (fits, group_of(i), &test) {
+                                (true, Some(g), Some(t)) => {
+                                    let span = g.iter().map(|&(_, c)| c).max().unwrap_or(0);
+                                    let win = Cond { ws: t.scale(Rat::int(span + 1)), fits: true };
+                                    let lines = if g[0].0 == i { np.lines.clone() }
+                                        else if g[g.len() - 1].0 == i { picks[i].lines.scale(Rat::int(span)) }
+                                        else { Poly::zero() };
+                                    Some((win, lines))
+                                }
+                                _ => None,
+                            };
+                            let alts: Vec<LP> = match grouped {
+                                None => vec![np],
+                                Some((win, lines)) => {
+                                    let mut cf = conds.clone(); if !cf.contains(&win) { cf.push(win.clone()); }
+                                    let mut cn = conds.clone(); let nw = Cond { ws: win.ws.clone(), fits: false }; if !cn.contains(&nw) { cn.push(nw); }
+                                    let mut v = Vec::new();
+                                    if super::piece::feasible(&cf) { v.push(LP { conds: cf, lines, contig: false }); }
+                                    if super::piece::feasible(&cn) { v.push(LP { conds: cn, lines: np.lines.clone(), contig: np.contig }); }
+                                    v
+                                }
+                            };
+                            for np in alts {
+                                if !out[i].iter().any(|x| x.conds == np.conds && x.lines == np.lines && x.contig == np.contig) { out[i].push(np); }
+                            }
                         }
                     }
                 }

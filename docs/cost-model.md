@@ -407,6 +407,31 @@ each (§ Moves). That is an upper bound too.
 - An entry value that is neither known nor bounded below because some assignment to `i` shrinks
   it: "`i`'s entry value is not known and `i` is not only increased".
 
+## Neighbouring sites
+
+**Written 2026-09-27, for the stencil.** § Moves adds up the lines of every site. A five-point
+stencil reads `src[(i − 1)·n + j]`, `src[i·n + j]`, `src[(i + 1)·n + j]`, `src[i·n + j − 1]` and
+`src[i·n + j + 1]` — five sites, five streams, where the machine reads three rows, each once, while
+they are near each other in cache. The lower bound said so: `16·n²` against `48·n²` charged.
+
+**The rule.** At a loop, sites on one array — the same field, nest and branch, the same coefficient
+on every loop variable — whose constant parts differ by whole laps of this loop are a group: the
+one ahead reads now what the others read one or two laps later. When the working set of `span + 1`
+laps of this loop fits in `M` — the loop's own working set per lap, as § Moves computes it, times
+the laps between the first member and the last — the group costs one member in full plus the
+lines of `span` laps, once, and the others nothing. Where the window does not fit, each member is
+its own stream, as before; the report forks on the condition like any other.
+
+Two guards keep a line from being saved twice: a group is formed at the loop whose laps its offsets
+are, and only if (where both are numbers) the offsets are less than one lap of the loop outside;
+and a site already charged less by a group further in joins no other. The stencil's `j ± 1` group
+at `j` and its `i ± 1` group at `i` are two streams, and `dst` the third: `24·n²` against the lower
+bound's `16·n²`. The centre read, grouped at `j`, is not also counted as sharing the rows at `i`,
+which is where the remaining factor of 1.5 is.
+
+Measured on `heat` (the corpus's stencil) the prediction stays above the machine's refills, at
+0.05 and 0.34 of it at `n` = 300 and 900, and its time goes from 0.26 to 0.50 of the predicted.
+
 ## A scan's accesses
 
 **Written 2026-09-27, after the corpus was timed.** § A scan bounds a scan's *trip*, but its index

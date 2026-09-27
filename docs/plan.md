@@ -923,7 +923,12 @@ read only by a time: `(moves − chase)/BW + chase/B · L`, `L = 112 ns` fitted 
 goes from 5–31× too fast to 0.28–1.00, the kernels' geometric mean from 1.56 to 1.14; no bound, tier or
 report line moved. The same day: calls in both branches of an `if` had their moves added where work
 took the larger branch; they now take the larger when it is cheap to know and the sum otherwise
-(`heat` 8× → 4× high; five compiler lock lines drop, the count does not move).
+(`heat` 8× → 4× high; five compiler lock lines drop, the count does not move). Then neighbouring
+sites (cost-model § Neighbouring sites): sites on one array whose offsets are whole laps of a loop
+share lines when `span + 1` laps fit, so the stencil is three streams, not five (`24·n²` against the
+lower bound's `16·n²`), `heat` goes to 0.50, measured refills stay below the prediction, one compiler
+lock line moves and the self-hosted pass, without the rule, is listed as charging more
+(`NEIGHBOURS_INSTEAD`).
 
 ## M7 — the constant factor
 
