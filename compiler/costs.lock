@@ -37,7 +37,7 @@ block            unknown: `while` has no measure the compiler can find; write `w
 bound_moves      unknown: the bound of `s` is not a size expression; `while` has no measure the compiler can find; write `while cond decreasing <expr>` with an `i64` that goes down by at least one every iteration
 builds_struct    unknown: the number of recursive calls per invocation depends on the input
 bump             work 3                            moves B                            exact
-bytes_len        unknown: `i` is compared in the `while` condition but is not stepped by a constant exactly once in the body; `while` has no measure the compiler can find; write `while cond decreasing <expr>` with an `i64` that goes down by at least one every iteration
+bytes_len        work 9·toks[t].len + 2            moves B·toks[t].len + 2·B          bound
 c_atom           unknown: `while` has no measure the compiler can find; write `while cond decreasing <expr>` with an `i64` that goes down by at least one every iteration
 c_factor         unknown: `while` has no measure the compiler can find; write `while cond decreasing <expr>` with an `i64` that goes down by at least one every iteration  rests on c_space (unknown); pol_close (unknown)
 c_is_alpha       work 9                            moves 0                            exact
@@ -177,7 +177,7 @@ lpe_push         work 11                           moves 2·B                   
 m_block          unknown: calls `m_expr`, whose cost is unknown (`while` has no measure the compiler can find; write `while cond decreasing <expr>` with an `i64` that goes down by at least one every iteration)  rests on pol_close (unknown); ck_close (unknown)
 m_expr           unknown: `while` has no measure the compiler can find; write `while cond decreasing <expr>` with an `i64` that goes down by at least one every iteration  rests on pol_close (unknown); ck_close (unknown); site_add (unknown); scalar_bytes (unknown); ck_add (unknown); conds_union (unknown); pol_dominates (unknown)
 m_func           unknown: argument 12 to `solve_recurrence` is not a size expression, and `solve_recurrence`'s cost depends on it  rests on pol_close (unknown); m_block (unknown); ck_close (unknown); level_members (unknown); settle_level (unknown); group_moves (unknown); ck_add (unknown); conds_union (unknown); pol_dominates (unknown); bound_moves (unknown); pol_subst (unknown); mono_mul (unknown)
-m_stmt           unknown: calls `m_expr`, whose cost is unknown (`while` has no measure the compiler can find; write `while cond decreasing <expr>` with an `i64` that goes down by at least one every iteration)  rests on val_of (unknown); pol_close (unknown); mono_mul (unknown); scalar_bytes (unknown); ck_close (unknown); bytes_len (unknown)
+m_stmt           unknown: calls `m_expr`, whose cost is unknown (`while` has no measure the compiler can find; write `while cond decreasing <expr>` with an `i64` that goes down by at least one every iteration)  rests on val_of (unknown); pol_close (unknown); mono_mul (unknown); scalar_bytes (unknown); ck_close (unknown); bytes_len (bound, a scan)
 main             unknown: calls `read_stdin`, which is declared unbounded, io
 min_dec          unknown: the bound of `i` is not a size expression; `while` has no measure the compiler can find; write `while cond decreasing <expr>` with an `i64` that goes down by at least one every iteration
 mk_assign        work 21                           moves 3·B                          exact

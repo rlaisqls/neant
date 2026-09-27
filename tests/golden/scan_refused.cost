@@ -1,0 +1,5 @@
+word_end         work 2·xs.len() − 2·start + 4     moves xs.len() − start + 2·B       exact
+                 footprint        xs: [0, xs.len()) (whole array)   no residue claimed
+words            unknown: `i` does not grow on every path through the body, so this is not a scan (line 15)
+main             work work[words](3) + 6           moves moves[words](3) + 3          modulo, io
+                 rests on         words (unknown)

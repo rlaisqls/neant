@@ -58,9 +58,16 @@ const COPIES_INSTEAD: &[(&str, &str)] = &[];
 /// `walk.nt`'s four are the same stop at the first loop: each is a `while s >= 0` down a list, which
 /// the Rust bounds by the longest walk along the link (stage D (3)) and this pass, with no walk
 /// atom, declines before it has recorded a site.
+///
+/// `scan.nt`'s `word_end` and `trimmed`, and `scan_refused.nt`'s `word_end`, are the same stop
+/// again: each loop is `while i < xs.len() && xs[i] … `, whose trip the Rust takes from the first
+/// conjunct (cost-model § Loops without a range) — in `trimmed`'s second loop by a scan (§ A scan)
+/// — and this pass, with neither rule, declines before it has recorded the site on `xs`.
 const FOOTPRINT_NARROWER: &[(&str, &str)] = &[("parse.nt", "number"), ("bfs.nt", "bfs"),
                                               ("walk.nt", "sum_list"), ("walk.nt", "sum_all"),
-                                              ("walk.nt", "double_list"), ("walk.nt", "chain_len")];
+                                              ("walk.nt", "double_list"), ("walk.nt", "chain_len"),
+                                              ("scan.nt", "word_end"), ("scan.nt", "trimmed"),
+                                              ("scan_refused.nt", "word_end")];
 
 /// The same for the **footprint lower bound**: stated where `neant cost` states one and this pass
 /// states none. A `while` loop is given no loop atom by this pass — only a `for` mints one — so a
@@ -99,13 +106,13 @@ const EXACT_MOVES: usize = 101;
 /// whole of it is resident on return, whitespace-normalised so the report's column padding is not
 /// part of the comparison. Counted over every function, so one that should state no footprint and
 /// states none counts too.
-const EXACT_FOOT: usize = 124;
+const EXACT_FOOT: usize = 128;
 
 /// The same for the **footprint lower bound** — `moves` cannot be less than the distinct bytes a
 /// function's parameter arrays reach. Counted over every function, so a `main` that should have no
 /// bound and gets none counts too: a bound invented where `neant cost` states none is as wrong as
 /// a missing one, and only one of those two shows up as a difference.
-const EXACT_BOUNDS: usize = 127;
+const EXACT_BOUNDS: usize = 134;
 
 
 

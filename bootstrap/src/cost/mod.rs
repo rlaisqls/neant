@@ -8,6 +8,7 @@ pub mod lock;
 pub mod measure;
 pub mod piece;
 pub mod rewrite;
+pub mod scan;
 pub mod scop;
 pub mod size;
 

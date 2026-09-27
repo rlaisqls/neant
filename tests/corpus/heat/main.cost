@@ -1,14 +1,30 @@
 struct Num       layout AoS  the model does not decide: no function's moves differ
 is_digit         work 3                            moves 0                            exact
-next_int         unknown: `i` is assigned inside a loop before this one, so its entry value is not known (../lib/parse.nt:23)
+next_int         work 9·xs.len() − 9·start + 29    moves                              bound  (2 regimes)
+                                               moves ≈ B·xs.len() + xs.len() − B·start − start if xs.len() ≥ M
+                                               moves 2·xs.len() − start + 2·B     if xs.len() < M
                  footprint        xs: [0, xs.len()) (whole array)   no residue claimed
-parse_int        work work[next_int](xs.len(), 0) + 2 moves moves[next_int](xs.len(), 0) modulo
-                 rests on         next_int (unknown)
-count_ints       unknown: `i` is compared in the `while` condition but is not stepped by a constant exactly once in the body; `while` has no measure the compiler can find; write `while cond decreasing <expr>` with an `i64` that goes down by at least one every iteration (../lib/parse.nt:41)
-read_ints        work out.len()·work[next_int](xs.len(), _) + 6·out.len() + 1 moves out.len()·moves[next_int](xs.len(), _) + 8·out.len() + B modulo
+                 scan: `i` grows by at least 1 a lap, so the `while` at ../lib/parse.nt:23 runs at most xs.len() − start times
+parse_int        work 9·xs.len() + 31              moves                              bound  (2 regimes)
+                                               moves B·xs.len() + xs.len() + 2·B  if xs.len() ≥ M
+                                               moves 2·xs.len() + 2·B             if xs.len() < M
+                 in `next_int`: scan: `i` grows by at least 1 a lap, so the `while` at ../lib/parse.nt:23 runs at most xs.len() − start times
+                 rests on         next_int (bound, a scan)
+count_ints       work 9·xs.len()² + 35·xs.len() + 1 moves                              bound  (2 regimes)
+                                               moves B·xs.len()² + xs.len()² + 2·B·xs.len() if xs.len() ≥ M
+                                               moves 2·xs.len()² + 2·B·xs.len()   if xs.len() < M
+                 in `next_int`: scan: `i` grows by at least 1 a lap, so the `while` at ../lib/parse.nt:23 runs at most xs.len() − start times
+                 scan: `i` grows by at least 1 a lap, so the `while` at ../lib/parse.nt:41 runs at most xs.len() times
+                 scan: argument 2 to `next_int` is taken at its least, 0, and `next_int`'s cost falls as it grows
+                 rests on         next_int (bound, a scan)
+read_ints        work 9·xs.len()·out.len() + 35·out.len() + 1 moves                              bound  (2 regimes)
+                                               moves ≈ B·xs.len()·out.len() + xs.len()·out.len() if xs.len() ≥ M
+                                               moves ≈ 2·xs.len()·out.len()       if xs.len() < M
                  lower bound      moves 8·out.len()                  (footprint, every distinct element crosses once)
                  footprint        out: [0, 8·out.len())   resident after if 8·out.len() < M
-                 rests on         next_int (unknown)
+                 in `next_int`: scan: `i` grows by at least 1 a lap, so the `while` at ../lib/parse.nt:23 runs at most xs.len() − start times
+                 scan: argument 2 to `next_int` is taken at its least, 0, and `next_int`'s cost falls as it grows
+                 rests on         next_int (bound, a scan)
 sweep            work 31·n² − 121·n + 119          moves                              exact  (2 regimes)
                                                moves ≈ 48·n²                      if ≈ 48·n < M
                                                moves ≈ 48·n²                      if ≈ 48·n ≥ M
@@ -20,8 +36,15 @@ edges            work 13·n                         moves 2·B·n + 16·n + 2·B
 mean             work 4·g.len() + 2                moves 8·g.len() + B                exact
                  lower bound      moves 8·g.len()                    (footprint, every distinct element crosses once)   gap 1× at M = 2 MiB, B = 64
                  footprint        g: [0, 8·g.len())   resident after if 8·g.len() < M
-main             work ≈ 31·n²·steps + work[next_int](a1.len(), 0) + work[next_int](a0.len(), 0) moves                              modulo, io  (2 regimes)
-                                               moves ≈ 96·n²·steps + moves[next_int](a1.len(), 0) + moves[next_int](a0.len(), 0) if ≈ 48·n < M
-                                               moves ≈ 96·n²·steps + moves[next_int](a1.len(), 0) + moves[next_int](a0.len(), 0) if ≈ 48·n ≥ M
-                 rests on         arg (declared, extern); next_int (unknown)
+main             work ≈ 31·n²·steps                moves                              bound, io  (8 regimes)
+                                               moves ≈ 96·n²·steps                if ≈ 48·n < M and a0.len() ≥ M and a1.len() ≥ M
+                                               moves ≈ 96·n²·steps                if ≈ 48·n ≥ M and a0.len() ≥ M and a1.len() ≥ M
+                                               moves ≈ 96·n²·steps                if ≈ 48·n < M and a0.len() ≥ M and a1.len() < M
+                                               moves ≈ 96·n²·steps                if ≈ 48·n ≥ M and a0.len() ≥ M and a1.len() < M
+                                               moves ≈ 96·n²·steps                if ≈ 48·n < M and a0.len() < M and a1.len() ≥ M
+                                               moves ≈ 96·n²·steps                if ≈ 48·n ≥ M and a0.len() < M and a1.len() ≥ M
+                                               moves ≈ 96·n²·steps                if ≈ 48·n < M and a0.len() < M and a1.len() < M
+                                               moves ≈ 96·n²·steps                if ≈ 48·n ≥ M and a0.len() < M and a1.len() < M
+                 in `parse_int`: in `next_int`: scan: `i` grows by at least 1 a lap, so the `while` at ../lib/parse.nt:23 runs at most xs.len() − start times
+                 rests on         arg (declared, extern); next_int (bound, a scan)
 arg              work ≤ result.len()               moves ≤ result.len()               declared, io

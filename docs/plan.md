@@ -771,6 +771,38 @@ is taken is bound before the call — `n` stores and `n` bytes, a constant. Stil
 type, no concatenation, no growth, no printing of a `[u8]` as text. Left: the corpus adopting std,
 printing a buffer, and the self-hosted loader.
 
+**A scan, 2026-09-26** (cost-model § A scan). The corpus's second gap: a `while i < e` whose index
+grows by at least `d` on every path through the body, with `i₀` a lower bound at entry, runs at
+most `(e − i₀)/d` times.
+- The growth is proved by a walk over the body, like the check on a `decreasing` measure.
+- A call's result is read through a per-function summary of what it returns (`next_int`: `end ≥
+  start`; `after_header`: `≥ 1`), computed to a fixed point from nothing over the call graph.
+- `i₀` is the entry value, or, when every assignment to `i` in the function grows it, what `i`
+  was first bound to.
+- A callee whose cost only falls as an `i64` argument grows is charged with the argument at its
+  least.
+
+Such lines are `bound`, with a `scan:` note, and a caller says `rests on f (bound, a scan)`.
+`scan.nt` pins the rule and `scan_refused.nt` a body with a path that does not grow the index.
+
+On the corpus, now eight programs, **27 of 28 functions have a cost and 7 of 8 `main`s do**. Only
+BFS's worklist is unknown, and nothing is modulo. The bound is loose where a scan calls a scan:
+`count_ints` is `9·xs.len()²`, where the calls together read the text once. That is the
+amortised scan, left next. On the compiler, `compiler/costs.lock` goes from 92/49/32/103 to
+**92, 49, 33, 102**: `bytes_len`, an escape-skipping loop, is bound. `tok_text_eq` did
+not move, having already had a constant step. Nor did the lexer, for two reasons the walk states
+plainly:
+- `i = j + 1` goes through a mutable `j`, and the walk follows immutable bindings only.
+- The comment branch grows `i` only through a nested `while`, which the walk must count as
+  possibly running zero times.
+
+The second could be closed by the loop's own condition, `src[i] == '/'` holding on entry; the
+first by tracking a mutable local that is only increased. The self-hosted cost pass has neither rule. On the two new goldens its footprint is
+narrower where a loop is `while i < xs.len() && …`, which it declines before recording the site:
+`word_end` twice and `trimmed`, listed in `self_host_cost.rs` with that reason. Its matched counts
+grow by the functions it matches: footprint 124 → 128, bound 127 → 134. Work and moves do not
+change.
+
 ## M7 — the constant factor
 
 Prove the asymptote, search the constant. A micro-architectural cost line (what llvm-mca and uiCA
