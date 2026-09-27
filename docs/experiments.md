@@ -666,6 +666,21 @@ column slides, and it is there the walk shows. A per-line charge cannot tell the
 off (`--tlb 0`), and the question it leaves is which lines are hits — the same reuse the model
 already computes for moves, asked of pages.
 
+**The M5 question answered, 2026-09-28** (cost-model § Time, cores). With `BW(P) = min(P·BW, BW_max)`
+and `BW_max = 65.6 GB/s` fitted on `par_memory` at P = 10, the M5 sweep (`par_sweep.py`, quiet
+machine) against the prediction, measured / predicted:
+
+| kernel | P = 1 | 2 | 4 | 10 |
+|---|---|---|---|---|
+| `par_memory` (a `.par().sum()`) | 1.45 | 1.49 | 1.44 | 0.99 (the fit) |
+| `par_compute` (a degree-16 map, summed) | 2.73 | 2.87 | 3.12 | 2.01 |
+
+The shapes are the machine's: the memory-bound chain saturates past four cores (speedup 4.6 at ten,
+predicted 3.2 over P = 1) and the compute-bound one keeps scaling (6.8 at ten). The constants are
+off by a steady factor each — one OpenMP thread streams at 14 GB/s, not the 20.8 a plain loop does,
+and the map's 16-deep chain per element inside a reduction runs 2.7–3× slower than the polynomial
+`τ` was fitted on. What M5 said the model could not do, tell the two apart, it now does.
+
 **What changed.** The `--eval` line prints the time and its bound (`work-bound` / `moves-bound`);
 `--tau` and `--bw` set the constants, defaulting to the fit above. Nothing in any report without
 `--eval` changed, and no golden moved. Next: the same comparison on the corpus's programs, which

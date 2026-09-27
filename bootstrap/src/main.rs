@@ -4,7 +4,7 @@
 //!   neant run   f.nt [--unchecked] [-- args]  build to a temp file and run it
 //!   neant emit  f.nt [--unchecked]            print the generated C
 //!   neant check f.nt                          parse and type-check only
-//!   neant cost  f.nt [-M bytes] [-B bytes] [-P cores] [--tau ns] [--bw GB/s] [--lat ns] [--tlb ns] [--taus ns] [--tdiv ns] [--M3 bytes] [--bw2 GB/s] [--lat3 ns] [--eval n=..,..]
+//!   neant cost  f.nt [-M bytes] [-B bytes] [-P cores] [--tau ns] [--bw GB/s] [--lat ns] [--tlb ns] [--taus ns] [--tdiv ns] [--bwmax GB/s] [--M3 bytes] [--bw2 GB/s] [--lat3 ns] [--eval n=..,..]
 //!                                             infer work, moves and span for every function
 //!   neant lock  f.nt [--check]                write costs.lock next to the source, or diff it
 //!   neant measure f.nt --fn name [--sizes 1000,4000,...] [--shape p=n*n,...] [--repeat k] [--cpu 5] [--lock]
@@ -51,6 +51,9 @@ fn main() {
     // the bytes per nanosecond it serves `M` with, and what a chased line that hits it waits
     // off unless `--M3` is given: measured, it moves the error between kernels rather than
     // shrinking it (docs/experiments.md § The roofline, a second level)
+    // the memory's bandwidth to every core at once, the ceiling a `.par()` chain's moves meet
+    // (docs/cost-model.md § Time, cores), fitted on a parallel sum over all ten big cores
+    let mut bw_max: f64 = 65.6;
     let mut outer = Outer { bytes: 16 << 20, bytes_per_ns: 30.1, ns_per_miss: 23.0, on: false };
     let mut eval: Option<String> = None;
     let mut lock_check = false;
@@ -81,6 +84,7 @@ fn main() {
             "--taus" => { i += 1; machine.ns_per_serial = args.get(i).and_then(|s| s.parse().ok()).unwrap_or(machine.ns_per_serial); }
             "--tlb" => { i += 1; machine.ns_per_page = args.get(i).and_then(|s| s.parse().ok()).unwrap_or(machine.ns_per_page); }
             "--lat" => { i += 1; machine.ns_per_miss = args.get(i).and_then(|s| s.parse().ok()).unwrap_or(machine.ns_per_miss); }
+            "--bwmax" => { i += 1; bw_max = args.get(i).and_then(|s| s.parse().ok()).unwrap_or(bw_max); }
             "--M3" => { i += 1; outer.bytes = parse_bytes(args.get(i)); outer.on = true; }
             "--bw2" => { i += 1; outer.bytes_per_ns = args.get(i).and_then(|s| s.parse().ok()).unwrap_or(outer.bytes_per_ns); }
             "--lat3" => { i += 1; outer.ns_per_miss = args.get(i).and_then(|s| s.parse().ok()).unwrap_or(outer.ns_per_miss); }
@@ -217,7 +221,9 @@ fn main() {
                         };
                         let b = machine.b_bytes as f64;
                         let from_outer = ((m - m3) - (ch - ch3)).max(0.0) / outer.bytes_per_ns + (ch - ch3) / b * outer.ns_per_miss;
-                        let from_memory = (m3 - ch3) / machine.bytes_per_ns + ch3 / b * machine.ns_per_miss;
+                        // a parallel chain's P cores each pull a core's bandwidth, up to what memory gives them all
+                        let bw = if span != work { (machine.bytes_per_ns * p).min(bw_max.max(machine.bytes_per_ns)) } else { machine.bytes_per_ns };
+                        let from_memory = (m3 - ch3) / bw + ch3 / b * machine.ns_per_miss;
                         // a line on a page of its own waits for the TLB walk first
                         let pg = if c.paged.pieces.is_empty() { 0.0 } else { eval_one(c, &c.paged, ev, &machine).unwrap_or(0.0) }.min(m - ch).max(0.0);
                         let tm = from_outer + from_memory + pg / b * machine.ns_per_page;

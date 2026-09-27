@@ -869,6 +869,11 @@ with `L` the nanoseconds a chased line waits, fitted on a chase over a 64 MB are
 cycle: **L = 112 ns**. `chase` is only ever read by a time: no bound, tier or report line changes,
 and `--eval` prints it when it is not zero.
 
+**Cores (2026-09-28).** A `.par()` chain's time is `max(span·τ, work·τ/P, moves/BW(P))`, and `BW(P)`
+is not one core's: `P` cores each pull a core's bandwidth until memory runs out, `BW(P) = min(P·BW,
+BW_max)` — the two-line roofline M5 decided and did not fit. `BW_max = 65.6 GB/s`, fitted on the
+parallel sum over all ten big cores (`--bwmax`); sequential code keeps one core's `BW`.
+
 **Serial work (2026-09-28).** `τ` is a throughput: the rate of a loop whose laps overlap in the
 pipelines, fitted on a polynomial over an array. A loop whose body carries a scalar from one lap to
 the next through a multiply or a divide — `x ← r·x·(1 − x)`, mandelbrot's `z ← z² + c`, a digit

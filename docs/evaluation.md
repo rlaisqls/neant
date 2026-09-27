@@ -65,6 +65,11 @@ over the kernels' 31 runs is 1.12 (1.56 before the latency term, when `arena` wa
 | `arena`, a pointer chase past L3, with the latency term | 1.00 |
 | `arena` inside L3 / inside L2 | 0.58 / 0.28 |
 
+**Cores** (the M5 sweep, `par_sweep.py`): with the memory's aggregate bandwidth as a ceiling,
+`BW(P) = min(P·BW, 65.6 GB/s)`, a parallel sum is 1.44–1.49 at P = 1, 2, 4 (0.99 at ten, where it was
+fitted) and a compute-bound map 2.0–3.1, each flat in `P`: the model now tells a chain that saturates
+the memory from one that scales, which M5 found it could not, and is off by one constant each.
+
 **The corpus's programs** (`tests/corpus/timing.py`, three generated input sizes each), after the
 changes the first timing forced (cost-model § A scan's accesses):
 

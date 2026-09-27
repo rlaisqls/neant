@@ -962,7 +962,9 @@ nothing (cost-model § Moves): n-body's per-step moves go to zero, which its ref
 2.3× too fast instead of 3.7× too slow; thirteen goldens' `main`s drop a constant, the self-hosted pass
 is listed as charging those calls (`RESIDENT_INSTEAD`), and the compiler's count does not move. A
 store chained through memory at a fixed index is a serial unit a lap: n-body 2.3 → 1.76, the Benchmarks
-Game programs within 0.50–1.77.
+Game programs within 0.50–1.77. And the roofline M5 decided and did not fit: `BW(P) = min(P·BW,
+BW_max)`, `BW_max = 65.6 GB/s` on ten cores; the M5 kernels' measured / predicted is flat in `P`
+(parallel sum 1.44–1.49, compute map 2.0–3.1), so a memory-bound chain's flattening is predicted.
 
 ## M7 — the constant factor
 
