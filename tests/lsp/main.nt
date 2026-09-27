@@ -1,0 +1,14 @@
+use "geometry.nt";
+
+fn norms(ps: &[Point]) -> i64 {
+    let mut s = 0;
+    for i in 0..ps.len() {
+        s = s + dot(ps[i], ps[i]);
+    }
+    s
+}
+
+fn main() {
+    let ps = [Point { x: 3, y: 4 }; 10];
+    println(norms(&ps));
+}

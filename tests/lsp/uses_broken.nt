@@ -1,0 +1,5 @@
+use "broken_lib.nt";
+
+fn main() {
+    println(answer());
+}

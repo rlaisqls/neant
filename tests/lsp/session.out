@@ -1,0 +1,15 @@
+{"jsonrpc":"2.0","id":1,"result":{"capabilities":{"textDocumentSync":{"openClose":true,"change":1,"save":{"includeText":false}},"hoverProvider":true,"definitionProvider":true,"inlayHintProvider":true},"serverInfo":{"name":"neant","version":"0.1.0"}}}
+{"jsonrpc":"2.0","method":"textDocument/publishDiagnostics","params":{"uri":"file://$ROOT/tests/lsp/main.nt","diagnostics":[]}}
+{"jsonrpc":"2.0","id":2,"result":[{"position":{"line":2,"character":31},"label":"work 10·ps.len()   moves 16·ps.len() + B   exact","paddingLeft":true},{"position":{"line":10,"character":11},"label":"work 113   moves B + 320   exact, io","paddingLeft":true}]}
+{"jsonrpc":"2.0","id":3,"result":{"contents":{"kind":"markdown","value":"```text\nnorms  work 10·ps.len()   moves 16·ps.len() + B   exact\nlower bound      moves 16·ps.len()                  (footprint, every distinct element crosses once)   gap 1× at M = 2 MiB, B = 64\nfootprint        ps: [0, 16·ps.len())   resident after if 16·ps.len() < M\n```"},"range":{"start":{"line":12,"character":12},"end":{"line":12,"character":17}}}}
+{"jsonrpc":"2.0","id":4,"result":{"contents":{"kind":"markdown","value":"```text\ndot  work 3   moves 0   exact\n```"},"range":{"start":{"line":5,"character":16},"end":{"line":5,"character":19}}}}
+{"jsonrpc":"2.0","id":5,"result":{"uri":"file://$ROOT/tests/lsp/geometry.nt","range":{"start":{"line":3,"character":3},"end":{"line":3,"character":6}}}}
+{"jsonrpc":"2.0","id":6,"result":{"uri":"file://$ROOT/tests/lsp/geometry.nt","range":{"start":{"line":1,"character":7},"end":{"line":1,"character":12}}}}
+{"jsonrpc":"2.0","id":7,"result":{"uri":"file://$ROOT/tests/lsp/main.nt","range":{"start":{"line":2,"character":3},"end":{"line":2,"character":8}}}}
+{"jsonrpc":"2.0","method":"textDocument/publishDiagnostics","params":{"uri":"file://$ROOT/tests/lsp/main.nt","diagnostics":[{"range":{"start":{"line":5,"character":16},"end":{"line":5,"character":19}},"severity":1,"source":"neant","message":"`dot` takes 2 argument(s), 1 given"}]}}
+{"jsonrpc":"2.0","method":"textDocument/publishDiagnostics","params":{"uri":"file://$ROOT/tests/lsp/main.nt","diagnostics":[]}}
+{"jsonrpc":"2.0","method":"textDocument/publishDiagnostics","params":{"uri":"file://$ROOT/tests/lsp/uses_broken.nt","diagnostics":[]}}
+{"jsonrpc":"2.0","method":"textDocument/publishDiagnostics","params":{"uri":"file://$ROOT/tests/lsp/broken_lib.nt","diagnostics":[{"range":{"start":{"line":2,"character":0},"end":{"line":2,"character":8}},"severity":1,"source":"neant","message":"`answer` returns `i64`, but its body has type `bool`"}]}}
+{"jsonrpc":"2.0","method":"textDocument/publishDiagnostics","params":{"uri":"file://$ROOT/tests/lsp/uses_broken.nt","diagnostics":[]}}
+{"jsonrpc":"2.0","method":"textDocument/publishDiagnostics","params":{"uri":"file://$ROOT/tests/lsp/broken_lib.nt","diagnostics":[]}}
+{"jsonrpc":"2.0","id":8,"result":null}
