@@ -735,6 +735,41 @@ bound and errs high. What remains is the same short list, each a place the bound
 - `matmul`: 1.4–2.7× low where it is work-bound at small `n`: its inner loop's `work·τ` uses a `τ`
   fitted on a vectorised polynomial, and a strided dot product vectorises worse.
 
+## Programs the project did not write: the Benchmarks Game (2026-09-28)
+
+**Why.** The corpus is the project's own (evaluation.md, threats). Five programs of the Computer
+Language Benchmarks Game were ported keeping the published programs' structure — `tests/bench/`,
+pinned by `bootstrap/tests/bench.rs` — and each prints the reference output at its test size (n-body
+at 1000 steps −0.169075164 / −0.169087605, spectral-norm at 100 1.274219991, fannkuch-redux at 7
+checksum 228 and 16 flips, binary-trees at 10 the published counts). Only one thing had to be
+worked around: there is no shift operator, so `1 << k` is a loop.
+
+**Tiers.** 11 of 15 functions exact, 4 unknown. Exact: all of n-body (`advance`, `energy`, `main`
+`634·steps + …`), all of spectral-norm (`main` ≈ `640·n²`), both of mandelbrot. Unknown, each for a
+reason already named: fannkuch's `main` (permutation state in `while` loops whose trips are the
+data's); binary-trees' `build` (two recursive calls each shrinking the depth by one — an exponential
+recurrence, which the calculus refuses), `check` (recursion over a tree in an arena, the compiler's
+largest unknown row) and `main`.
+
+**Against the clock** (`tests/bench/timing.py`, the fitted roofline, CPU 5):
+
+| program | sizes | bound | measured / predicted |
+|---|---|---|---|
+| nbody | 10⁵ / 10⁶ / 5·10⁶ steps | moves | 0.15 / 0.15 / 0.15 |
+| spectral_norm | n = 200 / 800 / 2000 | work | 1.47 / 1.89 / 1.92 |
+| mandelbrot | n = 200 / 800 / 2000 | work | 3.58 / 4.27 / 4.24 |
+
+Geometric mean 1.02, range 0.15 to 4.3 — the stable ratios say the shapes are right and the
+constants are not, and each constant is off for a reason:
+- **Work is not one rate.** `τ` was fitted on a polynomial the C compiler vectorises and pipelines.
+  Mandelbrot's inner loop carries `z` from one lap to the next and exits early, so it runs at the
+  latency of its dependent multiply-adds, 4× slower; spectral-norm divides in its inner loop, 2×.
+  A latency term for work — a dependency chain's length, as `chase` is for memory — is what this asks.
+- **n-body's moves are charged where it has none.** Five bodies are 280 bytes; `advance` is charged
+  ≈ `28·n²` moves a call while its whole array fits, because its inner loop runs `j in i + 1..n`, a
+  range that moves with `i`, and each lap's lines were summed rather than taken as the hull they
+  share. The prediction is moves-bound at 6.7× the time.
+
 ## The compiler's cost model, on the compiler — and the machine's answer
 
 The self-hosted cost reporter (`compiler/costdump.nt`, compiled by the self-hosted compiler) was

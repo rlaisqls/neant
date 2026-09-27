@@ -945,6 +945,13 @@ both sides locals was a loop in `start`, and `i + 1 < n` had no variable alone; 
 fall to unknown for an argument they cannot name; charging such callees as terms was tried and made
 costing the compiler take minutes, so it is left.
 
+**Programs the project did not write, 2026-09-28** (experiments.md § The Benchmarks Game;
+`tests/bench`). n-body, spectral-norm, mandelbrot, fannkuch-redux and binary-trees, ported with their
+published structure, print the reference outputs; 11 of 15 functions are exact, and the three with a
+cost time at 0.15–4.3 of the predicted. The two constants' failures are named: work's latency
+(mandelbrot's dependent loop 4×) and a triangular loop's moves summed where they share a hull
+(n-body 6.7× high).
+
 ## M7 — the constant factor
 
 Prove the asymptote, search the constant. A micro-architectural cost line (what llvm-mca and uiCA

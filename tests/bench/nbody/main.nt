@@ -1,0 +1,78 @@
+// The Computer Language Benchmarks Game's n-body: a symplectic integrator over the Jovian planets,
+// the structure of the published programs kept — `advance` over every pair, `energy` before and
+// after. Steps come from the command line.
+
+use "std/math.nt";
+use "std/text.nt";
+
+struct Body { x: f64, y: f64, z: f64, vx: f64, vy: f64, vz: f64, mass: f64 }
+
+fn advance(bs: &mut [Body], dt: f64) {
+    for i in 0..bs.len() {
+        for j in i + 1..bs.len() {
+            let dx = bs[i].x - bs[j].x;
+            let dy = bs[i].y - bs[j].y;
+            let dz = bs[i].z - bs[j].z;
+            let d2 = dx * dx + dy * dy + dz * dz;
+            let mag = dt / (d2 * sqrt(d2));
+            let mj = bs[j].mass * mag;
+            let mi = bs[i].mass * mag;
+            bs[i].vx = bs[i].vx - dx * mj;
+            bs[i].vy = bs[i].vy - dy * mj;
+            bs[i].vz = bs[i].vz - dz * mj;
+            bs[j].vx = bs[j].vx + dx * mi;
+            bs[j].vy = bs[j].vy + dy * mi;
+            bs[j].vz = bs[j].vz + dz * mi;
+        }
+    }
+    for i in 0..bs.len() {
+        bs[i].x = bs[i].x + dt * bs[i].vx;
+        bs[i].y = bs[i].y + dt * bs[i].vy;
+        bs[i].z = bs[i].z + dt * bs[i].vz;
+    }
+}
+
+fn energy(bs: &[Body]) -> f64 {
+    let mut e = 0.0;
+    for i in 0..bs.len() {
+        e += 0.5 * bs[i].mass * (bs[i].vx * bs[i].vx + bs[i].vy * bs[i].vy + bs[i].vz * bs[i].vz);
+        for j in i + 1..bs.len() {
+            let dx = bs[i].x - bs[j].x;
+            let dy = bs[i].y - bs[j].y;
+            let dz = bs[i].z - bs[j].z;
+            e -= bs[i].mass * bs[j].mass / sqrt(dx * dx + dy * dy + dz * dz);
+        }
+    }
+    e
+}
+
+fn main() {
+    let pi = 3.141592653589793;
+    let sm = 4.0 * pi * pi;
+    let dp = 365.24;
+    let mut bs = [Body { x: 0.0, y: 0.0, z: 0.0, vx: 0.0, vy: 0.0, vz: 0.0, mass: 0.0 }; 5];
+    bs[0].mass = sm;
+    bs[1] = Body { x: 4.84143144246472090e+00, y: -1.16032004402742839e+00, z: -1.03622044471123109e-01, vx: 1.66007664274403694e-03 * dp, vy: 7.69901118419740425e-03 * dp, vz: -6.90460016972063023e-05 * dp, mass: 9.54791938424326609e-04 * sm };
+    bs[2] = Body { x: 8.34336671824457987e+00, y: 4.12479856412430479e+00, z: -4.03523417114321381e-01, vx: -2.76742510726862411e-03 * dp, vy: 4.99852801234917238e-03 * dp, vz: 2.30417297573763929e-05 * dp, mass: 2.85885980666130812e-04 * sm };
+    bs[3] = Body { x: 1.28943695621391310e+01, y: -1.51111514016986312e+01, z: -2.23307578892655734e-01, vx: 2.96460137564761618e-03 * dp, vy: 2.37847173959480950e-03 * dp, vz: -2.96589568540237556e-05 * dp, mass: 4.36624404335156298e-05 * sm };
+    bs[4] = Body { x: 1.53796971148509165e+01, y: -2.59193146099879641e+01, z: 1.79258772950371181e-01, vx: 2.68067772490389322e-03 * dp, vy: 1.62824170038242295e-03 * dp, vz: -9.51592254519715870e-05 * dp, mass: 5.15138902046611451e-05 * sm };
+    // the sun moves so that the system's momentum is zero
+    let mut px = 0.0;
+    let mut py = 0.0;
+    let mut pz = 0.0;
+    for i in 0..5 {
+        px += bs[i].vx * bs[i].mass;
+        py += bs[i].vy * bs[i].mass;
+        pz += bs[i].vz * bs[i].mass;
+    }
+    bs[0].vx = 0.0 - px / sm;
+    bs[0].vy = 0.0 - py / sm;
+    bs[0].vz = 0.0 - pz / sm;
+    let a0 = arg(0);
+    let steps = parse_int(&a0, 0).v;
+    println(energy(&bs));
+    for s in 0..steps {
+        advance(&mut bs, 0.01);
+    }
+    println(energy(&bs));
+}

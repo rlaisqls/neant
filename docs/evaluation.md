@@ -155,7 +155,11 @@ constant to tune:
   and did not fit `BW` for it.
 - **The corpus is the project's own.** It was written the way someone would write those programs,
   not shaped to the rules, and what it had to be written around is kept as rejected cases — but it
-  is not independent code, and eight programs are few.
+  is not independent code, and eight programs are few. Five Benchmarks Game programs, ported with
+  their published structure (`tests/bench`, experiments.md), are 11 of 15 functions exact — the
+  unknowns an exponential recurrence, a tree recursion and data-driven permutation loops — and
+  their times are 0.15–4.3 of the predicted, geometric mean 1.02: the shapes carry over, the
+  constants do not, and why is named (work's latency; a triangular loop's moves).
 - **Generated inputs.** Uniform random integers and rows; real data with long lines or skew would
   move the parse's constants.
 - **Bounds err high by design.** A geometric mean of 0.41 is a bound behaving as one; it is also a

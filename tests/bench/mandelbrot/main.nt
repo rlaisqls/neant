@@ -1,0 +1,33 @@
+// The Benchmarks Game's mandelbrot, counting instead of writing a bitmap: an n×n grid over
+// [−1.5, 0.5] × [−1, 1], a point inside when 50 iterations stay within radius 2.
+
+use "std/text.nt";
+
+fn inside(cr: f64, ci: f64) -> bool {
+    let mut zr = 0.0;
+    let mut zi = 0.0;
+    let mut k = 0;
+    while k < 50 && zr * zr + zi * zi <= 4.0 {
+        let t = zr * zr - zi * zi + cr;
+        zi = 2.0 * zr * zi + ci;
+        zr = t;
+        k += 1;
+    }
+    zr * zr + zi * zi <= 4.0
+}
+
+fn main() {
+    let a0 = arg(0);
+    let n = parse_int(&a0, 0).v;
+    let mut count = 0;
+    for y in 0..n {
+        let ci = 2.0 * y as f64 / n as f64 - 1.0;
+        for x in 0..n {
+            let cr = 2.0 * x as f64 / n as f64 - 1.5;
+            if inside(cr, ci) {
+                count += 1;
+            }
+        }
+    }
+    println(count);
+}

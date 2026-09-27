@@ -1,0 +1,60 @@
+// The Benchmarks Game's binary-trees: full binary trees built bottom-up and checked by walking
+// them, here in an arena of left/right indices (the language has no heap of nodes), depth from the
+// command line; a long-lived tree, then trees of every other depth.
+
+use "std/text.nt";
+
+struct Node { left: i64, right: i64 }
+
+fn build(ns: &mut [Node], next: &mut [i64], depth: i64) -> i64 {
+    let at = next[0];
+    next[0] = at + 1;
+    if depth > 0 {
+        let l = build(ns, next, depth - 1);
+        let r = build(ns, next, depth - 1);
+        ns[at] = Node { left: l, right: r };
+    } else {
+        ns[at] = Node { left: -1, right: -1 };
+    }
+    at
+}
+
+fn check(ns: &[Node], t: i64) -> i64 {
+    if ns[t].left < 0 {
+        1
+    } else {
+        1 + check(ns, ns[t].left) + check(ns, ns[t].right)
+    }
+}
+
+// the language has no shift operator
+fn pow2(k: i64) -> i64 {
+    let mut p = 1;
+    for i in 0..k {
+        p = p * 2;
+    }
+    p
+}
+
+fn main() {
+    let a0 = arg(0);
+    let depth = parse_int(&a0, 0).v;
+    let cap = 2 * pow2(depth + 2);
+    let mut ns = [Node { left: -1, right: -1 }; cap];
+    let mut next = [0; 1];
+    let long = build(&mut ns, &mut next, depth);
+    let mut d = 4;
+    while d <= depth {
+        let iters = pow2(depth - d + 4);
+        let mut sum = 0;
+        for i in 0..iters {
+            next[0] = long + pow2(depth + 1);
+            let t = build(&mut ns, &mut next, d);
+            sum += check(&ns, t);
+        }
+        println(iters);
+        println(sum);
+        d += 2;
+    }
+    println(check(&ns, long));
+}

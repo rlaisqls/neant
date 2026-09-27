@@ -1,0 +1,71 @@
+// The Benchmarks Game's fannkuch-redux: every permutation of 1..n in the published order, and for
+// each the pancake flips until 1 is first; the checksum and the most flips.
+
+use "std/text.nt";
+
+fn main() {
+    let a0 = arg(0);
+    let n = parse_int(&a0, 0).v;
+    let mut perm = [0; n];
+    let mut perm1 = [0; n];
+    let mut count = [0; n];
+    for i in 0..n {
+        perm1[i] = i;
+    }
+    let mut max_flips = 0;
+    let mut checksum = 0;
+    let mut sign = 1;
+    let mut r = n;
+    let mut done = false;
+    while !done {
+        while r != 1 {
+            count[r - 1] = r;
+            r -= 1;
+        }
+        for i in 0..n {
+            perm[i] = perm1[i];
+        }
+        let mut flips = 0;
+        let mut k = perm[0];
+        while k != 0 {
+            let mut lo = 0;
+            let mut hi = k;
+            while lo < hi {
+                let t = perm[lo];
+                perm[lo] = perm[hi];
+                perm[hi] = t;
+                lo += 1;
+                hi -= 1;
+            }
+            flips += 1;
+            k = perm[0];
+        }
+        max_flips = max(max_flips, flips);
+        checksum += sign * flips;
+        sign = 0 - sign;
+        // the next permutation, rotating the first r + 1
+        let mut more = true;
+        while more {
+            if r == n {
+                done = true;
+                more = false;
+            } else {
+                let p0 = perm1[0];
+                let mut i = 0;
+                while i < r {
+                    perm1[i] = perm1[i + 1];
+                    i += 1;
+                }
+                perm1[r] = p0;
+                count[r] -= 1;
+                if count[r] > 0 {
+                    more = false;
+                } else {
+                    r += 1;
+                }
+            }
+        }
+    }
+    println(checksum);
+    println(max_flips);
+}
