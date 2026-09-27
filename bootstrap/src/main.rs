@@ -11,6 +11,7 @@
 //!                                             run the function over a size sweep under perf and fit ~n^k
 //!   any command: --apply fn:tile[,fn:transpose]  rewrite a function first
 //!   neant hints [--stdin] f.nt                every function's cost and every error as JSON, for an editor
+//!   neant lsp [-M bytes] [-B bytes]           the same as a Language Server on stdio (editors/README.md)
 //!   neant lexdump f.nt   this lexer's token kinds, one per line, numbered per compiler/lex.nt's
 //!                        own scheme (`lex_kind_number`) — the self-hosted lexer's cross-check
 //!                        (bootstrap/tests/self_host_lex.rs, docs/self-hosting-design.md)
@@ -23,6 +24,7 @@ mod hints;
 mod input;
 mod ir;
 mod lex;
+mod lsp;
 mod modules;
 mod parse;
 mod types;
@@ -83,6 +85,7 @@ fn main() {
         }
         i += 1;
     }
+    if cmd == "lsp" { process::exit(lsp::serve(&machine)); }
     let Some(file) = file else {
         eprintln!("no input file");
         process::exit(2);

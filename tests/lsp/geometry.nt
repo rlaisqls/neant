@@ -1,0 +1,6 @@
+// the library half of tests/lsp's two-file program: a struct and a function main.nt uses
+struct Point { x: i64, y: i64 }
+
+fn dot(a: Point, b: Point) -> i64 {
+    a.x * b.x + a.y * b.y
+}

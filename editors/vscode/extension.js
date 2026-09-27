@@ -1,7 +1,10 @@
-// The editor surface of neant: on open, on save, and — debounced — as the buffer changes, run
-// `neant hints` (on the live buffer through `--stdin`, on the file on save) and show each
-// function's cost as grey text after its `fn` line, the report under it in a hover, and every
-// error in the Problems panel. Nothing here computes a cost; it prints what the compiler said.
+// The editor surface of neant. By default it talks to `neant lsp`, the compiler as a Language
+// Server (a small client below: JSON-RPC over the child's stdio), which answers diagnostics,
+// inlay hints, hovers and definitions on the live buffer. With `neant.mode` set to `hints` it
+// runs `neant hints` instead: on open, on save, and — debounced — as the buffer changes (on the
+// live buffer through `--stdin`, on the file on save). Either way each function's cost is grey
+// text after its `fn` line, the report under it in a hover, and every error in the Problems
+// panel. Nothing here computes a cost; it prints what the compiler said.
 // Plain JavaScript against the vscode API, no build step and no dependencies.
 
 'use strict';
@@ -180,6 +183,207 @@ const inlayProvider = {
   },
 };
 
+// ---------------------------------------------------------------- `neant lsp`
+
+/** The server: the child, its unparsed output, and requests waiting for an answer by id. */
+let server = null;
+
+function workspaceDoc() {
+  const f = (vscode.workspace.workspaceFolders || [])[0];
+  return { uri: f ? vscode.Uri.file(path.join(f.uri.fsPath, 'x.nt')) : vscode.Uri.file(path.join(process.cwd(), 'x.nt')) };
+}
+
+function send(msg) {
+  if (!server) return;
+  const body = Buffer.from(JSON.stringify({ jsonrpc: '2.0', ...msg }), 'utf8');
+  server.child.stdin.write(`Content-Length: ${body.length}\r\n\r\n`);
+  server.child.stdin.write(body);
+}
+
+function request(method, params) {
+  if (!server) return Promise.resolve(null);
+  const id = ++server.next;
+  return new Promise((resolve) => {
+    server.pending.set(id, resolve);
+    send({ id, method, params });
+  });
+}
+
+function notify(method, params) { send({ method, params }); }
+
+function received(msg) {
+  if (msg.id !== undefined && server.pending.has(msg.id)) {
+    const resolve = server.pending.get(msg.id);
+    server.pending.delete(msg.id);
+    if (msg.error) output.appendLine(`neant lsp: ${msg.error.message}`);
+    resolve(msg.error ? null : msg.result);
+    return;
+  }
+  if (msg.method === 'textDocument/publishDiagnostics') {
+    const uri = vscode.Uri.parse(msg.params.uri);
+    diagnostics.set(uri, msg.params.diagnostics.map((d) => {
+      const r = d.range;
+      const diag = new vscode.Diagnostic(new vscode.Range(r.start.line, r.start.character, r.end.line, r.end.character), d.message, d.severity - 1);
+      diag.source = d.source;
+      return diag;
+    }));
+    // the analysis behind the grey text is new: ask for it again
+    paintLsp();
+    inlayChanged.fire();
+  }
+}
+
+function startServer() {
+  const doc = workspaceDoc();
+  const child = cp.spawn(neantPath(doc), ['lsp', ...(config().get('args') || [])], {
+    cwd: path.dirname(doc.uri.fsPath),
+    stdio: ['pipe', 'pipe', 'pipe'],
+  });
+  server = { child, next: 0, pending: new Map(), buf: Buffer.alloc(0), opened: new Set() };
+  const me = server;
+  child.on('error', (e) => {
+    if (e.code === 'ENOENT' && !warnedMissing) {
+      warnedMissing = true;
+      vscode.window.showWarningMessage(`neant: cannot run \`${neantPath(doc)}\`; set neant.path to the compiler (bootstrap/target/debug/neant).`);
+    } else output.appendLine(`neant lsp: ${e}`);
+  });
+  child.on('exit', (code) => {
+    if (server === me) { output.appendLine(`neant lsp exited (${code})`); server = null; }
+  });
+  child.stdin.on('error', () => {});
+  child.stderr.on('data', (d) => output.append(d.toString()));
+  child.stdout.on('data', (chunk) => {
+    me.buf = Buffer.concat([me.buf, chunk]);
+    for (;;) {
+      const end = me.buf.indexOf('\r\n\r\n');
+      if (end < 0) return;
+      const m = /Content-Length:\s*(\d+)/i.exec(me.buf.slice(0, end).toString());
+      const len = m ? Number(m[1]) : 0;
+      if (me.buf.length < end + 4 + len) return;
+      const body = me.buf.slice(end + 4, end + 4 + len).toString('utf8');
+      me.buf = me.buf.slice(end + 4 + len);
+      try { if (server === me) received(JSON.parse(body)); } catch (e) { output.appendLine(`neant lsp: ${e}`); }
+    }
+  });
+  request('initialize', {
+    processId: process.pid,
+    rootUri: (vscode.workspace.workspaceFolders || [])[0]?.uri.toString() || null,
+    capabilities: {},
+    initializationOptions: { unknownsAsDiagnostics: !!config().get('unknownsAsDiagnostics') },
+  }).then(() => {
+    notify('initialized', {});
+    vscode.workspace.textDocuments.forEach(openLsp);
+  });
+}
+
+function stopServer() {
+  if (!server) return;
+  const s = server;
+  server = null;
+  for (const t of timers.values()) clearTimeout(t);
+  timers.clear();
+  const frame = (m) => { const b = Buffer.from(JSON.stringify({ jsonrpc: '2.0', ...m }), 'utf8'); return `Content-Length: ${b.length}\r\n\r\n${b}`; };
+  s.child.stdin.write(frame({ id: 0, method: 'shutdown' }));
+  s.child.stdin.end(frame({ method: 'exit' }));
+  setTimeout(() => s.child.kill(), 2000);
+  diagnostics.clear();
+}
+
+function openLsp(doc) {
+  if (!server || !isNeant(doc) || server.opened.has(doc.uri.toString())) return;
+  server.opened.add(doc.uri.toString());
+  notify('textDocument/didOpen', { textDocument: { uri: doc.uri.toString(), languageId: 'neant', version: doc.version, text: doc.getText() } });
+}
+
+function changeLsp(doc) {
+  if (!server || !server.opened.has(doc.uri.toString())) return;
+  notify('textDocument/didChange', { textDocument: { uri: doc.uri.toString(), version: doc.version }, contentChanges: [{ text: doc.getText() }] });
+}
+
+/** The decoration style: the server's inlay hints, drawn as grey text after the line. */
+function paintLsp() {
+  if (!server) return;
+  const style = config().get('hints.style');
+  for (const editor of vscode.window.visibleTextEditors) {
+    const doc = editor.document;
+    if (!isNeant(doc)) continue;
+    if (style !== 'decoration') { editor.setDecorations(decoration, []); continue; }
+    request('textDocument/inlayHint', { textDocument: { uri: doc.uri.toString() }, range: { start: { line: 0, character: 0 }, end: { line: doc.lineCount, character: 0 } } }).then((hs) => {
+      editor.setDecorations(decoration, (hs || []).map((h) => {
+        const p = new vscode.Position(h.position.line, h.position.character);
+        return { range: new vscode.Range(p, p), renderOptions: { after: { contentText: `  // ${clip(h.label)}` } } };
+      }));
+    });
+  }
+}
+
+function activateLsp(context) {
+  context.subscriptions.push(
+    vscode.languages.registerInlayHintsProvider({ language: 'neant', scheme: 'file' }, {
+      onDidChangeInlayHints: inlayChanged.event,
+      async provideInlayHints(doc, range) {
+        if (config().get('hints.style') !== 'inlay') return [];
+        const hs = await request('textDocument/inlayHint', { textDocument: { uri: doc.uri.toString() }, range: { start: range.start, end: range.end } });
+        return (hs || []).map((h) => {
+          const x = new vscode.InlayHint(new vscode.Position(h.position.line, h.position.character), `// ${clip(h.label)}`);
+          x.paddingLeft = true;
+          return x;
+        });
+      },
+    }),
+    vscode.languages.registerHoverProvider({ language: 'neant', scheme: 'file' }, {
+      async provideHover(doc, pos) {
+        const h = await request('textDocument/hover', { textDocument: { uri: doc.uri.toString() }, position: { line: pos.line, character: pos.character } });
+        if (!h) return null;
+        const r = h.range;
+        return new vscode.Hover(new vscode.MarkdownString(h.contents.value), r && new vscode.Range(r.start.line, r.start.character, r.end.line, r.end.character));
+      },
+    }),
+    vscode.languages.registerDefinitionProvider({ language: 'neant', scheme: 'file' }, {
+      async provideDefinition(doc, pos) {
+        const d = await request('textDocument/definition', { textDocument: { uri: doc.uri.toString() }, position: { line: pos.line, character: pos.character } });
+        if (!d) return null;
+        const r = d.range;
+        return new vscode.Location(vscode.Uri.parse(d.uri), new vscode.Range(r.start.line, r.start.character, r.end.line, r.end.character));
+      },
+    }),
+    vscode.workspace.onDidOpenTextDocument(openLsp),
+    vscode.workspace.onDidChangeTextDocument((e) => {
+      if (!isNeant(e.document) || e.contentChanges.length === 0) return;
+      // the server analyses every change it is sent: send the buffer once typing pauses
+      const key = e.document.uri.toString();
+      clearTimeout(timers.get(key));
+      timers.set(key, setTimeout(() => { timers.delete(key); changeLsp(e.document); }, Math.max(config().get('hints.debounceMs') || 0, 0)));
+    }),
+    vscode.workspace.onDidSaveTextDocument((d) => {
+      if (!server || !server.opened.has(d.uri.toString())) return;
+      const key = d.uri.toString();
+      if (timers.has(key)) { clearTimeout(timers.get(key)); timers.delete(key); changeLsp(d); }
+      notify('textDocument/didSave', { textDocument: { uri: key } });
+    }),
+    vscode.workspace.onDidCloseTextDocument((d) => {
+      if (!server || !server.opened.delete(d.uri.toString())) return;
+      notify('textDocument/didClose', { textDocument: { uri: d.uri.toString() } });
+    }),
+    vscode.window.onDidChangeVisibleTextEditors(paintLsp),
+    vscode.workspace.onDidChangeConfiguration((e) => {
+      if (!e.affectsConfiguration('neant')) return;
+      if (e.affectsConfiguration('neant.mode')) {
+        vscode.window.showInformationMessage('neant: reload the window to switch between `neant lsp` and `neant hints`.');
+        return;
+      }
+      warnedMissing = false;
+      stopServer();
+      startServer();
+    }),
+    vscode.commands.registerCommand('neant.refreshHints', () => { stopServer(); startServer(); }),
+    { dispose: stopServer },
+  );
+  startServer();
+}
+
+// ---------------------------------------------------------------- activation
+
 function activate(context) {
   output = vscode.window.createOutputChannel('neant');
   diagnostics = vscode.languages.createDiagnosticCollection('neant');
@@ -189,9 +393,10 @@ function activate(context) {
   });
   inlayChanged = new vscode.EventEmitter();
   inlayProvider.onDidChangeInlayHints = inlayChanged.event;
+  context.subscriptions.push(output, diagnostics, decoration, inlayChanged);
+  if (config().get('mode') !== 'hints') { activateLsp(context); return; }
 
   context.subscriptions.push(
-    output, diagnostics, decoration, inlayChanged,
     vscode.languages.registerInlayHintsProvider({ language: 'neant', scheme: 'file' }, inlayProvider),
     vscode.workspace.onDidOpenTextDocument(run),
     vscode.workspace.onDidSaveTextDocument((d) => { clearTimeout(timers.get(d.uri.toString())); timers.delete(d.uri.toString()); run(d); }),
@@ -232,6 +437,7 @@ function activate(context) {
 }
 
 function deactivate() {
+  stopServer();
   for (const t of timers.values()) clearTimeout(t);
   timers.clear();
   for (const child of running.values()) child.kill();

@@ -1,0 +1,4 @@
+// a used file with a type error: the diagnostic belongs to this file, not to the one that uses it
+fn answer() -> i64 {
+    true
+}

@@ -857,6 +857,22 @@ buffer after a pause in typing, keeping save as the fallback; the hints were for
 and are now for what is on the screen. Left: the whole-file analysis on every pause, which on a
 large file wants a cache keyed by function.
 
+**A language server, 2026-09-27** (editors/README.md). `neant lsp` is the grey text over the
+Language Server Protocol, so it is not tied to one editor: JSON-RPC on stdio with a hand-written
+JSON reader and writer (bootstrap/src/lsp.rs, no dependency), full-text sync, and five answers —
+diagnostics (lex, parse and type errors and broken `#[cost]` bounds, each published to the file
+of a multi-file program it belongs to, and cleared when it is fixed or its buffer closes), an
+inlay hint per function after its signature, a hover with the function's report, and a
+definition of a function or a struct in whichever `use`d file holds it. It computes nothing:
+each analysis is `hints::run` on the buffer, as `hints --stdin` does, its document read back, and
+a definition is the module loader's line. `editors/vscode` now talks to it through a small client
+of its own, keeping `neant hints` as `neant.mode: hints`; editors/README.md configures Neovim and
+Helix. `tests/lsp/` pins a scripted session on a two-file program, 15 messages in 10 ms. Left:
+analysis is synchronous and whole-program on every change the editor sends, so a request waits
+behind it (the VS Code client debounces; Neovim and Helix send every change); a `use`d file is
+read from disk even when its buffer is open and edited; and a definition knows functions and
+structs, not locals, fields or parameters.
+
 ## M7 — the constant factor
 
 Prove the asymptote, search the constant. A micro-architectural cost line (what llvm-mca and uiCA
@@ -895,6 +911,7 @@ bootstrap/              everything that builds the compiler from nothing
     modules.rs          `use "file.nt"`: loads a program's files into one line space, maps lines back
     input.rs            the input builtins (arg, read_file, …) as externs with declared costs
     hints.rs            `neant hints`: the report as JSON, for an editor
+    lsp.rs              `neant lsp`: the same as a Language Server on stdio
     cost/
       size.rs           symbolic sizes and costs: rational polynomials over atoms, B and M
       piece.rs          piecewise costs: conditions, max, feasibility
@@ -909,11 +926,12 @@ bootstrap/              everything that builds the compiler from nothing
   neant.c               compiler/ compiled by itself. Seed two. (self-hosting)
 compiler/               the compiler in neant. Empty until self-hosting.
 std/                    the standard library, `use "std/…"`: text.nt (numbers in text), math.nt
-editors/                the grey text in an editor: vscode/ (grammar, hints, diagnostics); README.md
+editors/                the grey text in an editor: vscode/ (grammar, a client of `neant lsp`); README.md, with Neovim and Helix
 tests/
   golden/               .nt programs with expected output (.out, .exit), rejection (.err), cost report (.cost)
     modules/            multi-file programs, one directory each, rooted at main.nt
   hints/                what `neant hints` prints for some of golden/, one .json each
+  lsp/                  a two-file program and the pinned `neant lsp` session on it (session.out)
   corpus/               the domain corpus (docs/corpus.md): one program per directory, rooted at main.nt, lib/ shared by `use`
   kernels/              the M1/M2 experiments: kernel templates and sweep.py, the perf harness; iolb.sh runs IOLB in docker
 docs/
