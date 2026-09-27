@@ -886,6 +886,17 @@ compiler's count does not move (92/49/34/103; the compiler has no call of this s
 parity counts become work 102, moves 102, footprint 133, bound 143. Left: the moves (a warm walk's
 residue), bfs's worklist, and the lexer's two scan shapes.
 
+**A bounded worklist, 2026-09-27** (cost-model § A bounded worklist; golden `worklist`). M3's first
+hole, and the corpus's last unknown `main`, is closed by the bounds check rather than a count of
+pushes: in `while h < t` a tail that only grows by one straight after a write `a[t] = …` stays at
+most `t₀ + a.len()`, so the loop runs at most `(t₀ + a.len() − h₀)/step` laps. `bfs` has a cost,
+and **every program in the corpus has one: 18 exact, 10 bound, 0 unknown of 28**. The parity test
+then found the self-hosted pass wrong where it should have declined: its `assigns_any`, which asks
+whether the body assigns a loop's bound, never looked at an `if` in a block's tail, so a worklist
+whose push sits in a trailing `if` was costed as a single pass — `drain` at `xs.len() + 8`. Fixed in
+`compiler/cost.nt`, seed two rebuilt; the compiler's count does not move (92/49/34/103), and the
+parity counts become work 102, moves 102, footprint 135, bound 146.
+
 ## M7 — the constant factor
 
 Prove the asymptote, search the constant. A micro-architectural cost line (what llvm-mca and uiCA

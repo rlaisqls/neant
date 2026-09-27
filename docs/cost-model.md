@@ -465,6 +465,35 @@ Golden `amortised` has both sides: `fields` (`19·xs.len() + 1`, from quadratic)
 (`14·out.len() + 4·xs.len() + 1`), `hops` and `restart` refused and quadratic. In golden `scan`,
 `words` goes from `2·xs.len()² + 11·xs.len() + 1` to `13·xs.len() + 1`, moves too.
 
+## A bounded worklist
+
+**Written 2026-09-27.** Breadth-first search keeps its frontier in an array: `while head < tail`,
+`head` stepped by one, and `tail` pushed inside the body — `queue[tail] = v; tail += 1;`. Neither
+rule above bounds it, since the bound is assigned inside the body, and M3 named it as the worklist
+a count of pushes would bound. A count of pushes does not reach it: the pushes are guarded by
+`dist[v] < 0`, which only a count of vertices sees. What does reach it is the bounds check.
+
+**The rule.** `while h < t`, `h` stepped by a constant `step ≥ 1`, runs at most
+`(t₀ + a.len() − h₀)/step` times when every assignment to `t` in the body, nested blocks included,
+is `t += 1` straight after a write `a[t] = …` in the same block, `a` one array throughout, and
+`t₀ ≥ 0`. The write is bounds-checked, so it happens only if `t < a.len()`, and then `t` becomes at
+most `a.len()`; before any push `t` is `t₀`. So `t ≤ max(t₀, a.len()) ≤ t₀ + a.len()`, and `h`,
+growing by `step` a lap from `h₀`, meets it within that many laps. `h₀` and `t₀` are the entry
+values; `a`'s length a size. The line is `bound`, with a note:
+``worklist: `tail` only grows by one straight after a checked write `queue[tail]`, so it stays at most
+queue.len() + 1 and the `while` at line 42 runs at most … times as `head` meets it``, and a caller
+rests on it as on a scan.
+
+**Where it refuses.** A tail moved by more than one after a write (`t += 2`), moved without a write
+just before it, or written through two arrays; an entry value of either index not known; a tail
+that may start negative. `h` must be stepped by a constant: a head that jumps is a scan's business.
+
+Golden `worklist`: `reach` is `14·next.len() + 15`; `drain`, whose tail moves by two, stays unknown.
+In the corpus `bfs`'s `main` has a cost for the first time, `≈ 11·n·(max(start[_]) − min(start[_]))`:
+the worklist's `n + 1` laps, each charged its row at the widest a row can be. The truth is `2·m` over
+all rows — the rows partition `adj` — and that is an amortisation over the reads of `start`, not
+something this rule does.
+
 ## Recursion
 
 A function that calls itself is a recurrence. The body's own cost `f` is computed with the

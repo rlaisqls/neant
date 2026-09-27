@@ -1,0 +1,9 @@
+reach            work 14·next.len() + 15           moves                              bound  (2 regimes)
+                                               moves 5·B·next.len() + 16·next.len() + 7·B if 8·next.len() ≥ M
+                                               moves 40·next.len() + 2·B          if 8·next.len() < M
+                 footprint        next: [0, 8·next.len()) (whole array)   no residue claimed
+                 worklist: `tail` only grows by one straight after a checked write `queue[tail]`, so it stays at most next.len() + 1 and the `while` at line 16 runs at most next.len() + 1 times as `head` meets it
+drain            unknown: the bound of `head` is assigned inside the body; `while` has no measure the compiler can find; write `while cond decreasing <expr>` with an `i64` that goes down by at least one every iteration (line 33)
+main             work 182                          moves 4·B + 440                    bound, io
+                 in `reach`: worklist: `tail` only grows by one straight after a checked write `queue[tail]`, so it stays at most next.len() + 1 and the `while` at line 16 runs at most next.len() + 1 times as `head` meets it
+                 rests on         reach (bound, a scan)

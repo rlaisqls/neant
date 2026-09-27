@@ -3,7 +3,7 @@ bfs        next_int         bound
 bfs        parse_int        bound
 bfs        count_ints       bound
 bfs        read_ints        bound
-bfs        main             unknown
+bfs        main             bound
 bfs        arg              declared
 bfs        read_file        declared
 csv        is_digit         exact

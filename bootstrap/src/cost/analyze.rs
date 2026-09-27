@@ -2279,6 +2279,28 @@ impl<'a, 'b, 'c> Fa<'a, 'b, 'c> {
         out
     }
 
+    /// `while h < t` over a worklist (docs/cost-model.md § A bounded worklist): `t` is assigned in
+    /// the body only as `t += 1` straight after a write `a[t] = …` in the same block, which the
+    /// bounds check stops unless `t < a.len()`; so `t` is never more than `max(t₀, a.len())`, at
+    /// most `t₀ + a.len()` for `t₀ ≥ 0`, and `h`, stepped by `step` a lap from `h₀`, meets it within
+    /// `(t₀ + a.len() − h₀)/step` laps.
+    fn worklist_trip(&self, cond: &Expr, h: LocalId, bound: &Expr, body: &Block, step: i128) -> Option<Poly> {
+        let ExprKind::Local(t) = bound.kind else { return None };
+        if t == h || !self.f.locals[t].mutable || self.f.locals[t].ty != Ty::I64 { return None; }
+        let mut arr = None;
+        if !pushes_only(body, t, &mut arr) { return None; }
+        let a = arr?;
+        let len = self.local_size.get(&a)?.clone();
+        let t0 = self.entry_value(t)?;
+        if !super::piece::dominates(&t0, &Poly::zero()) { return None; }
+        let h0 = self.entry_value(h)?;
+        let trip = t0.add(&len).sub(&h0).scale(Rat::new(1, step));
+        let (hn, tn, an) = (&self.f.locals[h].name, &self.f.locals[t].name, &self.f.locals[a].name);
+        self.scans.borrow_mut().push(format!("worklist: `{tn}` only grows by one straight after a checked write `{an}[{tn}]`, so it stays at most {} and the `while` at line {} runs at most {} times as `{hn}` meets it",
+            t0.add(&len).display(&self.names), cond.line, trip.display(&self.names)));
+        Some(trip)
+    }
+
     /// `while i < e` bounded as a scan (docs/cost-model.md § A scan): `i` grows by at least `d`
     /// along every path through the body, from at least `i₀`, so the loop runs at most
     /// `(e − i₀)/d` times. `Err(None)`: the rule does not apply and the caller's own reason
@@ -2382,7 +2404,13 @@ impl<'a, 'b, 'c> Fa<'a, 'b, 'c> {
         if (asc && step <= 0) || (!asc && step >= 0) { return Err(format!("`{name}` steps away from its bound; {ask}")); }
         let mut w = Writes::default();
         w.block(body);
-        if w.locals.iter().any(|&l| l != var && bound_mentions(bound, l)) { return Err(format!("the bound of `{name}` is assigned inside the body; {ask}")); }
+        if w.locals.iter().any(|&l| l != var && bound_mentions(bound, l)) {
+            // a worklist whose tail only grows by a push (docs/cost-model.md § A bounded worklist)
+            if asc && matches!(op, BinOp::Lt) && step >= 1 {
+                if let Some(t) = self.worklist_trip(cond, var, bound, body, step as i128) { return Ok((t, None)); }
+            }
+            return Err(format!("the bound of `{name}` is assigned inside the body; {ask}"));
+        }
         let Some(e) = self.size_of(bound, if asc { Dir::Upper } else { Dir::Lower }) else { return Err(format!("the bound of `{name}` is not a size expression; {ask}")) };
         let i0 = match self.initial.get(&var) {
             Some(Some(vs)) if vs.len() == 1 => vs[0].clone(),
@@ -2578,7 +2606,7 @@ impl<'a, 'b, 'c> Fa<'a, 'b, 'c> {
                     }
                     for r in &callee.rests_on { if !self.rests_on.contains(r) { self.rests_on.push(r.clone()); } }
                     // a callee bounded by a scan of its own (§ A scan)
-                    if callee.notes.iter().any(|n| n.starts_with("scan: ")) {
+                    if callee.notes.iter().any(|n| n.starts_with("scan: ") || n.starts_with("worklist: ")) {
                         let tag = format!("{} {SCAN_TAG}", callee.name);
                         if !self.rests_on.contains(&tag) { self.rests_on.push(tag); }
                     }
@@ -3175,4 +3203,36 @@ fn strip_distance(c: &Cost, adv: super::scan::Advance) -> Cost {
         out.terms.retain(|m, _| !(m.has_atom(&va) || m.has_atom(&vp)));
         out
     })
+}
+
+/// Whether every assignment to `t` in `b`, nested blocks included, is `t += 1` straight after a
+/// write `a[t] = …` in the same block, `a` one array throughout (§ A bounded worklist).
+fn pushes_only(b: &Block, t: LocalId, arr: &mut Option<LocalId>) -> bool {
+    fn ex(e: &Expr, t: LocalId, arr: &mut Option<LocalId>) -> bool {
+        match &e.kind {
+            ExprKind::If(c, th, els) => ex(c, t, arr) && pushes_only(th, t, arr) && els.as_ref().is_none_or(|b| pushes_only(b, t, arr)),
+            ExprKind::Block(b) => pushes_only(b, t, arr),
+            _ => true,
+        }
+    }
+    for (k, s) in b.stmts.iter().enumerate() {
+        let ok = match s {
+            Stmt::Assign(LValue::Var(v), op, e) if *v == t => {
+                let one = matches!(op, Some(BinOp::Add)) && matches!(e.kind, ExprKind::Int(1));
+                let after_write = k > 0 && match &b.stmts[k - 1] {
+                    Stmt::Assign(LValue::Index(a, idx, _), _, _) if matches!(idx.kind, ExprKind::Local(x) if x == t) => match arr {
+                        Some(y) => *y == *a,
+                        None => { *arr = Some(*a); true }
+                    },
+                    _ => false,
+                };
+                one && after_write
+            }
+            Stmt::Assign(_, _, e) | Stmt::Let(_, e) | Stmt::Expr(e) | Stmt::LetRepeat(_, e, _) | Stmt::Return(Some(e)) => ex(e, t, arr),
+            Stmt::For { body, .. } | Stmt::While { body, .. } | Stmt::ParFor { body, .. } | Stmt::LetBuild { body, .. } => pushes_only(body, t, arr),
+            _ => true,
+        };
+        if !ok { return false; }
+    }
+    b.tail.as_ref().is_none_or(|e| ex(e, t, arr))
 }

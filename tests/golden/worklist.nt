@@ -1,0 +1,47 @@
+// A bounded worklist (docs/cost-model.md § A bounded worklist). `reach` is breadth-first search
+// over a successor array with an array as its queue: `tail` grows only by one straight after the
+// write `queue[tail] = …`, which the bounds check stops unless `tail < queue.len()`, so `tail` is
+// never more than `1 + queue.len()` and `head`, stepped by one a lap, meets it within that many.
+//
+// Refused: `drain` moves its tail by two after one write, so the check no longer holds it back,
+// and the loop stays without a measure.
+
+fn reach(next: &[i64], from: i64) -> i64 {
+    let mut seen = [0; next.len()];
+    let mut queue = [0; next.len()];
+    let mut head = 0;
+    let mut tail = 1;
+    queue[0] = from;
+    seen[from] = 1;
+    while head < tail {
+        let u = queue[head];
+        head += 1;
+        let v = next[u];
+        if v >= 0 && seen[v] == 0 {
+            seen[v] = 1;
+            queue[tail] = v;
+            tail += 1;
+        }
+    }
+    tail
+}
+
+fn drain(xs: &[i64]) -> i64 {
+    let mut queue = [0; xs.len()];
+    let mut head = 0;
+    let mut tail = 1;
+    while head < tail {
+        head += 1;
+        if head < xs.len() {
+            queue[tail] = xs[head];
+            tail += 2;
+        }
+    }
+    head
+}
+
+fn main() {
+    let next = [1, 2, 0, -1, 3];
+    println(reach(&next, 0));
+    println(reach(&next, 4));
+}

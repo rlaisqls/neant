@@ -181,6 +181,13 @@ text fits in memory, `next_int` is charged a cold read of the whole array at eve
 not a distance and which only a warm walk's residue would credit. That, and the worklist, are what
 is left between the corpus and a linear read of its input.
 
+**After the bounded worklist (2026-09-27, cost-model § A bounded worklist).** `bfs`'s `main` has a
+cost: `≈ 11·n·(max(start[_]) − min(start[_]))`, a bound — the queue's `tail` only grows by one
+after a checked write `queue[tail]`, so the search runs at most `n + 1` laps, each charged the widest
+row. **Every program in the corpus now has a cost**: 18 exact, 10 bound, 0 unknown of 28. What is
+loose is known: the parse's moves (a cold read of the text at every call) and `bfs`'s rows, whose
+sum is `2·m` where each lap is charged the widest.
+
 ## What the corpus could not say, and could not be written
 
 Rejected, each kept as a minimal case in `tests/corpus/rejected_*` with its error pinned:

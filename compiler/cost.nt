@@ -510,6 +510,12 @@ fn assigns_any(src: &[u8], toks: &[Token], nodes: &[Node], cof: &[Cof], wst: &[i
         }
         s = nodes[s].next;
     }
+    // an `if` in the tail is a statement too: `while h < t { …; if c { t += 1; } }` assigns `t`
+    let t = nodes[b].b;
+    if t >= 0 && nodes[t].kind == 75 {
+        if assigns_any(src, toks, nodes, cof, wst, nodes[t].b, skip) { hit = true; }
+        if assigns_any(src, toks, nodes, cof, wst, nodes[t].c, skip) { hit = true; }
+    }
     hit
 }
 

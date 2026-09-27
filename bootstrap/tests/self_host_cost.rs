@@ -67,6 +67,11 @@ const COPIES_INSTEAD: &[(&str, &str)] = &[];
 /// it once did not do: it stated `grid`'s `xs[a]` alone as exact and resident, having stopped at
 /// `0..xs[a]` before reaching `xs[b]`.
 ///
+/// `worklist.nt`'s `reach` is a worklist the Rust bounds (§ A bounded worklist) and this pass,
+/// which has no rule for a bound the body pushes, declines before recording `next` — rightly now:
+/// until 2026-09-27 it missed an assignment in an `if` at a block's tail and costed such a loop as
+/// if its bound held still.
+///
 /// `amortised.nt`'s `field` is that stop too, a `while i < xs.len() && …`; `sum_fields` stops at
 /// its call to `field` inside a loop the Rust amortises (§ An amortised scan) and this pass, with no
 /// scan rule, cannot bound, after writing `out` but before recording it.
@@ -82,7 +87,8 @@ const FOOTPRINT_NARROWER: &[(&str, &str)] = &[("parse.nt", "number"), ("bfs.nt",
                                               ("widen.nt", "pairs"),
                                               ("scan.nt", "word_end"), ("scan.nt", "trimmed"),
                                               ("scan_refused.nt", "word_end"),
-                                              ("amortised.nt", "field"), ("amortised.nt", "sum_fields")];
+                                              ("amortised.nt", "field"), ("amortised.nt", "sum_fields"),
+                                              ("worklist.nt", "reach")];
 
 /// The same for the **footprint lower bound**: stated where `neant cost` states one and this pass
 /// states none. A `while` loop is given no loop atom by this pass — only a `for` mints one — so a
@@ -122,13 +128,13 @@ const EXACT_MOVES: usize = 102;
 /// whole of it is resident on return, whitespace-normalised so the report's column padding is not
 /// part of the comparison. Counted over every function, so one that should state no footprint and
 /// states none counts too.
-const EXACT_FOOT: usize = 133;
+const EXACT_FOOT: usize = 135;
 
 /// The same for the **footprint lower bound** — `moves` cannot be less than the distinct bytes a
 /// function's parameter arrays reach. Counted over every function, so a `main` that should have no
 /// bound and gets none counts too: a bound invented where `neant cost` states none is as wrong as
 /// a missing one, and only one of those two shows up as a difference.
-const EXACT_BOUNDS: usize = 143;
+const EXACT_BOUNDS: usize = 146;
 
 
 
