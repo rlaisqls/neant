@@ -1,0 +1,7 @@
+// `n` past the view is a bounds failure, as an index past it is
+fn main() {
+    let s = "abc";
+    print_bytes(&s, 2);
+    println("");
+    print_bytes(&s, 4);
+}

@@ -4,6 +4,29 @@ Design decisions with the reasoning that produced them, so the reasoning is not 
 code is. Newest first. A decision is recorded when it was argued over, when it rejected
 alternatives worth remembering, or when a future reader would otherwise ask "why on earth".
 
+## 13 — A `[u8]` is printed by `print_bytes(&s, n)`, charged by the view
+
+**Decided and implemented 2026-09-26.** §12 left a formatted buffer unprintable: `print` takes a
+literal, so `std/text.nt`'s `format_int` into a buffer was printed a byte at a time, and the loop to
+the formatter's returned offset made `tests/golden/modules/std`'s `main` unknown. The surface
+added is one builtin: **`print_bytes(s: &[u8], n: i64)`** writes the first `n` bytes of the view to
+the output as they are, with no newline and no escaping. It is an extern in `bootstrap/rt.c` with
+a declared cost, added to a program that calls it the way the input builtins are (decisions §9);
+`n` outside `0..=s.len()` ends the program with exit 101, as an index past the view does.
+
+**What it is charged, and why not by `n`.** The declaration is in the view's length:
+`work ≤ s.len() + c`, `moves ≤ s.len()` (`c` is 200, `neant measure`'s: about 140 instructions a call at one byte, experiments.md).
+`n` is almost always where a formatter stopped — an offset the program computed from data, not a
+size expression — and a cost in `n` would make every caller that prints what it formatted unknown,
+which is the thing this is for. The view's length is a size the caller always names, and `n ≤
+s.len()` is checked, so the view bounds the write from above: `std`'s `main` is exact at work
+`6559`, the 64-byte buffer charged whole. A caller that wants the tight number passes a view of
+exactly what it prints.
+
+Rejected: `print(&s)` overloading `print` on a `[u8]` view, which would make `print` of a literal
+and of a buffer two things under one name with two cost rules; and `println_bytes`, which is
+`print_bytes` then `println("")`.
+
 ## 12 — A string literal is a `[u8]` value; a string is still not a type
 
 **Decided and implemented 2026-09-26.** §10 made a literal text for `print` and `println` and
@@ -28,8 +51,7 @@ parameter's length, an atom minted at a call) and never revises it. A growable t
 buffer whose length changes under the loops that read it, which is the shape stage D's unknowns
 already come from. There is no `==` on texts of different lengths (a `[u8; 3]` and a `[u8; 4]` are
 different types; compare by walking, as `same` in `text_value.nt` does), no formatting of a value
-into text beyond `std/text.nt`'s functions, and no printing of a `[u8]` as text: `print` takes a
-literal, so a formatted buffer is printed a byte at a time. The literal keeps §10's lexing — no
+into text beyond `std/text.nt`'s functions; a `[u8]` is printed with `print_bytes` (§13). The literal keeps §10's lexing — no
 escapes, no `"` inside; `b"…"` is the form with escapes.
 
 ## 11 — A grid of rows is a row-major idiom the checker writes, not a nested array type

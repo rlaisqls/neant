@@ -17,14 +17,14 @@ abs_i64          work 3                            moves 0                      
 clamp_f64        work 4                            moves 0                            exact
 clamp_i64        work 4                            moves 0                            exact
 sign_f64         work 5                            moves 0                            exact
-sqrt             work ≤ 20                         moves ≤ 0                          declared
-floor            work ≤ 5                          moves ≤ 0                          declared
-ceil             work ≤ 5                          moves ≤ 0                          declared
-exp              work ≤ 80                         moves ≤ 0                          declared
-log              work ≤ 80                         moves ≤ 0                          declared
-sin              work ≤ 100                        moves ≤ 0                          declared
-cos              work ≤ 100                        moves ≤ 0                          declared
-pow              work ≤ 200                        moves ≤ 0                          declared
-main             unknown: loop bound is not a size expression (main.nt:33), io
-                 rests on         sqrt (declared, extern)
-print_byte       work 25                           moves 1                            exact, io
+sqrt             work ≤ 5                          moves ≤ 0                          declared
+floor            work ≤ 2                          moves ≤ 0                          declared
+ceil             work ≤ 2                          moves ≤ 0                          declared
+exp              work ≤ 50                         moves ≤ 0                          declared
+log              work ≤ 65                         moves ≤ 0                          declared
+sin              work ≤ 140                        moves ≤ 0                          declared
+cos              work ≤ 140                        moves ≤ 0                          declared
+pow              work ≤ 130                        moves ≤ 0                          declared
+main             work 6559                         moves 547·B + 321                  exact, io
+                 rests on         sqrt (declared, extern); print_bytes (declared, extern)
+print_bytes      work ≤ s.len() + 200              moves ≤ s.len()                    declared, io

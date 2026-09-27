@@ -1,0 +1,32 @@
+// A `[u8]` printed as text: `print_bytes(&s, n)` writes the first `n` bytes of the view as they
+// are. It is a builtin extern charged by the view it is handed, `s.len()`, not by `n`: `n` is
+// usually where a formatter stopped, which is data, and it is checked against the view.
+fn digits(v: i64, out: &mut [u8]) -> i64 {
+    let mut u = v;
+    let mut n = 0;
+    for k in 0..out.len() {
+        if u > 0 || k == 0 {
+            out[out.len() - 1 - k] = b'0' + (u % 10) as u8;
+            u = u / 10;
+            n += 1;
+        }
+    }
+    n
+}
+
+fn main() {
+    let greeting = "hello, bytes";
+    print_bytes(&greeting, 5);
+    println("");
+    print_bytes(&greeting, greeting.len());
+    println("");
+    let mut buf = [b' '; 8];
+    let n = digits(4096, &mut buf);
+    print("4096 has ");
+    println(n);
+    print_bytes(&buf, buf.len());
+    println("|");
+    let raw = b"tab\there\n";
+    print_bytes(&raw, raw.len());
+    print_bytes(&raw, 0);
+}

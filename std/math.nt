@@ -1,8 +1,10 @@
 // std/math.nt — small math. The scalar helpers are neant, each exact; the transcendental
 // functions are libm's through the C boundary, each with a declared cost (docs/cost-model.md
-// § declarations first): work is an upper bound on the instructions glibc's x86-64/aarch64
-// implementations retire on the common path, moves 0 since they read no memory the program owns.
-// The declarations are not measured yet; `neant measure --fn <name>` confirms or refutes one.
+// § declarations first): work is what `neant measure` counted per call on the development machine
+// (glibc, a Cortex-X925, arguments 0.5..100.5; docs/experiments.md § The standard library's
+// declarations), rounded up; moves 0, since they read no memory the program owns. `sqrt`, `floor`
+// and `ceil` are an instruction or a few once gcc inlines them; `sin` and `cos` cost more for a
+// large argument, where the reduction takes a longer path than was measured.
 
 fn abs_f64(x: f64) -> f64 {
     if x < 0.0 { 0.0 - x } else { x }
@@ -26,26 +28,26 @@ fn sign_f64(x: f64) -> f64 {
     if x > 0.0 { 1.0 } else if x < 0.0 { -1.0 } else { 0.0 }
 }
 
-#[cost(work_at_most = "20", moves_at_most = "0")]
+#[cost(work_at_most = "5", moves_at_most = "0")]
 extern fn sqrt(x: f64) -> f64;
 
-#[cost(work_at_most = "5", moves_at_most = "0")]
+#[cost(work_at_most = "2", moves_at_most = "0")]
 extern fn floor(x: f64) -> f64;
 
-#[cost(work_at_most = "5", moves_at_most = "0")]
+#[cost(work_at_most = "2", moves_at_most = "0")]
 extern fn ceil(x: f64) -> f64;
 
-#[cost(work_at_most = "80", moves_at_most = "0")]
+#[cost(work_at_most = "50", moves_at_most = "0")]
 extern fn exp(x: f64) -> f64;
 
-#[cost(work_at_most = "80", moves_at_most = "0")]
+#[cost(work_at_most = "65", moves_at_most = "0")]
 extern fn log(x: f64) -> f64;
 
-#[cost(work_at_most = "100", moves_at_most = "0")]
+#[cost(work_at_most = "140", moves_at_most = "0")]
 extern fn sin(x: f64) -> f64;
 
-#[cost(work_at_most = "100", moves_at_most = "0")]
+#[cost(work_at_most = "140", moves_at_most = "0")]
 extern fn cos(x: f64) -> f64;
 
-#[cost(work_at_most = "200", moves_at_most = "0")]
+#[cost(work_at_most = "130", moves_at_most = "0")]
 extern fn pow(x: f64, y: f64) -> f64;

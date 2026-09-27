@@ -28,3 +28,25 @@ fn hints() {
     }
     if !failures.is_empty() { panic!("{}", failures.join("\n")); }
 }
+
+/// `neant hints --stdin <path>`: the buffer comes from stdin and `use` resolves from `<path>`'s
+/// directory. `two.nt` is an edited, unsaved buffer for `tests/golden/modules/two/main.nt` — it
+/// has a function the file on disk does not, and uses `geometry.nt` beside that file;
+/// `unsaved_new.nt` is a buffer for a path that does not exist yet, with a type error.
+#[test]
+fn hints_stdin() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("..");
+    let mut failures = Vec::new();
+    for (buffer, path) in [("two", "tests/golden/modules/two/main.nt"), ("unsaved_new", "tests/golden/modules/two/not_yet.nt")] {
+        let src = std::fs::read(root.join(format!("tests/hints/stdin/{buffer}.nt"))).unwrap();
+        let mut child = Command::new(env!("CARGO_BIN_EXE_neant")).args(["hints", "--stdin", path]).current_dir(&root)
+            .stdin(std::process::Stdio::piped()).stdout(std::process::Stdio::piped()).spawn().unwrap();
+        std::io::Write::write_all(&mut child.stdin.take().unwrap(), &src).unwrap();
+        let out = child.wait_with_output().unwrap();
+        let got = String::from_utf8_lossy(&out.stdout).to_string();
+        let want = std::fs::read_to_string(root.join(format!("tests/hints/stdin/{buffer}.json"))).unwrap();
+        if !out.status.success() { failures.push(format!("{buffer}: exit {:?}", out.status.code())); }
+        if got != want { failures.push(format!("{buffer}: hints differ\n--- got ---\n{got}--- want ---\n{want}")); }
+    }
+    if !failures.is_empty() { panic!("{}", failures.join("\n")); }
+}

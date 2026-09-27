@@ -26,9 +26,13 @@ extern fn arg(k: i64) -> [u8] uses io;
 extern fn read_file(path: &[u8]) -> [u8] uses io;
 #[cost(work_at_most = "path.len() + 2500", moves_at_most = "path.len()")]
 extern fn file_size(path: &[u8]) -> i64 uses io;
+#[cost(work_at_most = "s.len() + 200", moves_at_most = "s.len()")]
+extern fn print_bytes(s: &[u8], n: i64) uses io;
 "#;
 
-pub const NAMES: [&str; 4] = ["arg_count", "arg", "read_file", "file_size"];
+/// The builtins. `print_bytes` is output, not input, but it is the same kind of thing — an
+/// extern with a declared cost in `rt.c` (docs/decisions.md §13).
+pub const NAMES: [&str; 5] = ["arg_count", "arg", "read_file", "file_size", "print_bytes"];
 
 /// The builtins `toks` calls — a name directly followed by `(`, so a comment or a variable of the
 /// same name does not count.
@@ -80,10 +84,12 @@ pub fn probe(name: &str, n: i64, repeat: i64, with_call: bool, dir: &std::path::
             let call = if name == "read_file" { "let d = read_file(&p);\n        acc += d.len();" } else { "acc += file_size(&p);" };
             (call.to_string(), vec![], format!("path.len()={}{}", path.len(), if name == "read_file" { format!(",result.len()={n}") } else { String::new() }))
         }
+        // `n` bytes written, whole, to the binary's stdout (a pipe the driver drains)
+        "print_bytes" => ("print_bytes(&s, s.len());\n        acc += 1;".to_string(), vec![], format!("s.len()={n},n={n}")),
         other => return Err(format!("`{other}` is not an input builtin")),
     };
     let body = if with_call { call } else { "acc += 1;".to_string() };
-    let src = format!("fn main() {{\n    let p = b\"{path}\";\n    let mut acc = 0;\n    for r in 0..{repeat} {{\n        {body}\n    }}\n    println(acc + p.len());\n}}\n");
+    let src = format!("fn main() {{\n    let s = [b'x'; {n}];\n    let p = b\"{path}\";\n    let mut acc = 0;\n    for r in 0..{repeat} {{\n        {body}\n    }}\n    println(acc + p.len() + s.len());\n}}\n");
     let toks = crate::lex::lex(&src).map_err(|e| e.to_string())?;
     let used = called(&toks);
     let mut prog = crate::parse::parse(toks).map_err(|e| e.to_string())?;

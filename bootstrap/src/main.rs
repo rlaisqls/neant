@@ -10,7 +10,7 @@
 //!   neant measure f.nt --fn name [--sizes 1000,4000,...] [--shape p=n*n,...] [--repeat k] [--cpu 5] [--lock]
 //!                                             run the function over a size sweep under perf and fit ~n^k
 //!   any command: --apply fn:tile[,fn:transpose]  rewrite a function first
-//!   neant hints f.nt                          every function's cost and every error as JSON, for an editor
+//!   neant hints [--stdin] f.nt                every function's cost and every error as JSON, for an editor
 //!   neant lexdump f.nt   this lexer's token kinds, one per line, numbered per compiler/lex.nt's
 //!                        own scheme (`lex_kind_number`) — the self-hosted lexer's cross-check
 //!                        (bootstrap/tests/self_host_lex.rs, docs/self-hosting-design.md)
@@ -54,6 +54,9 @@ fn main() {
     let mut m_lock = false;
     let mut scop_fn: Option<String> = None;
     let mut use_iolb = false;
+    // `--stdin`: the source is read from stdin and `file` only names it — an editor's unsaved
+    // buffer, whose `use`s resolve from where the file is (editors/README.md)
+    let mut from_stdin = false;
     let mut i = 1;
     while i < args.len() {
         match args[i].as_str() {
@@ -73,6 +76,7 @@ fn main() {
             "--lock" => m_lock = true,
             "--scop" => { i += 1; scop_fn = args.get(i).cloned(); }
             "--iolb" => use_iolb = true,
+            "--stdin" => from_stdin = true,
             "--" => { passthrough = args[i + 1..].to_vec(); break; }
             a if a.starts_with('-') => { eprintln!("unknown flag {a}"); process::exit(2); }
             a => file = Some(PathBuf::from(a)),
@@ -83,7 +87,12 @@ fn main() {
         eprintln!("no input file");
         process::exit(2);
     };
-    let src = match std::fs::read_to_string(&file) {
+    let src = if from_stdin {
+        let mut s = String::new();
+        if let Err(e) = std::io::Read::read_to_string(&mut std::io::stdin(), &mut s) { eprintln!("stdin: {e}"); process::exit(2); }
+        Ok(s)
+    } else { std::fs::read_to_string(&file) };
+    let src = match src {
         Ok(s) => s,
         Err(e) => { eprintln!("{}: {e}", file.display()); process::exit(2); }
     };
@@ -506,7 +515,7 @@ fn cc(c: &str, out: &Path, src: &Path) -> Result<(), String> {
     // the self-hosting I/O bridge (docs/self-hosting-design.md §2): a fixed convention, not a
     // flag — bootstrap/rt.c is linked in whenever the generated C actually calls into it
     let rt_c = Path::new(env!("CARGO_MANIFEST_DIR")).join("rt.c");
-    if ["read_file(", "write_file(", "read_stdin(", "write_stdout(", "quit(", "nt_arg", "nt_file_size("].iter().any(|f| c.contains(f))
+    if ["read_file(", "write_file(", "read_stdin(", "write_stdout(", "quit(", "nt_arg", "nt_file_size(", "nt_print_bytes("].iter().any(|f| c.contains(f))
         && rt_c.exists() { cmd.arg(&rt_c); }
     let status = cmd
         .arg("-o").arg(out)

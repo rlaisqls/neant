@@ -1,4 +1,5 @@
-// The editor surface of neant: on open and on save, run `neant hints` on the file and show each
+// The editor surface of neant: on open, on save, and — debounced — as the buffer changes, run
+// `neant hints` (on the live buffer through `--stdin`, on the file on save) and show each
 // function's cost as grey text after its `fn` line, the report under it in a hover, and every
 // error in the Problems panel. Nothing here computes a cost; it prints what the compiler said.
 // Plain JavaScript against the vscode API, no build step and no dependencies.
@@ -13,6 +14,8 @@ const path = require('path');
 const results = new Map();
 /** Runs in flight by URI, so a save during a run kills the stale one. */
 const running = new Map();
+/** Pending debounced runs on the live buffer, by URI. */
+const timers = new Map();
 
 let diagnostics;
 let decoration;
@@ -36,12 +39,13 @@ function isNeant(doc) {
   return doc.languageId === 'neant' && doc.uri.scheme === 'file';
 }
 
-function run(doc) {
+/** `live`: the buffer as it is now goes on stdin, and `use` still resolves from the file's path. */
+function run(doc, live) {
   if (!isNeant(doc)) return;
   const key = doc.uri.toString();
   const prev = running.get(key);
   if (prev) prev.kill();
-  const args = ['hints', ...(config().get('args') || []), doc.uri.fsPath];
+  const args = ['hints', ...(config().get('args') || []), ...(live ? ['--stdin'] : []), doc.uri.fsPath];
   const child = cp.execFile(neantPath(doc), args, {
     cwd: path.dirname(doc.uri.fsPath),
     timeout: config().get('timeoutMs') || 120000,
@@ -70,7 +74,17 @@ function run(doc) {
     results.set(key, doc_);
     publish(doc, doc_);
   });
+  if (live) {
+    child.stdin.on('error', () => {});
+    child.stdin.end(doc.getText());
+  }
   running.set(key, child);
+}
+
+/** Whether a function or diagnostic of a multi-file program is in this document: each names its
+ *  own file, as reached from the directory `neant` ran in, which is the document's. */
+function here(doc, x) {
+  return !x.file || path.resolve(path.dirname(doc.uri.fsPath), x.file) === doc.uri.fsPath;
 }
 
 /** A position from the compiler's 1-based line and column, clamped to the document. */
@@ -90,14 +104,14 @@ function span(doc, pos) {
 
 function publish(doc, hints) {
   const list = [];
-  for (const d of hints.diagnostics || []) {
+  for (const d of (hints.diagnostics || []).filter((d) => here(doc, d))) {
     const sev = d.severity === 'warning' ? vscode.DiagnosticSeverity.Warning : vscode.DiagnosticSeverity.Error;
     const diag = new vscode.Diagnostic(span(doc, at(doc, d.line, d.col)), d.message, sev);
     diag.source = 'neant';
     list.push(diag);
   }
   if (config().get('unknownsAsDiagnostics')) {
-    for (const f of hints.functions || []) {
+    for (const f of (hints.functions || []).filter((f) => here(doc, f))) {
       if (f.tier !== 'unknown' || !f.cause_line) continue;
       const pos = at(doc, f.cause_line, 1);
       const line = doc.lineAt(pos.line);
@@ -137,7 +151,7 @@ function paint() {
     if (!isNeant(doc)) continue;
     const hints = results.get(doc.uri.toString());
     if (!hints || style !== 'decoration') { editor.setDecorations(decoration, []); continue; }
-    const opts = (hints.functions || []).filter((f) => f.line >= 1 && f.line <= doc.lineCount).map((f) => {
+    const opts = (hints.functions || []).filter((f) => here(doc, f) && f.line >= 1 && f.line <= doc.lineCount).map((f) => {
       const end = doc.lineAt(f.line - 1).range.end;
       return {
         range: new vscode.Range(end, end),
@@ -155,7 +169,7 @@ const inlayProvider = {
     if (config().get('hints.style') !== 'inlay') return [];
     const hints = results.get(doc.uri.toString());
     if (!hints) return [];
-    return (hints.functions || [])
+    return (hints.functions || []).filter((f) => here(doc, f))
       .filter((f) => f.line >= 1 && f.line <= doc.lineCount && f.line - 1 >= range.start.line && f.line - 1 <= range.end.line)
       .map((f) => {
         const h = new vscode.InlayHint(doc.lineAt(f.line - 1).range.end, `// ${clip(f.hint)}`);
@@ -180,7 +194,7 @@ function activate(context) {
     output, diagnostics, decoration, inlayChanged,
     vscode.languages.registerInlayHintsProvider({ language: 'neant', scheme: 'file' }, inlayProvider),
     vscode.workspace.onDidOpenTextDocument(run),
-    vscode.workspace.onDidSaveTextDocument(run),
+    vscode.workspace.onDidSaveTextDocument((d) => { clearTimeout(timers.get(d.uri.toString())); timers.delete(d.uri.toString()); run(d); }),
     vscode.workspace.onDidCloseTextDocument((doc) => {
       results.delete(doc.uri.toString());
       diagnostics.delete(doc.uri);
@@ -188,6 +202,15 @@ function activate(context) {
     // an edit moves lines under the last run's hints; they come back, right, on the next save
     vscode.workspace.onDidChangeTextDocument((e) => {
       if (!isNeant(e.document) || e.contentChanges.length === 0) return;
+      // the live buffer, once typing pauses; the save still runs on the file
+      const ms = config().get('hints.debounceMs');
+      if (ms > 0) {
+        const key = e.document.uri.toString();
+        clearTimeout(timers.get(key));
+        timers.set(key, setTimeout(() => { timers.delete(key); run(e.document, true); }, ms));
+        return;
+      }
+      // live hints off: an edit that moves lines clears the hints until the next save
       if (e.contentChanges.some((c) => c.range.start.line !== c.range.end.line || c.text.includes('\n'))) {
         results.delete(e.document.uri.toString());
         paint();
@@ -198,17 +221,19 @@ function activate(context) {
     vscode.workspace.onDidChangeConfiguration((e) => {
       if (!e.affectsConfiguration('neant')) return;
       warnedMissing = false;
-      vscode.workspace.textDocuments.forEach(run);
+      vscode.workspace.textDocuments.forEach((d) => run(d));
     }),
     vscode.commands.registerCommand('neant.refreshHints', () => {
       const ed = vscode.window.activeTextEditor;
       if (ed) run(ed.document);
     }),
   );
-  vscode.workspace.textDocuments.forEach(run);
+  vscode.workspace.textDocuments.forEach((d) => run(d));
 }
 
 function deactivate() {
+  for (const t of timers.values()) clearTimeout(t);
+  timers.clear();
   for (const child of running.values()) child.kill();
   running.clear();
 }
