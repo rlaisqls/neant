@@ -768,7 +768,10 @@ constants are not, and each constant is off for a reason:
 - **n-body's moves are charged where it has none.** Five bodies are 280 bytes; `advance` is charged
   ≈ `28·n²` moves a call while its whole array fits, because its inner loop runs `j in i + 1..n`, a
   range that moves with `i`, and each lap's lines were summed rather than taken as the hull they
-  share. The prediction is moves-bound at 6.7× the time.
+  share. The prediction is moves-bound at 6.7× the time. Charged its hull once (cost-model § Moves,
+  a triangle), `advance` is `272·n + 20·B − 112` in cache and n-body is 0.27 of the predicted; the rest
+  is each call charged cold, since seven SoA fields make one inexact footprint and no residue is
+  credited across calls.
 
 ## The compiler's cost model, on the compiler — and the machine's answer
 

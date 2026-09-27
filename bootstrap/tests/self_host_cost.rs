@@ -46,6 +46,11 @@ const COPIES_INSTEAD: &[(&str, &str)] = &[];
 /// self-hosted pass states more, never less, and `main` inherits it through the call.
 const NEIGHBOURS_INSTEAD: &[(&str, &str)] = &[("stencil.nt", "stencil"), ("stencil.nt", "main")];
 
+/// `(file, function)` where the self-hosted `moves` are higher because it sums a triangular loop's
+/// laps: `tri`'s `pairs` runs `j in i..a.len()`, which the Rust charges the hull of its laps once
+/// while they fit (cost-model § Moves, a triangle, 2026-09-28) and this pass charges lap by lap.
+const TRIANGLES_INSTEAD: &[(&str, &str)] = &[("tri.nt", "pairs"), ("tri.nt", "main")];
+
 /// Functions whose **footprint** this pass states more narrowly than `neant cost`: it reports none,
 /// or fewer arrays, where the Rust reports one. A narrowing, not a disagreement — the two never state *different*
 /// footprints, and a missing one only costs a caller a credit it could have had.
@@ -138,7 +143,7 @@ const EXACT: usize = 105;
 /// **Nothing is declined.** Every `moves` column either matches or is one of the four in
 /// `COPIES_INSTEAD` — a footprint is a range now, so a callee that reads two fields of a four-field
 /// particle leaves half the array resident and the next call over the other half pays in full.
-const EXACT_MOVES: usize = 103;
+const EXACT_MOVES: usize = 101;
 
 /// The same for the **footprint**: one entry per array parameter and the condition under which the
 /// whole of it is resident on return, whitespace-normalised so the report's column padding is not
@@ -415,7 +420,8 @@ fn self_hosted_work_agrees_with_bootstrap() {
             // assignment the Rust proves is in place. The layout family is gone — the self-hosted
             // compiler chooses AoS or SoA for itself now (docs/self-hosting-layout-design.md).
             let listed = COPIES_INSTEAD.contains(&(name.as_str(), fname.as_str()))
-                || NEIGHBOURS_INSTEAD.contains(&(name.as_str(), fname.as_str()));
+                || NEIGHBOURS_INSTEAD.contains(&(name.as_str(), fname.as_str()))
+                || TRIANGLES_INSTEAD.contains(&(name.as_str(), fname.as_str()));
             if g == mw {
                 exact_moves += 1;
 

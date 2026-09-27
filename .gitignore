@@ -3,3 +3,4 @@
 *.o
 /tests/golden/*.bin
 /tests/golden/*.c
+__pycache__/

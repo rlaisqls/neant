@@ -1655,7 +1655,24 @@ impl<'a, 'b, 'c> Fa<'a, 'b, 'c> {
                                     }
                                 }
                             }
-                            let same_set = || if rec.atom.is_some_and(|a| lp.lines.mentions(a)) { summed.clone() } else { lp.lines.clone() };
+                            // a site that does not move with this loop re-reads the same lines every lap — or,
+                            // when its inner range varies with this loop (`j in i + 1..n`, a triangle),
+                            // subsets of the lines of its hull over every lap, each fetched once while they fit
+                            let same_set = || if rec.atom.is_some_and(|a| lp.lines.mentions(a)) {
+                                let a = rec.atom.unwrap();
+                                let hull = if fits { self.site_range(site) } else { None }.and_then(|(lo, hi)| {
+                                    use super::piece::dominates;
+                                    let (l0, l1) = (lo.subst(a, &rec.lo), lo.subst(a, &rec.last()));
+                                    let (h0, h1) = (hi.subst(a, &rec.lo), hi.subst(a, &rec.last()));
+                                    let lo = if dominates(&l1, &l0) { l0 } else if dominates(&l0, &l1) { l1 } else { return None };
+                                    let hi = if dominates(&h1, &h0) { h1 } else if dominates(&h0, &h1) { h0 } else { return None };
+                                    Some(hi.sub(&lo))
+                                });
+                                match hull {
+                                    Some(bytes) => bytes.mul_atom_pow(Atom::B, Rat::int(-1)).add(&Poly::constant(1)),
+                                    None => summed.clone(),
+                                }
+                            } else { lp.lines.clone() };
                             let (total, contig) = if !fits {
                                 (summed.clone(), false)
                             } else {

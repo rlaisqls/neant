@@ -458,6 +458,16 @@ which is where the remaining factor of 1.5 is.
 Measured on `heat` (the corpus's stencil) the prediction stays above the machine's refills, at
 0.05 and 0.34 of it at `n` = 300 and 900, and its time goes from 0.26 to 0.50 of the predicted.
 
+**A triangle (2026-09-28).** A site that does not move with a loop re-reads the same lines every lap,
+and § Moves charges them once. When its inner range moves with that loop — `for j in i + 1..n` —
+each lap re-reads a subset of the lines of the range's hull over every lap, and they were summed
+lap by lap: n-body's `advance` over five bodies was `≈ 28·n²` bytes in the regime where the whole
+array fits. Where the loop's working set fits, such a site is now charged the lines of that hull
+once, the range taken at the loop's first and last lap and the one that dominates chosen at each
+end; where it does not, or neither end dominates, lap by lap as before. `pairs` in golden `tri` goes
+from `4·n²` to `32·n + 2·B − 8` in cache, against the lower bound's `8·n`; the self-hosted pass
+still sums (`TRIANGLES_INSTEAD`).
+
 ## A scan's accesses
 
 **Written 2026-09-27, after the corpus was timed.** § A scan bounds a scan's *trip*, but its index
