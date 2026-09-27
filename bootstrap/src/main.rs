@@ -4,7 +4,7 @@
 //!   neant run   f.nt [--unchecked] [-- args]  build to a temp file and run it
 //!   neant emit  f.nt [--unchecked]            print the generated C
 //!   neant check f.nt                          parse and type-check only
-//!   neant cost  f.nt [-M bytes] [-B bytes] [-P cores] [--tau ns] [--bw GB/s] [--lat ns] [--eval n=..,..]
+//!   neant cost  f.nt [-M bytes] [-B bytes] [-P cores] [--tau ns] [--bw GB/s] [--lat ns] [--M3 bytes] [--bw2 GB/s] [--lat3 ns] [--eval n=..,..]
 //!                                             infer work, moves and span for every function
 //!   neant lock  f.nt [--check]                write costs.lock next to the source, or diff it
 //!   neant measure f.nt --fn name [--sizes 1000,4000,...] [--shape p=n*n,...] [--repeat k] [--cpu 5] [--lock]
@@ -45,6 +45,11 @@ fn main() {
     let mut passthrough: Vec<String> = Vec::new();
     let default_p = std::thread::available_parallelism().map(|n| n.get() as i128).unwrap_or(4);
     let mut machine = cost::Machine { m_bytes: 2 << 20, b_bytes: 64, p_cores: default_p, ns_per_work: 0.0176, bytes_per_ns: 20.8, ns_per_miss: 112.3 };
+    // the cache outside `M`, for a time only (docs/cost-model.md § Time, a second level): its size,
+    // the bytes per nanosecond it serves `M` with, and what a chased line that hits it waits
+    // off unless `--M3` is given: measured, it moves the error between kernels rather than
+    // shrinking it (docs/experiments.md § The roofline, a second level)
+    let mut outer = Outer { bytes: 16 << 20, bytes_per_ns: 30.1, ns_per_miss: 23.0, on: false };
     let mut eval: Option<String> = None;
     let mut lock_check = false;
     let mut applies: Vec<String> = Vec::new();
@@ -71,6 +76,9 @@ fn main() {
             "--tau" => { i += 1; machine.ns_per_work = args.get(i).and_then(|s| s.parse().ok()).unwrap_or(machine.ns_per_work); }
             "--bw" => { i += 1; machine.bytes_per_ns = args.get(i).and_then(|s| s.parse().ok()).unwrap_or(machine.bytes_per_ns); }
             "--lat" => { i += 1; machine.ns_per_miss = args.get(i).and_then(|s| s.parse().ok()).unwrap_or(machine.ns_per_miss); }
+            "--M3" => { i += 1; outer.bytes = parse_bytes(args.get(i)); outer.on = true; }
+            "--bw2" => { i += 1; outer.bytes_per_ns = args.get(i).and_then(|s| s.parse().ok()).unwrap_or(outer.bytes_per_ns); }
+            "--lat3" => { i += 1; outer.ns_per_miss = args.get(i).and_then(|s| s.parse().ok()).unwrap_or(outer.ns_per_miss); }
             "--eval" => { i += 1; eval = args.get(i).cloned(); }
             "--apply" => { i += 1; applies.extend(args.get(i).map(|s| s.split(',').map(String::from).collect::<Vec<_>>()).unwrap_or_default()); }
             "--fn" => { i += 1; m_fn = args.get(i).cloned(); }
@@ -152,6 +160,13 @@ fn main() {
             print!("{}", cost::lock::layout_report(&layouts));
             let mut costs = cost::analyze(&module, &machine);
             if use_iolb { iolb_bounds(&module, &mut costs, &machine); }
+            // for a time's second level, the whole analysis again with `M` the outer cache's size:
+            // a size known here decides which regime holds at analysis time, so the cost at one
+            // `M` cannot be re-read at another (docs/cost-model.md § Time, a second level)
+            let outer_costs = if eval.is_some() && outer.on {
+                let m3c = cost::Machine { m_bytes: outer.bytes, ..machine };
+                Some(cost::analyze(&module, &m3c))
+            } else { None };
             // a diagnostic: every cost piece `dominates` cannot show is non-negative, with the least
             // value sampling finds (docs/plan.md § Stage D, the sign audit)
             if std::env::var("NEANT_SIGNS").is_ok() {
@@ -167,7 +182,7 @@ fn main() {
                     }
                 }
             }
-            for c in &costs {
+            for (ci, c) in costs.iter().enumerate() {
                 print!("{}", sources.relabel(&cost::lock::report(c, &machine)));
                 if let (Some(ev), cost::CostResult::Exact { work, moves, span }) = (&eval, &c.result) {
                     if let Some((w, m)) = evaluate(c, work, moves, ev, &machine) {
@@ -180,7 +195,22 @@ fn main() {
                         let tw = sv.max(w / p) * machine.ns_per_work;
                         // a chase's lines wait one on the last: latency, not bandwidth
                         let ch = if c.chase.pieces.is_empty() { 0.0 } else { eval_one(c, &c.chase, ev, &machine).unwrap_or(0.0) }.min(m);
-                        let tm = (m - ch) / machine.bytes_per_ns + ch / machine.b_bytes as f64 * machine.ns_per_miss;
+                        // the same cost across the boundary of the cache outside `M`: what crosses
+                        // it came from memory, and the rest of what crossed `M` from that cache
+                        let m3c = cost::Machine { m_bytes: outer.bytes, ..machine };
+                        let c3 = outer_costs.as_ref().and_then(|v| v.get(ci)).filter(|c3| c3.name == c.name);
+                        let (m3, ch3) = match c3.map(|c3| (c3, &c3.result)) {
+                            Some((c3, cost::CostResult::Exact { moves: mv3, .. })) => {
+                                let m3 = eval_one(c3, mv3, ev, &m3c).unwrap_or(m).min(m);
+                                let ch3 = if c3.chase.pieces.is_empty() { 0.0 } else { eval_one(c3, &c3.chase, ev, &m3c).unwrap_or(ch) };
+                                (m3, ch3.min(ch).min(m3))
+                            }
+                            _ => (m, ch),
+                        };
+                        let b = machine.b_bytes as f64;
+                        let from_outer = ((m - m3) - (ch - ch3)).max(0.0) / outer.bytes_per_ns + (ch - ch3) / b * outer.ns_per_miss;
+                        let from_memory = (m3 - ch3) / machine.bytes_per_ns + ch3 / b * machine.ns_per_miss;
+                        let tm = from_outer + from_memory;
                         if ch > 0.0 { print!("  chase {ch:.0} bytes"); }
                         print!("  time {:.3e} s ({}-bound)", tw.max(tm) / 1e9, if tw >= tm { "work" } else { "moves" });
                         if span != work {
@@ -627,3 +657,6 @@ fn eval_one(c: &cost::FuncCost, cost: &cost::Cost, ev: &str, m: &cost::Machine) 
 fn evaluate(c: &cost::FuncCost, work: &cost::Cost, moves: &cost::Cost, ev: &str, m: &cost::Machine) -> Option<(f64, f64)> {
     Some((eval_one(c, work, ev, m)?, eval_one(c, moves, ev, m)?))
 }
+
+/// The cache outside `M` for a time's second level (docs/cost-model.md § Time).
+struct Outer { bytes: i128, bytes_per_ns: f64, ns_per_miss: f64, on: bool }

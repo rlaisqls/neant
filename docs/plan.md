@@ -928,7 +928,9 @@ sites (cost-model § Neighbouring sites): sites on one array whose offsets are w
 share lines when `span + 1` laps fit, so the stencil is three streams, not five (`24·n²` against the
 lower bound's `16·n²`), `heat` goes to 0.50, measured refills stay below the prediction, one compiler
 lock line moves and the self-hosted pass, without the rule, is listed as charging more
-(`NEIGHBOURS_INSTEAD`).
+(`NEIGHBOURS_INSTEAD`). A second cache level for the time (`--M3`, the analysis run again at
+`M` = L3, BW₂ and L₃ fitted by differences) was measured and left off by default: it moves the error
+between kernels (streams better, strided access worse) and the geometric mean from 1.14 to 1.16.
 
 ## M7 — the constant factor
 

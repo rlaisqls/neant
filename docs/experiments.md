@@ -645,6 +645,17 @@ of measured over predicted over the 31 runs goes from 1.56 to **1.14**. What is 
 row is the missing cache levels again: at 16 MB the arena fits in L3 and waits for L3, and at 1 MB it
 fits in L2.
 
+**A second level, tried the same day, and not made the default.** `--M3 16777216` re-runs the
+analysis with `M` = L3 and charges what crosses L2 but not L3 at L3's rates, fitted by differences
+(100 more repeats of a 6.4 MB stream: **BW₂ = 30.1 GB/s**; a second walk of an 8 MB arena: **L₃ =
+23 ns** a line). A first fit that read the model's own first touch gave a negative `L₃`: the arena
+had just been written by `main` and was in L3 already, which the model, charging each call's first
+touch cold, does not know. With it on, mid-size streams move toward 1 (`dot` at 800 000: 0.64 →
+0.97) and strided `matmul_naive` moves away (at 832 / 1216: 0.94 / 1.16 → 1.36 / 1.69, L3 serving a
+column walk slower than a stream), and the geometric mean goes from 1.14 to 1.16. A level whose
+bandwidth depends on the access pattern is what that asks for, which is the TLB row's question
+too.
+
 **What changed.** The `--eval` line prints the time and its bound (`work-bound` / `moves-bound`);
 `--tau` and `--bw` set the constants, defaulting to the fit above. Nothing in any report without
 `--eval` changed, and no golden moved. Next: the same comparison on the corpus's programs, which

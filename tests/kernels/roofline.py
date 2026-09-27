@@ -20,7 +20,11 @@ FIT = {
     "horner": (3_000, 20_000),        # 24 KB, in L1; 6·10⁷ evaluations
     "sum":    (12_800_000, 20),       # 100 MB, far past L3
     "arena":  (4_194_304, 3),         # 64 MB of nodes in a random cycle: one dependent miss a step
+    # the second level, the cache outside M (L3, 16 MiB): a stream that fits in it, a chase that does
+    "sum3":   (800_000, 100),         # 6.4 MB
+    "arena3": (524_288, 1),           # 8 MB, one walk: a repeat would find it in L3, which the model does not credit across calls
 }
+L3 = 16 << 20
 CHECK = {
     "sum":          ([200_000, 800_000, 3_200_000, 12_800_000], 20),
     "dot":          ([200_000, 800_000, 3_200_000, 12_800_000], 20),
@@ -85,6 +89,9 @@ def main():
     ap.add_argument("--tau", type=float)
     ap.add_argument("--bw", type=float)
     ap.add_argument("--lat", type=float)
+    ap.add_argument("--bw2", type=float)
+    ap.add_argument("--lat3", type=float)
+    ap.add_argument("--M3", action="store_true", help="predict with the second level (L3) as well")
     ap.add_argument("kernels", nargs="*")
     a = ap.parse_args()
     if not NEANT.exists():
@@ -112,12 +119,32 @@ def main():
         t = wall(b, a.cpu, a.runs) - base
         lat = (t - (mv - ch) / (bw * 1e9)) / (ch / 64) * 1e9
         print(f"arena n={n} R={r}: moves {mv:.3e}  of them a chase {ch:.3e}  time {t*1e3:.1f} ms  →  L = {lat:.1f} ns a chased line")
-        print(f"\nneant cost --tau {tau:.4f} --bw {bw:.2f} --lat {lat:.1f}")
+        # the second level, by differences, so that what the model believes about the first touch
+        # does not enter: R more repeats of a stream that fits in L3 are R·n·8 bytes from L3, and a
+        # second walk of an arena that fits in L3 is n dependent lines from L3
+        n, r = FIT["sum3"]
+        src = (HERE / "sum.nt.in").read_text()
+        _, b1 = build(src, "sum3a", n, r, work)
+        _, b2 = build(src, "sum3b", n, 2 * r, work)
+        dt = wall(b2, a.cpu, a.runs) - wall(b1, a.cpu, a.runs)
+        bw2 = r * n * 8 / dt / 1e9
+        print(f"sum n={n}: {r} more repeats take {dt*1e3:.1f} ms  →  BW2 = {bw2:.2f} GB/s from L3")
+        n, _ = FIT["arena3"]
+        src = (HERE / "arena.nt.in").read_text()
+        _, b1 = build(src, "arena3a", n, 1, work)
+        _, b2 = build(src, "arena3b", n, 2, work)
+        dt = wall(b2, a.cpu, a.runs) - wall(b1, a.cpu, a.runs)
+        lat3 = dt / n * 1e9
+        print(f"arena n={n}: a second walk takes {dt*1e3:.1f} ms  →  L3 = {lat3:.1f} ns a chased line from L3")
+        print(f"\nneant cost --tau {tau:.4f} --bw {bw:.2f} --lat {lat:.1f} --bw2 {bw2:.2f} --lat3 {lat3:.1f}")
         return
     extra = []
     if a.tau is not None: extra += ["--tau", str(a.tau)]
     if a.bw is not None: extra += ["--bw", str(a.bw)]
     if a.lat is not None: extra += ["--lat", str(a.lat)]
+    if a.bw2 is not None: extra += ["--bw2", str(a.bw2)]
+    if a.lat3 is not None: extra += ["--lat3", str(a.lat3)]
+    if a.M3: extra += ["--M3", str(L3)]
     print(f"  {'kernel':<14} {'n':>10} {'pred work':>11} {'pred bytes':>11} {'pred ms':>9} {'meas ms':>9} {'meas/pred':>9}")
     ratios = []
     for k in a.kernels or list(CHECK):

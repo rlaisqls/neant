@@ -821,6 +821,13 @@ with `L` the nanoseconds a chased line waits, fitted on a chase over a 64 MB are
 cycle: **L = 112 ns**. `chase` is only ever read by a time: no bound, tier or report line changes,
 and `--eval` prints it when it is not zero.
 
+**A second level, tried (2026-09-27).** With `--M3 bytes` the whole analysis runs a second time with
+`M` the outer cache's size — a size known at analysis time decides its regime there, so a cost at
+one `M` cannot be re-read at another — and what crosses `M` but not the outer boundary is charged
+at that cache's bandwidth and latency, `BW₂ = 30 GB/s` and `L₃ = 23 ns`, fitted by differences so
+that the model's first touch does not enter. Measured, it moves the error between kernels rather than
+shrinking it, so it is not the default (experiments.md § The roofline, a second level).
+
 What the model is not, and the measurements say so (experiments.md § The roofline): it has one
 cache level, so data that fits in `M` moves nothing and its time is all work, while L2 and page
 faults are real, and a chase over an arena that fits in L3 waits for L3, not memory; and it charges a
