@@ -873,6 +873,19 @@ behind it (the VS Code client debounces; Neovim and Helix send every change); a 
 read from disk even when its buffer is open and edited; and a definition knows functions and
 structs, not locals, fields or parameters.
 
+**An amortised scan, 2026-09-27** (cost-model § An amortised scan; golden `amortised`). The scan
+rule charged a parser called once a lap its whole-range cost every lap, so `count_ints` was
+`9·xs.len()²` where the truth is linear. A function that advances an index through an array —
+returns it, starts it at a parameter, steps it by one under `i < a.len()` and loops only as scans of
+it — has its cost read as `α·(a.len() − start) + β`, and a caller that calls it once a lap and moves
+its own index on through what it returned pays `β` a lap and `α·(a.len() − v₀)` once: the distances
+telescope. Work and moves are amortised column by column. In the corpus the parse's work is linear
+(`count_ints` `44·xs.len() + 1`; `fir`'s and `pid`'s `main`s linear in the text); its moves are not,
+because while the text fits in memory each call is charged a cold read of the whole array. The
+compiler's count does not move (92/49/34/103; the compiler has no call of this shape), and the
+parity counts become work 102, moves 102, footprint 133, bound 143. Left: the moves (a warm walk's
+residue), bfs's worklist, and the lexer's two scan shapes.
+
 ## M7 — the constant factor
 
 Prove the asymptote, search the constant. A micro-architectural cost line (what llvm-mca and uiCA

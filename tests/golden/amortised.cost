@@ -1,0 +1,44 @@
+struct Span      layout AoS  the model does not decide: no function's moves differ
+field            work 4·xs.len() − 4·start + 8     moves                              bound  (2 regimes)
+                                               moves ≈ B·xs.len() + xs.len() − B·start − start if xs.len() ≥ M
+                                               moves 2·xs.len() − start + 2·B     if xs.len() < M
+                 footprint        xs: [0, xs.len()) (whole array)   no residue claimed
+                 scan: `i` grows by at least 1 a lap, so the `while` at line 19 runs at most xs.len() − start times
+fields           work 19·xs.len() + 1              moves                              bound  (2 regimes)
+                                               moves B·xs.len()² + xs.len()² + 2·B·xs.len() if xs.len() ≥ M
+                                               moves 2·xs.len()² + 2·B·xs.len()   if xs.len() < M
+                 in `field`: scan: `i` grows by at least 1 a lap, so the `while` at line 19 runs at most xs.len() − start times
+                 scan: `i` grows by at least 1 a lap, so the `while` at line 28 runs at most xs.len() times
+                 scan: argument 2 to `field` is taken at its least, 0, and `field`'s cost falls as it grows
+                 scan: the calls to `field` at line 29 are amortised: `i` only moves on through where `field` stopped in `xs`, so together they are charged 4·xs.len() once, not a scan of `xs` a lap
+                 rests on         field (bound, a scan)
+sum_fields       work 14·out.len() + 4·xs.len() + 1 moves                              bound  (2 regimes)
+                                               moves ≈ B·xs.len()·out.len() + xs.len()·out.len() if xs.len() ≥ M
+                                               moves ≈ 2·xs.len()·out.len()       if xs.len() < M
+                 lower bound      moves 8·out.len()                  (footprint, every distinct element crosses once)
+                 footprint        out: [0, 8·out.len())   resident after if 8·out.len() < M
+                 in `field`: scan: `i` grows by at least 1 a lap, so the `while` at line 19 runs at most xs.len() − start times
+                 scan: argument 2 to `field` is taken at its least, 0, and `field`'s cost falls as it grows
+                 scan: the calls to `field` at line 42 are amortised: `i` only moves on through where `field` stopped in `xs`, so together they are charged 4·xs.len() once, not a scan of `xs` a lap
+                 rests on         field (bound, a scan)
+hop              work xs.len() − start + 1         moves 0                            exact
+hops             work xs.len()² + 6·xs.len() + 1   moves 0                            bound
+                 scan: `i` grows by at least 1 a lap, so the `while` at line 60 runs at most xs.len() times
+                 scan: argument 2 to `hop` is taken at its least, 0, and `hop`'s cost falls as it grows
+restart          work 2·xs.len()² + 16·xs.len() + 1 moves                              bound  (2 regimes)
+                                               moves 3·xs.len()²/2 + 2·B·xs.len() + xs.len()/2 if xs.len() < M
+                                               moves ≈ B·xs.len()²/2 + xs.len()²/2 if xs.len() ≥ M
+                 in `field`: scan: `i` grows by at least 1 a lap, so the `while` at line 19 runs at most xs.len() − start times
+                 rests on         field (bound, a scan)
+main             work 725                          moves 46·B + 399                   bound, io
+                 in `fields`: in `field`: scan: `i` grows by at least 1 a lap, so the `while` at line 19 runs at most xs.len() − start times
+                 in `fields`: scan: `i` grows by at least 1 a lap, so the `while` at line 28 runs at most xs.len() times
+                 in `fields`: scan: argument 2 to `field` is taken at its least, 0, and `field`'s cost falls as it grows
+                 in `fields`: scan: the calls to `field` at line 29 are amortised: `i` only moves on through where `field` stopped in `xs`, so together they are charged 4·xs.len() once, not a scan of `xs` a lap
+                 in `sum_fields`: in `field`: scan: `i` grows by at least 1 a lap, so the `while` at line 19 runs at most xs.len() − start times
+                 in `sum_fields`: scan: argument 2 to `field` is taken at its least, 0, and `field`'s cost falls as it grows
+                 in `sum_fields`: scan: the calls to `field` at line 42 are amortised: `i` only moves on through where `field` stopped in `xs`, so together they are charged 4·xs.len() once, not a scan of `xs` a lap
+                 in `hops`: scan: `i` grows by at least 1 a lap, so the `while` at line 60 runs at most xs.len() times
+                 in `hops`: scan: argument 2 to `hop` is taken at its least, 0, and `hop`'s cost falls as it grows
+                 in `restart`: in `field`: scan: `i` grows by at least 1 a lap, so the `while` at line 19 runs at most xs.len() − start times
+                 rests on         field (bound, a scan); fields (bound, a scan); sum_fields (bound, a scan); hops (bound, a scan)

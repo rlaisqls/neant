@@ -1,0 +1,86 @@
+// An amortised scan (docs/cost-model.md § An amortised scan). `field` advances an index through
+// `xs` and returns where it stopped: it costs a constant plus 7 a byte it moved past, and what it
+// returns is at most `xs.len()`. `fields` and `sum_fields` call it once a lap and then move on
+// from where it stopped, so over the whole loop the distances add up to at most `xs.len()` — the
+// index is the potential — and `xs` is paid for once, not once a lap.
+//
+// Refused: `hop` steps by two past its guard, so what it returns can pass `xs.len()`; and
+// `restart` moves its index by one, not through what `field` returned, so nothing telescopes.
+// Both are charged a scan of `xs` a lap, as before.
+
+struct Span { start: i64, end: i64 }
+
+fn field(xs: &[u8], start: i64) -> Span {
+    let mut i = start;
+    while i < xs.len() && xs[i] == b',' {
+        i += 1;
+    }
+    let first = i;
+    while i < xs.len() && xs[i] != b',' {
+        i += 1;
+    }
+    Span { start: first, end: i }
+}
+
+fn fields(xs: &[u8]) -> i64 {
+    let mut n = 0;
+    let mut i = 0;
+    while i < xs.len() {
+        let s = field(xs, i);
+        if s.end > s.start {
+            n += 1;
+        }
+        i = s.end + 1;
+    }
+    n
+}
+
+fn sum_fields(xs: &[u8], out: &mut [i64]) {
+    let mut i = 0;
+    let mut k = 0;
+    while k < out.len() {
+        let s = field(xs, i);
+        out[k] = s.end - s.start;
+        k += 1;
+        i = s.end;
+    }
+}
+
+fn hop(xs: &[u8], start: i64) -> i64 {
+    let mut i = start;
+    while i < xs.len() {
+        i += 2;
+    }
+    i
+}
+
+fn hops(xs: &[u8]) -> i64 {
+    let mut n = 0;
+    let mut i = 0;
+    while i < xs.len() {
+        i = hop(xs, i) + 1;
+        n += 1;
+    }
+    n
+}
+
+fn restart(xs: &[u8]) -> i64 {
+    let mut n = 0;
+    let mut i = 0;
+    while i < xs.len() {
+        let s = field(xs, i);
+        n += s.end - s.start;
+        i += 1;
+    }
+    n
+}
+
+fn main() {
+    let s = b"ab,,cde,f";
+    println(fields(&s));
+    let mut out = [0; 3];
+    sum_fields(&s, &mut out);
+    println(out[0] + out[1] * 10 + out[2] * 100);
+    println(hops(&s));
+    println(restart(&s));
+}

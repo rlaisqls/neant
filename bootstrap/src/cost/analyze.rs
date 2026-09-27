@@ -373,6 +373,9 @@ struct Analyzer<'a> {
     /// what each function guarantees about what it returns (`end ≥ start`), for a scan
     /// (docs/cost-model.md § A scan)
     scan_summ: Vec<Vec<super::scan::Ge>>,
+    /// which functions advance an index through an array and return where it stopped, for an
+    /// amortised scan in a caller (docs/cost-model.md § An amortised scan)
+    advances: Vec<Option<super::scan::Advance>>,
 }
 
 impl<'a> Analyzer<'a> {
@@ -393,7 +396,9 @@ impl<'a> Analyzer<'a> {
             }
             seen
         }).collect();
-        Analyzer { m, machine: *machine, done: vec![None; n], active: vec![false; n], reach, field_writes: field_writes(m), scan_summ: super::scan::summaries(m) }
+        let summ = super::scan::summaries(m);
+        let advances: Vec<Option<super::scan::Advance>> = m.funcs.iter().map(|f| super::scan::advance(f, &summ)).collect();
+        Analyzer { m, machine: *machine, done: vec![None; n], active: vec![false; n], reach, field_writes: field_writes(m), scan_summ: summ, advances }
     }
     /// Two distinct functions that call each other, however indirectly: a cost of either is a
     /// system of recurrences, and neither can stand as a named term in the other.
@@ -532,6 +537,12 @@ impl LoopRec {
     fn last(&self) -> Poly { self.lo.add(&self.trip.sub(&Poly::constant(1)).scale(Rat::int(self.step))) }
 }
 
+/// One call amortised over a loop: `let r = g(.., a, .., v, ..)` once a lap and `v = r.f + c`, so
+/// the laps' distances telescope. `alpha` is what the callee charges per unit of distance, found
+/// at the call from its cost, and `(work, moves)`.
+#[derive(Debug, Clone)]
+struct Amort { line: u32, fid: FuncId, adv: super::scan::Advance, arr: LocalId, var: LocalId, alpha: Option<(Cost, Cost)> }
+
 struct Fa<'a, 'b, 'c> {
     an: &'b mut Analyzer<'a>,
     f: &'c Func,
@@ -615,6 +626,9 @@ struct Fa<'a, 'b, 'c> {
     loop_writes: Vec<Vec<LocalId>>,
     /// the scans this function's loops are bounded by, as notes (docs/cost-model.md § A scan)
     scans: std::cell::RefCell<Vec<String>>,
+    /// for each open `while` (by loop depth), the calls in its body whose laps are amortised
+    /// against one index (docs/cost-model.md § An amortised scan)
+    amort: Vec<(usize, Vec<Amort>)>,
 }
 
 impl<'a, 'b, 'c> Fa<'a, 'b, 'c> {
@@ -624,7 +638,7 @@ impl<'a, 'b, 'c> Fa<'a, 'b, 'c> {
             local_size: HashMap::new(), local_affine: HashMap::new(), initial: HashMap::new(), at_entry: false,
             loops: vec![], work: Cost::zero(), moves: Cost::zero(), span: Cost::zero(), saved: vec![], branch: vec![], next_if: 0,
             local_root: HashMap::new(), resident: vec![], call_moves: Cost::zero(), saved_calls: vec![], replay: false, has_call: vec![], rests_on: vec![],
-            reads: Default::default(), loop_writes: vec![], scans: Default::default(),
+            reads: Default::default(), loop_writes: vec![], scans: Default::default(), amort: vec![],
         };
         for (i, &p) in f.params.iter().enumerate() {
             let l = &f.locals[p];
@@ -2056,9 +2070,30 @@ impl<'a, 'b, 'c> Fa<'a, 'b, 'c> {
                 self.expr(cond)?;
                 self.work = w0;
                 self.span = sp0;
+                let cands = self.amortised_calls(body);
+                let spans: Vec<Poly> = cands.iter().map(|(_, sp)| sp.clone()).collect();
+                self.amort.push((self.loops.len(), cands.into_iter().map(|(c, _)| c).collect()));
                 let r = self.block(body);
+                if r.is_err() { self.amort.pop(); }
                 r?;
-                self.leave_loop(body)?;
+                let left = self.leave_loop(body);
+                let (_, done) = self.amort.pop().unwrap();
+                left?;
+                // the amortised calls' distance, charged once for the whole loop
+                for (c, span) in done.iter().zip(&spans) {
+                    let Some((aw, am)) = &c.alpha else { continue };
+                    let (wc, mc) = (aw.mul_poly(span), am.mul_poly(span));
+                    if !self.replay {
+                        self.work = self.work.add(&wc);
+                        self.span = self.span.add(&wc);
+                        self.moves = self.moves.add(&mc);
+                    }
+                    let callee = self.an.m.funcs[c.fid].name.clone();
+                    let arr = self.f.locals[c.arr].name.clone();
+                    let var = self.f.locals[c.var].name.clone();
+                    self.scans.borrow_mut().push(format!("scan: the calls to `{callee}` at line {} are amortised: `{var}` only moves on through where `{callee}` stopped in `{arr}`, so together they are charged {} once, not a scan of `{arr}` a lap",
+                        c.line, wc.display(&self.names)));
+                }
                 self.loop_writes.pop();
                 Ok(())
             }
@@ -2206,6 +2241,42 @@ impl<'a, 'b, 'c> Fa<'a, 'b, 'c> {
         }
         let root_ref = match self.f.params.iter().position(|&p| p == root) { Some(i) => Root::Param(i, name), None => Root::Local(name) };
         Ok(Poly::atom(Atom::Read(Box::new(Read { id: 0, root: root_ref, index: None, field: fname, least: false, walk: true }))))
+    }
+
+    /// The least a mutable `i64` is on entry to the loop being walked: its one entry value, else
+    /// what it was first bound to when nothing ever makes it smaller (§ A scan).
+    fn start_of(&self, v: LocalId) -> Option<Poly> {
+        use super::scan::{only_increased, Base};
+        if let Some(p) = self.entry_value(v) { return Some(p); }
+        only_increased(self.f, &self.an.scan_summ, v)?.iter().find_map(|(b, c)| {
+            let base = match b {
+                Base::Zero => Poly::zero(),
+                Base::Param(p) => self.local_affine.get(&self.f.params[*p]).filter(|a| a.is_const())?.konst.clone(),
+                Base::Cur => return None,
+            };
+            Some(base.add(&Poly::from_rat(*c)))
+        })
+    }
+
+    /// The calls in a `while` body amortised against one index (docs/cost-model.md § An amortised
+    /// scan): `let r = g(.., a, .., v, ..)` at the body's top level, `g` advancing its index through
+    /// `a`, and later `v = r.f + c` with `c ≥ 0`, the only assignment to `v` in the body; with what
+    /// the loop's total adds, `α·(a.len() − v₀)`, needing `a`'s length and `v₀` known now.
+    fn amortised_calls(&self, body: &Block) -> Vec<(Amort, Poly)> {
+        let mut out = Vec::new();
+        for (k, s) in body.stmts.iter().enumerate() {
+            let Stmt::Let(r, Expr { kind: ExprKind::Call(g, args), line, .. }) = s else { continue };
+            let Some(adv) = self.an.advances[*g] else { continue };
+            let Some(Expr { kind: ExprKind::Local(v), .. }) = args.get(adv.p) else { continue };
+            let v = *v;
+            if !self.f.locals[v].mutable || self.f.locals[v].ty != Ty::I64 { continue; }
+            let arr = match args.get(adv.a).map(|a| &a.kind) { Some(ExprKind::Ref(x, _)) | Some(ExprKind::Local(x)) => *x, _ => continue };
+            let then = body.stmts[k + 1..].iter().any(|t| matches!(t, Stmt::Assign(LValue::Var(w), None, e) if *w == v && from_field(e, *r, adv.field)));
+            if !then || count_assigns(body, v) != 1 { continue; }
+            let (Some(len), Some(v0)) = (self.local_size.get(&arr).cloned(), self.start_of(v)) else { continue };
+            out.push((Amort { line: *line, fid: *g, adv, arr, var: v, alpha: None }, len.sub(&v0)));
+        }
+        out
     }
 
     /// `while i < e` bounded as a scan (docs/cost-model.md § A scan): `i` grows by at least `d`
@@ -2512,6 +2583,22 @@ impl<'a, 'b, 'c> Fa<'a, 'b, 'c> {
                         if !self.rests_on.contains(&tag) { self.rests_on.push(tag); }
                     }
                 }
+                // an amortised call (§ An amortised scan): a lap pays what the callee charges
+                // besides the distance it moves, and the loop pays the distance once
+                let depth = self.loops.len();
+                let mut amort_alpha: Option<(usize, Cost, Cost)> = None;
+                if let Some((d, cands)) = self.amort.last() {
+                    if *d == depth {
+                        if let Some((ci, c)) = cands.iter().enumerate().find(|(_, c)| c.line == e.line && c.fid == *fid) {
+                            // each column on its own: one whose distance term is not of the form
+                            // stays charged a lap at a time, which is sound
+                            let (aw, asp, am) = (distance_rate(&w, c.adv), distance_rate(&sp, c.adv), distance_rate(&mv, c.adv));
+                            let aw = match (aw, asp) { (Some(a), Some(b)) => { w = strip_distance(&w, c.adv); sp = strip_distance(&sp, c.adv); Some(a.max(&b)) } _ => None };
+                            let am = am.map(|a| { mv = strip_distance(&mv, c.adv); a });
+                            if aw.is_some() || am.is_some() { amort_alpha = Some((ci, aw.unwrap_or_default(), am.unwrap_or_default())); }
+                        }
+                    }
+                }
                 let mut map: Vec<(usize, Poly)> = Vec::new();
                 let mut roots: Vec<Option<LocalId>> = Vec::new();
                 let mut unnamed: Vec<(usize, u32)> = Vec::new();
@@ -2614,6 +2701,11 @@ impl<'a, 'b, 'c> Fa<'a, 'b, 'c> {
                 w = w.rename_roots(&rename).subst_many(&map);
                 mv = mv.rename_roots(&rename).subst_many(&map);
                 sp = sp.rename_roots(&rename).subst_many(&map);
+                // the rate per unit of distance, in this function's sizes as the rest of the cost is
+                if let Some((ci, aw, am)) = amort_alpha {
+                    let (aw, am) = (aw.rename_roots(&rename).subst_many(&map), am.rename_roots(&rename).subst_many(&map));
+                    if !self.replay { if let Some((_, cands)) = self.amort.last_mut() { cands[ci].alpha = Some((aw, am)); } }
+                }
                 self.last_result = callee.result_size.as_ref().map(|p| p.subst_many(&map));
                 // the callee's footprint in this function's arrays (none is known of a declared callee)
                 let feet: Vec<(LocalId, Poly, Poly, bool)> = callee.footprint.iter().filter(|_| !declared_only && !opaque).filter_map(|f| {
@@ -3013,4 +3105,74 @@ fn stores_expr(e: &Expr, f: &Func, roots: &mut HashMap<LocalId, LocalId>, summ: 
         ExprKind::Block(b) => stores_block(b, f, roots, summ, hit),
         ExprKind::Int(_) | ExprKind::Float(_) | ExprKind::Bool(_) | ExprKind::Byte(_) | ExprKind::Local(_) | ExprKind::Len(_) | ExprKind::Ref(..) | ExprKind::Text(..) => {}
     }
+}
+
+/// `e` is `r.f + c`, `r.f` or (with no field) `r + c`, `r`, with `c ≥ 0`.
+fn from_field(e: &Expr, r: LocalId, field: Option<usize>) -> bool {
+    let base = |x: &Expr| match (&x.kind, field) {
+        (ExprKind::Field(inner, fi), Some(f)) => *fi == f && matches!(inner.kind, ExprKind::Local(l) if l == r),
+        (ExprKind::Local(l), None) => *l == r,
+        _ => false,
+    };
+    match &e.kind {
+        ExprKind::Binary(BinOp::Add, a, b) => match (&a.kind, &b.kind) {
+            (_, ExprKind::Int(c)) => *c >= 0 && base(a),
+            (ExprKind::Int(c), _) => *c >= 0 && base(b),
+            _ => false,
+        },
+        _ => base(e),
+    }
+}
+
+/// How many assignments to `v` a block makes, nested blocks included.
+fn count_assigns(b: &Block, v: LocalId) -> usize {
+    fn ex(e: &Expr, v: LocalId) -> usize {
+        match &e.kind {
+            ExprKind::If(c, t, els) => ex(c, v) + count_assigns(t, v) + els.as_ref().map_or(0, |b| count_assigns(b, v)),
+            ExprKind::Block(b) => count_assigns(b, v),
+            _ => 0,
+        }
+    }
+    b.stmts.iter().map(|s| match s {
+        Stmt::Assign(LValue::Var(w), _, e) => (*w == v) as usize + ex(e, v),
+        Stmt::Assign(_, _, e) | Stmt::Let(_, e) | Stmt::Expr(e) | Stmt::LetRepeat(_, e, _) | Stmt::Return(Some(e)) => ex(e, v),
+        Stmt::For { body, .. } | Stmt::While { body, .. } | Stmt::LetBuild { body, .. } | Stmt::ParFor { body, .. } => count_assigns(body, v),
+        _ => 0,
+    }).sum::<usize>() + b.tail.as_ref().map_or(0, |t| ex(t, v))
+}
+
+/// A callee's cost as `α·(a.len() − p) + β` piece by piece, `α` and `β` free of both (`α` may be
+/// `B + 1`, bytes a line): `α` as a cost with the pieces' conditions, or `None` when some piece is
+/// not of that form or `α` could be negative (§ An amortised scan).
+fn distance_rate(c: &Cost, adv: super::scan::Advance) -> Option<Cost> {
+    let (va, vp) = (Atom::Var(adv.a), Atom::Var(adv.p));
+    let mut out = Vec::new();
+    for pc in &c.pieces {
+        let (mut ca, mut cp) = (Poly::zero(), Poly::zero());
+        for (m, k) in &pc.poly.terms {
+            let (ha, hp) = (m.has_atom(&va), m.has_atom(&vp));
+            if !ha && !hp { continue; }
+            if ha && hp { return None; }
+            let at = if ha { &va } else { &vp };
+            if m.factors.get(at) != Some(&Rat::one()) { return None; }
+            let mut rest = m.clone();
+            rest.factors.remove(at);
+            let mut t = Poly::zero();
+            t.terms.insert(rest, *k);
+            if ha { ca = ca.add(&t) } else { cp = cp.add(&t) }
+        }
+        if !ca.add(&cp).is_zero() || !super::piece::dominates(&ca, &Poly::zero()) { return None; }
+        out.push(Piece { conds: pc.conds.clone(), poly: ca });
+    }
+    Some(Cost { pieces: out })
+}
+
+/// The cost with each piece's distance term, `α·(a.len() − p)`, taken out.
+fn strip_distance(c: &Cost, adv: super::scan::Advance) -> Cost {
+    let (va, vp) = (Atom::Var(adv.a), Atom::Var(adv.p));
+    c.map(|q| {
+        let mut out = q.clone();
+        out.terms.retain(|m, _| !(m.has_atom(&va) || m.has_atom(&vp)));
+        out
+    })
 }

@@ -1,15 +1,15 @@
 word_end         work 2·xs.len() − 2·start + 4     moves xs.len() − start + 2·B       exact
                  footprint        xs: [0, xs.len()) (whole array)   no residue claimed
-words            work 2·xs.len()² + 11·xs.len() + 1 moves xs.len()² + 2·B·xs.len()     bound
+words            work 13·xs.len() + 1              moves 2·B·xs.len() + xs.len()      bound
                  scan: `i` grows by at least 1 a lap, so the `while` at line 19 runs at most xs.len() times
-                 scan: argument 2 to `word_end` is taken at its least, 0, and `word_end`'s cost falls as it grows
+                 scan: the calls to `word_end` at line 20 are amortised: `i` only moves on through where `word_end` stopped in `xs`, so together they are charged 2·xs.len() once, not a scan of `xs` a lap
 trimmed          work 5·xs.len() + 8               moves                              bound  (2 regimes)
                                                moves B·xs.len() + xs.len() + 2·B  if xs.len() ≥ M
                                                moves 2·xs.len() + 2·B             if xs.len() < M
                  footprint        xs: [0, xs.len()) (whole array)   no residue claimed
                  scan: `i` grows by at least 1 a lap, so the `while` at line 35 runs at most xs.len() times
-main             work 1357                         moves 46·B + 550                   bound, io
+main             work 433                          moves 46·B + 88                    bound, io
                  in `words`: scan: `i` grows by at least 1 a lap, so the `while` at line 19 runs at most xs.len() times
-                 in `words`: scan: argument 2 to `word_end` is taken at its least, 0, and `word_end`'s cost falls as it grows
+                 in `words`: scan: the calls to `word_end` at line 20 are amortised: `i` only moves on through where `word_end` stopped in `xs`, so together they are charged 2·xs.len() once, not a scan of `xs` a lap
                  in `trimmed`: scan: `i` grows by at least 1 a lap, so the `while` at line 35 runs at most xs.len() times
                  rests on         words (bound, a scan); trimmed (bound, a scan)

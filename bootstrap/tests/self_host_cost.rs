@@ -67,6 +67,10 @@ const COPIES_INSTEAD: &[(&str, &str)] = &[];
 /// it once did not do: it stated `grid`'s `xs[a]` alone as exact and resident, having stopped at
 /// `0..xs[a]` before reaching `xs[b]`.
 ///
+/// `amortised.nt`'s `field` is that stop too, a `while i < xs.len() && …`; `sum_fields` stops at
+/// its call to `field` inside a loop the Rust amortises (§ An amortised scan) and this pass, with no
+/// scan rule, cannot bound, after writing `out` but before recording it.
+///
 /// `scan.nt`'s `word_end` and `trimmed`, and `scan_refused.nt`'s `word_end`, are the same stop
 /// again: each loop is `while i < xs.len() && xs[i] … `, whose trip the Rust takes from the first
 /// conjunct (cost-model § Loops without a range) — in `trimmed`'s second loop by a scan (§ A scan)
@@ -77,7 +81,8 @@ const FOOTPRINT_NARROWER: &[(&str, &str)] = &[("parse.nt", "number"), ("bfs.nt",
                                               ("parse.nt", "atom"), ("modulo.nt", "twice"),
                                               ("widen.nt", "pairs"),
                                               ("scan.nt", "word_end"), ("scan.nt", "trimmed"),
-                                              ("scan_refused.nt", "word_end")];
+                                              ("scan_refused.nt", "word_end"),
+                                              ("amortised.nt", "field"), ("amortised.nt", "sum_fields")];
 
 /// The same for the **footprint lower bound**: stated where `neant cost` states one and this pass
 /// states none. A `while` loop is given no loop atom by this pass — only a `for` mints one — so a
@@ -87,13 +92,14 @@ const FOOTPRINT_NARROWER: &[(&str, &str)] = &[("parse.nt", "number"), ("bfs.nt",
 /// `owned.nt`'s `sum_doubled` is the third, for a different reason: its bound is its *callee's*,
 /// handed up — "a bound on a part is a bound on the whole, once" — and this pass states a function's
 /// bound from its own sites only. `sum_doubled` indexes no parameter array; it passes one to
-/// `doubled` and walks what comes back.
+/// `doubled` and walks what comes back. `amortised.nt`'s `sum_fields` has no lower bound here for
+/// the reason it has no footprint: the walk declined its loop before recording `out`.
 const BOUND_NARROWER: &[(&str, &str)] = &[("while.nt", "count_lt"), ("while.nt", "first_zero"),
-                                          ("owned.nt", "sum_doubled")];
+                                          ("owned.nt", "sum_doubled"), ("amortised.nt", "sum_fields")];
 
 /// The number of functions whose `work` the self-hosted pass reproduces exactly. In the test so
 /// that widening the slice means changing a number someone has to look at.
-const EXACT: usize = 101;
+const EXACT: usize = 102;
 
 /// The same for `moves`, whose slice is narrower: a function that calls anything is unknown,
 /// because a callee's traffic depends on what is already resident — which it now computes, so a
@@ -110,19 +116,19 @@ const EXACT: usize = 101;
 /// **Nothing is declined.** Every `moves` column either matches or is one of the four in
 /// `COPIES_INSTEAD` — a footprint is a range now, so a callee that reads two fields of a four-field
 /// particle leaves half the array resident and the next call over the other half pays in full.
-const EXACT_MOVES: usize = 101;
+const EXACT_MOVES: usize = 102;
 
 /// The same for the **footprint**: one entry per array parameter and the condition under which the
 /// whole of it is resident on return, whitespace-normalised so the report's column padding is not
 /// part of the comparison. Counted over every function, so one that should state no footprint and
 /// states none counts too.
-const EXACT_FOOT: usize = 128;
+const EXACT_FOOT: usize = 133;
 
 /// The same for the **footprint lower bound** — `moves` cannot be less than the distinct bytes a
 /// function's parameter arrays reach. Counted over every function, so a `main` that should have no
 /// bound and gets none counts too: a bound invented where `neant cost` states none is as wrong as
 /// a missing one, and only one of those two shows up as a difference.
-const EXACT_BOUNDS: usize = 137;
+const EXACT_BOUNDS: usize = 143;
 
 
 

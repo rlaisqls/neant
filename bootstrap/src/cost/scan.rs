@@ -341,3 +341,108 @@ fn binding(f: &Func, l: LocalId) -> Option<Expr> {
     }
     in_block(f.body.as_ref()?, l)
 }
+
+/// A function that advances an index through an array and returns where it stopped
+/// (docs/cost-model.md § An amortised scan): it returns `i` (or a struct with `i` in field
+/// `field`), `i` starts at its `i64` parameter `p`, and every assignment to `i` is `+= 1` made only
+/// where `i < a.len()` holds, `a` its array parameter, and at most once there; every loop in it is a
+/// `while` that scans `i`. Then what it returns is in `[p, max(p, a.len())]`, and each lap of each
+/// loop moved `i` by at least one: the laps together are at most the distance it returned.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Advance { pub p: usize, pub a: usize, pub field: Option<usize> }
+
+pub fn advance(f: &Func, summ: &[Vec<Ge>]) -> Option<Advance> {
+    let body = f.body.as_ref()?;
+    if has_return(body) { return None; }
+    let tail = body.tail.as_ref()?;
+    let scalar = |l: LocalId| f.locals[l].mutable && f.locals[l].ty == Ty::I64;
+    let cands: Vec<(Option<usize>, LocalId)> = match &tail.kind {
+        ExprKind::StructLit(_, vals) => vals.iter().enumerate()
+            .filter_map(|(fi, v)| match v.kind { ExprKind::Local(l) if scalar(l) => Some((Some(fi), l)), _ => None }).collect(),
+        ExprKind::Local(l) if scalar(*l) => vec![(None, *l)],
+        _ => return None,
+    };
+    for (field, i) in cands {
+        // `let mut i = p`, at the top level, `p` an `i64` parameter
+        let Some(p) = body.stmts.iter().find_map(|s| match s {
+            Stmt::Let(x, Expr { kind: ExprKind::Local(q), .. }) if *x == i => f.params.iter().position(|pp| pp == q).filter(|&k| f.locals[f.params[k]].ty == Ty::I64),
+            _ => None,
+        }) else { continue };
+        let mut a: Option<LocalId> = None;
+        if guarded(f, summ, body, false, i, &mut a).is_some() {
+            if let Some(al) = a {
+                if let Some(ak) = f.params.iter().position(|q| *q == al) {
+                    return Some(Advance { p, a: ak, field });
+                }
+            }
+        }
+    }
+    None
+}
+
+/// `i < a.len()` as the whole condition or its first conjunct, fixing `a` on first sight.
+fn guard_of(c: &Expr, i: LocalId, a: &mut Option<LocalId>) -> bool {
+    let mut c = c;
+    while let ExprKind::Binary(BinOp::And, l, _) = &c.kind { c = l; }
+    match &c.kind {
+        ExprKind::Binary(BinOp::Lt, l, r) => match (&l.kind, &r.kind) {
+            (ExprKind::Local(v), ExprKind::Len(x)) if *v == i => match a {
+                Some(y) => y == x,
+                None => { *a = Some(*x); true }
+            },
+            _ => false,
+        },
+        _ => false,
+    }
+}
+
+/// Whether every assignment to `i` in `b` is one `+= 1` under a guard `i < a.len()` that nothing
+/// before it in the same stretch has moved past; `Some(true)` when `b` assigned `i`.
+fn guarded(f: &Func, summ: &[Vec<Ge>], b: &Block, guard: bool, i: LocalId, a: &mut Option<LocalId>) -> Option<bool> {
+    let mut moved = false;
+    let tail = b.tail.as_ref().map(|t| Stmt::Expr((**t).clone()));
+    for s in b.stmts.iter().chain(tail.iter()) {
+        match s {
+            Stmt::Assign(LValue::Var(v), op, e) if *v == i => {
+                let one = matches!(op, Some(BinOp::Add)) && matches!(e.kind, ExprKind::Int(1));
+                if !one || !guard || moved { return None; }
+                moved = true;
+            }
+            Stmt::While { cond, body, .. } => {
+                if mentions_assign(cond, i) { return None; }
+                if !guard_of(cond, i, a) { return None; }
+                match least_growth(f, summ, body, i) { Some(Some(d)) if d >= Rat::one() => {} _ => return None }
+                if guarded(f, summ, body, true, i, a)? { moved = true; }
+            }
+            Stmt::For { .. } | Stmt::ParFor { .. } | Stmt::LetBuild { .. } => return None,
+            Stmt::Expr(Expr { kind: ExprKind::If(c, t, e), .. }) => {
+                if mentions_assign(c, i) { return None; }
+                let g = guard_of(c, i, a);
+                let mt = guarded(f, summ, t, (guard && !moved) || g, i, a)?;
+                let me = match e { Some(e) => guarded(f, summ, e, guard && !moved, i, a)?, None => false };
+                if mt || me { moved = true; }
+            }
+            Stmt::Let(_, e) | Stmt::Expr(e) | Stmt::LetRepeat(_, e, _) | Stmt::Assign(_, _, e) => {
+                if mentions_assign(e, i) || contains_loop(e) { return None; }
+            }
+            Stmt::Return(_) => return None,
+            _ => {}
+        }
+    }
+    Some(moved)
+}
+
+fn contains_loop(e: &Expr) -> bool {
+    fn blk(b: &Block) -> bool {
+        b.stmts.iter().any(|s| match s {
+            Stmt::For { .. } | Stmt::While { .. } | Stmt::ParFor { .. } | Stmt::LetBuild { .. } => true,
+            Stmt::Let(_, e) | Stmt::Expr(e) | Stmt::Assign(_, _, e) | Stmt::LetRepeat(_, e, _) => contains_loop(e),
+            _ => false,
+        }) || b.tail.as_ref().is_some_and(|t| contains_loop(t))
+    }
+    match &e.kind {
+        ExprKind::If(_, t, els) => blk(t) || els.as_ref().is_some_and(blk),
+        ExprKind::Block(b) => blk(b),
+        _ => false,
+    }
+}

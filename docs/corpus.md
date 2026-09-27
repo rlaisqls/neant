@@ -171,6 +171,16 @@ count, and for text it is a square where the truth is linear. The next lever is 
 amortised scan, a loop that calls a scan starting where the last call ended. The worklist
 remains, as in the compiler.
 
+**After the amortised scan (2026-09-27, cost-model § An amortised scan).** The parse's work is
+linear: `count_ints` is `44·xs.len() + 1` where it was `9·xs.len()² + 35·xs.len() + 1`, and
+`read_ints` `35·out.len() + 9·xs.len() + 1` where it was `9·xs.len()·out.len() + …`; `fir`'s `main`
+is `≈ 82·n + 54·text.len() + 2·path.len()` and `pid`'s `≈ 128·n + 54·text.len() + 2·path.len()`,
+from `≈ 9·text.len()² + 9·text.len()·n`. The tiers do not move — 18 exact, 9 bound, 1 unknown of
+28 — since a tighter bound is still a bound. The parse's *moves* are still quadratic: while the
+text fits in memory, `next_int` is charged a cold read of the whole array at every call, which is
+not a distance and which only a warm walk's residue would credit. That, and the worklist, are what
+is left between the corpus and a linear read of its input.
+
 ## What the corpus could not say, and could not be written
 
 Rejected, each kept as a minimal case in `tests/corpus/rejected_*` with its error pinned:

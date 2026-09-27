@@ -407,6 +407,64 @@ each (§ Moves). That is an upper bound too.
 - An entry value that is neither known nor bounded below because some assignment to `i` shrinks
   it: "`i`'s entry value is not known and `i` is not only increased".
 
+## An amortised scan
+
+**Written 2026-09-27.** A scan bounds a loop that calls a parser once a lap, but it charges each
+call the parser's whole-range cost: `next_int(xs, i)` costs `9·(xs.len() − start) + 29`, the
+caller's `i` is taken at its least, `0`, and `count_ints` came out at `9·xs.len()²`. The truth is
+linear: each call moves `i` on, the next starts where it stopped, and the distances add up to the
+length once. That is the potential method, with the index as the potential.
+
+**The callee: a function that advances.** `g` advances an index through its array parameter `a`
+when it returns an `i64` local `i` (or a struct with `i` in a field `f`), bound as `let mut i = p`
+from its `i64` parameter `p`, and:
+- every assignment to `i` is `i += 1`, made where `i < a.len()` holds — inside a `while` whose
+  condition is `i < a.len()` or starts with it, or an `if` whose condition does — and at most once
+  there before the guard is tested again;
+- every loop in `g` is such a `while`, and a scan of `i` (§ A scan): a lap grows `i` by at least one.
+  There is no `for`.
+
+Then `p ≤ result ≤ max(p, a.len())`, and every lap of every loop moved `i` by at least one, so the
+laps together are at most `result − p`. When `g`'s cost has the form `α·(a.len() − p) + β` piece by
+piece, with `α` and `β` free of `a.len()` and `p` and `α ≥ 0` (`α` may be `B + 1`, bytes a line),
+its cost is at most `α·(result − p) + β`: `α` was the laps' rate and `a.len() − p` their trip.
+`bootstrap/src/cost/scan.rs` checks the shape (`advance`); the form is read off `g`'s cost at the call.
+
+**The caller.** In a `while` body, at its top level, `let r = g(.., A, .., v, ..)` with `v` a mutable
+`i64` in `g`'s parameter `p` and an array `A` in `a`, and later in the body `v = r.f + c` with
+`c ≥ 0`, the only assignment to `v` in the body. Lap `k` calls at `v_k` and gets `r_k.f ≤ v_{k+1}`;
+and `r_k.f ≤ A.len()` whenever `v_k < A.len()`, while `r_k.f = v_k` otherwise. So the distances
+telescope:
+
+    Σ_k (r_k.f − v_k) ≤ A.len() − v₀
+
+with `v₀` what `v` is at entry, or at least (§ A scan). A lap is charged `β`, and the loop is
+charged `α·(A.len() − v₀)` once, after it. The loop's own trip comes from whatever bounds it: a
+scan of `v` (`count_ints`, `i = r.end + 1`) or anything else (`read_ints`, which runs to
+`out.len()` and moves `i` alongside).
+
+Each column on its own: work, span and moves are each amortised when their distance term has the
+form, and charged a lap at a time otherwise. `next_int`'s moves while `xs` fits in memory are
+`2·xs.len() − start + 2·B` — a cold read of the whole array at every call, not a distance — and so
+stay per lap: the corpus's parser moves are still quadratic. That is the residue a warm walk would
+credit, not something this rule reaches.
+
+**What the report says.** The line is `bound`, as a scan's is, and a note names the call:
+``scan: the calls to `next_int` at line 42 are amortised: `i` only moves on through where `next_int`
+stopped in `xs`, so together they are charged 9·xs.len() once, not a scan of `xs` a lap``.
+
+**Where it refuses** — the calls are then charged as a scan charges them, a lap at a time:
+- a callee that may step past its guard (`i += 2`, or two increments before the guard is tested
+  again), whose result can pass `a.len()`;
+- a callee with a loop that is not a scan of its index, or a `for`;
+- a caller that moves `v` other than through what the call returned (`v += 1`), or assigns it twice;
+- a call not at the top level of the loop body, so perhaps more than once a lap;
+- `A`'s length or `v`'s entry not known where the loop starts.
+
+Golden `amortised` has both sides: `fields` (`19·xs.len() + 1`, from quadratic) and `sum_fields`
+(`14·out.len() + 4·xs.len() + 1`), `hops` and `restart` refused and quadratic. In golden `scan`,
+`words` goes from `2·xs.len()² + 11·xs.len() + 1` to `13·xs.len() + 1`, moves too.
+
 ## Recursion
 
 A function that calls itself is a recurrence. The body's own cost `f` is computed with the

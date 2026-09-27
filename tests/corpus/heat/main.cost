@@ -10,20 +10,22 @@ parse_int        work 9·xs.len() + 31              moves                       
                                                moves 2·xs.len() + 2·B             if xs.len() < M
                  in `next_int`: scan: `i` grows by at least 1 a lap, so the `while` at ../lib/parse.nt:23 runs at most xs.len() − start times
                  rests on         next_int (bound, a scan)
-count_ints       work 9·xs.len()² + 35·xs.len() + 1 moves                              bound  (2 regimes)
+count_ints       work 44·xs.len() + 1              moves                              bound  (2 regimes)
                                                moves B·xs.len()² + xs.len()² + 2·B·xs.len() if xs.len() ≥ M
                                                moves 2·xs.len()² + 2·B·xs.len()   if xs.len() < M
                  in `next_int`: scan: `i` grows by at least 1 a lap, so the `while` at ../lib/parse.nt:23 runs at most xs.len() − start times
                  scan: `i` grows by at least 1 a lap, so the `while` at ../lib/parse.nt:41 runs at most xs.len() times
                  scan: argument 2 to `next_int` is taken at its least, 0, and `next_int`'s cost falls as it grows
+                 scan: the calls to `next_int` at ../lib/parse.nt:42 are amortised: `i` only moves on through where `next_int` stopped in `xs`, so together they are charged 9·xs.len() once, not a scan of `xs` a lap
                  rests on         next_int (bound, a scan)
-read_ints        work 9·xs.len()·out.len() + 35·out.len() + 1 moves                              bound  (2 regimes)
+read_ints        work 35·out.len() + 9·xs.len() + 1 moves                              bound  (2 regimes)
                                                moves ≈ B·xs.len()·out.len() + xs.len()·out.len() if xs.len() ≥ M
                                                moves ≈ 2·xs.len()·out.len()       if xs.len() < M
                  lower bound      moves 8·out.len()                  (footprint, every distinct element crosses once)
                  footprint        out: [0, 8·out.len())   resident after if 8·out.len() < M
                  in `next_int`: scan: `i` grows by at least 1 a lap, so the `while` at ../lib/parse.nt:23 runs at most xs.len() − start times
                  scan: argument 2 to `next_int` is taken at its least, 0, and `next_int`'s cost falls as it grows
+                 scan: the calls to `next_int` at ../lib/parse.nt:56 are amortised: `i` only moves on through where `next_int` stopped in `xs`, so together they are charged 9·xs.len() once, not a scan of `xs` a lap
                  rests on         next_int (bound, a scan)
 sweep            work 31·n² − 121·n + 119          moves                              exact  (2 regimes)
                                                moves ≈ 48·n²                      if ≈ 48·n < M
