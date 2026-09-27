@@ -1,0 +1,6 @@
+grid             work 3·xs[a]·xs[b] + 3·xs[a] + 1  moves 2·B                          exact
+                 footprint        xs: [0, 8·xs.len()) (whole array)   no residue claimed
+pairs            work 3·ys.len()·max(xs[_])² + 3·ys.len()·max(xs[_]) + 9·ys.len() moves 2·B·ys.len() + 8·ys.len() + B bound
+                 lower bound      moves 8·ys.len()                   (footprint, every distinct element crosses once)   gap 17× at M = 2 MiB, B = 64
+                 footprint        ys: [0, 8·ys.len())   resident after if 8·ys.len() < M
+main             work 9·max(xs[_])² + 9·max(xs[_]) + 41 moves 7·B + 112                    bound, io

@@ -117,12 +117,11 @@ fn val_of(src: &[u8], toks: &[Token], nodes: &[Node], facs: &mut [Fac], terms: &
 
 // ---- `if` is the larger branch, which needs a comparison ----
 
-// Does `q` dominate `p` — is `q` at least `p` for every assignment of sizes ≥ 1? Both halves of
+// Does `q` dominate `p` — is `q` at least `p` for every assignment of sizes ≥ 1? The halves of
 // `piece::dominates`. The easy one: every coefficient of `q − p` is non-negative. The other: give
-// each positive term of `q` a budget and let the terms of `p` consume the budgets of monomials
-// that *cover* them, largest first. That is what lets `64·n − 64` dominate `n`, which is the
-// comparison the arena fork turns on, and the budget arithmetic is `f64` here because it is `f64`
-// in the Rust and this has to agree with it.
+// each positive term of `q − p` a budget and let its negative terms consume the budgets of
+// monomials that *cover* them, largest first; and a difference in one atom is decided exactly.
+// The budget arithmetic is `f64` here because it is `f64` in the Rust and this has to agree.
 fn mono_covers(facs: &[Fac], big: i64, nb: i64, small: i64, ns: i64) -> bool {
     let mut i = 0;
     let mut ok = true;
@@ -142,6 +141,9 @@ fn mono_covers(facs: &[Fac], big: i64, nb: i64, small: i64, ns: i64) -> bool {
 
 fn pol_dominates(facs: &[Fac], terms: &mut [Term], pols: &mut [Pol], pst: &mut [i64],
                  budget: &mut [f64], q: i64, p: i64) -> bool {
+    // the argument is about `q − p ≥ 0`, as `piece::dominates` has it: the difference's positive
+    // terms are the budget, its negative terms what the budget must cover. Budgeting `q`'s
+    // positive terms against `p`'s alone dropped `q`'s negative ones, and called `32·i − 32 ≥ 32·i`
     let d = pol_sub(facs, terms, pols, pst, q, p);
     let mut i = 0;
     let mut easy = true;
@@ -150,23 +152,57 @@ fn pol_dominates(facs: &[Fac], terms: &mut [Term], pols: &mut [Pol], pst: &mut [
         i += 1;
     }
     if easy { return true; }
-    // budgets, one per positive term of `q`
-    let mut nb = 0;
+    if univariate_nonneg(facs, terms, pols, d) { return true; }
+    let nb = pols[d].n_term;
     i = 0;
-    while i < pols[q].n_term {
-        let t = pols[q].term + i;
+    while i < nb {
+        let t = pols[d].term + i;
         budget[i] = if terms[t].cn > 0 { (terms[t].cn as f64) / (terms[t].cd as f64) } else { 0.0 };
-        nb += 1;
         i += 1;
     }
-    // `p`'s terms largest first, so a big one takes the budget it needs before a small one spends it
+    // the negative terms largest first, so a big one takes the budget it needs before a small one
+    let mut ok = true;
+    let mut x = pols[d].n_term - 1;
+    while x >= 0 {
+        let tp = pols[d].term + x;
+        if terms[tp].cn < 0 {
+            let mut need = (0.0 - terms[tp].cn as f64) / (terms[tp].cd as f64);
+            let mut k = 0;
+            while k < nb {
+                let tq = pols[d].term + k;
+                if budget[k] > 0.0 && need > 0.0
+                    && mono_covers(facs, terms[tq].fac, terms[tq].n_fac, terms[tp].fac, terms[tp].n_fac) {
+                    let take = if need < budget[k] { need } else { budget[k] };
+                    budget[k] = budget[k] - take;
+                    need = need - take;
+                }
+                k += 1;
+            }
+            if need > 0.000000000001 { ok = false; }
+        }
+        x -= 1;
+    }
+    ok
+}
+
+// Does `q` grow at least as fast as `p` — `q`'s positive terms budgeted against `p`'s, every
+// negative term dropped? `piece::dominates_eventually`: not an inequality, and used only where
+// it chooses between two sound bounds, as "the walk is longer than the arena" does, which is how
+// `64·n − 64` still passes for at least `n`.
+fn pol_grows_as(facs: &[Fac], terms: &[Term], pols: &[Pol], budget: &mut [f64], q: i64, p: i64) -> bool {
+    let nb = pols[q].n_term;
+    let mut i = 0;
+    while i < nb {
+        let t = pols[q].term + i;
+        budget[i] = if terms[t].cn > 0 { (terms[t].cn as f64) / (terms[t].cd as f64) } else { 0.0 };
+        i += 1;
+    }
     let mut ok = true;
     let mut x = pols[p].n_term - 1;
     while x >= 0 {
         let tp = pols[p].term + x;
-        let need0 = (terms[tp].cn as f64) / (terms[tp].cd as f64);
-        if need0 > 0.0 {
-            let mut need = need0;
+        let mut need = (terms[tp].cn as f64) / (terms[tp].cd as f64);
+        if need > 0.0 {
             let mut k = 0;
             while k < nb {
                 let tq = pols[q].term + k;
@@ -181,6 +217,63 @@ fn pol_dominates(facs: &[Fac], terms: &mut [Term], pols: &mut [Pol], pst: &mut [
             if need > 0.000000000001 { ok = false; }
         }
         x -= 1;
+    }
+    ok
+}
+
+// `d ≥ 0` at every whole value ≥ 1 of its one atom, when it has one: past the Cauchy bound on its
+// roots its sign is its leading coefficient's, and below it there are few integers to try —
+// `8·n² − 32·n + 32`, which is `8·(n − 2)²`, the way `piece::univariate_nonneg` decides it
+fn univariate_nonneg(facs: &[Fac], terms: &[Term], pols: &[Pol], d: i64) -> bool {
+    let mut atom = 0 - 1;
+    let mut deg = 0 - 1;
+    let mut lead = 0.0;
+    let mut i = 0;
+    while i < pols[d].n_term {
+        let t = pols[d].term + i;
+        let mut k = 0;
+        if terms[t].n_fac > 1 { return false; }
+        if terms[t].n_fac == 1 {
+            let a = facs[terms[t].fac].atom;
+            if a >= 2000 || facs[terms[t].fac].exp < 0 { return false; }
+            if atom >= 0 && atom != a { return false; }
+            atom = a;
+            k = facs[terms[t].fac].exp;
+        };
+        if k > deg { deg = k; lead = (terms[t].cn as f64) / (terms[t].cd as f64); };
+        i += 1;
+    }
+    if deg < 0 { return true; }
+    if lead < 0.0 { return false; }
+    let mut bound = 1.0;
+    i = 0;
+    while i < pols[d].n_term {
+        let t = pols[d].term + i;
+        let k = if terms[t].n_fac == 1 { facs[terms[t].fac].exp } else { 0 };
+        if k != deg {
+            let r = (terms[t].cn as f64) / (terms[t].cd as f64) / lead;
+            let m = 1.0 + (if r < 0.0 { 0.0 - r } else { r });
+            if m > bound { bound = m; };
+        };
+        i += 1;
+    }
+    if bound > 4096.0 { return false; }
+    let mut x = 1;
+    let mut ok = true;
+    while (x as f64) < bound + 1.0 {
+        let mut v = 0.0;
+        let mut j = 0;
+        while j < pols[d].n_term {
+            let t = pols[d].term + j;
+            let k = if terms[t].n_fac == 1 { facs[terms[t].fac].exp } else { 0 };
+            let mut pw = 1.0;
+            let mut e = 0;
+            while e < k { pw = pw * (x as f64); e += 1; }
+            v = v + (terms[t].cn as f64) / (terms[t].cd as f64) * pw;
+            j += 1;
+        }
+        if v < 0.0 - 0.000000001 { ok = false; };
+        x += 1;
     }
     ok
 }
@@ -2630,7 +2723,7 @@ fn settle_one(src: &[u8], toks: &[Token], facs: &mut [Fac], terms: &mut [Term], 
     if fits == 1 && scattered && sites[s].alen >= 0 {
         let foot = pol_scale(facs, terms, pols, pst, sites[s].alen, sites[s].es, 1);
         let touched = pol_scale(facs, terms, pols, pst, summed, 64, 1);
-        if pol_dominates(facs, terms, pols, pst, budget, touched, foot) {
+        if pol_grows_as(facs, terms, pols, budget, touched, foot) {
             let arena = pol_div_atom(facs, terms, pols, pst, foot, 0);
             let keep = if first { arena } else { pol_zero(facs, terms, pols, pst) };
             // the array's lines, which is both what the site costs when it fits and the condition
@@ -3567,8 +3660,8 @@ fn bound_moves(src: &[u8], toks: &[Token], nodes: &[Node], facs: &mut [Fac], ter
     total
 }
 
-// **A parameter's footprint**: the sites on it, merged. The same range twice is one; two disjoint
-// ranges become the span; anything else is the whole array and not exact — the rule
+// **A parameter's footprint**: the sites on it, merged. The same range twice is one; two that
+// overlap or touch become their union; anything else is the whole array and not exact — the rule
 // `signature_footprint` uses, now on polynomials rather than on bytes per element, so a walk that
 // does not cover its whole array is stated as what it covers (design §23, retiring §20's
 // approximation). One inexact parameter forfeits the residue for the whole call.
@@ -3579,13 +3672,16 @@ fn bound_moves(src: &[u8], toks: &[Token], nodes: &[Node], facs: &mut [Fac], ter
 fn foot_ranges(src: &[u8], toks: &[Token], nodes: &[Node], facs: &mut [Fac], terms: &mut [Term],
                pols: &mut [Pol], pst: &mut [i64], budget: &mut [f64], sites: &[Site],
                ffoot: &mut [i64], wst: &mut [i64], f: i64, si: i64) {
+    // a walk that stopped at something it could not cost has not seen every site: what it saw is
+    // stated, but as whole arrays, and claims no residue
+    let stopped = wst[1] != 0;
     let mut p = nodes[f].b;
     let mut i = 0;
     while p >= 0 && i < 16 {
         let b = (si * 16 + i) * 8;
         let mut have = false;
         let mut walked = false;
-        let mut exact = true;
+        let mut exact = !stopped;
         let mut lo = 0 - 1;
         let mut hi = 0 - 1;
         let mut whole = 0;
@@ -3603,10 +3699,12 @@ fn foot_ranges(src: &[u8], toks: &[Token], nodes: &[Node], facs: &mut [Fac], ter
                 } else if exact {
                     let same = pol_eq(facs, terms, pols, lo, sites[k].rlo)
                         && pol_eq(facs, terms, pols, hi, sites[k].rhi);
-                    let after = pol_dominates(facs, terms, pols, pst, budget, sites[k].rlo, hi);
-                    let before = pol_dominates(facs, terms, pols, pst, budget, lo, sites[k].rhi);
+                    // two ranges that overlap or touch are their union; two with a gap between
+                    // them are not one exact range, since the gap was never read
+                    let meets = pol_dominates(facs, terms, pols, pst, budget, hi, sites[k].rlo)
+                        && pol_dominates(facs, terms, pols, pst, budget, sites[k].rhi, lo);
                     if same {
-                    } else if after || before {
+                    } else if meets {
                         if pol_dominates(facs, terms, pols, pst, budget, lo, sites[k].rlo) {
                             lo = sites[k].rlo;
                         };

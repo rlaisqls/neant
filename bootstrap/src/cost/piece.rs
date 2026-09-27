@@ -128,6 +128,48 @@ pub fn dominates_eventually(q: &Poly, p: &Poly) -> bool {
     dominates_as_written(&pos(q), &pos(p))
 }
 
+/// The least value `p` takes over a few thousand samples in which every atom is a whole number
+/// in 1..=40 — an array field's least element at most its most, and each element between them —
+/// with `B` = 64, `M` = 2 MiB, and an unknown callee's cost in 0..=1000. Not a proof of anything:
+/// a diagnostic for the pieces `dominates` cannot show are non-negative, which tells a prover too
+/// weak for a true inequality (least ≥ 0) from a cost that is wrong (least < 0).
+pub fn sample_least(p: &Poly) -> f64 {
+    use std::cell::{Cell, RefCell};
+    use std::collections::HashMap;
+    let seed = Cell::new(0x9e37_79b9_7f4a_7c15u64);
+    let rnd = |lo: f64, hi: f64| {
+        let mut x = seed.get();
+        x ^= x << 13; x ^= x >> 7; x ^= x << 17;
+        seed.set(x);
+        lo + ((x % 1000) as f64 / 999.0 * (hi - lo)).round()
+    };
+    let mut least = f64::INFINITY;
+    for _ in 0..3000 {
+        let seen: RefCell<HashMap<String, f64>> = RefCell::default();
+        let get = |k: String, lo: f64, hi: f64| -> f64 {
+            if let Some(v) = seen.borrow().get(&k) { return *v; }
+            let v = rnd(lo, hi);
+            seen.borrow_mut().insert(k, v);
+            v
+        };
+        let v = p.eval(&|a| Some(match &a {
+            Atom::B => 64.0,
+            Atom::M => 2097152.0,
+            Atom::P => 8.0,
+            Atom::Read(r) if !r.walk => {
+                let key = format!("{:?}{:?}", r.root, r.field);
+                let most = get(format!("max{key}"), 1.0, 40.0);
+                let fewest = get(format!("min{key}"), 1.0, most);
+                if r.index.is_none() { if r.least { fewest } else { most } } else { get(format!("{a:?}"), fewest, most) }
+            }
+            Atom::Opaque(_) => get(format!("{a:?}"), 0.0, 1000.0),
+            other => get(format!("{other:?}"), 1.0, 40.0),
+        }));
+        if let Some(v) = v { least = least.min(v); }
+    }
+    least
+}
+
 /// Can these conditions hold together? A `fits` on `ws₁` and a `¬fits` on `ws₂ ≤ ws₁` cannot.
 pub fn feasible(conds: &[Cond]) -> bool {
     for a in conds {

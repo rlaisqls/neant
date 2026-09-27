@@ -296,6 +296,11 @@ measured number can come in under the prediction.
 
 ## Loops without a range
 
+**A cost holds where every range it counts is non-empty.** `for i in a..b` counts `b − a` and a
+`while` counts its distance to the bound, with no `max(·, 0)`: where the range is empty the formula
+may read negative and the loop in fact costs nothing. Conditions on regimes are working sets only,
+so the clamp is not expressible yet (plan § Stage D, the sign audit).
+
 A `while` gets a trip count in one of two ways, or none.
 
 - **An induction variable.** `while i < e { … i += c … }` runs at most `(e − i₀)/c` times when

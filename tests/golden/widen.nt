@@ -1,0 +1,27 @@
+// two reads that lose their elements become one atom, and the term has it squared: `pairs` runs
+// `grid` over the elements `ys` names, and its cost there is at most `max(xs[_])²` per call —
+// before stage D's sign audit it was `max(xs[_])`, a factor dropped from an upper bound
+
+fn grid(xs: &[i64], a: i64, b: i64) -> i64 {
+    let mut s = 0;
+    for i in 0..xs[a] {
+        for j in 0..xs[b] {
+            s += 1;
+        }
+    }
+    s
+}
+
+fn pairs(xs: &[i64], ys: &[i64]) -> i64 {
+    let mut s = 0;
+    for k in 0..ys.len() {
+        s += grid(xs, ys[k], ys[k] + 1);
+    }
+    s
+}
+
+fn main() {
+    let xs = [3; 8];
+    let ys = [0, 2, 4];
+    println(pairs(&xs, &ys));
+}

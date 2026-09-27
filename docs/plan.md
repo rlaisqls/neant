@@ -624,6 +624,43 @@ some range inside it is a `max − min` hull multiplied through, and it is not y
 that every cost the compiler prints is non-negative by `dominates` would have caught all of the
 above, and is the next thing to add before the potential method.
 
+**The sign audit (2026-09-26).** `NEANT_SIGNS=1 neant cost` lists every cost piece `dominates`
+cannot show is non-negative, with the least value a few thousand samples find — every atom a
+whole number, an array's least element at most its most and each element between them. Least
+below zero is a cost that is wrong; at or above it, a prover too weak for a true inequality. On
+the compiler it listed twelve functions, and the one found wrong was the `asym_dominated` term
+left open above: **a rewrite that maps two atoms of a term to one kept the last exponent instead
+of adding them**, so `pols[a].n_term · pols[b].n_term`, both losing their elements in a caller,
+became `max(pols[_].n_term)` and not its square — a factor dropped from an upper bound. The same
+overwrite was in renaming a callee's arrays (`f(xs, xs)`) and in substitution (`xs[j]` at
+`j = i`); all four sites now add (golden `widen`, whose `pairs` was bounded by 81 on the old code
+and costs 135). Five lockfile lines move, the count does not.
+
+`widen` then found the same class in the self-hosted pass, through the parity test. Its
+`pol_dominates` was the Rust's old rule, dropping `q`'s negative terms, and now argues about
+`q − p` with the one-atom exact check beside it; the arena rule's "the walk is longer" is its own
+growth comparison, `pol_grows_as`, as in the Rust. Its footprint merge still took the span of two
+disjoint ranges, and takes their union only when they meet. And a walk that stopped at something
+it could not cost stated what it had seen as exact and resident — `grid`'s `xs[a]` alone, having
+stopped at `0..xs[a]` before `xs[b]` — and now states whole arrays with no residue; three
+functions it stated exactly by luck (`twice`, `atom`, `pairs`) are listed as narrower for it.
+Parity: work 99, moves 99, footprint 117, bound 123 (from 120, the new goldens' columns). The
+compiler has two functions more, `pol_grows_as` (bound) and `univariate_nonneg` (unknown: its
+loop runs to a bound in `f64`): **92 exact, 47 modulo, 33 bound, 106 unknown, of 278.** What the audit lists now:
+
+| functions | least sampled | why |
+|---|---|---|
+| `lpe_add`, `used_after`; in the corpus `recur`'s `sum_from` and `msum`, `stencil` | negative | a trip count or measure that is negative where the loop does not run |
+| `conds_feasible`, `asym_dominated`, `size_atom`, `check_func`, `pol_cmp_ord`, `piece_before`, `pol_nth`, `asserts_hold` | ≥ 0 | true, beyond term budgets: `m·(n − 1)²` with `m` an unknown callee's cost, `5·B·w − 40·w`, which needs `B ≥ 8`, and correlations between an element and its array's extremes |
+
+The first row is a decision the calculus made without saying so: **a cost holds where every loop
+it counts runs a non-negative number of times.** `for i in 1..n − 1` counts `n − 2`, and `while t <
+e` from `from` counts `e − from`, with no `max(·, 0)`; where the range is empty the formula can be
+negative and the real cost is the loop's absence. The regimes can carry conditions only on
+working sets, so the true trip is not expressible yet. Written down here and in cost-model
+§ Loops; the audit stays a diagnostic, not a test, until that row can be closed or stated as a
+precondition the report prints.
+
 **Not in this stage, but what makes the number meaningful afterwards.** The roofline term M5
 decided (`moves/BW` taken as a `max` with `work/P`), so the prediction reaches time; argv, modules
 and arrays by value, without which a domain corpus (stage C's control loops and kernels) cannot be

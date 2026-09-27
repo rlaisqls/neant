@@ -58,9 +58,19 @@ const COPIES_INSTEAD: &[(&str, &str)] = &[];
 /// `walk.nt`'s four are the same stop at the first loop: each is a `while s >= 0` down a list, which
 /// the Rust bounds by the longest walk along the link (stage D (3)) and this pass, with no walk
 /// atom, declines before it has recorded a site.
+///
+/// The last three stop after a site, not before one: `parse.nt`'s `atom` at its call to `number`,
+/// which this pass cannot cost; `modulo.nt`'s `twice` at a callee whose cost is unknown, which the
+/// Rust makes a term (stage D (1)) and this pass declines; and `widen.nt`'s `pairs` at a call
+/// whose argument is a read. A walk that stopped has not seen every site, so what it saw is stated
+/// as whole arrays with no residue — what the first pair of the list's rule asks, and exactly what
+/// it once did not do: it stated `grid`'s `xs[a]` alone as exact and resident, having stopped at
+/// `0..xs[a]` before reaching `xs[b]`.
 const FOOTPRINT_NARROWER: &[(&str, &str)] = &[("parse.nt", "number"), ("bfs.nt", "bfs"),
                                               ("walk.nt", "sum_list"), ("walk.nt", "sum_all"),
-                                              ("walk.nt", "double_list"), ("walk.nt", "chain_len")];
+                                              ("walk.nt", "double_list"), ("walk.nt", "chain_len"),
+                                              ("parse.nt", "atom"), ("modulo.nt", "twice"),
+                                              ("widen.nt", "pairs")];
 
 /// The same for the **footprint lower bound**: stated where `neant cost` states one and this pass
 /// states none. A `while` loop is given no loop atom by this pass — only a `for` mints one — so a
@@ -105,7 +115,7 @@ const EXACT_FOOT: usize = 117;
 /// function's parameter arrays reach. Counted over every function, so a `main` that should have no
 /// bound and gets none counts too: a bound invented where `neant cost` states none is as wrong as
 /// a missing one, and only one of those two shows up as a difference.
-const EXACT_BOUNDS: usize = 120;
+const EXACT_BOUNDS: usize = 123;
 
 
 
@@ -196,10 +206,11 @@ fn rust_foot(out: &str) -> BTreeMap<String, String> {
     m
 }
 
-/// Whether footprint `g` names only entries `w` names too, and claims no residue: what a walk that
-/// stopped early states of what a longer walk found.
+/// Whether footprint `g` names only arrays `w` names too, each with `w`'s range or the whole array,
+/// and claims no residue: what a walk that stopped early states of what a longer walk found. The
+/// whole array claims less than a range does — a fit test may use it, a credit may not.
 fn foot_subset(w: &str, g: &str) -> bool {
-    fn entries(s: &str) -> Option<Vec<String>> {
+    fn entries(s: &str) -> (Vec<String>, bool) {
         let (es, res) = s.rsplit_once(" | ").map_or((s, s), |(a, b)| (a, b));
         let toks: Vec<&str> = es.split(' ').collect();
         let mut out: Vec<String> = Vec::new();
@@ -210,12 +221,12 @@ fn foot_subset(w: &str, g: &str) -> bool {
                 _ => out.push(t.to_string()),
             }
         }
-        (res == "none" || res == "| none").then_some(out)
+        (out, res == "none" || res == "| none")
     }
-    match (entries(w), entries(g)) {
-        (Some(we), Some(ge)) => ge.iter().all(|e| we.contains(e)),
-        _ => false,
-    }
+    let ((we, _), (ge, none)) = (entries(w), entries(g));
+    let array = |e: &str| e.split(':').next().unwrap_or("").to_string();
+    none && ge.iter().all(|e| we.contains(e)
+        || (e.ends_with("(whole array)") && we.iter().any(|x| array(x) == array(e))))
 }
 
 fn rust_bounds(out: &str) -> BTreeMap<String, String> {

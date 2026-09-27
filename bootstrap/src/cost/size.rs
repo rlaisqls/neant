@@ -153,6 +153,13 @@ impl Mono {
         Mono { factors: f }
     }
     pub fn has_atom(&self, a: &Atom) -> bool { self.factors.contains_key(a) }
+    /// Multiply in `a^e`. A rewrite that maps two atoms of a term to one — a substitution that
+    /// makes `xs[j]` into `xs[i]`, a read that loses its element — must add their exponents, not
+    /// keep the last: `xs[i]·xs[j]` at `j = i` is `xs[i]²`.
+    fn put(&mut self, a: Atom, e: Rat) {
+        let ne = self.factors.get(&a).map_or(e, |x| x.add(e));
+        if ne.is_zero() { self.factors.remove(&a); } else { self.factors.insert(a, ne); }
+    }
     fn mul(&self, o: &Mono) -> Mono {
         let mut f = self.factors.clone();
         for (a, e) in &o.factors {
@@ -281,7 +288,9 @@ impl Poly {
                     Atom::Opaque(_) => a.map_inner(&|p| Some(p.rename_roots(f))),
                     other => other.clone(),
                 };
-                fs.insert(a, *e);
+                // `f(xs, xs)` makes two parameters' reads one: their exponents add
+                let ne = fs.get(&a).map_or(*e, |x: &Rat| x.add(*e));
+                fs.insert(a, ne);
             }
             let mut t = Poly::zero();
             t.terms.insert(Mono { factors: fs }, *c);
@@ -346,7 +355,10 @@ impl Poly {
                     Atom::Opaque(_) | Atom::Read(_) => a.map_inner(&|p| if hide(p) { None } else { Some(p.clone()) }),
                     other => other.clone(),
                 };
-                f.insert(a, *e);
+                // two reads that lose their elements may become the same atom, and then the term
+                // has it squared: `pols[a].n_term · pols[b].n_term` is `max(pols[_].n_term)²`
+                let ne = f.get(&a).map_or(*e, |x: &Rat| x.add(*e));
+                f.insert(a, ne);
             }
             let mut t = Poly::zero();
             t.terms.insert(Mono { factors: f }, *c);
@@ -469,9 +481,9 @@ impl Poly {
                 match a {
                     Atom::Var(v) if *v == var => var_pow = Some(*e),
                     // a log of an expression that mentions the variable: substitute inside
-                    Atom::Log(inner) => { rest.factors.insert(Atom::Log(Box::new(inner.subst(var, by))), *e); }
-                    Atom::Opaque(_) | Atom::Read(_) => { rest.factors.insert(a.map_inner(&|p| Some(p.subst(var, by))), *e); }
-                    other => { rest.factors.insert(other.clone(), *e); }
+                    Atom::Log(inner) => rest.put(Atom::Log(Box::new(inner.subst(var, by))), *e),
+                    Atom::Opaque(_) | Atom::Read(_) => rest.put(a.map_inner(&|p| Some(p.subst(var, by))), *e),
+                    other => rest.put(other.clone(), *e),
                 }
             }
             t.terms.insert(rest, *c);
@@ -558,8 +570,8 @@ impl Poly {
                             if ne.is_zero() { rest.factors.remove(ba); } else { rest.factors.insert(ba.clone(), ne); }
                         }
                     }
-                    Atom::Log(inner) => { rest.factors.insert(Atom::Log(Box::new(inner.subst_pow(var, by))), *e); }
-                    Atom::Opaque(_) | Atom::Read(_) => { rest.factors.insert(a.map_inner(&|p| Some(p.subst_pow(var, by))), *e); }
+                    Atom::Log(inner) => rest.put(Atom::Log(Box::new(inner.subst_pow(var, by))), *e),
+                    Atom::Opaque(_) | Atom::Read(_) => rest.put(a.map_inner(&|p| Some(p.subst_pow(var, by))), *e),
                     other => {
                         let ne = rest.factors.get(other).map_or(*e, |x| x.add(*e));
                         if ne.is_zero() { rest.factors.remove(other); } else { rest.factors.insert(other.clone(), ne); }

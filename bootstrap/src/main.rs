@@ -127,6 +127,21 @@ fn main() {
             print!("{}", cost::lock::layout_report(&layouts));
             let mut costs = cost::analyze(&module, &machine);
             if use_iolb { iolb_bounds(&module, &mut costs, &machine); }
+            // a diagnostic: every cost piece `dominates` cannot show is non-negative, with the least
+            // value sampling finds (docs/plan.md § Stage D, the sign audit)
+            if std::env::var("NEANT_SIGNS").is_ok() {
+                for c in &costs {
+                    if let cost::CostResult::Exact { work, moves, .. } = &c.result {
+                        for (col, k) in [("work", work), ("moves", moves)] {
+                            for pc in &k.pieces {
+                                if !cost::piece::dominates(&pc.poly, &cost::size::Poly::zero()) {
+                                    eprintln!("SIGN {} {col} least sampled {:.0}: {}", c.name, cost::piece::sample_least(&pc.poly), pc.poly.display(&c.names));
+                                }
+                            }
+                        }
+                    }
+                }
+            }
             for c in &costs {
                 print!("{}", cost::lock::report(c, &machine));
                 if let (Some(ev), cost::CostResult::Exact { work, moves, span }) = (&eval, &c.result) {
