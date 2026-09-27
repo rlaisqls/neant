@@ -74,6 +74,10 @@ const NEIGHBOURS_INSTEAD: &[(&str, &str)] = &[("stencil.nt", "stencil"), ("stenc
 /// it once did not do: it stated `grid`'s `xs[a]` alone as exact and resident, having stopped at
 /// `0..xs[a]` before reaching `xs[b]`.
 ///
+/// `whileshapes.nt`'s two are the condition this pass still misreads as the Rust did until
+/// 2026-09-27: `j > start` with both sides locals taken as a loop in `start`, and `i + 1 < n` with
+/// no variable alone on a side; it declines them before recording `xs`.
+///
 /// `lexer.nt`'s `words` is a scan whose index moves only inside nested loops that surely run
 /// (§ A scan), which this pass, with no scan rule, declines before it records `xs`.
 ///
@@ -98,7 +102,8 @@ const FOOTPRINT_NARROWER: &[(&str, &str)] = &[("parse.nt", "number"), ("bfs.nt",
                                               ("scan.nt", "word_end"), ("scan.nt", "trimmed"),
                                               ("scan_refused.nt", "word_end"),
                                               ("amortised.nt", "field"), ("amortised.nt", "sum_fields"),
-                                              ("worklist.nt", "reach"), ("lexer.nt", "words")];
+                                              ("worklist.nt", "reach"), ("lexer.nt", "words"),
+                                              ("whileshapes.nt", "from_one"), ("whileshapes.nt", "sort_from")];
 
 /// The same for the **footprint lower bound**: stated where `neant cost` states one and this pass
 /// states none. A `while` loop is given no loop atom by this pass — only a `for` mints one — so a
@@ -111,7 +116,8 @@ const FOOTPRINT_NARROWER: &[(&str, &str)] = &[("parse.nt", "number"), ("bfs.nt",
 /// `doubled` and walks what comes back. `amortised.nt`'s `sum_fields` has no lower bound here for
 /// the reason it has no footprint: the walk declined its loop before recording `out`.
 const BOUND_NARROWER: &[(&str, &str)] = &[("while.nt", "count_lt"), ("while.nt", "first_zero"),
-                                          ("owned.nt", "sum_doubled"), ("amortised.nt", "sum_fields")];
+                                          ("owned.nt", "sum_doubled"), ("amortised.nt", "sum_fields"),
+                                          ("whileshapes.nt", "from_one")];
 
 /// The number of functions whose `work` the self-hosted pass reproduces exactly. In the test so
 /// that widening the slice means changing a number someone has to look at.
@@ -138,13 +144,13 @@ const EXACT_MOVES: usize = 103;
 /// whole of it is resident on return, whitespace-normalised so the report's column padding is not
 /// part of the comparison. Counted over every function, so one that should state no footprint and
 /// states none counts too.
-const EXACT_FOOT: usize = 140;
+const EXACT_FOOT: usize = 141;
 
 /// The same for the **footprint lower bound** — `moves` cannot be less than the distinct bytes a
 /// function's parameter arrays reach. Counted over every function, so a `main` that should have no
 /// bound and gets none counts too: a bound invented where `neant cost` states none is as wrong as
 /// a missing one, and only one of those two shows up as a difference.
-const EXACT_BOUNDS: usize = 152;
+const EXACT_BOUNDS: usize = 154;
 
 
 

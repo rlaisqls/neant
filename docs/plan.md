@@ -938,7 +938,12 @@ same way and is off too: transpose 2–3× → 0.85–1.28, naive matmul 1.0 →
 nested `while` counts one lap of growth when the path surely enters it — its guards imply its
 condition over all 256 values of the byte at the index — and a lap-local `let mut j = i + 1` only
 increased is at least its initialiser. `lex` is a bound (quadratic: its string branches are not
-amortised inline), the compiler is 92/49/35/102, and parity is 105/103/140/152.
+amortised inline), the compiler is 92/49/35/102, and parity is 105/103/140/152. Then a misreading
+of `while` conditions (cost-model § Loops without a range, reading the condition): `j > start` with
+both sides locals was a loop in `start`, and `i + 1 < n` had no variable alone; fixed, the compiler is
+**94/51/35/98**, parity 105/103/141/154 (golden `whileshapes`). Two callers of the newly exact callees
+fall to unknown for an argument they cannot name; charging such callees as terms was tried and made
+costing the compiler take minutes, so it is left.
 
 ## M7 — the constant factor
 

@@ -88,7 +88,8 @@ language, written to compile itself and not to suit the calculus:
 | stage D starts (2026-09-23) | 81 | — | — | 195 | 276 |
 | unknown callees as terms, sizes read from memory, list walks, the lockfile | 92 | 47 | 32 | 105 | 276 |
 | the sign audit, a size bound once, the scan rule | 92 | 49 | 34 | 103 | 278 |
-| a loop that surely runs (the lexer), now | 92 | 49 | 35 | 102 | 278 |
+| a loop that surely runs (the lexer) | 92 | 49 | 35 | 102 | 278 |
+| a `while` condition read right (`j > start`, `i + 1 < n`), now | 94 | 51 | 35 | 98 | 278 |
 
 Exact did not move after the first extensions; what moved is how much is stated at all, 81 of 276
 to 175 of 278, a third of it `bound`. The largest remaining row is mutual recursion over the
@@ -112,7 +113,7 @@ text, and a number read out of text is bounded, not counted.
 The calculus has been caught wrong, and saying so is part of the evaluation.
 
 - **Two compilers.** The self-hosted cost pass is checked column by column against the Rust one
-  (`bootstrap/tests/self_host_cost.rs`): 105 work, 103 moves, 140 footprint, 152 bound columns agree
+  (`bootstrap/tests/self_host_cost.rs`): 105 work, 103 moves, 141 footprint, 154 bound columns agree
   exactly, and every place one states less than the other is listed with its reason. The check has
   found bugs in both — most recently the self-hosted pass costing a worklist as one pass, because it
   did not see an assignment in an `if` at a block's tail (plan, 2026-09-27).

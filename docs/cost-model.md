@@ -332,6 +332,17 @@ no later than either conjunct would, so the first conjunct that has a trip count
 The condition is evaluated once more than the body runs, and the memory it reads is charged each
 time; its work is the loop's compare-and-branch, as it always was.
 
+**Reading the condition (2026-09-27).** A `while` condition is read as a variable against a
+bound. When both sides were locals the reading took the right-hand one whenever the operator was
+`>`, so `while j > start { …; j -= 1; }` was a loop in `start`, which is not mutable, and was refused;
+and `while i + 1 < n` had no variable alone on either side. Now the variable is the local the body
+assigns, and `i + c` against `e` is `i` against `e − c`. On the compiler, 92/49/35/102 becomes
+94/51/35/98 — insertion sorts and `i + 1 <` scans — and two callers of the newly exact
+`mono_mul` and `mono_with` become unknown in turn, because those callees' costs depend on an
+argument the callers pass as a read inside a loop that writes it (`terms[ta].n_fac`). Charging such a
+callee as a term over `_`, as an unknown one is, was tried and costs the compiler minutes instead of
+seconds — terms nest along every chain of calls — so it is not done (golden `whileshapes`).
+
 ## A scan
 
 **Written 2026-09-26, before the code.** Text is read by a loop whose index advances by what it

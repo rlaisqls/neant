@@ -1,0 +1,34 @@
+// While conditions the normalisation used to misread: `j > start` with both sides locals is a
+// loop down in `j`, the one the body assigns, not up in `start`; `i + 1 < n` is `i < n − 1`.
+// Insertion sort's inner loop is both at once, and its cost the sort's worst case.
+
+fn sort_from(xs: &mut [i64], start: i64, end: i64) {
+    let mut k = start + 1;
+    while k < end {
+        let mut j = k;
+        while j > start && xs[j - 1] > xs[j] {
+            let t = xs[j - 1];
+            xs[j - 1] = xs[j];
+            xs[j] = t;
+            j -= 1;
+        }
+        k += 1;
+    }
+}
+
+fn from_one(xs: &[i64], n: i64) -> i64 {
+    let mut i = 0;
+    let mut s = 0;
+    while i + 1 < n {
+        s += xs[i];
+        i += 1;
+    }
+    s
+}
+
+fn main() {
+    let mut a = [3, 1, 2, 5, 4];
+    sort_from(&mut a, 0, 5);
+    println(a[0]);
+    println(from_one(&a, 5));
+}

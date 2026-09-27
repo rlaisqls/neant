@@ -2605,12 +2605,35 @@ impl<'a, 'b, 'c> Fa<'a, 'b, 'c> {
             };
         }
         let ExprKind::Binary(op, l, r) = &cond.kind else { return Err(ask) };
-        // normalise to (var, bound, ascending)
+        // `i + c < e` is `i < e − c`, on either side: the variable alone on its side
+        let unshift = |x: &Expr, y: &Expr| -> Option<(Expr, Expr)> {
+            match &x.kind {
+                ExprKind::Binary(BinOp::Add, a, c) if matches!(a.kind, ExprKind::Local(_)) && matches!(c.kind, ExprKind::Int(_)) => {
+                    Some(((**a).clone(), Expr { kind: ExprKind::Binary(BinOp::Sub, Box::new(y.clone()), c.clone()), ty: y.ty.clone(), line: y.line }))
+                }
+                _ => None,
+            }
+        };
+        let (l, r): (Expr, Expr) = match (unshift(l, r), unshift(r, l)) {
+            (Some((v, b)), _) => (v, b),
+            (None, Some((v, b))) => (b, v),
+            _ => ((**l).clone(), (**r).clone()),
+        };
+        let (l, r) = (&l, &r);
+        // normalise to (var, bound, ascending); when both sides are locals, the variable is the
+        // one the body assigns — `j > start` walks `j`, not `start`
+        let assigned = |e: &Expr| matches!(e.kind, ExprKind::Local(v) if self.f.locals[v].mutable && { let mut w = Writes::default(); w.block(body); w.locals.contains(&v) });
         let (var, bound, asc) = match (&l.kind, &r.kind, op) {
-            (ExprKind::Local(v), _, BinOp::Lt | BinOp::Le | BinOp::Ne) => (*v, &**r, true),
-            (_, ExprKind::Local(v), BinOp::Gt | BinOp::Ge) => (*v, &**l, true),
-            (ExprKind::Local(v), _, BinOp::Gt | BinOp::Ge) => (*v, &**r, false),
-            (_, ExprKind::Local(v), BinOp::Lt | BinOp::Le) => (*v, &**l, false),
+            (ExprKind::Local(_), ExprKind::Local(_), _) if assigned(r) && !assigned(l) => match (&r.kind, op) {
+                (ExprKind::Local(v), BinOp::Gt | BinOp::Ge) => (*v, l, true),
+                (ExprKind::Local(v), BinOp::Lt | BinOp::Le) => (*v, l, false),
+                _ => return Err(ask),
+            },
+            (ExprKind::Local(v), _, BinOp::Lt | BinOp::Le | BinOp::Ne) => (*v, r, true),
+            (ExprKind::Local(v), _, BinOp::Gt | BinOp::Ge) if assigned(l) || !matches!(r.kind, ExprKind::Local(_)) => (*v, r, false),
+            (_, ExprKind::Local(v), BinOp::Gt | BinOp::Ge) => (*v, l, true),
+            (ExprKind::Local(v), _, BinOp::Gt | BinOp::Ge) => (*v, r, false),
+            (_, ExprKind::Local(v), BinOp::Lt | BinOp::Le) => (*v, l, false),
             _ => return Err(ask),
         };
         let name = &self.f.locals[var].name;

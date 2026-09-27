@@ -1,0 +1,8 @@
+sort_from        work ≈ 4·end² + 4·start² − 8·start·end moves                              exact  (2 regimes)
+                                               moves ≈ 4·end² + 4·start² − 8·start·end if ≈ 8·end − 8·start ≥ M
+                                               moves ≈ 4·end² + 4·start² − 8·start·end if ≈ 8·end − 8·start < M
+                 footprint        xs: [0, 8·xs.len()) (whole array)   no residue claimed
+from_one         work 4·n − 2                      moves 8·n + B − 8                  exact
+                 lower bound      moves 8·n − 8                      (footprint, every distinct element crosses once)   gap 1× at M = 2 MiB, B = 64
+                 footprint        xs: [0, 8·n − 8)   resident after if ≈ 8·n < M
+main             work 144                          moves 15·B + 152                   exact, io
