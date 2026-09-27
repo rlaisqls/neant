@@ -74,6 +74,9 @@ const NEIGHBOURS_INSTEAD: &[(&str, &str)] = &[("stencil.nt", "stencil"), ("stenc
 /// it once did not do: it stated `grid`'s `xs[a]` alone as exact and resident, having stopped at
 /// `0..xs[a]` before reaching `xs[b]`.
 ///
+/// `lexer.nt`'s `words` is a scan whose index moves only inside nested loops that surely run
+/// (§ A scan), which this pass, with no scan rule, declines before it records `xs`.
+///
 /// `worklist.nt`'s `reach` is a worklist the Rust bounds (§ A bounded worklist) and this pass,
 /// which has no rule for a bound the body pushes, declines before recording `next` — rightly now:
 /// until 2026-09-27 it missed an assignment in an `if` at a block's tail and costed such a loop as
@@ -95,7 +98,7 @@ const FOOTPRINT_NARROWER: &[(&str, &str)] = &[("parse.nt", "number"), ("bfs.nt",
                                               ("scan.nt", "word_end"), ("scan.nt", "trimmed"),
                                               ("scan_refused.nt", "word_end"),
                                               ("amortised.nt", "field"), ("amortised.nt", "sum_fields"),
-                                              ("worklist.nt", "reach")];
+                                              ("worklist.nt", "reach"), ("lexer.nt", "words")];
 
 /// The same for the **footprint lower bound**: stated where `neant cost` states one and this pass
 /// states none. A `while` loop is given no loop atom by this pass — only a `for` mints one — so a
@@ -112,7 +115,7 @@ const BOUND_NARROWER: &[(&str, &str)] = &[("while.nt", "count_lt"), ("while.nt",
 
 /// The number of functions whose `work` the self-hosted pass reproduces exactly. In the test so
 /// that widening the slice means changing a number someone has to look at.
-const EXACT: usize = 102;
+const EXACT: usize = 105;
 
 /// The same for `moves`, whose slice is narrower: a function that calls anything is unknown,
 /// because a callee's traffic depends on what is already resident — which it now computes, so a
@@ -129,19 +132,19 @@ const EXACT: usize = 102;
 /// **Nothing is declined.** Every `moves` column either matches or is one of the four in
 /// `COPIES_INSTEAD` — a footprint is a range now, so a callee that reads two fields of a four-field
 /// particle leaves half the array resident and the next call over the other half pays in full.
-const EXACT_MOVES: usize = 100;
+const EXACT_MOVES: usize = 103;
 
 /// The same for the **footprint**: one entry per array parameter and the condition under which the
 /// whole of it is resident on return, whitespace-normalised so the report's column padding is not
 /// part of the comparison. Counted over every function, so one that should state no footprint and
 /// states none counts too.
-const EXACT_FOOT: usize = 135;
+const EXACT_FOOT: usize = 140;
 
 /// The same for the **footprint lower bound** — `moves` cannot be less than the distinct bytes a
 /// function's parameter arrays reach. Counted over every function, so a `main` that should have no
 /// bound and gets none counts too: a bound invented where `neant cost` states none is as wrong as
 /// a missing one, and only one of those two shows up as a difference.
-const EXACT_BOUNDS: usize = 146;
+const EXACT_BOUNDS: usize = 152;
 
 
 

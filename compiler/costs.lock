@@ -160,7 +160,7 @@ is_struct_name   work 10·max(toks[_].len)·st[3] + 19·st[3] + 2 moves 2·B·ma
 item             unknown: calls `primary`, whose cost is unknown (`while` has no measure the compiler can find; write `while cond decreasing <expr>` with an `i64` that goes down by at least one every iteration)
 keyword          work 284                          moves 30·B                         exact
 level_members    unknown: the bound of `s` is not a size expression; `while` has no measure the compiler can find; write `while cond decreasing <expr>` with an `i64` that goes down by at least one every iteration
-lex              unknown: `i` is compared in the `while` condition but is not stepped by a constant exactly once in the body; `while` has no measure the compiler can find; write `while cond decreasing <expr>` with an `i64` that goes down by at least one every iteration
+lex              work max(6·n² + 132·n + 3, 2·n² + 364·n + 3) moves 32·B·n + 13·n + 11·B if 7·n + 42·B − 3 < M | 3·n² + 42·B·n + B if 7·n + 42·B − 3 ≥ M bound
 line_of          work 6·toks[t].start + work[emit_int](out.len(), est.len(), _) + 4 moves toks[t].start + moves[emit_int](out.len(), est.len(), _) + 3·B modulo  rests on emit_int (unknown)
 log_atom         work 21·max(terms[_].n_fac)·max(pols[_].n_term)·pst[5] + 34·max(pols[_].n_term)·pst[5] + 14·pst[5] + 11 moves 48·max(terms[_].n_fac)·max(pols[_].n_term)·pst[5] + 48·max(terms[_].n_fac)·pols[logs[0]].n_term + 6·B·max(pols[_].n_term)·pst[5] − 48·max(terms[_].n_fac)·max(pols[_].n_term) + 8·pst[5] + 48·terms[pols[logs[0]].term].n_fac + 6·B·pst[5] + 6·B·pols[logs[0]].n_term − 48·max(terms[_].n_fac) − 6·B·max(pols[_].n_term) + 4·B bound
 lp_atom          work 4                            moves B                            exact

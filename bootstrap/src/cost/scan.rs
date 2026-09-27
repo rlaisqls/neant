@@ -28,6 +28,16 @@ struct Walk<'a> {
     var: Option<LocalId>,
     /// a mutable local's lower bound, relative to what it was first bound to, for a summary
     facts: Facts,
+    /// the program, to read the byte predicates a guard calls (§ A scan, a loop that runs once)
+    m: Option<&'a Module>,
+    /// immutable locals bound to `a[i]` while `i` has not moved this lap, by the array `a`
+    bytes: HashMap<LocalId, LocalId>,
+    /// the conditions of the `if`s the walk is inside, with the branch taken
+    guards: Vec<(Expr, bool)>,
+    /// whether `i` has not been assigned yet this lap, so the loop's own condition still holds
+    fresh: bool,
+    /// the condition of the loop whose lap is being walked
+    outer: Option<Expr>,
 }
 
 impl<'a> Walk<'a> {
@@ -93,6 +103,40 @@ impl<'a> Walk<'a> {
     /// An assignment made the index something new: what was known relative to it is not.
     fn forget_cur(&mut self) {
         for gs in self.facts.values_mut() { gs.retain(|g| g.base != Base::Cur); }
+        self.bytes.clear();
+        self.fresh = false;
+    }
+
+    /// Whether a nested `while` with condition `c`, reached here, surely runs at least one lap:
+    /// every conjunct is one of the enclosing loop's own, which still holds since `i` has not moved,
+    /// or a predicate of the byte `a[i]` that the guards on the path imply, for every one of the 256
+    /// values the byte can take.
+    fn runs_once(&self, c: &Expr) -> bool {
+        let (Some(var), Some(outer)) = (self.var, &self.outer) else { return false };
+        if !self.fresh { return false; }
+        let outer_cs = conjuncts(outer);
+        conjuncts(c).into_iter().all(|x| {
+            outer_cs.iter().any(|o| expr_eq(x, o)) && locals_fixed(self.f, x, var)
+                || self.byte_implied(x)
+        })
+    }
+
+    fn byte_implied(&self, pred: &Expr) -> bool {
+        let (Some(var), Some(m)) = (self.var, self.m) else { return false };
+        let Some(arr) = byte_array(pred, var, &self.bytes) else { return false };
+        let env = |v: i64| -> HashMap<LocalId, i64> { self.bytes.iter().filter(|(_, a)| **a == arr).map(|(l, _)| (*l, v)).collect() };
+        let ev = |e: &Expr, v: i64| eval(m, self.f, &env(v), e, Some((arr, var, v)), 8);
+        // the premises that can be read over the byte: a taken branch's conjuncts one by one, a
+        // branch not taken only when its whole condition can be (the negation of a part says nothing)
+        let mut prem: Vec<(&Expr, bool)> = Vec::new();
+        for (g, taken) in &self.guards {
+            if *taken { for x in conjuncts(g) { if ev(x, 0).is_some() { prem.push((x, true)); } } }
+            else if ev(g, 0).is_some() { prem.push((g, false)); }
+        }
+        (0..256).all(|v| {
+            let holds = prem.iter().all(|(e, t)| ev(e, v).map(|r| (r != 0) == *t).unwrap_or(false));
+            !holds || ev(pred, v) == Some(1)
+        })
     }
 
     /// The least growth of the index along every path through `b` that falls through:
@@ -101,10 +145,12 @@ impl<'a> Walk<'a> {
     fn block(&mut self, b: &Block, each: bool) -> Option<Option<Rat>> {
         let var = self.var?;
         let saved = self.facts.clone();
+        let (saved_bytes, saved_guards, saved_fresh) = (self.bytes.clone(), self.guards.len(), self.fresh);
         let mut acc = Rat::zero();
         let tail = b.tail.as_ref().map(|t| Stmt::Expr((**t).clone()));
+        let all: Vec<&Stmt> = b.stmts.iter().chain(tail.iter()).collect();
         let r = (|| {
-            for s in b.stmts.iter().chain(tail.iter()) {
+            for (k, s) in all.iter().copied().enumerate() {
                 match s {
                     Stmt::Break | Stmt::Return(_) => return Some(None),
                     Stmt::Assign(LValue::Var(v), op, e) if *v == var => {
@@ -124,11 +170,28 @@ impl<'a> Walk<'a> {
                     Stmt::Let(x, e) => {
                         if mentions_assign(e, var) { return None; }
                         self.bind(*x, e);
+                        // `let c = a[i]` while `i` has not moved: `c` is the byte the lap is at
+                        if !self.f.locals[*x].mutable && self.fresh {
+                            if let ExprKind::Index(a, idx) = &e.kind {
+                                if matches!(idx.kind, ExprKind::Local(l) if l == var) { self.bytes.insert(*x, *a); }
+                            }
+                        }
+                        // `let mut j = e` that the rest of the block only ever increases: at least `e`
+                        if self.f.locals[*x].mutable && self.f.locals[*x].ty == Ty::I64 && all[k + 1..].iter().all(|t| only_grows(t, *x)) {
+                            let out: Vec<Ge> = self.lower(e).into_iter().map(|(base, c)| Ge { field: None, base, c }).collect();
+                            if !out.is_empty() { self.facts.insert(*x, out); }
+                        }
                     }
                     Stmt::Expr(Expr { kind: ExprKind::If(c, t, e), .. }) => {
                         if mentions_assign(c, var) { return None; }
-                        let bt = self.block(t, each)?;
-                        let be = match e { Some(e) => self.block(e, each)?, None => Some(Rat::zero()) };
+                        self.guards.push(((**c).clone(), true));
+                        let bt = self.block(t, each);
+                        self.guards.pop();
+                        let bt = bt?;
+                        self.guards.push(((**c).clone(), false));
+                        let be = match e { Some(e) => self.block(e, each), None => Some(Some(Rat::zero())) };
+                        self.guards.pop();
+                        let be = be?;
                         match (bt, be) {
                             (None, None) => return Some(None),
                             (Some(a), None) | (None, Some(a)) => acc = acc.add(a),
@@ -138,9 +201,16 @@ impl<'a> Walk<'a> {
                         if assigns_var(t, var) || e.as_ref().is_some_and(|e| assigns_var(e, var)) { self.forget_cur(); }
                     }
                     Stmt::For { body, .. } | Stmt::While { body, .. } => {
-                        // a nested loop may run zero times: it helps only if it never hurts
-                        match self.block(body, each) {
-                            Some(Some(d)) if d >= Rat::zero() => {}
+                        // a nested loop may run zero times: it helps only if it never hurts —
+                        // unless it surely runs once, and then it grows `i` by one lap's growth
+                        let once = match s { Stmt::While { cond, .. } => self.runs_once(cond), _ => false };
+                        let (ob, oo, of) = (std::mem::take(&mut self.bytes), self.outer.clone(), self.fresh);
+                        if let Stmt::While { cond, .. } = s { self.outer = Some(cond.clone()); }
+                        self.fresh = true;
+                        let inner = self.block(body, each);
+                        (self.bytes, self.outer, self.fresh) = (ob, oo, of);
+                        match inner {
+                            Some(Some(d)) if d >= Rat::zero() => { if once { acc = acc.add(d); } }
                             Some(None) => {}
                             _ => return None,
                         }
@@ -154,6 +224,8 @@ impl<'a> Walk<'a> {
             Some(Some(acc))
         })();
         self.facts = saved;
+        (self.bytes, self.fresh) = (saved_bytes, saved_fresh);
+        self.guards.truncate(saved_guards);
         r
     }
 }
@@ -196,16 +268,29 @@ fn has_return(b: &Block) -> bool {
 /// The least growth of `var` along every path through `body` (`None`: cannot follow; a path
 /// that leaves is not counted), for the trip of a scan.
 pub fn least_growth(f: &Func, summ: &[Vec<Ge>], body: &Block, var: LocalId) -> Option<Option<Rat>> {
-    Walk { f, summ, var: Some(var), facts: HashMap::new() }.block(body, false)
+    Walk { f, summ, var: Some(var), facts: HashMap::new(), m: None, bytes: HashMap::new(), guards: vec![], fresh: true, outer: None }.block(body, false)
+}
+
+/// `least_growth` for the lap of `while cond`, knowing the program: a nested `while` the path
+/// surely enters counts one lap of its own growth (docs/cost-model.md § A scan, a loop that runs once).
+pub fn least_growth_in(m: &Module, f: &Func, summ: &[Vec<Ge>], cond: &Expr, body: &Block, var: LocalId) -> Option<Option<Rat>> {
+    Walk { f, summ, var: Some(var), facts: HashMap::new(), m: Some(m), bytes: HashMap::new(), guards: vec![], fresh: true, outer: Some(cond.clone()) }.block(body, false)
 }
 
 /// Whether every assignment to `var` anywhere in the function grows it, and the lower bounds of
 /// what it was first bound to: then `var ≥` each of them wherever it is read.
 pub fn only_increased(f: &Func, summ: &[Vec<Ge>], var: LocalId) -> Option<Vec<(Base, Rat)>> {
     let body = f.body.as_ref()?;
-    // the one binding, at the top level of the body
-    let (k, init) = body.stmts.iter().enumerate().find_map(|(k, s)| match s { Stmt::Let(x, e) if *x == var => Some((k, e)), _ => None })?;
-    let mut w = Walk { f, summ, var: Some(var), facts: HashMap::new() };
+    // the one binding, at the top level of the body; one nested inside a block (a local of a
+    // loop's lap, `let mut j = start`) is at least its initialiser's least when every assignment
+    // to it anywhere in the function only grows it
+    let Some((k, init)) = body.stmts.iter().enumerate().find_map(|(k, s)| match s { Stmt::Let(x, e) if *x == var => Some((k, e)), _ => None }) else {
+        let init = binding(f, var)?;
+        if !body.stmts.iter().all(|s| only_grows(s, var)) || !body.tail.as_ref().is_none_or(|t| !mentions_assign(t, var)) { return None; }
+        let lb: Vec<(Base, Rat)> = least_in(f, summ, &init, 6).into_iter().filter(|(b, _)| *b != Base::Cur).collect();
+        return if lb.is_empty() { None } else { Some(lb) };
+    };
+    let mut w = Walk { f, summ, var: Some(var), facts: HashMap::new(), m: None, bytes: HashMap::new(), guards: vec![], fresh: false, outer: None };
     for s in &body.stmts[..k] { if let Stmt::Let(x, e) = s { w.bind(*x, e); } }
     let init_lb: Vec<(Base, Rat)> = w.lower(init).into_iter().filter(|(b, _)| *b != Base::Cur).collect();
     let rest = Block { stmts: body.stmts[k + 1..].to_vec(), tail: body.tail.clone(), ty: body.ty.clone() };
@@ -241,7 +326,7 @@ fn summarise(f: &Func, summ: &[Vec<Ge>]) -> Vec<Ge> {
     if has_return(body) { return vec![]; }
     let Some(tail) = &body.tail else { return vec![] };
     // the immutable bindings of the top level, then the returned value's bounds
-    let mut w = Walk { f, summ, var: None, facts: HashMap::new() };
+    let mut w = Walk { f, summ, var: None, facts: HashMap::new(), m: None, bytes: HashMap::new(), guards: vec![], fresh: false, outer: None };
     for s in &body.stmts { if let Stmt::Let(x, e) = s { w.bind(*x, e); } }
     let value = |e: &Expr, w: &Walk| -> Vec<(Base, Rat)> {
         match &e.kind {
@@ -444,5 +529,107 @@ fn contains_loop(e: &Expr) -> bool {
         ExprKind::If(_, t, els) => blk(t) || els.as_ref().is_some_and(blk),
         ExprKind::Block(b) => blk(b),
         _ => false,
+    }
+}
+
+/// The conjuncts of `a && b && …`.
+fn conjuncts(e: &Expr) -> Vec<&Expr> {
+    match &e.kind {
+        ExprKind::Binary(BinOp::And, l, r) => { let mut v = conjuncts(l); v.extend(conjuncts(r)); v }
+        _ => vec![e],
+    }
+}
+
+/// Structural equality of two expressions, lines aside, over the shapes a loop condition uses.
+fn expr_eq(a: &Expr, b: &Expr) -> bool {
+    match (&a.kind, &b.kind) {
+        (ExprKind::Local(x), ExprKind::Local(y)) => x == y,
+        (ExprKind::Int(x), ExprKind::Int(y)) => x == y,
+        (ExprKind::Byte(x), ExprKind::Byte(y)) => x == y,
+        (ExprKind::Len(x), ExprKind::Len(y)) => x == y,
+        (ExprKind::Binary(o, l, r), ExprKind::Binary(p, m, n)) => o == p && expr_eq(l, m) && expr_eq(r, n),
+        (ExprKind::Index(x, i), ExprKind::Index(y, j)) => x == y && expr_eq(i, j),
+        _ => false,
+    }
+}
+
+/// Whether every local `e` reads is immutable, or the index itself (which has not moved).
+fn locals_fixed(f: &Func, e: &Expr, var: LocalId) -> bool {
+    match &e.kind {
+        ExprKind::Local(l) => *l == var || !f.locals[*l].mutable,
+        ExprKind::Int(_) | ExprKind::Byte(_) | ExprKind::Len(_) => true,
+        ExprKind::Binary(_, l, r) => locals_fixed(f, l, var) && locals_fixed(f, r, var),
+        ExprKind::Index(_, i) => locals_fixed(f, i, var),
+        _ => false,
+    }
+}
+
+/// The array whose byte at the index a predicate reads, as `a[i]` or through a local bound to it.
+fn byte_array(e: &Expr, var: LocalId, bytes: &HashMap<LocalId, LocalId>) -> Option<LocalId> {
+    match &e.kind {
+        ExprKind::Index(a, i) if matches!(i.kind, ExprKind::Local(l) if l == var) => Some(*a),
+        ExprKind::Local(l) => bytes.get(l).copied(),
+        ExprKind::Binary(_, l, r) => byte_array(l, var, bytes).or_else(|| byte_array(r, var, bytes)),
+        ExprKind::Unary(_, x) | ExprKind::Cast(x, _) => byte_array(x, var, bytes),
+        ExprKind::Call(_, args) => args.iter().find_map(|a| byte_array(a, var, bytes)),
+        _ => None,
+    }
+}
+
+/// The value of a byte predicate: literals, the locals in `env`, `a[i]` for the one array in
+/// `at` (with the byte's value), comparisons, `&&`, `||`, `!`, `+`, `-`, casts, and calls to functions whose body is one
+/// such expression of their parameters. `None` for anything else.
+fn eval(m: &Module, f: &Func, env: &HashMap<LocalId, i64>, e: &Expr, at: Option<(LocalId, LocalId, i64)>, depth: u32) -> Option<i64> {
+    let go = |x: &Expr| eval(m, f, env, x, at, depth);
+    match &e.kind {
+        ExprKind::Byte(b) => Some(*b as i64),
+        ExprKind::Int(c) => Some(*c as i64),
+        ExprKind::Bool(b) => Some(*b as i64),
+        ExprKind::Local(l) => env.get(l).copied(),
+        ExprKind::Index(a, i) => match (at, &i.kind) { (Some((arr, var, v)), ExprKind::Local(l)) if *a == arr && *l == var => Some(v), _ => None },
+        ExprKind::Cast(x, _) => go(x),
+        ExprKind::Unary(crate::ast::UnOp::Not, x) => go(x).map(|v| (v == 0) as i64),
+        ExprKind::Binary(op, l, r) => {
+            if matches!(op, BinOp::And) { let a = go(l)?; return if a == 0 { Some(0) } else { go(r).map(|b| (b != 0) as i64) }; }
+            if matches!(op, BinOp::Or) { let a = go(l)?; return if a != 0 { Some(1) } else { go(r).map(|b| (b != 0) as i64) }; }
+            let (a, b) = (go(l)?, go(r)?);
+            Some(match op {
+                BinOp::Eq => (a == b) as i64, BinOp::Ne => (a != b) as i64,
+                BinOp::Lt => (a < b) as i64, BinOp::Le => (a <= b) as i64,
+                BinOp::Gt => (a > b) as i64, BinOp::Ge => (a >= b) as i64,
+                BinOp::Add => a.checked_add(b)?, BinOp::Sub => a.checked_sub(b)?,
+                _ => return None,
+            })
+        }
+        ExprKind::Call(g, args) if depth > 0 => {
+            let gf = &m.funcs[*g];
+            let body = gf.body.as_ref()?;
+            if !body.stmts.is_empty() || args.len() != gf.params.len() { return None; }
+            let mut genv = HashMap::new();
+            for (p, a) in gf.params.iter().zip(args) { genv.insert(*p, go(a)?); }
+            eval(m, gf, &genv, body.tail.as_ref()?, None, depth - 1)
+        }
+        _ => None,
+    }
+}
+
+/// Whether a statement leaves `x` no smaller: no assignment to it but `x += c` with `c ≥ 0`,
+/// nested blocks included.
+fn only_grows(s: &Stmt, x: LocalId) -> bool {
+    fn blk(b: &Block, x: LocalId) -> bool {
+        b.stmts.iter().all(|s| only_grows(s, x)) && b.tail.as_ref().is_none_or(|t| ex(t, x))
+    }
+    fn ex(e: &Expr, x: LocalId) -> bool {
+        match &e.kind {
+            ExprKind::If(c, t, els) => ex(c, x) && blk(t, x) && els.as_ref().is_none_or(|b| blk(b, x)),
+            ExprKind::Block(b) => blk(b, x),
+            _ => true,
+        }
+    }
+    match s {
+        Stmt::Assign(LValue::Var(v), op, e) if *v == x => matches!(op, Some(BinOp::Add)) && matches!(e.kind, ExprKind::Int(c) if c >= 0),
+        Stmt::Assign(_, _, e) | Stmt::Let(_, e) | Stmt::Expr(e) | Stmt::LetRepeat(_, e, _) | Stmt::Return(Some(e)) => ex(e, x),
+        Stmt::For { body, .. } | Stmt::While { body, .. } | Stmt::ParFor { body, .. } | Stmt::LetBuild { body, .. } => blk(body, x),
+        _ => true,
     }
 }

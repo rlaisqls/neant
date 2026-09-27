@@ -1,0 +1,64 @@
+// A lexer's scan (docs/cost-model.md § A scan, a loop that surely runs): the loop in `words` steps
+// `i` only inside the nested loops of its branches, but each branch's guard on the byte `c = xs[i]`
+// makes its nested loop run at least once — `is_alpha(c)` implies `is_alnum(xs[i])`, checked over
+// all 256 bytes — so every path through a lap grows `i`. The quoted branch moves `i` through `j`,
+// bound at `i + 1` and only increased, so `i = j + 1` grows it by at least 2.
+//
+// Refused: `stuck` enters a nested loop whose condition its guard does not imply (`c` is a digit,
+// the loop wants a letter), so a lap may not move `i`.
+
+fn is_alpha(c: u8) -> bool {
+    (c >= b'a' && c <= b'z') || (c >= b'A' && c <= b'Z')
+}
+
+fn is_digit(c: u8) -> bool {
+    c >= b'0' && c <= b'9'
+}
+
+fn is_alnum(c: u8) -> bool {
+    is_alpha(c) || is_digit(c)
+}
+
+fn words(xs: &[u8]) -> i64 {
+    let n = xs.len();
+    let mut i = 0;
+    let mut count = 0;
+    while i < n {
+        let c = xs[i];
+        if is_alpha(c) {
+            while i < n && is_alnum(xs[i]) { i += 1; }
+            count += 1;
+        } else if c == b'"' {
+            let mut j = i + 1;
+            while j < n && xs[j] != b'"' { j += 1; }
+            i = j + 1;
+            count += 1;
+        } else {
+            i += 1;
+        }
+    }
+    count
+}
+
+fn stuck(xs: &[u8]) -> i64 {
+    let n = xs.len();
+    let mut i = 0;
+    let mut count = 0;
+    while i < n {
+        let c = xs[i];
+        if is_digit(c) {
+            while i < n && is_alpha(xs[i]) { i += 1; }
+            count += 1;
+        } else {
+            i += 1;
+        }
+    }
+    count
+}
+
+fn main() {
+    let s = b"let x1 = \"hi there\" + y22";
+    println(words(&s));
+    let t = b"ab cd";
+    println(stuck(&t));
+}

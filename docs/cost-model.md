@@ -407,6 +407,21 @@ each (§ Moves). That is an upper bound too.
 - An entry value that is neither known nor bounded below because some assignment to `i` shrinks
   it: "`i`'s entry value is not known and `i` is not only increased".
 
+**A loop that surely runs (2026-09-27).** A lexer moves its index only inside the nested loops of
+its branches — `if is_alpha(c) { while i < n && is_alnum(xs[i]) { i += 1; } }` — and a nested loop
+may run zero times, so the walk above counted it as growing `i` by nothing and refused. It now counts
+one lap of a nested `while` when the path surely enters it: `i` has not moved this lap, so every
+conjunct the enclosing loop's condition shares still holds, and every other conjunct is a predicate
+of the byte `xs[i]` (directly or through `c = xs[i]`) that the guards on the path imply for each of
+the 256 values the byte can take — the guards and the predicate read by evaluating them, calls to
+byte predicates like `is_alnum` included. A guard not taken is used only when all of it can be read,
+since the negation of a part says nothing. And a mutable local bound inside the lap and only ever
+increased, `let mut j = i + 1`, is at least its initialiser, so `i = j + 1` grows `i` by 2; one bound
+anywhere in the function and only increased is at least its initialiser's least. The compiler's own
+`lex` is a bound for the first time (`6·n² + …`: its string branches' inner loops are charged the
+rest of the text a lap, an inline amortisation not done); golden `lexer`, with `stuck` refused — its
+guard, a digit, does not imply the letter its loop wants.
+
 ## Neighbouring sites
 
 **Written 2026-09-27, for the stencil.** § Moves adds up the lines of every site. A five-point

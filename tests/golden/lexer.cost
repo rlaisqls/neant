@@ -1,0 +1,16 @@
+is_alpha         work 7                            moves 0                            exact
+is_digit         work 3                            moves 0                            exact
+is_alnum         work 15                           moves 0                            exact
+words            work 2·xs.len()² + 33·xs.len() + 1 moves                              bound  (2 regimes)
+                                               moves 4·xs.len() + 3·B             if ≈ 2·xs.len() < M
+                                               moves xs.len()² + 3·B·xs.len()     if ≈ 2·xs.len() ≥ M
+                 footprint        xs: [0, xs.len()) (whole array)   no residue claimed
+                 scan: `i` grows by at least 1 a lap, so the `while` at line 26 runs at most xs.len() times
+                 scan: `j` grows by at least 1 a lap, so the `while` at line 33 runs at most xs.len() − 1 times
+                 scan: `i` grows by at least 1 a lap, so the `while` at line 29 runs at most xs.len() times
+stuck            unknown: `i` does not grow on every path through the body, so this is not a scan (line 47)
+main             work work[stuck](5) + 2112        moves moves[stuck](5) + 3·B + 130  modulo, io
+                 in `words`: scan: `i` grows by at least 1 a lap, so the `while` at line 26 runs at most xs.len() times
+                 in `words`: scan: `j` grows by at least 1 a lap, so the `while` at line 33 runs at most xs.len() − 1 times
+                 in `words`: scan: `i` grows by at least 1 a lap, so the `while` at line 29 runs at most xs.len() times
+                 rests on         words (bound, a scan); stuck (unknown)

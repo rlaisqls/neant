@@ -2533,13 +2533,13 @@ impl<'a, 'b, 'c> Fa<'a, 'b, 'c> {
     /// stands; `Err(Some(why))`: it applies as far as `why`. `step` is the constant step when there
     /// is one and only the entry value was missing.
     fn scan_trip(&self, cond: &Expr, var: LocalId, bound: &Expr, op: &BinOp, body: &Block, step: Option<i128>) -> Result<(Poly, Option<(LocalId, Poly, i128)>), Option<String>> {
-        use super::scan::{least_growth, only_increased, Base};
+        use super::scan::{least_growth_in, only_increased, Base};
         if !matches!(op, BinOp::Lt | BinOp::Le) || !matches!(&cond.kind, ExprKind::Binary(_, l, _) if matches!(l.kind, ExprKind::Local(v) if v == var)) { return Err(None); }
         let name = self.f.locals[var].name.clone();
         let d = match step {
             Some(c) if c >= 1 => Rat::int(c),
             Some(_) => return Err(None),
-            None => match least_growth(self.f, &self.an.scan_summ, body, var) {
+            None => match least_growth_in(self.an.m, self.f, &self.an.scan_summ, cond, body, var) {
                 Some(Some(d)) if d >= Rat::one() => d,
                 Some(Some(_)) => return Err(Some(format!("`{name}` does not grow on every path through the body, so this is not a scan"))),
                 Some(None) => Rat::one(),

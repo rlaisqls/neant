@@ -934,6 +934,12 @@ between kernels (streams better, strided access worse) and the geometric mean fr
 A TLB charge per line of a page-strided access (`--tlb`, 9 ns fitted on transpose) was measured the
 same way and is off too: transpose 2–3× → 0.85–1.28, naive matmul 1.0 → 0.24–0.30.
 
+**The lexer's shapes, 2026-09-27** (cost-model § A scan, a loop that surely runs; golden `lexer`). A
+nested `while` counts one lap of growth when the path surely enters it — its guards imply its
+condition over all 256 values of the byte at the index — and a lap-local `let mut j = i + 1` only
+increased is at least its initialiser. `lex` is a bound (quadratic: its string branches are not
+amortised inline), the compiler is 92/49/35/102, and parity is 105/103/140/152.
+
 ## M7 — the constant factor
 
 Prove the asymptote, search the constant. A micro-architectural cost line (what llvm-mca and uiCA
