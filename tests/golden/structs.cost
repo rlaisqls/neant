@@ -1,4 +1,4 @@
-struct Point     layout SoA  decided by sum_x (8·ps.len() + B, AoS 24·ps.len() + B), sum_all (24·ps.len() + 3·B, AoS 24·ps.len() + B), shift (8·ps.len() + B, AoS 24·ps.len() + B), main (8·B + 192, AoS 4·B + 224)
+struct Point     layout SoA  decided by sum_x (8·ps.len() + B, AoS 24·ps.len() + B), sum_all (24·ps.len() + 3·B, AoS 24·ps.len() + B), shift (8·ps.len() + B, AoS 24·ps.len() + B), main (7·B + 192, AoS 3·B + 208)
 norm2            work 5                            moves 0                            exact
 sum_x            work 4·ps.len()                   moves 8·ps.len() + B               exact
                  lower bound      moves 8·ps.len()                   (footprint, every distinct element crosses once)   gap 1× at M = 2 MiB, B = 64
@@ -9,4 +9,4 @@ sum_all          work 8·ps.len()                   moves 24·ps.len() + 3·B   
 shift            work 5·ps.len()                   moves 8·ps.len() + B               exact
                  lower bound      moves 8·ps.len()                   (footprint, every distinct element crosses once)   gap 1× at M = 2 MiB, B = 64
                  footprint        ps: [0, 8·ps.len())   resident after if 8·ps.len() < M
-main             work 91                           moves 8·B + 192                    exact, io
+main             work 91                           moves 7·B + 192                    exact, io

@@ -7,4 +7,4 @@ dot              work 6·a.len() + 2                moves 16·a.len() + 2·B    
 weighted         work 6·xs.len()                   moves 8·xs.len() + B               exact
                  lower bound      moves 8·xs.len()                   (footprint, every distinct element crosses once)   gap 1× at M = 2 MiB, B = 64
                  footprint        xs: [0, 8·xs.len())   resident after if 8·xs.len() < M
-main             work 451                          moves 29·B + 240                   exact, io
+main             work 451                          moves 28·B + 240                   exact, io

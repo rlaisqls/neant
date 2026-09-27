@@ -9,4 +9,4 @@ is_palindrome    work 7·s.len() − 4                moves                     
                                                moves s.len()                      if s.len() < M
                                                moves 2·B·s.len() − 2·B            if s.len() ≥ M
                  footprint        s: [0, s.len()) (whole array)   no residue claimed
-main             work 1024                         moves 4·B + 123                    exact, io
+main             work 1024                         moves 2·B + 92                     exact, io

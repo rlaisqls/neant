@@ -956,7 +956,11 @@ once while they fit (cost-model § Moves, a triangle), n-body 0.15 → 0.27, gol
 that carries a scalar through a multiply is `serial`, charged `τ_s = 0.155 ns` fitted on a logistic map
 (cost-model § Time, serial work); mandelbrot 4.2× → 0.50, the benchmarks within 0.26–1.93. Then
 divisions counted apart and charged `τ_div = 0.148 ns` more (a sum of reciprocals): spectral-norm
-1.9 → 1.27, the benchmarks within 0.26–1.28.
+1.9 → 1.27, the benchmarks within 0.26–1.28. Then footprints of several exact ranges per parameter,
+widened over outer laps and clamped to the site's field, and a call on a resident footprint moving
+nothing (cost-model § Moves): n-body's per-step moves go to zero, which its refills confirm, and it is
+2.3× too fast instead of 3.7× too slow; thirteen goldens' `main`s drop a constant, the self-hosted pass
+is listed as charging those calls (`RESIDENT_INSTEAD`), and the compiler's count does not move.
 
 ## M7 — the constant factor
 

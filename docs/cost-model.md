@@ -468,6 +468,18 @@ end; where it does not, or neither end dominates, lap by lap as before. `pairs` 
 from `4·n²` to `32·n + 2·B − 8` in cache, against the lower bound's `8·n`; the self-hosted pass
 still sums (`TRIANGLES_INSTEAD`).
 
+**Footprints of several ranges, and a resident call (2026-09-28).** A parameter's footprint was one
+range, so two SoA fields of one element — ranges `8·n` apart — fell back to the whole array, inexact,
+and no caller was credited for either. A parameter now keeps its disjoint exact ranges apart; a range
+whose ends move with an outer loop is widened to its hull over that loop's laps, each end at the lap
+where it is furthest out, and clamped to the region the site can touch (its field's under SoA) —
+without the clamp the two ends, taken at different laps, overran into the next field. And a call
+whose every footprint range is already resident, to a callee with no array of its own, moves nothing
+where those residues hold: what the credit leaves above zero is set to zero, while a credit already at
+or below zero — the cross product cancelling an earlier call's charge, `dot(&xs, &xs)` — stands. On
+n-body the steps loop's calls to `advance` move nothing per step, which the machine confirms: its L2
+refills are the same at 10³ and 10⁶ steps. A square root is counted as a division.
+
 ## A scan's accesses
 
 **Written 2026-09-27, after the corpus was timed.** § A scan bounds a scan's *trip*, but its index

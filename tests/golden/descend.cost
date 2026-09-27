@@ -9,5 +9,5 @@ get              work 1                            moves B                      
                  footprint        xs: [8·i, 8·i + 8)   resident after if 8 < M
 each             work 6·xs.len()                   moves B·xs.len()                   exact
 pair             work 3                            moves 2·B                          exact
-                 footprint        ps: [0, 16·ps.len()) (whole array)   no residue claimed
-main             work 263                          moves 20·B + 320                   exact, io
+                 footprint        ps: [8·i + 8·ps.len(), 8·i + 8·ps.len() + 8)  ps: [8·i, 8·i + 8)   resident after if 16 < M
+main             work 263                          moves 19·B + 320                   exact, io

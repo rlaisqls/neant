@@ -9,4 +9,4 @@ upper            work 10·s.len()                   moves 2·s.len() + 2·B     
                  lower bound      moves 2·s.len()                    (footprint, every distinct element crosses once)   gap 1× at M = 2 MiB, B = 64
                  footprint        s: [0, s.len())  out: [0, s.len())   resident after if 2·s.len() < M
 countdown        work 3·from/2 + 1                 moves 0                            exact
-main             work 16641/2                      moves 8·B + 128                    exact, io
+main             work 16641/2                      moves 7·B + 128                    exact, io

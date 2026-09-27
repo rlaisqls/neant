@@ -784,6 +784,15 @@ charged `τ_div = 0.148 ns` beyond a unit of work, fitted on a sum of reciprocal
 divisions): spectral-norm 1.89–1.94 → **1.26–1.28**, the three programs within **0.26–1.28**,
 geometric mean 0.57; the kernels (1.15) and the corpus (0.60) are where they were.
 
+**A resident call, the same day** (cost-model § Moves, footprints of several ranges). n-body's
+`advance` on five bodies now leaves a footprint of exact ranges, and the steps loop's calls move
+nothing once it is resident: the prediction is work-bound, **2.3×** too fast (from 0.27, too slow),
+and the L2 refills agree that nothing moves per step (220–280 KB at 10³, 10⁵ and 10⁶ steps, an empty
+program's 180 KB of start-up included). What is left there is compute the constants do not see: inner
+loops of four laps or fewer, and `bs[i].vx` accumulated through memory on every lap — a chain the
+serial rule, which looks at scalars, does not follow. The three programs are within 0.47–2.28, geometric
+mean 1.11; the corpus 0.60, the kernels 1.13.
+
 ## The compiler's cost model, on the compiler — and the machine's answer
 
 The self-hosted cost reporter (`compiler/costdump.nt`, compiled by the self-hosted compiler) was

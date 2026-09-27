@@ -51,6 +51,14 @@ const NEIGHBOURS_INSTEAD: &[(&str, &str)] = &[("stencil.nt", "stencil"), ("stenc
 /// while they fit (cost-model § Moves, a triangle, 2026-09-28) and this pass charges lap by lap.
 const TRIANGLES_INSTEAD: &[(&str, &str)] = &[("tri.nt", "pairs"), ("tri.nt", "main")];
 
+/// `(file, function)` where the self-hosted `moves` are higher because a call whose every
+/// footprint range is resident still pays what the credit leaves above zero there; the Rust moves
+/// nothing for it (cost-model § Moves, a resident call, 2026-09-28). Each is a `main` calling the
+/// same callee twice over the same arrays.
+const RESIDENT_INSTEAD: &[(&str, &str)] = &[("arrayview.nt", "main"), ("chains.nt", "main"), ("dot.nt", "main"),
+    ("particles.nt", "main"), ("repeat.nt", "main"), ("saxpy.nt", "main"), ("structs.nt", "main"),
+    ("warm.nt", "main"), ("while.nt", "main"), ("words.nt", "main")];
+
 /// Functions whose **footprint** this pass states more narrowly than `neant cost`: it reports none,
 /// or fewer arrays, where the Rust reports one. A narrowing, not a disagreement — the two never state *different*
 /// footprints, and a missing one only costs a caller a credit it could have had.
@@ -78,6 +86,10 @@ const TRIANGLES_INSTEAD: &[(&str, &str)] = &[("tri.nt", "pairs"), ("tri.nt", "ma
 /// as whole arrays with no residue — what the first pair of the list's rule asks, and exactly what
 /// it once did not do: it stated `grid`'s `xs[a]` alone as exact and resident, having stopped at
 /// `0..xs[a]` before reaching `xs[b]`.
+///
+/// `particles.nt`'s `step` and `tri.nt`'s `pairs` state a whole array here where the Rust states
+/// its ranges: two SoA fields kept apart, and a triangle's lanes widened to their hull (cost-model
+/// § Moves, footprint, 2026-09-28) — a whole array is the wider claim and credits nothing.
 ///
 /// `whileshapes.nt`'s two are the condition this pass still misreads as the Rust did until
 /// 2026-09-27: `j > start` with both sides locals taken as a loop in `start`, and `i + 1 < n` with
@@ -108,7 +120,8 @@ const FOOTPRINT_NARROWER: &[(&str, &str)] = &[("parse.nt", "number"), ("bfs.nt",
                                               ("scan_refused.nt", "word_end"),
                                               ("amortised.nt", "field"), ("amortised.nt", "sum_fields"),
                                               ("worklist.nt", "reach"), ("lexer.nt", "words"),
-                                              ("whileshapes.nt", "from_one"), ("whileshapes.nt", "sort_from")];
+                                              ("whileshapes.nt", "from_one"), ("whileshapes.nt", "sort_from"),
+                                              ("particles.nt", "step"), ("tri.nt", "pairs")];
 
 /// The same for the **footprint lower bound**: stated where `neant cost` states one and this pass
 /// states none. A `while` loop is given no loop atom by this pass — only a `for` mints one — so a
@@ -143,13 +156,13 @@ const EXACT: usize = 105;
 /// **Nothing is declined.** Every `moves` column either matches or is one of the four in
 /// `COPIES_INSTEAD` — a footprint is a range now, so a callee that reads two fields of a four-field
 /// particle leaves half the array resident and the next call over the other half pays in full.
-const EXACT_MOVES: usize = 101;
+const EXACT_MOVES: usize = 91;
 
 /// The same for the **footprint**: one entry per array parameter and the condition under which the
 /// whole of it is resident on return, whitespace-normalised so the report's column padding is not
 /// part of the comparison. Counted over every function, so one that should state no footprint and
 /// states none counts too.
-const EXACT_FOOT: usize = 141;
+const EXACT_FOOT: usize = 139;
 
 /// The same for the **footprint lower bound** — `moves` cannot be less than the distinct bytes a
 /// function's parameter arrays reach. Counted over every function, so a `main` that should have no
@@ -421,7 +434,8 @@ fn self_hosted_work_agrees_with_bootstrap() {
             // compiler chooses AoS or SoA for itself now (docs/self-hosting-layout-design.md).
             let listed = COPIES_INSTEAD.contains(&(name.as_str(), fname.as_str()))
                 || NEIGHBOURS_INSTEAD.contains(&(name.as_str(), fname.as_str()))
-                || TRIANGLES_INSTEAD.contains(&(name.as_str(), fname.as_str()));
+                || TRIANGLES_INSTEAD.contains(&(name.as_str(), fname.as_str()))
+                || RESIDENT_INSTEAD.contains(&(name.as_str(), fname.as_str()));
             if g == mw {
                 exact_moves += 1;
 

@@ -82,11 +82,13 @@ stencil's neighbouring sites were grouped and `heat` moved from 0.13 to 0.50).
 
 | program | measured / predicted |
 |---|---|
-| `nbody` (10⁵–5·10⁶ steps) | 0.26 – 0.27 |
+| `nbody` (10⁵–5·10⁶ steps) | 2.27 – 2.28 |
 | `spectral_norm` (n = 200–2000) | 1.26 – 1.28 |
-| `mandelbrot` (n = 200–2000) | 0.50 – 0.53 |
+| `mandelbrot` (n = 200–2000) | 0.47 – 0.51 |
 
-Geometric mean 0.57, range 0.26 to 1.28. Before the scan's
+Geometric mean 1.11, range 0.47 to 2.28 — n-body now errs the other way, its per-step moves gone
+(the L2 refills agree) and its compute under-counted: laps of four or fewer, and a velocity summed
+through memory. Before the scan's
 accesses were charged as a stream, the text readers were 10³ to 10⁶ too high — a bound, and a
 useless time; the first timing is kept in experiments.md because it is what found that.
 
@@ -185,7 +187,7 @@ On its own domain the claim holds in the form plan § Who switches set for it: e
 corpus has a cost the compiler inferred, the kernels' costs predict bytes to within the ideal-cache
 model's known limits and time to within about 30% where one term dominates, and the programs' costs
 predict their time within a small factor, erring high — and so do five programs the project did not
-write, with constants fitted on none of them (0.26–1.28). What it does not yet do is reach the larger
+write, with constants fitted on none of them (0.47–2.28). What it does not yet do is reach the larger
 part of ordinary code *exactly* — the compiler is a third exact, a third stated as a bound or modulo
 a callee, a third unknown — and every place it is loose is a named term or shape, each with the
 measurement that found it.

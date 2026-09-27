@@ -92,6 +92,8 @@ pub struct FuncCost {
     /// How many `f64` divisions `work` holds: a division's throughput is a fraction of an add's,
     /// so a time charges each more (cost-model § Time, divisions). Read only by a time.
     pub divs: Cost,
+    /// Whether the function touches an array of its own, which a caller's residue cannot cover.
+    pub internal: bool,
     /// Lower bounds the catalogue recognised in this function's body.
     pub bounds: Vec<Bound>,
     /// What the bound's operands do in the innermost loop, when it is worth saying.
@@ -444,7 +446,7 @@ impl<'a> Analyzer<'a> {
                 self.done[fid] = Some(FuncCost {
                     name: f.name.clone(),
                     names: param_names(f),
-                    result: CostResult::Unknown { reason: "mutually recursive with another function; only self-recursion is solved".into(), line: f.line }, chase: Cost::zero(), paged: Cost::zero(), serial: Cost::zero(), divs: Cost::zero(),
+                    result: CostResult::Unknown { reason: "mutually recursive with another function; only self-recursion is solved".into(), line: f.line }, chase: Cost::zero(), paged: Cost::zero(), serial: Cost::zero(), divs: Cost::zero(), internal: true,
                     bounds: vec![], notes: vec![], suggestions: vec![], effects: vec![], violations: vec![], tier: "unknown", result_size: None,
                     footprint: vec![], resident: None, declared: Declared::default(), rests_on: vec![],
                 });
@@ -759,7 +761,7 @@ impl<'a, 'b, 'c> Fa<'a, 'b, 'c> {
                 _ if effects.contains(&"unbounded") => CostResult::Unknown { reason: "declared unbounded".into(), line: self.f.line },
                 _ => CostResult::Unknown { reason: "an extern needs `#[cost(work_at_most = …, moves_at_most = …)]` or `uses unbounded`".into(), line: self.f.line },
             };
-            return FuncCost { name: self.f.name.clone(), names: self.names, result, chase: Cost::zero(), paged: Cost::zero(), serial: Cost::zero(), divs: Cost::zero(), bounds: vec![], notes: vec![], suggestions: vec![], effects, violations, tier: "declared", footprint: vec![], resident: None, declared, rests_on: vec![], result_size: self.result_size.clone() };
+            return FuncCost { name: self.f.name.clone(), names: self.names, result, chase: Cost::zero(), paged: Cost::zero(), serial: Cost::zero(), divs: Cost::zero(), internal: true, bounds: vec![], notes: vec![], suggestions: vec![], effects, violations, tier: "declared", footprint: vec![], resident: None, declared, rests_on: vec![], result_size: self.result_size.clone() };
         };
         let mut tier = "exact";
         self.chase_vars = loaded_in_loops(body);
@@ -881,7 +883,8 @@ impl<'a, 'b, 'c> Fa<'a, 'b, 'c> {
         let paged = if matches!(result, CostResult::Exact { .. }) { self.paged.clone() } else { Cost::zero() };
         let serial = if matches!(result, CostResult::Exact { .. }) { self.serial.clone() } else { Cost::zero() };
         let divs = if matches!(result, CostResult::Exact { .. }) { self.divs.clone() } else { Cost::zero() };
-        FuncCost { name: self.f.name.clone(), names: self.names, result, chase, paged, serial, divs, bounds: self.bounds, notes: self.notes, suggestions: vec![], effects, violations, tier, footprint, resident, declared, rests_on: self.rests_on, result_size: self.result_size.clone() }
+        let internal = self.sites.iter().any(|st| { let r = self.local_root.get(&st.arr).copied().unwrap_or(st.arr); !self.f.params.contains(&r) });
+        FuncCost { name: self.f.name.clone(), names: self.names, result, chase, paged, serial, divs, internal, bounds: self.bounds, notes: self.notes, suggestions: vec![], effects, violations, tier, footprint, resident, declared, rests_on: self.rests_on, result_size: self.result_size.clone() }
     }
 
     /// The byte range one access site covers over its loop nest, from its affine index and the
@@ -913,11 +916,38 @@ impl<'a, 'b, 'c> Fa<'a, 'b, 'c> {
         Some((lo.scale(st).add(&site.base), hi.scale(st).add(&Poly::constant(site.es)).add(&site.base)))
     }
 
+    /// A site's range with every loop atom of its nest gone: a range whose ends move with an outer
+    /// loop (`j in i + 1..n`) is widened to its hull over that loop's laps, each end taken at the lap
+    /// where it is furthest out; `None` when neither lap's end dominates the other's.
+    fn hull_over_laps(&self, site: &Site, (mut lo, mut hi): (Poly, Poly)) -> Option<(Poly, Poly)> {
+        use super::piece::dominates;
+        for &l in &site.path {
+            let rec = &self.loop_recs[l];
+            let Some(a) = rec.atom else { continue };
+            if !lo.mentions(a) && !hi.mentions(a) { continue; }
+            let (l0, l1) = (lo.subst(a, &rec.lo), lo.subst(a, &rec.last()));
+            let (h0, h1) = (hi.subst(a, &rec.lo), hi.subst(a, &rec.last()));
+            lo = if dominates(&l1, &l0) { l0 } else if dominates(&l0, &l1) { l1 } else { return None };
+            hi = if dominates(&h1, &h0) { h1 } else if dominates(&h0, &h1) { h0 } else { return None };
+        }
+        // the ends are each taken at their own lap, so the hull can overrun what the site can touch:
+        // clamp it to the site's own region, its field's under SoA, the array's under AoS
+        let root = self.local_root.get(&site.arr).copied().unwrap_or(site.arr);
+        if let Some(len) = self.local_size.get(&root) {
+            let (rlo, rhi) = (site.base.clone(), site.base.add(&len.scale(Rat::int(site.stride))));
+            if dominates(&rlo, &lo) { lo = rlo; }
+            if dominates(&hi, &rhi) { hi = rhi; }
+        }
+        Some((lo, hi))
+    }
+
     /// The function's footprint over its parameters, and the condition under which all of it is
     /// resident on return. A site whose range is not exact makes its parameter's range the whole
     /// array and forfeits the residue.
     fn signature_footprint(&self) -> (Vec<Foot>, Option<Cond>) {
-        let mut feet: HashMap<usize, (Poly, Poly, bool)> = HashMap::new();
+        // per parameter, its ranges: disjoint exact ones kept apart — two fields of one element
+        // under SoA are two ranges `8·n` apart, not the whole array (cost-model § Moves, footprint)
+        let mut feet: HashMap<usize, Vec<(Poly, Poly, bool)>> = HashMap::new();
         let mut total = Poly::zero();
         let mut all_exact = true;
         for site in &self.sites {
@@ -926,35 +956,45 @@ impl<'a, 'b, 'c> Fa<'a, 'b, 'c> {
             let Some(pi) = self.f.params.iter().position(|&p| p == root) else {
                 // an internal array: competes for the cache, invisible to the caller
                 let (_, h) = whole(root);
-                if !feet.contains_key(&(usize::MAX - root)) { feet.insert(usize::MAX - root, (Poly::zero(), h, true)); }
+                feet.entry(usize::MAX - root).or_insert_with(|| vec![(Poly::zero(), h, true)]);
                 continue;
             };
             // a range whose end is the most or least an array holds is a hull over elements, not
-            // a range every byte of which was read
-            // a scan's site is a hull too: a jump skips elements inside it (§ A scan's accesses)
+            // a range every byte of which was read; a scan's site is a hull too
             let scanned = site.path.iter().any(|&l| self.loop_recs[l].monotone);
-            let (lo, hi, exact) = match self.site_range(site) { Some((l, h)) => { let ex = !scanned && !l.has_loose_read() && !h.has_loose_read(); (l, h, ex) } None => { let (l, h) = whole(root); (l, h, false) } };
-            match feet.get_mut(&pi) {
-                None => { feet.insert(pi, (lo, hi, exact)); }
-                Some(e) => {
-                    // two ranges on one parameter: the same range twice is one, two that overlap
-                    // or touch are their union, and anything else falls back to the whole array.
-                    // Not the span of two ranges with a gap between them — two fields of one
-                    // element under SoA are `8·n` apart — since an exact range is one every byte
-                    // of which was read: callers are credited for it and told it is resident
-                    if exact && e.2 && e.0 == lo && e.1 == hi {}
-                    else if exact && e.2 && super::piece::dominates(&e.1, &lo) && super::piece::dominates(&hi, &e.0) {
-                        let (nlo, nhi) = (if super::piece::dominates(&e.0, &lo) { lo.clone() } else { e.0.clone() },
-                                          if super::piece::dominates(&hi, &e.1) { hi.clone() } else { e.1.clone() });
-                        *e = (nlo, nhi, true);
-                    }
-                    else { let (l, h) = whole(root); *e = (l, h, false); }
+            let (lo, hi, exact) = match self.site_range(site).and_then(|r| self.hull_over_laps(site, r)) { Some((l, h)) => { let ex = !scanned && !l.has_loose_read() && !h.has_loose_read(); (l, h, ex) } None => { let (l, h) = whole(root); (l, h, false) } };
+            let list = feet.entry(pi).or_default();
+            if list.iter().any(|r| !r.2) || !exact {
+                // anything inexact on a parameter makes it the whole array, inexact
+                let (l, h) = whole(root);
+                *list = vec![(l, h, false)];
+                continue;
+            }
+            // the same range twice is one; one that overlaps or touches a range is their union;
+            // one apart from every range is a range of its own
+            let mut merged = false;
+            for r in list.iter_mut() {
+                if r.0 == lo && r.1 == hi { merged = true; break; }
+                if super::piece::dominates(&r.1, &lo) && super::piece::dominates(&hi, &r.0) {
+                    let nlo = if super::piece::dominates(&r.0, &lo) { lo.clone() } else { r.0.clone() };
+                    let nhi = if super::piece::dominates(&hi, &r.1) { hi.clone() } else { r.1.clone() };
+                    *r = (nlo, nhi, true);
+                    merged = true;
+                    break;
                 }
             }
+            if !merged {
+                // apart only where it can be shown: the new range ends before a range starts or
+                // starts after it ends; otherwise the whole array, inexact
+                let apart = list.iter().all(|r| super::piece::dominates(&r.0, &hi) || super::piece::dominates(&lo, &r.1));
+                if apart { list.push((lo, hi, true)); } else { let (l, h) = whole(root); *list = vec![(l, h, false)]; }
+            }
         }
-        for (_, (lo, hi, exact)) in &feet { total = total.add(&hi.sub(lo)); if !exact { all_exact = false; } }
-        let mut out: Vec<Foot> = feet.into_iter().filter(|(k, _)| *k < usize::MAX / 2).map(|(param, (lo, hi, exact))| Foot { param, lo, hi, exact }).collect();
-        out.sort_by_key(|f| f.param);
+        for (_, rs) in &feet { for (lo, hi, exact) in rs { total = total.add(&hi.sub(lo)); if !exact { all_exact = false; } } }
+        let mut out: Vec<Foot> = feet.into_iter().filter(|(k, _)| *k < usize::MAX / 2)
+            .flat_map(|(param, rs)| rs.into_iter().map(move |(lo, hi, exact)| Foot { param, lo, hi, exact }))
+            .collect();
+        out.sort_by(|a, b| a.param.cmp(&b.param).then_with(|| format!("{:?}", a.lo).cmp(&format!("{:?}", b.lo))));
         let resident = if all_exact && !out.is_empty() { Some(Cond { ws: total.mul_atom_pow(Atom::B, Rat::int(-1)), fits: true }) } else { None };
         (out, resident)
     }
@@ -3090,6 +3130,35 @@ impl<'a, 'b, 'c> Fa<'a, 'b, 'c> {
                         mv = mv.add_under(&r.conds, &overlap.scale(Rat::int(-1)));
                     }
                 }
+                // everything the callee touches is resident here, and it has no array of its own:
+                // the call moves nothing where those residues hold (a loop of calls on a small array)
+                if !declared_only && !opaque && !callee.internal && !feet.is_empty() {
+                    let mut conds: Vec<Cond> = Vec::new();
+                    let all = feet.iter().all(|(root, lo, hi, exact)| *exact && self.resident.iter().any(|r| {
+                        let ok = r.root == *root && super::piece::dominates(lo, &r.lo) && super::piece::dominates(&r.hi, hi);
+                        if ok { for c in &r.conds { if !conds.contains(c) { conds.push(c.clone()); } } }
+                        ok
+                    }));
+                    if all {
+                        let mut out = Vec::new();
+                        for p in &mv.pieces {
+                            // a credit already at or below zero is the cross product cancelling an
+                            // earlier call's charge (`dot(&xs, &xs)`): it stands; only what is left
+                            // above zero is what a resident footprint does not move
+                            let keep = self.numeric(&p.poly).is_some_and(|v| v <= 0.0);
+                            let mut cs = p.conds.clone(); cs.extend(conds.iter().cloned());
+                            if super::piece::feasible(&cs) { out.push(Piece { conds: cs, poly: if keep { p.poly.clone() } else { Poly::zero() } }); }
+                            for c in &conds {
+                                let mut cn = p.conds.clone(); cn.push(Cond { ws: c.ws.clone(), fits: !c.fits });
+                                if super::piece::feasible(&cn) { out.push(Piece { conds: cn, poly: p.poly.clone() }); }
+                            }
+                            if conds.is_empty() { out.clear(); out.push(Piece { conds: p.conds.clone(), poly: Poly::zero() }); }
+                        }
+                        let mut c = Cost { pieces: out };
+                        c.prune();
+                        mv = c;
+                    }
+                }
                 // a bound on a part is a bound on the whole, once: repeated calls are not
                 // multiplied, since a bound on any schedule of the part says nothing about what
                 // the repetitions may share. A cold-start bound travels only for arrays the caller
@@ -3136,6 +3205,8 @@ impl<'a, 'b, 'c> Fa<'a, 'b, 'c> {
                         let c = callee.serial.hide_args(&hide);
                         if !c.pieces.iter().any(|pc| hide(&pc.poly)) { self.serial = self.serial.add(&c.rename_roots(&rename).subst_many(&map)); }
                     }
+                    // a square root runs on the divider: counted as a division (cost-model § Time, divisions)
+                    if cf.body.is_none() && cf.name == "sqrt" { self.divs = self.divs.add_poly(&Poly::constant(1)); }
                     if !declared_only && !opaque && !callee.divs.pieces.is_empty() {
                         let hide = |p: &Poly| unnamed.iter().any(|(i, _)| p.mentions(*i));
                         let c = callee.divs.hide_args(&hide);

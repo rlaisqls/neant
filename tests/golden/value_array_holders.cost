@@ -8,4 +8,4 @@ drift            work 23·bs.len()                  moves 32·bs.len() + B      
 height           work 5·bs.len()                   moves 32·bs.len() + B              exact
                  lower bound      moves 24·bs.len()                  (footprint, every distinct element crosses once)   gap 1× at M = 2 MiB, B = 64
                  footprint        bs: [0, 32·bs.len() − 8)   resident after if ≈ 32·bs.len() < M
-main             work 195                          moves 7·B + 328                    exact, io
+main             work 195                          moves 6·B + 304                    exact, io

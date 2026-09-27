@@ -38,7 +38,7 @@ trace            work 6·n                          moves B·n                  
                  footprint        m: [0, 8·n²)   resident after if 8·n² < M
 main             work ≈ 10·n³                      moves                              bound, io  (6 regimes)
                                                moves ≈ B·n³ + 8·n³                if ≈ 8·n ≥ M
-                                               moves ≈ 56·n²                      if 24·n² < M
+                                               moves ≈ 64·n²                      if 24·n² < M
                                                moves ≈ B·n³ + 8·n³                if ≈ 8·n < M and ≈ B·n + 8·n ≥ M
                                                moves ≈ 8·n³                       if ≈ 8·n² ≥ M and 8·n² < M
                                                moves ≈ 8·n³                       if ≈ B·n + 8·n < M and 8·n² ≥ M
