@@ -641,6 +641,38 @@ roofline term was built to test, and on these kernels it holds.
 `--eval` changed, and no golden moved. Next: the same comparison on the corpus's programs, which
 read their input and mix both regimes.
 
+## The corpus against the clock, before any fix (2026-09-27)
+
+**Prediction.** Each corpus program's `main`, `time = max(work·τ, moves/BW)` with the constants the
+kernels fitted (τ = 0.0176 ns, BW = 20.8 GB/s), at three generated input sizes; measured wall-clock
+on CPU 5, minimum of three runs, an empty program subtracted (`tests/corpus/timing.py`). `bfs` is
+out: its cost is in `max(start[_])`, a value read from the graph, which `--eval` cannot be given.
+
+| program | size | bound | predicted ms | measured ms | measured/predicted |
+|---|---|---|---|---|---|
+| matmul | n = 100 / 300 / 600 | work / work / moves | 0.18 / 4.81 / 84.2 | 0.25 / 12.5 / 113 | 1.37 / 2.60 / 1.34 |
+| heat | n = 100 / 300 / 900, 50 steps | moves | 2.41 / 21.2 / 189 | 0.02 / 2.40 / 24.2 | 0.01 / 0.11 / 0.13 |
+| fir | 10⁴ / 10⁵ / 10⁶ integers | moves | 145 / 1.45·10⁴ / 4.7·10⁷ | 0.02 / 2.05 / 23.0 | ≈ 10⁻⁴ … 10⁻⁶ |
+| pid | 10⁴ / 10⁵ / 10⁶ integers | moves | 183 / 1.8·10⁴ / 5.9·10⁷ | 0.30 / 2.31 / 21.4 | ≈ 10⁻³ … 10⁻⁶ |
+| csv | 10³ / 10⁴ / 10⁵ rows | work | 16.8 / 2024 / 2.4·10⁵ | ≈ 0 / 0.02 / 2.23 | ≈ 10⁻⁵ |
+
+**What it says.** Where the program is a kernel, the roofline carries over: `matmul` is within
+1.3–2.6×. Everywhere the program reads text, the prediction is a true upper bound and useless as a
+time: 10³ to 10⁶ too high, and growing with the input, because its *moves* are quadratic. Two
+causes, both in how a scan is charged, neither in the roofline:
+- **A scan's accesses are charged a line each.** `xs[i]` with `i` a scan's index is not affine, so
+  § Moves charges it `B` bytes per access — 64 bytes for one byte of text — and never as the stream
+  it is: `i` only grows, so the lines are visited in order, each once.
+- **A scan's footprint is the whole array.** `next_int(xs, start)` claims `xs: [0, xs.len())`, not
+  `[start, xs.len())`, so while the text fits in memory each call is charged a cold read of all of
+  it. Its moves then have no distance form, the amortised scan leaves them per lap, and a loop of
+  calls reads the text once per integer.
+
+`csv` is quadratic in work as well: its row loop steps by what `after_header`-style parsing returns
+through a local the amortised scan does not follow. `heat` is 8× too high in moves: the five reads
+of the stencil are counted as more streams than the rows they share. These are the next changes;
+each is a place the bound is loose, measured, not a constant to tune.
+
 ## The compiler's cost model, on the compiler — and the machine's answer
 
 The self-hosted cost reporter (`compiler/costdump.nt`, compiled by the self-hosted compiler) was
