@@ -702,8 +702,13 @@ bound and errs high. What remains is the same short list, each a place the bound
 - `fir`, `pid`: 2.4× high. A call to `next_int` is charged `3·B` of partly used lines at its ends,
   which consecutive calls share in fact.
 - `csv`: 5–10× high, the same `3·B` a call, three calls a row, on rows of a dozen bytes.
-- `heat`: 8× high in moves. The stencil's five reads are counted as more streams than the three rows
-  they share, a reuse between neighbouring sites § Moves does not yet see.
+- `heat`: 8× high in moves, of which 2× was a plain overcount, fixed the same day: an `if` whose two
+  branches each call `sweep` added both calls' moves, where work took the larger branch. With the
+  larger taken (when it is cheap to know — the same cost, or one dominating regime by regime; the
+  sum otherwise, which a plain `max` of piecewise costs had turned into a regime blow-up on the
+  compiler), `heat` is **0.21 / 0.26** at n = 300 / 900, five of the compiler's lock lines drop and its
+  count does not move. The other 3× is the stencil's five reads counted as more streams than the
+  three rows they share, a reuse between neighbouring sites § Moves does not yet see.
 - `matmul`: 1.4–2.7× low where it is work-bound at small `n`: its inner loop's `work·τ` uses a `τ`
   fitted on a vectorised polynomial, and a strided dot product vectorises worse.
 

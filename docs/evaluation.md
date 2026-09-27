@@ -71,7 +71,7 @@ changes the first timing forced (cost-model § A scan's accesses):
 | `fir`, `pid` (read 10⁴–10⁶ integers, filter / control loop) | 0.41 – 0.53 |
 | `csv` (10³–10⁵ rows) | 0.10 – 0.22 |
 | `matmul` (n = 100–600) | 1.36 – 2.66 |
-| `heat` (n = 100–900, 50 steps) | 0.13 – 0.14 |
+| `heat` (n = 300–900, 50 steps) | 0.21 – 0.26 |
 
 Every program is within **0.10 to 2.7** of its measured time, geometric mean 0.41. Before the scan's
 accesses were charged as a stream, the text readers were 10³ to 10⁶ too high — a bound, and a
@@ -135,7 +135,8 @@ constant to tune:
 - **Strides and the TLB** (`transpose`, 2–3×), and **bandwidth that grows with the number of
   streams** (`dot`, 0.6×).
 - **Reuse between neighbouring sites.** A stencil's five reads are counted as more streams than the
-  three rows they share (`heat`, 8× high).
+  three rows they share (`heat`, 4× high; it was 8× until calls in both branches of an `if` were
+  charged the larger rather than the sum).
 - **Per-call constants in a parse.** `3·B` of partly used lines at each end of a call, which
   consecutive calls share (`csv`, 5–10× high).
 - **A `τ` for code that vectorises worse** than the polynomial it was fitted on (`matmul` at small

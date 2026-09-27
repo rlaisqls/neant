@@ -1090,8 +1090,9 @@ impl<'a, 'b, 'c> Fa<'a, 'b, 'c> {
         self.chase_saved.push(std::mem::replace(&mut self.chase, Cost::zero()));
         self.has_call.push(false);
     }
-    /// Pop a frame (an `if` branch): its calls count once, into the frame below.
-    fn pop_frame(&mut self) -> (Cost, Cost, Cost, Cost) {
+    /// Pop a frame (an `if` branch). Its calls' moves are handed back with the rest, not added to
+    /// the frame below: the two branches are alternatives, and the caller takes the larger.
+    fn pop_frame(&mut self) -> (Cost, Cost, Cost, Cost, Cost) {
         let (pw, pm, psp) = self.saved.pop().unwrap();
         let pc = self.saved_calls.pop().unwrap();
         let pch = self.chase_saved.pop().unwrap();
@@ -1099,8 +1100,7 @@ impl<'a, 'b, 'c> Fa<'a, 'b, 'c> {
         let had = self.has_call.pop().unwrap_or(false);
         if let Some(h) = self.has_call.last_mut() { *h |= had; }
         let calls = std::mem::replace(&mut self.call_moves, pc);
-        self.call_moves = self.call_moves.add(&calls);
-        (std::mem::replace(&mut self.work, pw), std::mem::replace(&mut self.moves, pm), std::mem::replace(&mut self.span, psp), ch)
+        (std::mem::replace(&mut self.work, pw), std::mem::replace(&mut self.moves, pm), std::mem::replace(&mut self.span, psp), ch, calls)
     }
     /// Leave a loop. The body frame is summed over the loop variable. Calls in the body are costed
     /// twice: as walked (cold, the first iteration) and again with the residue the first iteration
@@ -2607,20 +2607,23 @@ impl<'a, 'b, 'c> Fa<'a, 'b, 'c> {
                 self.branch.push((if_id, true));
                 self.push_frame();
                 self.block(t)?;
-                let (wt, mt, spt, cht) = self.pop_frame();
+                let (wt, mt, spt, cht, callt) = self.pop_frame();
                 self.branch.pop();
                 let then_calls: Vec<_> = self.rec_calls.drain(before..).collect();
                 let then_init = std::mem::replace(&mut self.initial, entry_init);
                 self.branch.push((if_id, false));
                 self.push_frame();
                 if let Some(b) = els { self.block(b)?; }
-                let (we, me, spe, che) = self.pop_frame();
+                let (we, me, spe, che, calle) = self.pop_frame();
                 self.branch.pop();
                 // the two branches are alternatives: the cost is the larger, not the sum
                 self.work = self.work.add(&wt.max(&we));
                 self.moves = self.moves.add(&mt.max(&me));
                 self.span = self.span.add(&spt.max(&spe));
                 self.chase = self.chase.add(&cht.max(&che));
+                // and the calls' moves: the larger where that is cheap to know, else both, which
+                // bounds it too — a `max` of piecewise costs multiplies regimes under nested `if`s
+                self.call_moves = self.call_moves.add(&branch_max(&callt, &calle));
                 // a local defined differently on the two sides may hold either value after
                 for (l, tv) in then_init {
                     let merged = match (tv, self.initial.get(&l).cloned().flatten()) {
@@ -3375,4 +3378,22 @@ fn loaded_in_loops(b: &Block) -> Vec<LocalId> {
     let mut out = Vec::new();
     walk(b, false, &mut out);
     out
+}
+
+/// The larger of two branches' costs when it is cheap to know — one side empty, the two the same,
+/// or the same regimes piece by piece with one dominating — and their sum otherwise, which is
+/// never smaller than either.
+fn branch_max(a: &Cost, b: &Cost) -> Cost {
+    if a.pieces.is_empty() { return b.clone(); }
+    if b.pieces.is_empty() || a == b { return a.clone(); }
+    if a.pieces.len() == b.pieces.len() && a.pieces.iter().zip(&b.pieces).all(|(x, y)| x.conds == y.conds) {
+        let pieces = a.pieces.iter().zip(&b.pieces).map(|(x, y)| {
+            let poly = if super::piece::dominates(&x.poly, &y.poly) { x.poly.clone() }
+                else if super::piece::dominates(&y.poly, &x.poly) { y.poly.clone() }
+                else { x.poly.add(&y.poly) };
+            Piece { conds: x.conds.clone(), poly }
+        }).collect();
+        return Cost { pieces };
+    }
+    a.add(b)
 }

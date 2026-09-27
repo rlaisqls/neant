@@ -921,7 +921,9 @@ shared rows, `τ` for code that vectorises worse).
 index is a local the loop loads — a pointer chase — are counted as `chase`, composed like work and
 read only by a time: `(moves − chase)/BW + chase/B · L`, `L = 112 ns` fitted on a 64 MB chase. `arena`
 goes from 5–31× too fast to 0.28–1.00, the kernels' geometric mean from 1.56 to 1.14; no bound, tier or
-report line moved.
+report line moved. The same day: calls in both branches of an `if` had their moves added where work
+took the larger branch; they now take the larger when it is cheap to know and the sum otherwise
+(`heat` 8× → 4× high; five compiler lock lines drop, the count does not move).
 
 ## M7 — the constant factor
 

@@ -29,8 +29,8 @@ mean             work 4·g.len() + 2                moves 8·g.len() + B        
                  lower bound      moves 8·g.len()                    (footprint, every distinct element crosses once)   gap 1× at M = 2 MiB, B = 64
                  footprint        g: [0, 8·g.len())   resident after if 8·g.len() < M
 main             work ≈ 31·n²·steps                moves                              bound, io  (2 regimes)
-                                               moves ≈ 96·n²·steps                if ≈ 48·n < M
-                                               moves ≈ 96·n²·steps                if ≈ 48·n ≥ M
+                                               moves ≈ 48·n²·steps                if ≈ 48·n < M
+                                               moves ≈ 48·n²·steps                if ≈ 48·n ≥ M
                  in `parse_int`: in `next_int`: scan: `i` grows by at least 1 a lap, so the `while` at ../lib/parse.nt:23 runs at most xs.len() − start times
                  rests on         arg (declared, extern); next_int (bound, a scan)
 arg              work ≤ result.len()               moves ≤ result.len()               declared, io
