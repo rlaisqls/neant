@@ -29,6 +29,11 @@ pub struct Machine {
     pub b_bytes: i128,
     /// Processors a `.par()` chain's `T ≤ work/P + span` bound is evaluated at.
     pub p_cores: i128,
+    /// The roofline's two constants (plan § Stage D, decisions §7): nanoseconds per unit of work
+    /// on one core, and bytes per nanosecond across the `M` boundary. Fitted by
+    /// `tests/kernels/roofline.py fit`; a predicted time is `max(span·τ, work·τ/P, moves/BW)`.
+    pub ns_per_work: f64,
+    pub bytes_per_ns: f64,
 }
 
 #[derive(Debug, Clone)]

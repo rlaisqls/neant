@@ -1,0 +1,24 @@
+// compute-bound on one core: a degree-8 Horner polynomial per element of an array that stays in
+// L1 (n·8 bytes, n a few thousand), evaluated many times. Work dominates moves by orders of
+// magnitude, so its time fits `ns per work unit` (the roofline's compute term).
+fn horner(xs: &[f64]) -> f64 {
+    let mut s = 0.0;
+    for i in 0..xs.len() {
+        let x = xs[i];
+        s += (((((((x * 1.0000001 + 0.5) * x + 0.25) * x + 0.125) * x + 0.0625) * x + 0.03125) * x + 0.015625) * x + 0.0078125) * x + 0.00390625;
+    }
+    s
+}
+
+fn main() {
+    let n = @N@;
+    let mut xs = [0.0; n];
+    for i in 0..n {
+        xs[i] = (i % 97) as f64 * 0.001;
+    }
+    let mut total = 0.0;
+    for r in 0..@R@ {
+        total += horner(&xs);
+    }
+    println(total);
+}

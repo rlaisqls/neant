@@ -4,7 +4,7 @@
 //!   neant run   f.nt [--unchecked] [-- args]  build to a temp file and run it
 //!   neant emit  f.nt [--unchecked]            print the generated C
 //!   neant check f.nt                          parse and type-check only
-//!   neant cost  f.nt [-M bytes] [-B bytes] [-P cores] [--eval n=..,..]
+//!   neant cost  f.nt [-M bytes] [-B bytes] [-P cores] [--tau ns] [--bw GB/s] [--eval n=..,..]
 //!                                             infer work, moves and span for every function
 //!   neant lock  f.nt [--check]                write costs.lock next to the source, or diff it
 //!   neant measure f.nt --fn name [--sizes 1000,4000,...] [--shape p=n*n,...] [--repeat k] [--cpu 5] [--lock]
@@ -44,7 +44,7 @@ fn main() {
     let mut checked = true;
     let mut passthrough: Vec<String> = Vec::new();
     let default_p = std::thread::available_parallelism().map(|n| n.get() as i128).unwrap_or(4);
-    let mut machine = cost::Machine { m_bytes: 2 << 20, b_bytes: 64, p_cores: default_p };
+    let mut machine = cost::Machine { m_bytes: 2 << 20, b_bytes: 64, p_cores: default_p, ns_per_work: 0.0176, bytes_per_ns: 20.8 };
     let mut eval: Option<String> = None;
     let mut lock_check = false;
     let mut applies: Vec<String> = Vec::new();
@@ -68,6 +68,8 @@ fn main() {
             "-M" => { i += 1; machine.m_bytes = parse_bytes(args.get(i)); }
             "-B" => { i += 1; machine.b_bytes = parse_bytes(args.get(i)); }
             "-P" => { i += 1; machine.p_cores = args.get(i).and_then(|s| s.parse().ok()).unwrap_or(machine.p_cores); }
+            "--tau" => { i += 1; machine.ns_per_work = args.get(i).and_then(|s| s.parse().ok()).unwrap_or(machine.ns_per_work); }
+            "--bw" => { i += 1; machine.bytes_per_ns = args.get(i).and_then(|s| s.parse().ok()).unwrap_or(machine.bytes_per_ns); }
             "--eval" => { i += 1; eval = args.get(i).cloned(); }
             "--apply" => { i += 1; applies.extend(args.get(i).map(|s| s.split(',').map(String::from).collect::<Vec<_>>()).unwrap_or_default()); }
             "--fn" => { i += 1; m_fn = args.get(i).cloned(); }
@@ -169,6 +171,14 @@ fn main() {
                 if let (Some(ev), cost::CostResult::Exact { work, moves, span }) = (&eval, &c.result) {
                     if let Some((w, m)) = evaluate(c, work, moves, ev, &machine) {
                         print!("{:<16}   at {ev}: work {w:.0}  moves {m:.0} bytes", "");
+                        // the roofline: the longer of the compute and the memory term
+                        // (docs/cost-model.md § Time); span stands for work in sequential code
+                        let p = ev.split(',').find_map(|p| p.split_once('=').filter(|(k, _)| k.trim() == "P").and_then(|(_, v)| v.trim().parse().ok()))
+                            .unwrap_or(machine.p_cores as f64);
+                        let sv = if span != work { eval_one(c, span, ev, &machine).unwrap_or(w) } else { w };
+                        let tw = sv.max(w / p) * machine.ns_per_work;
+                        let tm = m / machine.bytes_per_ns;
+                        print!("  time {:.3e} s ({}-bound)", tw.max(tm) / 1e9, if tw >= tm { "work" } else { "moves" });
                         if span != work {
                             if let Some(s) = eval_one(c, span, ev, &machine) {
                                 // `P` defaults to the machine's own core count unless `ev` names one

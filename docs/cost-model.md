@@ -735,6 +735,29 @@ footprint is kept inexact, so nothing is credited from it and nothing claimed re
 lower bound in that argument is not handed up, and the cost goes through as before — the argument
 `_` in a read's element, which makes it the `max`.
 
+## Time
+
+**Written 2026-09-27, the roofline M5 decided (decisions §7).** `work` counts operations and
+`moves` bytes across the `M` boundary; neither is a time. With `--eval`, a line now also says
+
+    time = max(span·τ, work·τ/P, moves/BW)
+
+and which term bound it: `τ` nanoseconds per unit of work on one core, `BW` bytes per nanosecond
+across `M`, and in sequential code `span = work`, so it is `max(work·τ, moves/BW)`. Both constants
+are the machine's, fitted by `tests/kernels/roofline.py fit` on a pinned big core — `τ` from a
+Horner polynomial over an array in L1 (work dominates by three orders), `BW` from a streaming sum
+over 100 MB (moves dominate by five times) — and set with `--tau` and `--bw`. On this machine
+(Cortex-X925, CPU 5): **τ = 0.0176 ns, BW = 20.8 GB/s**. `τ` is small because a unit of work is an
+operation of the source and the C compiler vectorises and fuses them: it is a rate for this
+compiler's code, not a cycle.
+
+What the model is not, and the measurements say so (experiments.md § The roofline): it has one
+cache level, so data that fits in `M` moves nothing and its time is all work, while L2 and page
+faults are real; it has no latency term, so a pointer chase, one dependent miss at a time, is
+charged as if it streamed; and it charges a strided sweep's lines at the streaming rate, while a
+stride that misses the TLB costs more. Each of those is a named term the model could grow, not a
+constant to tune.
+
 ## The measured tier
 
 `neant measure f.nt --fn name [--sizes …] [--shape p=n*n,…] [--repeat k] [--cpu c] [--lock]`

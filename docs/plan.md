@@ -897,6 +897,16 @@ whose push sits in a trailing `if` was costed as a single pass — `drain` at `x
 `compiler/cost.nt`, seed two rebuilt; the compiler's count does not move (92/49/34/103), and the
 parity counts become work 102, moves 102, footprint 135, bound 146.
 
+**The roofline, 2026-09-27** (cost-model § Time; experiments.md § The roofline). `neant cost --eval`
+prints a time, `max(span·τ, work·τ/P, moves/BW)`, and which term bound it, with `τ` and `BW`
+fitted once on this machine (0.0176 ns per unit of work, 20.8 GB/s) by
+`tests/kernels/roofline.py`. Held fixed across the other kernels, the two constants predict
+wall-clock within about 30% where a stream or a tiled block dominates — `sum` past the cache,
+`matmul_tiled` at every size, `horner`, `matmul_naive` past the cache — and miss by named terms the
+model lacks elsewhere: latency (`arena`, 5–31×, growing with the arena), a second cache level and
+page faults (small sizes, up to 6×), the TLB (`transpose`, 2–3×), and bandwidth that grows with the
+number of streams (`dot`, 0.64). Next is the corpus, program by program.
+
 ## M7 — the constant factor
 
 Prove the asymptote, search the constant. A micro-architectural cost line (what llvm-mca and uiCA

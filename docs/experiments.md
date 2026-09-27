@@ -589,6 +589,58 @@ between the two kernels because `work/P + span` has nothing in it that could tel
   `BW` and re-including the rest of the machine are open, not attempted here.
 
 
+## The roofline: predicted time against wall-clock (2026-09-27)
+
+**Prediction.** `time = max(work·τ, moves/BW)` on one core (cost-model § Time), with `τ` and `BW`
+fitted once and then held fixed for every other kernel.
+
+**Setup.** `tests/kernels/roofline.py`, the release compiler, `taskset -c 5` (a Cortex-X925), the
+minimum of 3–5 runs, an empty program's time (0.87 ms) subtracted, the machine otherwise idle. Fit:
+`horner` at `n = 3000` (24 KB, in L1), 2·10⁴ repeats → **τ = 0.0176 ns/work**; `sum` at
+`n = 12.8·10⁶` (100 MB), 20 repeats → **BW = 20.8 GB/s**, where `work·τ` would have been 19 ms of
+the 108 measured.
+
+| kernel | n | predicted ms | measured ms | measured/predicted |
+|---|---|---|---|---|
+| sum | 200 000 / 800 000 / 3.2·10⁶ / 12.8·10⁶ | 0.30 / 6.77 / 27.1 / 108 | 1.73 / 5.99 / 26.6 / 110 | 5.80 / 0.89 / 0.98 / 1.02 |
+| dot | 200 000 … 12.8·10⁶ | 3.38 … 217 | 2.17 … 150 | 0.64 – 0.71 |
+| saxpy | 200 000 … 12.8·10⁶ | 3.31 … 212 | 1.99 … 204 | 0.60 – 0.97 |
+| horner | 1000 / 30 000 / 3·10⁶ | 21.1 / 21.1 / 25.4 | 21.0 / 21.2 / 32.5 | 1.00 / 1.00 / 1.28 |
+| matmul_tiled | 448 / 832 / 1216 | 16.2 / 103 / 322 | 14.3 / 92.9 / 288 | 0.89 / 0.90 / 0.89 |
+| matmul_naive | 448 / 832 / 1216 | 15.9 / 223 / 696 | 25.2 / 208 / 802 | 1.59 / 0.93 / 1.15 |
+| transpose | 1000 / 2000 / 3000 | 5.02 / 20.0 / 45.1 | 9.70 / 44.0 / 131 | 1.93 / 2.19 / 2.91 |
+| struct_aos | 200 000 / 3.2·10⁶ | 1.61 / 25.9 | 2.21 / 44.4 | 1.37 / 1.72 |
+| struct_soa | 200 000 / 3.2·10⁶ | 0.38 / 11.1 | 2.11 / 35.0 | 5.49 / 3.16 |
+| arena | 65 536 / 1 048 576 / 4 194 304 | 0.25 / 11.3 / 45.2 | 1.26 / 207 / 1410 | 4.98 / 18.3 / 31.2 |
+
+Over the 31 runs of every kernel but `sum`, the geometric mean of measured over predicted is 1.56,
+range 0.60 to 31.
+
+**Where it holds.** Where one term clearly dominates and the access is a stream or a tiled block,
+two constants predict wall-clock within about 30% across two orders of magnitude of size:
+`sum` past `M` (0.89–1.02), `matmul_tiled` at every size (0.89–0.90), `horner` in cache (1.00),
+`matmul_naive` past `M` (0.93–1.15), `saxpy` at the large end (0.87–0.97). That is the claim the
+roofline term was built to test, and on these kernels it holds.
+
+**Where it does not, and why — each a term the model lacks, not a constant off.**
+- **Latency.** `arena` is a pointer chase: one dependent miss at a time. The model charges its
+  lines at the streaming rate, and the ratio grows with the arena, 5 to 31. A latency term — lines
+  that cannot overlap, times the miss latency — is what `max(work, moves/BW)` has no room for.
+- **One cache level.** Data that fits in `M` (2 MiB) moves nothing in the model, so `sum` at
+  200 000 and both `struct` kernels at 200 000 are predicted as pure work, while L2 bandwidth and
+  the page faults of a fresh allocation are real: 5–6× at the small end, gone by 800 000.
+- **Strides and the TLB.** `transpose` reads a column: its lines are counted right (M1), but each
+  touches a new page past a few thousand columns, and the ratio climbs 1.9 → 2.9 with `n`.
+  `struct_soa` at 3.2·10⁶ (3.2) and `matmul_naive` at 448 (1.6) are the same class.
+- **Two streams outrun one.** `dot` and `saxpy` read two or three arrays and are measured faster than
+  predicted (0.60–0.71 at the small end): the fitted `BW` is one stream's, and the prefetchers run
+  several at once. A bandwidth that depends on the number of streams is the refinement.
+
+**What changed.** The `--eval` line prints the time and its bound (`work-bound` / `moves-bound`);
+`--tau` and `--bw` set the constants, defaulting to the fit above. Nothing in any report without
+`--eval` changed, and no golden moved. Next: the same comparison on the corpus's programs, which
+read their input and mix both regimes.
+
 ## The compiler's cost model, on the compiler — and the machine's answer
 
 The self-hosted cost reporter (`compiler/costdump.nt`, compiled by the self-hosted compiler) was
