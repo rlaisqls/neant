@@ -19,6 +19,7 @@ NEANT = HERE / "../../bootstrap/target/release/neant"
 FIT = {
     "horner": (3_000, 20_000),        # 24 KB, in L1; 6·10⁷ evaluations
     "sum":    (12_800_000, 20),       # 100 MB, far past L3
+    "arena":  (4_194_304, 3),         # 64 MB of nodes in a random cycle: one dependent miss a step
 }
 CHECK = {
     "sum":          ([200_000, 800_000, 3_200_000, 12_800_000], 20),
@@ -42,8 +43,8 @@ def predict(nt, extra=()):
     lines = out.splitlines()
     start = next((i for i, l in enumerate(lines) if l.startswith("main")), None)
     for l in lines[(start or 0) + 1:]:
-        m = re.search(r"at .*?: work (\S+)\s+moves (\S+) bytes(?:\s+time (\S+) s)?", l)
-        if m: return float(m.group(1)), float(m.group(2)), (float(m.group(3)) if m.group(3) else None)
+        m = re.search(r"at .*?: work (\S+)\s+moves (\S+) bytes(?:\s+chase (\S+) bytes)?(?:\s+time (\S+) s)?", l)
+        if m: return float(m.group(1)), float(m.group(2)), (float(m.group(4)) if m.group(4) else None), float(m.group(3) or 0)
         if l and not l.startswith(" "): break
     sys.exit("could not read prediction from:\n" + out)
 
@@ -83,6 +84,7 @@ def main():
     ap.add_argument("--runs", type=int, default=5)
     ap.add_argument("--tau", type=float)
     ap.add_argument("--bw", type=float)
+    ap.add_argument("--lat", type=float)
     ap.add_argument("kernels", nargs="*")
     a = ap.parse_args()
     if not NEANT.exists():
@@ -93,22 +95,29 @@ def main():
     if a.mode == "fit":
         n, r = FIT["horner"]
         nt, b = build((HERE / "horner.nt.in").read_text(), "horner", n, r, work)
-        w, mv, _ = predict(nt)
+        w, mv, _, _ = predict(nt)
         t = wall(b, a.cpu, a.runs) - base
         tau = t / w * 1e9
         print(f"horner n={n} R={r}: work {w:.3e}  moves {mv:.3e}  time {t*1e3:.1f} ms  →  τ = {tau:.4f} ns per work unit")
         n, r = FIT["sum"]
         nt, b = build((HERE / "sum.nt.in").read_text(), "sum", n, r, work)
-        w, mv, _ = predict(nt)
+        w, mv, _, _ = predict(nt)
         t = wall(b, a.cpu, a.runs) - base
         bw = mv / t / 1e9
         print(f"sum n={n} R={r}: work {w:.3e}  moves {mv:.3e}  time {t*1e3:.1f} ms  →  BW = {bw:.2f} GB/s"
               f"  (work·τ would be {w*tau/1e6:.1f} ms)")
-        print(f"\nneant cost --tau {tau:.4f} --bw {bw:.2f}")
+        n, r = FIT["arena"]
+        nt, b = build((HERE / "arena.nt.in").read_text(), "arena", n, r, work)
+        w, mv, _, ch = predict(nt)
+        t = wall(b, a.cpu, a.runs) - base
+        lat = (t - (mv - ch) / (bw * 1e9)) / (ch / 64) * 1e9
+        print(f"arena n={n} R={r}: moves {mv:.3e}  of them a chase {ch:.3e}  time {t*1e3:.1f} ms  →  L = {lat:.1f} ns a chased line")
+        print(f"\nneant cost --tau {tau:.4f} --bw {bw:.2f} --lat {lat:.1f}")
         return
     extra = []
     if a.tau is not None: extra += ["--tau", str(a.tau)]
     if a.bw is not None: extra += ["--bw", str(a.bw)]
+    if a.lat is not None: extra += ["--lat", str(a.lat)]
     print(f"  {'kernel':<14} {'n':>10} {'pred work':>11} {'pred bytes':>11} {'pred ms':>9} {'meas ms':>9} {'meas/pred':>9}")
     ratios = []
     for k in a.kernels or list(CHECK):
@@ -117,7 +126,7 @@ def main():
         for n in sizes:
             r = reps_for(k, n, reps)
             nt, b = build(src, k, n, r, work)
-            w, mv, pt = predict(nt, extra)
+            w, mv, pt, _ = predict(nt, extra)
             if pt is None: sys.exit("neant cost printed no time: rebuild the compiler with the roofline term")
             t = wall(b, a.cpu, a.runs) - base
             ratios.append(t / pt)

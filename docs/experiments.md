@@ -636,6 +636,15 @@ roofline term was built to test, and on these kernels it holds.
   predicted (0.60–0.71 at the small end): the fitted `BW` is one stream's, and the prefetchers run
   several at once. A bandwidth that depends on the number of streams is the refinement.
 
+**The latency term, added the same day** (cost-model § Time, latency). A chase's lines are counted
+apart and charged `L` each instead of `B/BW`, `L` fitted on `arena` at 4 194 304 nodes (64 MB):
+**L = 112 ns**, `τ` and `BW` refitting to 0.0177 ns and 20.8 GB/s. With the three constants held
+fixed, `arena` goes from 4.98 / 18.3 / 31.2 to **0.28 / 0.58 / 1.00** at 65 536 / 1 048 576 /
+4 194 304 nodes, every other kernel is where it was (no other kernel chases), and the geometric mean
+of measured over predicted over the 31 runs goes from 1.56 to **1.14**. What is left of the `arena`
+row is the missing cache levels again: at 16 MB the arena fits in L3 and waits for L3, and at 1 MB it
+fits in L2.
+
 **What changed.** The `--eval` line prints the time and its bound (`work-bound` / `moves-bound`);
 `--tau` and `--bw` set the constants, defaulting to the fit above. Nothing in any report without
 `--eval` changed, and no golden moved. Next: the same comparison on the corpus's programs, which

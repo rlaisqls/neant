@@ -45,7 +45,10 @@ conflicts at power-of-two strides, which the sweeps avoid on purpose.
 cost-model § Time, experiments.md § The roofline, § The corpus against the clock (both tables).
 `time = max(span·τ, work·τ/P, moves/BW)`, with `τ = 0.0176 ns` per unit of work and
 `BW = 20.8 GB/s`, fitted once — `τ` on a polynomial in L1, `BW` on a 100 MB stream — and then held
-fixed for everything else.
+fixed for everything else; and a latency term, `chase/B · L` in place of `chase/BW` for the lines a
+pointer chase fetches, with `L = 112 ns` fitted on a chase over 64 MB. The geometric mean of
+measured over predicted over the kernels' 31 runs is 1.14 (it was 1.56 before the latency term, when
+`arena` was 5–31× too low).
 
 **Kernels** (31 runs, `tests/kernels/roofline.py`):
 
@@ -57,7 +60,8 @@ fixed for everything else.
 | two or three streams (`dot`, small `saxpy`) | 0.60 – 0.71 |
 | `transpose` (a new page a column) | 1.9 – 2.9 |
 | data that fits in `M`, and fresh allocations | up to 6 |
-| `arena`, a pointer chase | 5 – 31, growing with the arena |
+| `arena`, a pointer chase past L3, with the latency term | 1.00 |
+| `arena` inside L3 / inside L2 | 0.58 / 0.28 |
 
 **The corpus's programs** (`tests/corpus/timing.py`, three generated input sizes each), after the
 changes the first timing forced (cost-model § A scan's accesses):
@@ -125,9 +129,9 @@ were found through stage D says the next one is likely.
 Each of these is a term the model lacks or a shape the calculus does not reach, measured, not a
 constant to tune:
 
-- **Latency.** A pointer chase is charged its lines at the streaming rate (`arena`, 5–31×).
 - **One cache level.** Data inside `M` moves nothing in the model; L2 bandwidth and page faults are
-  real (small sizes, up to 6×).
+  real (small sizes, up to 6×), and a chase inside L3 waits for L3 rather than memory (`arena`,
+  0.28–0.58 there). The latency term closed the chase's gap past the last cache (5–31× → 1.00).
 - **Strides and the TLB** (`transpose`, 2–3×), and **bandwidth that grows with the number of
   streams** (`dot`, 0.6×).
 - **Reuse between neighbouring sites.** A stencil's five reads are counted as more streams than the
@@ -164,6 +168,6 @@ part of ordinary code *exactly* — the compiler is a third exact, a third state
 a callee, a third unknown — and every place it is loose is a named term or shape, each with the
 measurement that found it.
 
-Next, in the order they would change these numbers: a latency term (the `arena` row), reuse between
-neighbouring sites (`heat`), the parse's per-call constants (`csv`), a second machine for `τ` and
-`BW`, and, for reach, recursion over an arena tree.
+Next, in the order they would change these numbers: reuse between neighbouring sites (`heat`), a
+second cache level (the small sizes, and a chase inside L3), the parse's per-call constants (`csv`),
+a second machine for `τ`, `BW` and `L`, and, for reach, recursion over an arena tree.

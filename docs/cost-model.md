@@ -784,12 +784,23 @@ over 100 MB (moves dominate by five times) — and set with `--tau` and `--bw`. 
 operation of the source and the C compiler vectorises and fuses them: it is a rate for this
 compiler's code, not a cycle.
 
+**Latency (2026-09-27).** A pointer chase fetches one line, waits for it, and only then knows the
+next address: its lines do not overlap, and `moves/BW` charges them as if they streamed. So the
+lines fetched by an access whose index is a local the loop assigned from a load — `i = nodes[i].next;
+… nodes[i]` — are also counted as `chase`, a part of `moves`, composed through calls and loops as work
+is, and the memory term becomes
+
+    (moves − chase)/BW + chase/B · L
+
+with `L` the nanoseconds a chased line waits, fitted on a chase over a 64 MB arena in a random
+cycle: **L = 112 ns**. `chase` is only ever read by a time: no bound, tier or report line changes,
+and `--eval` prints it when it is not zero.
+
 What the model is not, and the measurements say so (experiments.md § The roofline): it has one
 cache level, so data that fits in `M` moves nothing and its time is all work, while L2 and page
-faults are real; it has no latency term, so a pointer chase, one dependent miss at a time, is
-charged as if it streamed; and it charges a strided sweep's lines at the streaming rate, while a
-stride that misses the TLB costs more. Each of those is a named term the model could grow, not a
-constant to tune.
+faults are real, and a chase over an arena that fits in L3 waits for L3, not memory; and it charges a
+strided sweep's lines at the streaming rate, while a stride that misses the TLB costs more. Each of
+those is a named term the model could grow, not a constant to tune.
 
 ## The measured tier
 

@@ -917,6 +917,12 @@ is now predicted within 0.10–2.7 of its measured time, geometric mean 0.41, er
 should; what is left is listed where it is measured (`3·B` a call at a parse's ends, the stencil's
 shared rows, `τ` for code that vectorises worse).
 
+**A latency term, 2026-09-27** (cost-model § Time, latency). The lines an access fetches when its
+index is a local the loop loads — a pointer chase — are counted as `chase`, composed like work and
+read only by a time: `(moves − chase)/BW + chase/B · L`, `L = 112 ns` fitted on a 64 MB chase. `arena`
+goes from 5–31× too fast to 0.28–1.00, the kernels' geometric mean from 1.56 to 1.14; no bound, tier or
+report line moved.
+
 ## M7 — the constant factor
 
 Prove the asymptote, search the constant. A micro-architectural cost line (what llvm-mca and uiCA
