@@ -1213,7 +1213,9 @@ impl<'a, 'b, 'c> Fa<'a, 'b, 'c> {
         self.paged = self.paged.add(&rec.sum_cost(&body_paged));
         self.divs = self.divs.add(&rec.sum_cost(&body_divs));
         // a loop whose lap waits on the last one: all its work is serial, nested loops' included
-        self.serial = self.serial.add(&rec.sum_cost(if carried_chain(body) { &w } else { &body_serial }));
+        // through memory only the chained stores wait, one unit each a lap
+        let chained = memory_chain(body, rec.var);
+        self.serial = self.serial.add(&rec.sum_cost(&if carried_chain(body) { w.clone() } else { body_serial.add_poly(&Poly::constant(chained as i128)) }));
         // an ordinary loop is sequential: its span sums the same way work does
         self.span = self.span.add(&rec.sum_cost(&sp));
         if had_call {
@@ -3743,4 +3745,47 @@ fn carried_chain(b: &Block) -> bool {
         })
     }
     walk(b, &lets)
+}
+
+/// How many stores a loop body makes to an array element of a value read from that same element, at an index
+/// that does not move with the loop: `xs[k] = xs[k] − …`, `bs[i].vx = bs[i].vx − dx·m` in a loop over
+/// `j`. Each lap's load waits for the last lap's store, whatever the operation (cost-model § Time,
+/// serial work, through memory).
+fn memory_chain(b: &Block, var: Option<LocalId>) -> usize {
+    fn same(a: &Expr, b: &Expr) -> bool {
+        match (&a.kind, &b.kind) {
+            (ExprKind::Local(x), ExprKind::Local(y)) => x == y,
+            (ExprKind::Int(x), ExprKind::Int(y)) => x == y,
+            (ExprKind::Binary(o, l, r), ExprKind::Binary(p, m, n)) => o == p && same(l, m) && same(r, n),
+            _ => false,
+        }
+    }
+    fn reads(e: &Expr, arr: LocalId, idx: &Expr, field: Option<usize>) -> bool {
+        match &e.kind {
+            ExprKind::Index(a, i) if field.is_none() => *a == arr && same(i, idx),
+            ExprKind::Field(inner, fi) => match &inner.kind {
+                ExprKind::Index(a, i) => Some(*fi) == field && *a == arr && same(i, idx),
+                _ => reads(inner, arr, idx, field),
+            },
+            ExprKind::Binary(_, l, r) | ExprKind::MinMax(_, l, r) => reads(l, arr, idx, field) || reads(r, arr, idx, field),
+            ExprKind::Unary(_, x) | ExprKind::Cast(x, _) => reads(x, arr, idx, field),
+            _ => false,
+        }
+    }
+    // an index that moves with the loop is one the body assigns, or a local it binds per lap
+    let mut moving: Vec<LocalId> = var.into_iter().collect();
+    for s in &b.stmts { match s { Stmt::Assign(LValue::Var(v), _, _) | Stmt::Let(v, _) => moving.push(*v), _ => {} } }
+    fn fixed(e: &Expr, moving: &[LocalId]) -> bool {
+        match &e.kind {
+            ExprKind::Local(l) => !moving.contains(l),
+            ExprKind::Int(_) => true,
+            ExprKind::Binary(_, l, r) => fixed(l, moving) && fixed(r, moving),
+            _ => false,
+        }
+    }
+    b.stmts.iter().filter(|s| match s {
+        Stmt::Assign(LValue::Index(a, i, _), op, e) => fixed(i, &moving) && (op.is_some() || reads(e, *a, i, None)),
+        Stmt::Assign(LValue::IndexField(a, i, f, _), op, e) => fixed(i, &moving) && (op.is_some() || reads(e, *a, i, Some(*f))),
+        _ => false,
+    }).count()
 }

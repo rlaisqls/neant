@@ -879,6 +879,13 @@ map: **τ_s = 0.155 ns**, nine times `τ`. A reduction, `s += f(x[i])`, carries 
 serial. Mandelbrot goes from 4.2× too fast to 0.50, the half an upper bound's: its 50 laps are the most
 a point can take. Only a time reads `serial`.
 
+*Through memory.* A store to an array element of a value read from that same element, at an index
+the loop does not move — `bs[i].vx = bs[i].vx − dx·m` in a loop over `j` — makes each lap's load wait
+for the last lap's store, whatever the operation. Such a store is one unit of serial work a lap (only
+the chained operation waits; the rest of the lap overlaps), where a scalar multiply chain makes the
+whole loop serial. Charging the whole loop for a memory chain was tried first and took n-body from
+2.3× too fast to 2.7× too slow.
+
 **Divisions (2026-09-28).** An `f64` division is one unit of work to the calculus and several to
 the machine: its throughput is a fraction of an add's. Divisions are counted apart as `divs`,
 composed as work is, and charged `τ_div = 0.148 ns` each beyond their unit, fitted on a sum of

@@ -960,7 +960,9 @@ divisions counted apart and charged `τ_div = 0.148 ns` more (a sum of reciproca
 widened over outer laps and clamped to the site's field, and a call on a resident footprint moving
 nothing (cost-model § Moves): n-body's per-step moves go to zero, which its refills confirm, and it is
 2.3× too fast instead of 3.7× too slow; thirteen goldens' `main`s drop a constant, the self-hosted pass
-is listed as charging those calls (`RESIDENT_INSTEAD`), and the compiler's count does not move.
+is listed as charging those calls (`RESIDENT_INSTEAD`), and the compiler's count does not move. A
+store chained through memory at a fixed index is a serial unit a lap: n-body 2.3 → 1.76, the Benchmarks
+Game programs within 0.50–1.77.
 
 ## M7 — the constant factor
 

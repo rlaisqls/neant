@@ -791,7 +791,10 @@ and the L2 refills agree that nothing moves per step (220–280 KB at 10³, 10�
 program's 180 KB of start-up included). What is left there is compute the constants do not see: inner
 loops of four laps or fewer, and `bs[i].vx` accumulated through memory on every lap — a chain the
 serial rule, which looks at scalars, does not follow. The three programs are within 0.47–2.28, geometric
-mean 1.11; the corpus 0.60, the kernels 1.13.
+mean 1.11; the corpus 0.60, the kernels 1.13. **The velocity chain through memory**, a store of
+`bs[i].vx` from `bs[i].vx` with `i` fixed in the loop, is one serial unit a lap (cost-model § Time,
+serial work, through memory): n-body 2.28 → **1.76**, the three programs within 0.50–1.77, geometric
+mean 1.09. Counting the whole loop serial instead overshot, to 0.37.
 
 ## The compiler's cost model, on the compiler — and the machine's answer
 

@@ -196,8 +196,12 @@ not been built.
 
 ## What this is not
 
-**It predicts movement, not time.** `moves` is bytes across one cache boundary in an ideal cache
-of one size `M`. The machine has three levels, a TLB the model does not mention that dominates at
+**It predicts time only within a factor.** `moves` is bytes across one cache boundary in an ideal
+cache of one size `M`, and `neant cost --eval` turns work and moves into a time with five constants
+fitted once on one core (docs/cost-model.md § Time) — a roofline with a latency term for a pointer
+chase, a slower rate for work on a dependency chain and for division. Held fixed, they put five
+Benchmarks Game programs within 0.5–1.8× of their measured time and the project's own corpus within
+a few times, erring high as a bound should; that is a factor, not a number (docs/evaluation.md). The machine has three levels, a TLB the model does not mention that dominates at
 large strides, set associativity that made one tiled product 75× slower at a stride with a big
 power of two in it, and a transition from "fits" to "does not" that the model puts at one `n` and
 the hardware spreads over an octave. `O(·)` does not capture constants either: a function can meet
@@ -248,20 +252,21 @@ you find obvious, the bargain Rust struck with the borrow checker made for time 
 
 ## Status
 
-Built and measured, 2026-09-22, in `bootstrap/`: a Rust compiler emitting C for the subset
-described above; `neant cost`, `lock`, `measure`, `--apply`; the calculus with piecewise costs,
-exact loop summation and solved recurrences; the M1 experiment (passed on the second rule set)
-and the M2 rewrite measurement (tile: 53× less traffic, predicted 39×). The corpus tier count
-above is the honest coverage number. Record of the sweeps: [docs/experiments.md](docs/experiments.md);
-the calculus as implemented: [docs/cost-model.md](docs/cost-model.md); decisions with their
-reasons: [docs/decisions.md](docs/decisions.md); what is next and in what order:
-[docs/plan.md](docs/plan.md).
+2026-09-28. `bootstrap/` is the Rust compiler (seed one), emitting C; `compiler/` is the compiler in
+neant, which compiles itself to a fixpoint (seed two, `bootstrap/neant.c`), its own cost pass included
+and checked column by column against the Rust one. The language has structs with a chosen AoS/SoA
+layout, arenas, owned returns, fixed-size arrays by value, modules (`use "file.nt"`), program input
+(`arg`, `read_file`), text output and a small `std/`; `neant hints` and `neant lsp` put the grey text
+in an editor.
 
-Next is not M4 but three stages that make the cost object compose: signatures that carry a
-footprint and a residue so a callee is never re-analysed (A); declarations first, with budgets in
-real units and callers seeing only the callee's declaration (B); and the boundary as a declared,
-measured, audited thing (C). Each has an exit test and a kill condition, and all three run on the
-subset that exists. M4 stands on A.
+The calculus states a cost for 180 of the compiler's own 278 functions (94 exact, 51 modulo a
+callee, 35 a bound) and for every function-level `main` of an eight-program domain corpus; five
+Benchmarks Game programs are 11 of 15 functions exact. What was measured against what, and where it
+fails and why: [docs/evaluation.md](docs/evaluation.md). The sweeps behind it:
+[docs/experiments.md](docs/experiments.md); the calculus as implemented:
+[docs/cost-model.md](docs/cost-model.md); decisions with their reasons:
+[docs/decisions.md](docs/decisions.md); what was done in what order and what is next:
+[docs/plan.md](docs/plan.md).
 
 This repository previously held a different language of the same name — a k-family array language
 with a self-hosted arm64 JIT and a checker that read the emitted machine code to decide whether a
