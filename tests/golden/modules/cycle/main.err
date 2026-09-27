@@ -1,0 +1,1 @@
+b.nt:3:1: `use "a.nt"` closes a cycle: a.nt → b.nt → a.nt

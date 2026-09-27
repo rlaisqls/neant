@@ -1,0 +1,5 @@
+use "util.nt";
+
+fn main() {
+    println(inc(1));
+}

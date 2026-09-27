@@ -1,0 +1,5 @@
+// a string literal is read-only: it is passed where `&[u8]` is taken, not `&mut [u8]`
+fn upper(s: &mut [u8]) { s[0] = b'M'; }
+fn main() {
+    upper("mean");
+}

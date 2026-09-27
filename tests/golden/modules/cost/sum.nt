@@ -1,0 +1,15 @@
+fn sum(xs: &[i64]) -> i64 {
+    let mut t = 0;
+    for i in 0..xs.len() {
+        t += xs[i];
+    }
+    t
+}
+
+fn walk(xs: &[i64]) -> i64 {
+    let mut i = 0;
+    while i < xs.len() {
+        i = i + xs[i];
+    }
+    i
+}

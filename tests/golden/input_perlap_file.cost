@@ -1,0 +1,5 @@
+main             unknown: calls `read_file` in a loop: what it reads is a size of its own at every iteration, `result.len()` (line 8), io
+                 rests on         arg_count (declared, extern); arg (declared, extern); read_file (declared, extern)
+arg_count        work ≤ 10                         moves ≤ 0                          declared, io
+arg              work ≤ result.len()               moves ≤ result.len()               declared, io
+read_file        work ≤ result.len() + path.len() + 2500 moves ≤ result.len() + path.len()  declared, io

@@ -1,0 +1,7 @@
+// a grid is sized once: its dimensions are literals, immutable `i64`s or lengths
+fn main() {
+    let mut n = 3;
+    n += 1;
+    let g = [[0; n]; 2];
+    println(g[1][1]);
+}

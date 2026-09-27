@@ -1,0 +1,24 @@
+// A program's arguments: `neant run input_args.nt -- …` hands it everything after `--`
+// (input_args.args, one per line). Each is a `[u8]` with a length of its own, `a.len()` here,
+// which the loop below is exact in, the way it would be in a parameter's.
+
+fn checksum(xs: &[u8]) -> i64 {
+    let mut s = 0;
+    for i in 0..xs.len() {
+        s += xs[i] as i64;
+    }
+    s
+}
+
+fn main() {
+    println(arg_count());
+    let a = arg(0);
+    let mut s = 0;
+    for i in 0..a.len() {
+        s += a[i] as i64;
+    }
+    println(a.len());
+    println(s);
+    let b = arg(1);
+    println(checksum(&b));
+}

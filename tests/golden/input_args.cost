@@ -1,0 +1,7 @@
+checksum         work 5·xs.len()                   moves xs.len() + B                 exact
+                 lower bound      moves xs.len()                     (footprint, every distinct element crosses once)   gap 1× at M = 2 MiB, B = 64
+                 footprint        xs: [0, xs.len())   resident after if xs.len() < M
+main             work 6·b.len() + 6·a.len() + 22   moves 2·b.len() + 2·a.len() + 2·B  exact, io
+                 rests on         arg_count (declared, extern); arg (declared, extern)
+arg_count        work ≤ 10                         moves ≤ 0                          declared, io
+arg              work ≤ result.len()               moves ≤ result.len()               declared, io

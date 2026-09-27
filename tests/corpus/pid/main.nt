@@ -1,0 +1,70 @@
+// A PID controller holding a second-order plant to a setpoint trajectory. The trajectory is a
+// file named on the command line, one setpoint per line in thousandths; the plant is a
+// discretised mass-spring-damper, its state a fixed-size vector stepped by value.
+
+use "../lib/parse.nt";
+use "../lib/math.nt";
+
+struct Plant { a: [f64; 4], b: [f64; 2], x: [f64; 2] }
+struct Pid { kp: f64, ki: f64, kd: f64, integ: f64, prev: f64 }
+
+// x' = A x + b u
+fn plant_step(p: Plant, u: f64) -> Plant {
+    let mut n = p;
+    for i in 0..2 {
+        let mut acc = p.b[i] * u;
+        for j in 0..2 {
+            acc += p.a[2 * i + j] * p.x[j];
+        }
+        n.x[i] = acc;
+    }
+    n
+}
+
+fn pid_step(c: Pid, err: f64, dt: f64) -> Pid {
+    let mut n = c;
+    n.integ = c.integ + err * dt;
+    n.prev = err;
+    n
+}
+
+fn pid_out(c: Pid, err: f64, dt: f64) -> f64 {
+    c.kp * err + c.ki * (c.integ + err * dt) + c.kd * (err - c.prev) / dt
+}
+
+fn abs(x: f64) -> f64 {
+    if x < 0.0 { -x } else { x }
+}
+
+fn main() {
+    let path = arg(0);
+    let text = read_file(&path);
+    let n = count_ints(&text);
+    let mut sp = [0; n];
+    read_ints(&text, &mut sp);
+
+    let dt = 0.01;
+    let mut plant = Plant { a: [1.0, 0.01, -0.04, 0.98], b: [0.0, 0.01], x: [0.0; 2] };
+    let mut pid = Pid { kp: 20.0, ki: 8.0, kd: 0.5, integ: 0.0, prev: 0.0 };
+    let mut worst = 0.0;
+    let mut total = 0.0;
+    let mut sq = 0.0;
+    for k in 0..sp.len() {
+        let target = sp[k] as f64 / 1000.0;
+        let err = target - plant.x[0];
+        let u = pid_out(pid, err, dt);
+        pid = pid_step(pid, err, dt);
+        plant = plant_step(plant, u);
+        let e = abs(err);
+        total += e;
+        sq += err * err;
+        if e > worst {
+            worst = e;
+        }
+    }
+    println(n);
+    println(plant.x[0]);
+    println(total / n as f64);
+    println(worst);
+    println(sqrt(sq / n as f64));
+}

@@ -234,6 +234,59 @@ noise over the repeats — against a tolerance of one line. Confirmed; the lockf
 `declared  measured over n = 1000..16000: confirmed`, and `total`, which calls it, `rests on labs
 (declared, extern)`. A small thing measured; the shape of the chain is the point.
 
+## The standard library's declarations, and the builtins', measured
+
+**2026-09-26, Cortex-X925, `taskset -c 5`** (`--cpu 5`; glibc 2.39, gcc 13.3 `-O2`, Linux
+6.17). The eight libm externs in `std/math.nt` were declared from the implementations' common
+paths, and the five builtins (`arg_count`, `arg`, `read_file`, `file_size`, and `print_bytes`,
+decisions §13) from the earlier sweep. `neant measure --fn <name>` builds the driver with and
+without the call, runs each under `perf stat -e instructions,l2d_cache_refill` three times, keeps
+the fewest instructions, and subtracts; per call below.
+
+**The first finding is about the driver.** Run as it was, every libm function measured **0.0
+instructions a call** and was "confirmed": the driver passed `1.0` to an `f64` parameter, and gcc,
+which knows `sqrt`, `exp` and the rest, folded `sqrt(1.0)` to a constant — the loop measured
+nothing. Stage C's `labs` confirmation (above, "gcc inlines its own `labs`") was the same thing.
+An `f64` argument now varies with the repeat loop, `r·0.001 + 0.5` (0.5..100.5 over 100 000
+repeats), and the baseline computes the same value in place of the call, so the difference is the
+call alone.
+
+| function | declared before | measured / call | declared now | verdict at the new one |
+|---|---|---|---|---|
+| `sqrt` | 20 | 3.7 | 5 | confirmed |
+| `floor` | 5 | 0.9 | 2 | confirmed |
+| `ceil` | 5 | 1.0 | 2 | confirmed |
+| `exp` | 80 | 42.0 | 50 | confirmed |
+| `log` | 80 | 55.7 | 65 | confirmed |
+| `sin` | 100 | 119.0 | 140 | confirmed |
+| `cos` | 100 | 122.8 | 140 | confirmed |
+| `pow` | 200 | 111.0 | 130 | confirmed |
+
+Sizes 1000, 4000, 16000 (they do not enter a scalar function; the per-call numbers agree to the
+instruction across them), moves 0.0–0.8 bytes a call, process noise, against a declared 0. `sin`
+and `cos` were **under-declared**: 119 and 123 against 100, confirmed only by the tolerance
+(×1.5 + 2); they are 140 now, and for a large argument their reduction takes a longer path than
+this range reaches. The rest were over-declared by up to 5×; `sqrt`, `floor` and `ceil` are one or
+two instructions once inlined.
+
+The builtins, 10 000 calls a size (1000 for `print_bytes`, which writes them to a pipe):
+
+| builtin | declared | measured / call, n = 1000 → 32000 | verdict |
+|---|---|---|---|
+| `arg_count` | 10 / 0 | 12.3 / 1.8–5.2 bytes | confirmed (tolerance) |
+| `arg` | `result.len()` / same | 603 → 10316, ≈ `n/3 + 300` / 4–110 bytes | confirmed |
+| `read_file` | `result.len() + path.len() + 2500` / `result.len() + path.len()` | 2264 → 4320 / 12–87 bytes | confirmed |
+| `file_size` | `path.len() + 2500` / `path.len()` | 1974–2002 / 3–5 bytes | confirmed |
+| `print_bytes` | `s.len() + 60` / `s.len()` | 142 at n = 1, 138 at 10, 147 at 100, 317 at 1000, 948 at 32000 | **exceeded** at n ≤ 10 |
+
+The input builtins are as the earlier sweep left them (cost-model § Program input): `arg_count`
+is still 12.3 against 10, inside the tolerance and not raised here. `print_bytes`'s first
+constant, 60, was a guess, and a call costs about 140 instructions of `fwrite` and the check before
+it; per byte it is well under one (the stdio buffer takes the bytes, the kernel's copy is not
+counted), so the declaration is now `s.len() + 200` and confirmed from 1 byte to 32 000. Moves are
+confirmed only as not exceeded, as for the input builtins: a write goes through stdio and the
+kernel, which the counter and the model do not see.
+
 ## Lower bounds — IOLB, and the compiler's own
 
 **Question.** With IOLB (Olivry et al. 2020) hooked up through `neant emit --scop` and

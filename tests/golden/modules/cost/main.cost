@@ -1,0 +1,6 @@
+sum              work 4·xs.len()                   moves 8·xs.len() + B               exact
+                 lower bound      moves 8·xs.len()                   (footprint, every distinct element crosses once)   gap 1× at M = 2 MiB, B = 64
+                 footprint        xs: [0, 8·xs.len())   resident after if 8·xs.len() < M
+walk             unknown: `i` is compared in the `while` condition but is not stepped by a constant exactly once in the body; `while` has no measure the compiler can find; write `while cond decreasing <expr>` with an `i64` that goes down by at least one every iteration (sum.nt:11)
+main             work work[walk](4) + 26           moves moves[walk](4) + B + 64      modulo, io
+                 rests on         walk (unknown)

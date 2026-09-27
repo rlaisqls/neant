@@ -1,0 +1,8 @@
+use "lib.nt";
+
+fn main() {
+    println(count());
+    if count() > 0 {
+        println(first_len());
+    }
+}

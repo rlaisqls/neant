@@ -10,6 +10,7 @@
 //!   neant measure f.nt --fn name [--sizes 1000,4000,...] [--shape p=n*n,...] [--repeat k] [--cpu 5] [--lock]
 //!                                             run the function over a size sweep under perf and fit ~n^k
 //!   any command: --apply fn:tile[,fn:transpose]  rewrite a function first
+//!   neant hints [--stdin] f.nt                every function's cost and every error as JSON, for an editor
 //!   neant lexdump f.nt   this lexer's token kinds, one per line, numbered per compiler/lex.nt's
 //!                        own scheme (`lex_kind_number`) — the self-hosted lexer's cross-check
 //!                        (bootstrap/tests/self_host_lex.rs, docs/self-hosting-design.md)
@@ -18,8 +19,11 @@ mod ast;
 mod cost;
 mod diag;
 mod emit_c;
+mod hints;
+mod input;
 mod ir;
 mod lex;
+mod modules;
 mod parse;
 mod types;
 
@@ -50,6 +54,9 @@ fn main() {
     let mut m_lock = false;
     let mut scop_fn: Option<String> = None;
     let mut use_iolb = false;
+    // `--stdin`: the source is read from stdin and `file` only names it — an editor's unsaved
+    // buffer, whose `use`s resolve from where the file is (editors/README.md)
+    let mut from_stdin = false;
     let mut i = 1;
     while i < args.len() {
         match args[i].as_str() {
@@ -69,6 +76,7 @@ fn main() {
             "--lock" => m_lock = true,
             "--scop" => { i += 1; scop_fn = args.get(i).cloned(); }
             "--iolb" => use_iolb = true,
+            "--stdin" => from_stdin = true,
             "--" => { passthrough = args[i + 1..].to_vec(); break; }
             a if a.starts_with('-') => { eprintln!("unknown flag {a}"); process::exit(2); }
             a => file = Some(PathBuf::from(a)),
@@ -79,7 +87,12 @@ fn main() {
         eprintln!("no input file");
         process::exit(2);
     };
-    let src = match std::fs::read_to_string(&file) {
+    let src = if from_stdin {
+        let mut s = String::new();
+        if let Err(e) = std::io::Read::read_to_string(&mut std::io::stdin(), &mut s) { eprintln!("stdin: {e}"); process::exit(2); }
+        Ok(s)
+    } else { std::fs::read_to_string(&file) };
+    let src = match src {
         Ok(s) => s,
         Err(e) => { eprintln!("{}: {e}", file.display()); process::exit(2); }
     };
@@ -101,12 +114,18 @@ fn main() {
         }
         return;
     }
-    let mut module = match compile(&src) {
+    if cmd == "hints" { print!("{}", hints::run(&file, &src, &machine)); return; }
+    // the root and every file it `use`s, in one line space (docs/modules-design.md)
+    let (prog, sources) = match modules::load(&file, &src) {
+        Ok(p) => p,
+        Err(e) => { eprintln!("{e}"); process::exit(1); }
+    };
+    let mut module = match types::check(&prog) {
         Ok(m) => m,
-        Err(e) => { eprintln!("{}:{e}", file.display()); process::exit(1); }
+        Err(e) => { eprintln!("{}", sources.error(&e)); process::exit(1); }
     };
     if let Err(e) = cost::analyze::apply_rewrites(&mut module, &applies, &machine) {
-        eprintln!("{e}");
+        eprintln!("{}", sources.relabel(&e));
         process::exit(1);
     }
     // the layout of every struct array, chosen before anything is costed or emitted
@@ -117,7 +136,7 @@ fn main() {
         let costs = cost::analyze(&module, &machine);
         let bad: Vec<&String> = costs.iter().flat_map(|c| c.violations.iter()).collect();
         if !bad.is_empty() {
-            for v in bad { eprintln!("{}:{v}", file.display()); }
+            for v in bad { eprintln!("{}", sources.violation(v)); }
             process::exit(1);
         }
     }
@@ -143,7 +162,7 @@ fn main() {
                 }
             }
             for c in &costs {
-                print!("{}", cost::lock::report(c, &machine));
+                print!("{}", sources.relabel(&cost::lock::report(c, &machine)));
                 if let (Some(ev), cost::CostResult::Exact { work, moves, span }) = (&eval, &c.result) {
                     if let Some((w, m)) = evaluate(c, work, moves, ev, &machine) {
                         print!("{:<16}   at {ev}: work {w:.0}  moves {m:.0} bytes", "");
@@ -164,7 +183,7 @@ fn main() {
             let costs = cost::analyze(&module, &machine);
             let path = file.parent().unwrap_or(Path::new(".")).join("costs.lock");
             let existing = std::fs::read_to_string(&path).unwrap_or_default();
-            let rendered = cost::lock::render_with(&file.file_name().unwrap().to_string_lossy(), &costs, &existing, &layouts);
+            let rendered = sources.relabel(&cost::lock::render_with(&file.file_name().unwrap().to_string_lossy(), &costs, &existing, &layouts));
             if lock_check {
                 let old = std::fs::read_to_string(&path).unwrap_or_default();
                 let d = cost::lock::diff(&old, &rendered);
@@ -186,18 +205,18 @@ fn main() {
                 let Some(f) = module.funcs.iter().find(|f| f.name == *name) else { eprintln!("no function `{name}`"); process::exit(2); };
                 match cost::scop::export(&module, f) {
                     Ok((c, assumptions)) => { print!("{c}"); for a in assumptions { eprintln!("assumes {a}"); } }
-                    Err(e) => { eprintln!("{}: `{name}` is not a SCoP: {e}", file.display()); process::exit(1); }
+                    Err(e) => { eprintln!("{}: `{name}` is not a SCoP: {}", file.display(), sources.relabel(&e.to_string())); process::exit(1); }
                 }
             }
-            None => print!("{}", emit_c::emit(&module, &opts)),
+            None => print!("{}", sources.patch_c(&emit_c::emit(&module, &opts))),
         },
         "build" => {
             let out = out.unwrap_or_else(|| file.with_extension(""));
-            let c = emit_c::emit(&module, &opts);
+            let c = sources.patch_c(&emit_c::emit(&module, &opts));
             if let Err(e) = cc(&c, &out, &file) { eprintln!("{e}"); process::exit(1); }
         }
         "run" => {
-            let c = emit_c::emit(&module, &opts);
+            let c = sources.patch_c(&emit_c::emit(&module, &opts));
             let dir = std::env::temp_dir().join(format!("neant-{}", process::id()));
             let _ = std::fs::create_dir_all(&dir);
             let bin = dir.join("a.out");
@@ -221,7 +240,7 @@ fn main() {
             }
             let costs = cost::analyze(&module, &machine);
             let fc = &costs[fid];
-            println!("{}", cost::lock::line(fc));
+            println!("{}", sources.relabel(&cost::lock::line(fc)));
             let declared = fc.declared.work.is_some() && fc.declared.moves.is_some();
             // a declaration is confirmed per call: repeat enough for process noise to divide away
             let m_repeat = if declared && m_repeat == 1 { 10000 } else { m_repeat };
@@ -232,11 +251,11 @@ fn main() {
             // the driver's own setup and loop are measured without the call and subtracted
             let head = if declared { "declared work / moves, per call" } else { "predicted work / moves" };
             println!("  {:>10} {:>16} {:>16}   {head}", "n", "instructions", "L2 bytes");
-            let run_perf = |bin: &Path| -> (u64, u64) {
+            let run_perf = |bin: &Path, args: &[String]| -> (u64, u64) {
                 let mut best: Option<(u64, u64)> = None;
                 for _ in 0..3 {
                     let mut cmd = if let Some(cpu) = m_cpu { let mut c = Command::new("taskset"); c.arg("-c").arg(cpu.to_string()).arg("perf"); c } else { Command::new("perf") };
-                    let out = cmd.args(["stat", "-x,", "-e", "instructions,l2d_cache_refill"]).arg(bin).output();
+                    let out = cmd.args(["stat", "-x,", "-e", "instructions,l2d_cache_refill"]).arg(bin).args(args).output();
                     let Ok(out) = out else { eprintln!("could not run perf"); process::exit(1) };
                     let err = String::from_utf8_lossy(&out.stderr);
                     let (Some(ins), Some(ref_)) = (cost::measure::perf_count(&err, "instructions"), cost::measure::perf_count(&err, "l2d_cache_refill")) else {
@@ -247,13 +266,23 @@ fn main() {
                 best.unwrap()
             };
             for &n in &m_sizes {
-                let drv = cost::measure::driver(&module, fid, n, m_repeat, &shapes);
-                let base = cost::measure::baseline(&module, fid, n, m_repeat, &shapes);
+                // an input builtin is measured on a real input of `n` bytes (src/input.rs `probe`)
+                let probed = if input::is_builtin(f) {
+                    match (input::probe(&name, n, m_repeat, true, &dir), input::probe(&name, n, m_repeat, false, &dir)) {
+                        (Ok(p), Ok(b)) => Some((p, b)),
+                        (Err(e), _) | (_, Err(e)) => { eprintln!("{e}"); process::exit(1) }
+                    }
+                } else { None };
+                let (drv, base) = match &probed {
+                    Some((p, b)) => (p.module.clone(), b.module.clone()),
+                    None => (cost::measure::driver(&module, fid, n, m_repeat, &shapes), cost::measure::baseline(&module, fid, n, m_repeat, &shapes)),
+                };
+                let run_args: Vec<String> = probed.as_ref().map_or(vec![], |(p, _)| p.args.clone());
                 let bin = dir.join(format!("m{n}")); let bbin = dir.join(format!("b{n}"));
                 if let Err(e) = cc(&emit_c::emit(&drv, &emit_c::Options { checked: false }), &bin, &file) { eprintln!("{e}"); process::exit(1); }
                 if let Err(e) = cc(&emit_c::emit(&base, &emit_c::Options { checked: false }), &bbin, &file) { eprintln!("{e}"); process::exit(1); }
-                let (ins, ref_) = run_perf(&bin);
-                let (bins, bref) = run_perf(&bbin);
+                let (ins, ref_) = run_perf(&bin, &run_args);
+                let (bins, bref) = run_perf(&bbin, &run_args);
                 let ins = ins.saturating_sub(bins); let ref_ = ref_.saturating_sub(bref);
                 let bytes = ref_ * machine.b_bytes as u64;
                 let ev: Vec<String> = f.params.iter().zip(&shapes).map(|(&p, s)| {
@@ -261,6 +290,7 @@ fn main() {
                     let nm = if l.ty.is_arrayish() { format!("{}.len()", l.name) } else { l.name.clone() };
                     format!("{nm}={}", s.at(n))
                 }).collect();
+                let ev: Vec<String> = match &probed { Some((p, _)) => vec![p.ev.clone()], None => ev };
                 let pred = if declared {
                     let (w, mv) = (cost::Cost::poly(fc.declared.work.clone().unwrap()), cost::Cost::poly(fc.declared.moves.clone().unwrap()));
                     match evaluate(fc, &w, &mv, &ev.join(","), &machine) {
@@ -272,7 +302,8 @@ fn main() {
                             if !ok { confirmed = false; }
                             format!("{w:.0} / {m:.0}   measured {pw:.1} / {pm:.1} per call   {}", if ok { "✓" } else { "✗ exceeds" })
                         }
-                        None => String::new(),
+                        // a declaration the sweep cannot evaluate is not confirmed by it
+                        None => { confirmed = false; "the declaration cannot be evaluated at these sizes".to_string() }
                     }
                 } else {
                     match &fc.result {
@@ -330,6 +361,8 @@ mod parsedump {
     }
     fn strukt(d: &StructDef, o: &mut Vec<i32>) -> Result<(), String> {
         if d.layout.is_some() { return Err("a `#[layout(...)]` attribute".into()); }
+        // an array field (docs/arrays-by-value-design.md) is not in the self-hosted checker yet
+        if d.fields.iter().any(|(_, t, _, _)| matches!(t, TypeExpr::Array(..))) { return Err("an array field".into()); }
         o.push(112);
         for (_, t, _, _) in &d.fields { o.push(113); ty(t, o)?; }
         Ok(())
@@ -344,6 +377,9 @@ mod parsedump {
             if !matches!(f.ret, TypeExpr::Unit) { ty(&f.ret, o)?; }
             return Ok(());
         }
+        // an array passed or returned by value (docs/arrays-by-value-design.md §7) is not in the
+        // self-hosted checker yet
+        if f.params.iter().any(|p| matches!(p.ty, TypeExpr::Array(..))) || matches!(f.ret, TypeExpr::Array(..)) { return Err("an array passed or returned by value".into()); }
         o.push(110);
         for p in &f.params { o.push(111); ty(&p.ty, o)?; }
         if !matches!(f.ret, TypeExpr::Unit) { ty(&f.ret, o)?; }
@@ -391,11 +427,15 @@ mod parsedump {
             ExprKind::Bool(_) => { o.push(62); Ok(()) }
             ExprKind::Byte(_) => { o.push(63); Ok(()) }
             ExprKind::Bytes(_) => { o.push(64); Ok(()) }
+            // a string literal for `print`/`println` is not in the self-hosted parser yet
+            ExprKind::Str(_) => Err("a string literal".into()),
             ExprKind::Var(_) => { o.push(65); Ok(()) }
             ExprKind::Binary(_, l, r) => { o.push(66); expr(l, o)?; expr(r, o) }
             ExprKind::Unary(_, a) => { o.push(67); expr(a, o) }
             ExprKind::Index(b, i) => { o.push(68); expr(b, o)?; expr(i, o) }
             ExprKind::Field(b, _) => { o.push(69); expr(b, o) }
+            // the input builtins (src/input.rs) are not in the self-hosted checker's table
+            ExprKind::Call(n, _) if crate::input::NAMES.contains(&n.as_str()) => Err(format!("a call to the builtin `{n}`")),
             ExprKind::Call(_, args) => { o.push(71); for a in args { expr(a, o)?; } Ok(()) }
             ExprKind::Ref(a, _) => { o.push(73); expr(a, o) }
             ExprKind::Cast(a, t) => { o.push(74); expr(a, o)?; ty(t, o) }
@@ -437,6 +477,8 @@ mod parsedump {
                 for e in es { expr(e, o)?; }
                 Ok(())
             }
+            // a grid of rows (docs/decisions.md §11) is not in the self-hosted checker yet
+            ExprKind::ArrayRepeat(e, _) if matches!(e.kind, ExprKind::ArrayRepeat(..)) => Err("a grid of rows".into()),
             ExprKind::ArrayRepeat(e, n) => {
                 o.push(78);
                 expr(e, o)?;
@@ -477,12 +519,6 @@ fn lex_kind_number(t: &lex::Tok) -> i32 {
     }
 }
 
-fn compile(src: &str) -> diag::Result<ir::Module> {
-    let toks = lex::lex(src)?;
-    let prog = parse::parse(toks)?;
-    types::check(&prog)
-}
-
 fn cc(c: &str, out: &Path, src: &Path) -> Result<(), String> {
     let cfile = out.with_extension("c");
     std::fs::write(&cfile, c).map_err(|e| format!("{}: {e}", cfile.display()))?;
@@ -494,7 +530,7 @@ fn cc(c: &str, out: &Path, src: &Path) -> Result<(), String> {
     // the self-hosting I/O bridge (docs/self-hosting-design.md §2): a fixed convention, not a
     // flag — bootstrap/rt.c is linked in whenever the generated C actually calls into it
     let rt_c = Path::new(env!("CARGO_MANIFEST_DIR")).join("rt.c");
-    if ["read_file(", "write_file(", "read_stdin(", "write_stdout(", "quit("].iter().any(|f| c.contains(f))
+    if ["read_file(", "write_file(", "read_stdin(", "write_stdout(", "quit(", "nt_arg", "nt_file_size(", "nt_print_bytes("].iter().any(|f| c.contains(f))
         && rt_c.exists() { cmd.arg(&rt_c); }
     let status = cmd
         .arg("-o").arg(out)

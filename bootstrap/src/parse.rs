@@ -6,8 +6,14 @@ use crate::diag::{err, Result};
 use crate::lex::{Tok, Token};
 
 pub fn parse(toks: Vec<Token>) -> Result<Program> {
+    parse_knowing(toks, &[])
+}
+
+/// One file of a multi-file program: `known` are the struct names the other files define, which
+/// a struct literal here may name (docs/modules-design.md).
+pub fn parse_knowing(toks: Vec<Token>, known: &[String]) -> Result<Program> {
     // struct names first, so `S { … }` can be told from a block wherever a struct literal may stand
-    let mut struct_names = Vec::new();
+    let mut struct_names = known.to_vec();
     for w in toks.windows(2) {
         if let (Tok::Struct, Tok::Ident(n)) = (&w[0].tok, &w[1].tok) { struct_names.push(n.clone()); }
     }
@@ -408,6 +414,7 @@ impl Parser {
             Tok::Float(v) => { self.next(); mk(ExprKind::Float(v)) }
             Tok::Byte(v) => { self.next(); mk(ExprKind::Byte(v)) }
             Tok::Bytes(v) => { self.next(); mk(ExprKind::Bytes(v)) }
+            Tok::Str(v) => { self.next(); mk(ExprKind::Str(v)) }
             Tok::True => { self.next(); mk(ExprKind::Bool(true)) }
             Tok::False => { self.next(); mk(ExprKind::Bool(false)) }
             Tok::Ident(name) => {

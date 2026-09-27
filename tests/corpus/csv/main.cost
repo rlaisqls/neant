@@ -1,0 +1,40 @@
+struct Num       layout AoS  the model does not decide: no function's moves differ
+is_digit         work 3                            moves 0                            exact
+next_int         work 9·xs.len() − 9·start + 29    moves                              bound  (2 regimes)
+                                               moves ≈ B·xs.len() + xs.len() − B·start − start if xs.len() ≥ M
+                                               moves 2·xs.len() − start + 2·B     if xs.len() < M
+                 footprint        xs: [0, xs.len()) (whole array)   no residue claimed
+                 scan: `i` grows by at least 1 a lap, so the `while` at ../lib/parse.nt:23 runs at most xs.len() − start times
+parse_int        work 9·xs.len() + 31              moves                              bound  (2 regimes)
+                                               moves B·xs.len() + xs.len() + 2·B  if xs.len() ≥ M
+                                               moves 2·xs.len() + 2·B             if xs.len() < M
+                 in `next_int`: scan: `i` grows by at least 1 a lap, so the `while` at ../lib/parse.nt:23 runs at most xs.len() − start times
+                 rests on         next_int (bound, a scan)
+count_ints       work 9·xs.len()² + 35·xs.len() + 1 moves                              bound  (2 regimes)
+                                               moves B·xs.len()² + xs.len()² + 2·B·xs.len() if xs.len() ≥ M
+                                               moves 2·xs.len()² + 2·B·xs.len()   if xs.len() < M
+                 in `next_int`: scan: `i` grows by at least 1 a lap, so the `while` at ../lib/parse.nt:23 runs at most xs.len() − start times
+                 scan: `i` grows by at least 1 a lap, so the `while` at ../lib/parse.nt:41 runs at most xs.len() times
+                 scan: argument 2 to `next_int` is taken at its least, 0, and `next_int`'s cost falls as it grows
+                 rests on         next_int (bound, a scan)
+read_ints        work 9·xs.len()·out.len() + 35·out.len() + 1 moves                              bound  (2 regimes)
+                                               moves ≈ B·xs.len()·out.len() + xs.len()·out.len() if xs.len() ≥ M
+                                               moves ≈ 2·xs.len()·out.len()       if xs.len() < M
+                 lower bound      moves 8·out.len()                  (footprint, every distinct element crosses once)
+                 footprint        out: [0, 8·out.len())   resident after if 8·out.len() < M
+                 in `next_int`: scan: `i` grows by at least 1 a lap, so the `while` at ../lib/parse.nt:23 runs at most xs.len() − start times
+                 scan: argument 2 to `next_int` is taken at its least, 0, and `next_int`'s cost falls as it grows
+                 rests on         next_int (bound, a scan)
+after_header     work 2·xs.len() + 5               moves xs.len() + 2·B               exact
+                 footprint        xs: [0, xs.len()) (whole array)   no residue claimed
+main             work ≈ 9·text.len()²              moves                              bound, io  (2 regimes)
+                                               moves ≈ 2·text.len()²              if text.len() < M
+                                               moves ≈ B·text.len()² + text.len()² if text.len() ≥ M
+                 in `next_int`: scan: `i` grows by at least 1 a lap, so the `while` at ../lib/parse.nt:23 runs at most xs.len() − start times
+                 scan: `i` grows by at least 3 a lap, so the `while` at main.nt:25 runs at most text.len()/3 − 1/3 times
+                 scan: argument 2 to `next_int` is taken at its least, 1, and `next_int`'s cost falls as it grows
+                 scan: argument 2 to `next_int` is taken at its least, 2, and `next_int`'s cost falls as it grows
+                 scan: argument 2 to `next_int` is taken at its least, 3, and `next_int`'s cost falls as it grows
+                 rests on         arg (declared, extern); read_file (declared, extern); next_int (bound, a scan)
+arg              work ≤ result.len()               moves ≤ result.len()               declared, io
+read_file        work ≤ result.len() + path.len() + 2500 moves ≤ result.len() + path.len()  declared, io

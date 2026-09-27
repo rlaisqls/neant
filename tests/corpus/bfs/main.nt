@@ -1,0 +1,68 @@
+// Shortest hop counts in an unweighted graph: the file holds `n m` and then `m` edges `u v`,
+// undirected. The graph is stored as compressed rows — degrees, their prefix sums, the neighbour
+// lists — and searched breadth-first from vertex 0 with an array as the queue.
+
+use "../lib/parse.nt";
+
+fn main() {
+    let path = arg(0);
+    let text = read_file(&path);
+    let total = count_ints(&text);
+    let mut nums = [0; total];
+    read_ints(&text, &mut nums);
+    let n = nums[0];
+    let m = nums[1];
+
+    // compressed rows: row u's neighbours are adj[start[u] .. start[u + 1]]
+    let mut deg = [0; n];
+    for e in 0..m {
+        deg[nums[2 + 2 * e]] += 1;
+        deg[nums[3 + 2 * e]] += 1;
+    }
+    let mut start = [0; n + 1];
+    for u in 0..n {
+        start[u + 1] = start[u] + deg[u];
+    }
+    let mut fill = [0; n];
+    let mut adj = [0; 2 * m];
+    for e in 0..m {
+        let u = nums[2 + 2 * e];
+        let v = nums[3 + 2 * e];
+        adj[start[u] + fill[u]] = v;
+        fill[u] += 1;
+        adj[start[v] + fill[v]] = u;
+        fill[v] += 1;
+    }
+
+    let mut dist = [-1; n];
+    let mut queue = [0; n];
+    let mut head = 0;
+    let mut tail = 1;
+    dist[0] = 0;
+    while head < tail {
+        let u = queue[head];
+        head += 1;
+        for k in start[u]..start[u + 1] {
+            let v = adj[k];
+            if dist[v] < 0 {
+                dist[v] = dist[u] + 1;
+                queue[tail] = v;
+                tail += 1;
+            }
+        }
+    }
+
+    let mut reached = 0;
+    let mut far = 0;
+    let mut sum = 0;
+    for u in 0..n {
+        if dist[u] >= 0 {
+            reached += 1;
+            sum += dist[u];
+            far = max(far, dist[u]);
+        }
+    }
+    println(reached);
+    println(far);
+    println(sum);
+}

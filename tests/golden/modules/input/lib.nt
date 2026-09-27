@@ -1,0 +1,9 @@
+// An input builtin called only from an imported file is still declared once for the program.
+fn count() -> i64 {
+    arg_count()
+}
+
+fn first_len() -> i64 {
+    let a = arg(0);
+    a.len()
+}

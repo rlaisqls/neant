@@ -1,0 +1,4 @@
+struct Pose      layout AoS  the model does not decide: no function's moves differ
+same             work 12                           moves 64                           exact
+moved            work 10                           moves 0                            exact
+main             work 119                          moves 496                          exact, io

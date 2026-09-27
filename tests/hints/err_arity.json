@@ -1,0 +1,7 @@
+{
+  "file": "tests/golden/err_arity.nt",
+  "diagnostics": [
+    {"line": 2, "col": 21, "severity": "error", "message": "`f` takes 1 argument(s), 2 given"}
+  ],
+  "functions": []
+}

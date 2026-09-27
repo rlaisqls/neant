@@ -1,0 +1,4 @@
+# neant costs.lock — generated from main.nt; do not edit
+main             work work[walk](4) + 26           moves moves[walk](4) + B + 64      modulo, io  rests on walk (unknown)
+sum              work 4·xs.len()                   moves 8·xs.len() + B               exact
+walk             unknown: `i` is compared in the `while` condition but is not stepped by a constant exactly once in the body; `while` has no measure the compiler can find; write `while cond decreasing <expr>` with an `i64` that goes down by at least one every iteration

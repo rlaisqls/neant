@@ -661,10 +661,201 @@ working sets, so the true trip is not expressible yet. Written down here and in 
 § Loops; the audit stays a diagnostic, not a test, until that row can be closed or stated as a
 precondition the report prints.
 
+With the loop work of 2026-09-26 merged beside it (a size bound once, the scan rule) the compiler is
+**92 exact, 49 modulo, 34 bound, 103 unknown, of 278**, and the parity counts are work 101, moves 101,
+footprint 128, bound 137.
+
 **Not in this stage, but what makes the number meaningful afterwards.** The roofline term M5
 decided (`moves/BW` taken as a `max` with `work/P`), so the prediction reaches time; argv, modules
 and arrays by value, without which a domain corpus (stage C's control loops and kernels) cannot be
-written; and the editor surface the README describes, which does not exist.
+written; and the editor surface the README describes, which did not exist.
+
+**The editor surface, 2026-09-26.** `neant hints f.nt` prints the report as one JSON document:
+each function with the line of its `fn`, its tier, the grey text (`work …   moves …   exact`, the
+README's wording, from the same `brief` the report uses), its work and moves as the lockfile
+states them, its regimes, bounds, footprint, what it rests on, and for an unknown the cause and
+the line the report names; lex, parse and type errors and broken `#[cost]` bounds are diagnostics
+with a line and a column instead of a message on stderr. It computes nothing: every field is a
+line of `neant cost` or of `costs.lock` taken apart (bootstrap/src/hints.rs), and on the
+concatenated compiler it counts what `lock.sh` counts, 92 exact, 47 modulo, 32 bound, 105 unknown
+of 276. `editors/vscode` is a VS Code extension in plain JavaScript that runs it on open and on
+save, prints each function's cost in grey after its signature with the report in the hover, and
+puts the errors in the Problems panel; its grammar is the lexer's keyword and operator set.
+`tests/hints/` pins the output on `dot` (exact), `fib` (unknown, recurrence, modulo), a type error
+and a broken budget. What is left: the hints are for the saved file — an edit that moves lines
+clears them until the next save, since the compiler reads the file and not the buffer — and the
+analysis is whole-file, 65 s on the compiler under a debug build, so an editor wants a release
+build and, later, a cache keyed by function. The `✓` the README draws after `exact` is not
+printed: nothing in the report says what it would check.
+
+**Modules, 2026-09-26** (docs/modules-design.md). A program can span files in seed one: a top-level
+`use "path.nt";` resolved from the naming file's directory, each file loaded once, a cycle
+rejected with its chain, one flat namespace with a name defined twice rejected naming both files
+and lines. The files share one line space, numbered through the concatenation, so the checker,
+the cost pass and the emitter are unchanged; the driver maps every line that leaves the compiler
+back to `path:N`, including the emitted bounds check. A single-file program takes the old path
+and no golden moved; eight new cases in `tests/golden/modules/`. The lockfile is one per program
+and keyed by name, so it does not say which file a function is in. Left: the self-hosted side
+(the loader in `compiler/*.nt` and `build.sh`'s `cat` replaced by a root file that `use`s the
+others), and a file index in positions so that no text is rewritten.
+
+**Program input, 2026-09-26.** argv is done, with a named file (decisions.md §9): `arg(k)` and
+`read_file(&path)` return an owned `[u8]`, `arg_count()` and `file_size(&path)` an `i64` (−1 is
+the error value), all four `extern`s with a declared cost in a prelude the compiler adds when a
+program calls one. What it measured is a cost line, not a speed: a loop over an argument's bytes
+is exact in that argument's own atom, `a.len()`, free as a parameter's length is, because an
+extern returning an array may name its result's length and a caller mints an atom of its own
+for it (`tests/golden/input_args.cost`, `input_file.cost`); reading `n` bytes is priced as a
+sequential write of `n`. `neant run f.nt -- args` and the built binary were already the same
+program and are tested as such (`.args` files in `tests/golden`). What is left: input read inside
+a loop makes the caller unknown rather than a sum over the laps; the declarations are not yet
+confirmed by `neant measure`; the self-hosted compiler has none of it.
+
+**Input in loops, and the input declarations measured, 2026-09-26** (cost-model.md § Program
+input). `arg_count()` is one atom for the run, so `for k in 0..arg_count()` is exact
+(`input_argc`); `arg(k)` read per lap is at most the longest argument, `max(arg[_].len())`, and
+the line is a bound (`input_perlap`); `read_file` per lap stays unknown and says why
+(`input_perlap_file`). `neant measure` now takes the four builtins, on a real argument or file of
+`n` bytes: `arg` was confirmed as declared, and the other three were exceeded by a constant their
+declarations lacked — 12.5 instructions for a call to `arg_count`, about 2000 for opening a file.
+With `10` and `+ 2500` added all four are confirmed; that changes the constant term of
+`input_args.cost`, `input_file.cost` and `modules/input/main.cost` and nothing else in them. A
+declaration the sweep cannot evaluate is no longer reported as confirmed. What is left: a function
+that returns an argument, called per lap, is unknown, because a result's atom does not carry where
+it came from; the kernel's side of a read is not in the counter.
+
+**Arrays by value, 2026-09-26** (docs/arrays-by-value-design.md). What was missing was not a
+second kind of buffer but a small fixed-size aggregate that is a value: a struct field may now be
+`[T; k]`, `k` a literal, read and written by element (`s.x[i]`, `s.x.len()` the literal `k`), built
+by `[a, b, …]` or `[e; k]` in the literal, and copied with the struct — passed, returned, `let`.
+The calculus charges writing such a field as it charges `let xs = [a, b, c]`, `k` stores and
+`k·elem` bytes, and a copy the same, at `let t = s`, `t = s` and every by-value argument; an
+element is a load with no bytes. Two goldens pin it: a state vector stepped by value, and a 2×2
+control loop `x = apply(m, x, u)` whose `run` is exact at work `56·n + 2`, moves `64·n + 16` — the
+48 bytes a lap are the two argument copies. An array of such a struct is rejected with its
+reason (a third layout); a bare `[T; k]` parameter, `==` on arrays, nested fixed-size arrays and
+the self-hosted side are left.
+
+**The domain corpus, 2026-09-26** (docs/corpus.md). With argv, modules and arrays by value in, the
+count stage C asked for was taken on six programs of its domain — a PID loop over a trajectory
+file, a Jacobi stencil and a dense `matmul` sized by arguments, a CSV aggregator, a BFS over an
+edge-list file, a ring-buffer filter — written as one would write them, in `tests/corpus/` and
+pinned by `corpus.rs`. **14 of 24 functions exact, 58%**, against 33% on the compiler: every kernel
+and every controller step is exact. **0 of 6 `main`s are.** The eight unknowns are two shapes: a
+size parsed out of text, which is an `i64` returned by a call and so not a size (five `main`s), and
+a scan that advances by what it read (`next_int`, `count_ints`, the CSV row loop); with the parsed
+size replaced by an argument's length, the stencil's and `matmul`'s programs become exact, the
+filter's and the controller's stop at the parser loop, and BFS's at its worklist. What moves the
+number next is therefore an integer read from input as an atom for the run, as `arg_count()` is.
+Four shapes the corpus had to be written around are kept as rejected cases: string output, a grid
+of rows, an array of structs with array fields, a bare `[T; k]` parameter.
+
+**Arrays by value, part two, 2026-09-26** (arrays-by-value-design.md §§ 7–9). A bare `[T; k]` is a
+parameter and a return type, and it is **moved**, not copied: `let b = a` was a move for every
+array and stays one, free, so a by-value argument is moved in the same way and the callee owns the
+buffer; `-> [T; k]` gives the caller the literal length, and `s = f(…, s, …)` rebinds a local to
+what comes back, so a control loop over a bare two-element state is exact at `14·n + 5` /
+`2·B·n + 2·B + 16`. `==` and `!=` compare a fixed-size array held in a variable, or any struct,
+element by element with no early exit — `3·k` work and `2·k·elem` bytes for an array, a compare
+per scalar field and three per array-field element with no bytes for a struct. An array of
+structs that hold an array is accepted and laid out AoS only; the chooser does not weigh SoA for
+it and says so, and `xs[i].p[j]` is a site on the whole field of element `i`, so an update of every
+element of every `p` is at its lower bound, `32·n`. It found a bug: an owned-array return of a
+literal pointed into its own stack frame; a literal whose buffer leaves the function is now built
+on the heap. `err_value_array`, which rejected the array of holders, now rejects `#[layout(soa)]`
+on one — the one golden whose expected output changed, because what it pinned is now accepted.
+Left: nested fixed-size arrays, a by-value array of structs, SoA for holders, and the self-hosted
+side of all of it.
+
+**What the corpus could not write, 2026-09-26** (decisions §§ 10–11, corpus.md). Three of the
+corpus's rejected cases. A by-value array passed twice, `dot(a, a)`, is a double move and now says
+so — "argument 2 moves `a` into `dot`, which argument 1 already moved" — where it spoke of views
+and `&mut`, and a use after a move into a call names the call. Text output is a literal: a string
+is the argument of `print` or `println` and nothing else, written byte for byte, costing one call
+and its `n` bytes, a constant, so `rejected_string` is `corpus/report`, a labelled report, exact.
+A grid of rows is the row-major idiom written by the checker rather than a nested type:
+`[[e; n]; m]` is a flat buffer, `g[i][j]` is `g[i·n + j]` with the row checked, and it costs what
+the flat idiom costs term for term — `corpus/rows`, a plate relaxed as rows, exact. Left: a string
+value, a nested array type, and the self-hosted side of all three.
+
+**A size bound once, 2026-09-26** (cost-model § A size bound once). The first of the corpus's two
+gaps is closed. An `i64` bound to an immutable local outside every loop, from anything the
+calculus cannot name, is now an atom of its own named after the local. A caller gets it at the
+call as `callee.local`. Inside a caller's loop it is refused when used as a size, and widened to
+`max(xs[_])` when it only indexes a read. `bound_once.nt` pins the rule and `bound_once_loop.nt`
+the two refusals: bound in a loop, and `let mut`.
+
+On the corpus, 4 of the 6 `main`s gain a cost and become modulo: `heat` `≈ 31·n²·steps`, `matmul`
+`≈ 10·n³`, and `pid` and `fir` linear in the sample count. Each rests on the parser's
+`next_int`, whose loop has no measure. BFS's `main` now stops at its worklist. The share of
+exact functions is unchanged at 14 of 24.
+
+On the compiler, `compiler/costs.lock` goes from 92 exact, 47 modulo, 32 bound, 105 unknown to
+**92, 49, 32, 103**. `site_top` and `w_func` move from unknown to modulo, and eight more move within
+their tier. A handle bound once (`nb = pol_scale(..)`) makes `pols[nb].n_term` an element, not
+`max(pols[_].n_term)`. Without the widening at a caller's loop, three functions fell from modulo
+to unknown; with it, none falls. The self-hosted cost pass does not have the rule. On the two new
+goldens it declines `squares` and the `main`s rather than disagreeing, and `self_host_cost.rs`'s
+counts grow only by the functions it matches: work and moves 99 → 101, footprint 117 → 124,
+bound 120 → 127. Left: the scan that steps by what it read, the worklist, and the rule on the
+self-hosted side.
+
+**A standard library, and text as a value, 2026-09-26** (modules-design § 8, decisions § 12).
+Every corpus program carried its own number parsing and math; now `use "std/text.nt";` and `use
+"std/math.nt";` find the library wherever the program is (`$NEANT_STD`, else the repository's
+`std/`), and it prints as `std/…`. Every function in it is exact or declared: the parsers and
+formatters walk a fixed 18 or 19 places, so `parse_int` is 333 and `format_int` 406, constants;
+`skip_space` scans by what it reads and is charged the rest of the text; libm's `sqrt`, `exp`, `log`,
+`sin`, `cos`, `pow`, `floor`, `ceil` are externs with declared, unmeasured bounds. A string literal
+is now also a value: `let s = "…"` is a `[u8; n]` as `b"…"` is, and a literal passed where `&[u8]`
+is taken is bound before the call — `n` stores and `n` bytes, a constant. Still not a string: no
+type, no concatenation, no growth, no printing of a `[u8]` as text. Left: the corpus adopting std,
+printing a buffer, and the self-hosted loader.
+
+**A scan, 2026-09-26** (cost-model § A scan). The corpus's second gap: a `while i < e` whose index
+grows by at least `d` on every path through the body, with `i₀` a lower bound at entry, runs at
+most `(e − i₀)/d` times.
+- The growth is proved by a walk over the body, like the check on a `decreasing` measure.
+- A call's result is read through a per-function summary of what it returns (`next_int`: `end ≥
+  start`; `after_header`: `≥ 1`), computed to a fixed point from nothing over the call graph.
+- `i₀` is the entry value, or, when every assignment to `i` in the function grows it, what `i`
+  was first bound to.
+- A callee whose cost only falls as an `i64` argument grows is charged with the argument at its
+  least.
+
+Such lines are `bound`, with a `scan:` note, and a caller says `rests on f (bound, a scan)`.
+`scan.nt` pins the rule and `scan_refused.nt` a body with a path that does not grow the index.
+
+On the corpus, now eight programs, **27 of 28 functions have a cost and 7 of 8 `main`s do**. Only
+BFS's worklist is unknown, and nothing is modulo. The bound is loose where a scan calls a scan:
+`count_ints` is `9·xs.len()²`, where the calls together read the text once. That is the
+amortised scan, left next. On the compiler, `compiler/costs.lock` goes from 92/49/32/103 to
+**92, 49, 33, 102**: `bytes_len`, an escape-skipping loop, is bound. `tok_text_eq` did
+not move, having already had a constant step. Nor did the lexer, for two reasons the walk states
+plainly:
+- `i = j + 1` goes through a mutable `j`, and the walk follows immutable bindings only.
+- The comment branch grows `i` only through a nested `while`, which the walk must count as
+  possibly running zero times.
+
+The second could be closed by the loop's own condition, `src[i] == '/'` holding on entry; the
+first by tracking a mutable local that is only increased. The self-hosted cost pass has neither rule. On the two new goldens its footprint is
+narrower where a loop is `while i < xs.len() && …`, which it declines before recording the site:
+`word_end` twice and `trimmed`, listed in `self_host_cost.rs` with that reason. Its matched counts
+grow by the functions it matches: footprint 124 → 128, bound 127 → 134. Work and moves do not
+change.
+
+**Printing bytes, the declarations measured, hints as you type, 2026-09-26** (decisions § 13,
+experiments.md § The standard library's declarations, editors/README.md). `print_bytes(&s, n)`
+writes a view's first `n` bytes, a builtin extern declared in the view's length so that printing
+what a formatter produced stays exact: `modules/std`'s `main` went from unknown to exact. Measuring
+the declarations found the driver measuring nothing — it passed `1.0`, and gcc folded every libm
+call — so an `f64` argument now varies per call; then `sin` and `cos` were under-declared (119 and
+123 against 100), the others over-declared up to 5×, and `print_bytes` about 140 a call against
+60, and each is redeclared at its measurement and confirmed on the X925. `neant hints --stdin
+<path>` reads an unsaved buffer and resolves `use` from `<path>`, and the extension sends the live
+buffer after a pause in typing, keeping save as the fallback; the hints were for the saved file,
+and are now for what is on the screen. Left: the whole-file analysis on every pause, which on a
+large file wants a cache keyed by function.
 
 ## M7 — the constant factor
 
@@ -701,6 +892,9 @@ the choice is reopened with the number in hand.
 bootstrap/              everything that builds the compiler from nothing
   Cargo.toml, src/      the Rust compiler. Seed one. Frozen after self-hosting, never deleted.
     lex.rs  parse.rs  ast.rs  types.rs  ir.rs  emit_c.rs  main.rs
+    modules.rs          `use "file.nt"`: loads a program's files into one line space, maps lines back
+    input.rs            the input builtins (arg, read_file, …) as externs with declared costs
+    hints.rs            `neant hints`: the report as JSON, for an editor
     cost/
       size.rs           symbolic sizes and costs: rational polynomials over atoms, B and M
       piece.rs          piecewise costs: conditions, max, feasibility
@@ -714,14 +908,20 @@ bootstrap/              everything that builds the compiler from nothing
       lock.rs           costs.lock and the report
   neant.c               compiler/ compiled by itself. Seed two. (self-hosting)
 compiler/               the compiler in neant. Empty until self-hosting.
+std/                    the standard library, `use "std/…"`: text.nt (numbers in text), math.nt
+editors/                the grey text in an editor: vscode/ (grammar, hints, diagnostics); README.md
 tests/
   golden/               .nt programs with expected output (.out, .exit), rejection (.err), cost report (.cost)
+    modules/            multi-file programs, one directory each, rooted at main.nt
+  hints/                what `neant hints` prints for some of golden/, one .json each
+  corpus/               the domain corpus (docs/corpus.md): one program per directory, rooted at main.nt, lib/ shared by `use`
   kernels/              the M1/M2 experiments: kernel templates and sweep.py, the perf harness; iolb.sh runs IOLB in docker
 docs/
   plan.md               this file
   cost-model.md         the calculus, as implemented
   experiments.md        what was measured against what prediction, and what it changed
   decisions.md          decisions with the reasoning that produced them
+  corpus.md             the domain corpus's tiers and what blocks the rest
 ```
 
 ## Validation harness notes

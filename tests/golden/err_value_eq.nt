@@ -1,0 +1,10 @@
+// `==` on arrays whose length is data is not a whole-value comparison; `first` keeps this
+// file out of the self-hosted slice, which has no by-value array.
+fn first(x: [i64; 2]) -> i64 { x[0] }
+fn main() {
+    let s = [3, 4];
+    let n = first(s);
+    let a = [0; n];
+    let b = [0; n];
+    println(a == b);
+}

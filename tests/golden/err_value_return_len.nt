@@ -1,0 +1,8 @@
+fn pair() -> [i64; 3] {
+    let a = [1, 2];
+    a
+}
+fn main() {
+    let p = pair();
+    println(p[0]);
+}

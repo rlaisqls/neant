@@ -1,0 +1,6 @@
+// A by-value argument and a view of the same array in one call: the move and the view overlap.
+fn scale(a: [f64; 2], b: &[f64]) -> f64 { a[0] * b[1] }
+fn main() {
+    let a = [1.0, 2.0];
+    println(scale(a, &a));
+}

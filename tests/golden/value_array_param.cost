@@ -1,0 +1,8 @@
+scaled           work 15                           moves 2·B                          exact
+                 lower bound      moves 24                           (footprint, every distinct element crosses once)   gap 5× at M = 2 MiB, B = 64
+                 footprint        x: [0, 24)   resident after if 24 < M
+origin           work 3                            moves 24                           exact
+norm1            work 12                           moves 2·B                          exact
+                 lower bound      moves 24                           (footprint, every distinct element crosses once)   gap 5× at M = 2 MiB, B = 64
+                 footprint        x: [0, 24)   resident after if 24 < M
+main             work 64                           moves 9·B + 48                     exact, io

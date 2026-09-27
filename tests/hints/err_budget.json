@@ -1,0 +1,10 @@
+{
+  "file": "tests/golden/err_budget.nt",
+  "diagnostics": [
+    {"line": 1, "col": 1, "severity": "error", "message": "`sum` has a moves budget of 1024 at the declared sizes but needs 2112"}
+  ],
+  "functions": [
+    {"name": "sum", "file": "tests/golden/err_budget.nt", "line": 2, "tier": "exact", "hint": "work 4·xs.len()   moves 8·xs.len() + B   exact", "work": "4·xs.len()", "moves": "8·xs.len() + B", "span": null, "regimes": [], "declared_work": null, "declared_moves": "1024", "effects": [], "bounds": ["moves 8·xs.len()                   (footprint, every distinct element crosses once)   gap 1× at M = 2 MiB, B = 64"], "footprint": "xs: [0, 8·xs.len())   resident after if 8·xs.len() < M", "rests_on": [], "cause": null, "cause_line": null, "violations": ["line 1: `sum` has a moves budget of 1024 at the declared sizes but needs 2112"], "report": ["lower bound      moves 8·xs.len()                   (footprint, every distinct element crosses once)   gap 1× at M = 2 MiB, B = 64", "footprint        xs: [0, 8·xs.len())   resident after if 8·xs.len() < M", "✗ line 1: `sum` has a moves budget of 1024 at the declared sizes but needs 2112"]},
+    {"name": "main", "file": "tests/golden/err_budget.nt", "line": 5, "tier": "exact", "hint": "work 13   moves B + 32   exact, io", "work": "13", "moves": "B + 32", "span": null, "regimes": [], "declared_work": null, "declared_moves": null, "effects": ["io"], "bounds": [], "footprint": null, "rests_on": [], "cause": null, "cause_line": null, "violations": [], "report": []}
+  ]
+}

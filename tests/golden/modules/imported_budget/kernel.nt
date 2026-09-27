@@ -1,0 +1,6 @@
+// a declared budget the body breaks; the violation names this file
+
+#[cost(moves_at_most = "1024", sizes = "xs.len() <= 256")]
+fn sum(xs: &[f64]) -> f64 {
+    xs.iter().sum()
+}

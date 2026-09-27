@@ -4,6 +4,191 @@ Design decisions with the reasoning that produced them, so the reasoning is not 
 code is. Newest first. A decision is recorded when it was argued over, when it rejected
 alternatives worth remembering, or when a future reader would otherwise ask "why on earth".
 
+## 13 — A `[u8]` is printed by `print_bytes(&s, n)`, charged by the view
+
+**Decided and implemented 2026-09-26.** §12 left a formatted buffer unprintable: `print` takes a
+literal, so `std/text.nt`'s `format_int` into a buffer was printed a byte at a time, and the loop to
+the formatter's returned offset made `tests/golden/modules/std`'s `main` unknown. The surface
+added is one builtin: **`print_bytes(s: &[u8], n: i64)`** writes the first `n` bytes of the view to
+the output as they are, with no newline and no escaping. It is an extern in `bootstrap/rt.c` with
+a declared cost, added to a program that calls it the way the input builtins are (decisions §9);
+`n` outside `0..=s.len()` ends the program with exit 101, as an index past the view does.
+
+**What it is charged, and why not by `n`.** The declaration is in the view's length:
+`work ≤ s.len() + c`, `moves ≤ s.len()` (`c` is 200, `neant measure`'s: about 140 instructions a call at one byte, experiments.md).
+`n` is almost always where a formatter stopped — an offset the program computed from data, not a
+size expression — and a cost in `n` would make every caller that prints what it formatted unknown,
+which is the thing this is for. The view's length is a size the caller always names, and `n ≤
+s.len()` is checked, so the view bounds the write from above: `std`'s `main` is exact at work
+`6559`, the 64-byte buffer charged whole. A caller that wants the tight number passes a view of
+exactly what it prints.
+
+Rejected: `print(&s)` overloading `print` on a `[u8]` view, which would make `print` of a literal
+and of a buffer two things under one name with two cost rules; and `println_bytes`, which is
+`print_bytes` then `println("")`.
+
+## 12 — A string literal is a `[u8]` value; a string is still not a type
+
+**Decided and implemented 2026-09-26.** §10 made a literal text for `print` and `println` and
+nothing else, and left a label as a value for later. A program that reads data compares what it
+read against a literal (a header, a keyword) and hands a literal to a parser, so the literal is
+now a value too, the one it already was as `b"…"`:
+
+- **`let s = "…";`** is a `[u8; n]` of the literal's bytes, as written — the same array, costed the
+  same, as `let s = b"…";`: work `n` (a store per byte) and moves `n`, a constant. `let mut` makes
+  it writable, `s.len()` is the literal `n`, and it is viewed with `&s` like any array.
+- **A literal where `&[u8]` is taken**, `count("mississippi", b's')`, is bound to a local of its own
+  just before the call and its view passed: the same `n` stores and `n` bytes, charged where the
+  call is. Where `&mut [u8]` or anything else is taken it is rejected with that reason, and so is a
+  literal handed to a function that returns an owned array (bind it first).
+- `print("…")` and `println("…")` are unchanged: the literal is written, not built.
+
+**What is still not a string, and why.** There is no string type: text is a `[u8]` and has what
+an array has — a length fixed where it is born, elements, views — and nothing more. There is no
+concatenation and no growth, because either makes a length that is not known where the value is
+born: every array in this language is sized once, and the calculus names that size (a literal, a
+parameter's length, an atom minted at a call) and never revises it. A growable text would be a
+buffer whose length changes under the loops that read it, which is the shape stage D's unknowns
+already come from. There is no `==` on texts of different lengths (a `[u8; 3]` and a `[u8; 4]` are
+different types; compare by walking, as `same` in `text_value.nt` does), no formatting of a value
+into text beyond `std/text.nt`'s functions; a `[u8]` is printed with `print_bytes` (§13). The literal keeps §10's lexing — no
+escapes, no `"` inside; `b"…"` is the form with escapes.
+
+## 11 — A grid of rows is a row-major idiom the checker writes, not a nested array type
+
+**Decided and implemented 2026-09-26.** `let g = [[0.0; n]; n]` was rejected
+(`rejected_grid2d`), and the corpus wrote its plate flat, `g[i * n + j]` — which the calculus
+already costs exactly, since `i·n + j` is an affine index whose coefficient is a size. Two ways to
+let the program say rows:
+
+- **A nested array type**, `[[T; n]; m]` as a type: an array whose elements are arrays. Every rule
+  of the calculus is written over an array of scalars or structs — sites, footprints, residue, the
+  slide rule, the layout chooser — so it needs an element that is itself a buffer: a size per
+  element or a proof that all rows share one, a view of a row (`&g[i]`, an address into a buffer,
+  which views of elements are not), a type for a parameter that takes a grid and the size atoms it
+  carries into the callee, a copy rule for `g[i] = r`, and an emitter representation for each.
+  That is a stage, not a change.
+- **The row-major idiom, written by the checker.** `[[e; n]; m]` in a `let` is one flat buffer of
+  `m·n` elements; `g[i][j]` is `g[i·n + j]`; the grid is rectangular by construction, which is
+  all a plate is.
+
+**The idiom is what is built.** `let g = [[e; n]; m]`, `e` a scalar, `n` and `m` each a literal, an
+immutable `i64` or a length — the same number at every use, so the flat index is the one the
+buffer was sized by — declares a flat `[T; m·n]` local and remembers its row length and count.
+`g[i][j]` reads and `g[i][j] = e` (and `op=`) writes `g[i·n + j]`, with `j` checked against `n`
+before the flat index is checked against `m·n`, so `g[1][4]` in rows of 4 exits 101 as any index
+out of bounds does, though `1·4 + 4` is inside the buffer. `g.len()` is `m` and `g[i].len()` is
+`n`. Everything else about `g` is the flat array's: `&g` is a `&[T]` of `m·n` elements (a callee
+indexes it flat), `let h = g` moves it and `h` is flat. A third dimension, a grid of structs, a
+declared type on the `let`, and a mutable dimension are rejected with that reason.
+
+**What the calculus charges**: what the flat idiom costs, term for term — the index is the flat
+one, and the row check is a bounds check, which no index is charged for. The same stencil written
+both ways costs `26·n² − 97·n + 101` either way; `grid.nt` walks a grid by columns and gets the
+`B·m·n` regime a column walk earns when a column does not fit. `tests/corpus/rows` is
+`rejected_grid2d` turned into a plate relaxed as rows, exact.
+
+**Left**: the nested type, when something needs rows that differ in length, a view of one row, or a
+grid passed to a function as a grid rather than flat.
+
+## 10 — Text output is a literal written by `print` and `println`, not a string value
+
+**Decided and implemented 2026-09-26.** The corpus could not label a number (`rejected_string`):
+`println("mean error")` was `expected an expression, found a string`. What the front end already
+had: the lexer reads `"…"` as `Tok::Str`, with no escapes and not past the end of a line, for
+`#[cost(…)]` values only; and `b"…"` as `Tok::Bytes`, with escapes, which a `let` turns into a
+`[u8; n]` array — a buffer, sized, indexable, costed as one. A report needs neither a string type
+nor a buffer: it needs bytes that go to the output.
+
+So the surface is the smallest that writes a label. **A string literal is the argument of
+`print` or `println` and nothing else.** `println("…")` writes the literal and a newline,
+`print("…")` the literal alone, so `print("x = "); println(x)` puts a name and a number on one
+line; `println(x)` of a scalar is unchanged, and `print` takes only a literal. Anywhere else —
+`let t = "a"`, an argument to a function — a literal is rejected with that reason. The literal is
+the lexer's `Tok::Str` as it was: bytes as written, UTF-8 included, `\` an ordinary byte, no
+escapes and no `"` inside; a newline is `println`. `print` and `println` are both builtin names.
+
+Rejected, and why. *A `[u8]` printed as text* (`println(b"…")`, or `print(&bytes)`) would reuse
+the byte string, but it makes a label a buffer the analysis tracks, sizes and charges as an
+array, and asks every reader to know that a `[u8]` argument prints as characters while a `u8`
+prints as a number. *A string type* is a value with a length, a layout and operations, all of
+which need a cost; nothing in the corpus asks for more than a fixed label. Either can come later
+without changing what a literal in `print` means.
+
+**What the calculus charges.** A literal of `n` bytes written out is one call, work 1, and its
+bytes read from where the literal lives, moves `n` — `n + 1` for `println`'s newline — a
+constant, and the function gets `io`. The emitter writes `fputs` of a C literal with every byte
+other than a letter, a digit or a space escaped in octal, so the C holds exactly the source's
+bytes. `text.nt` pins it; `tests/corpus/report` is `rejected_string` turned into a labelled
+report, exact.
+
+## 9 — Program input: arguments and a named file are externs that return `[u8]`
+
+**Decided and implemented 2026-09-26.** Until now a program's only input was stdin, read the way
+`compiler/main.nt` reads it: `extern fn read_stdin(buf: &mut [u8]) -> i64 uses io, unbounded`, a
+C function in `bootstrap/rt.c` filling a buffer the caller sized in advance, returning the count
+or −1. There was no argv (the emitted `main` was `main(void)`), and a file was `rt.c`'s
+`read_file(path, buf)` on the same convention: the size of the input was the size of the buffer,
+a constant, and the cost of reading it `unbounded`.
+
+**The surface.** Four builtins, each an ordinary `extern` declaration written in the language
+(`bootstrap/src/input.rs`) and added to a program that calls one without defining that name:
+
+```neant
+#[cost(work_at_most = "1", moves_at_most = "0")]
+extern fn arg_count() -> i64 uses io;
+#[cost(work_at_most = "result.len()", moves_at_most = "result.len()")]
+extern fn arg(k: i64) -> [u8] uses io;
+#[cost(work_at_most = "result.len() + path.len()", moves_at_most = "result.len() + path.len()")]
+extern fn read_file(path: &[u8]) -> [u8] uses io;
+#[cost(work_at_most = "path.len()", moves_at_most = "path.len()")]
+extern fn file_size(path: &[u8]) -> i64 uses io;
+```
+
+`args()` returning the list was the first idea, and there is no list of arrays to return: an
+array's elements are scalars or structs. `arg(k)` is one argument as an owned `[u8]`, `let a =
+arg(0);`, and `arg_count()` how many there are. `arg(0)` is the first argument after the
+program's name. A `k` out of range exits 101 with a message, as an index out of bounds does.
+
+**The error value.** The language has no `Result` and no `Option`; what it can express is an
+`i64` that is −1, which is `read_stdin`'s convention already. So `file_size(&path)` is the size
+or −1 when the file cannot be opened, and a program tests that. `read_file(&path)` on a file that
+cannot be read ends the program — `cannot read <path>: <reason>`, exit 101 — because an owned
+array has no −1 to be. A program that must survive a missing file calls `file_size` first.
+
+**Under `neant run` and in the emitted C.** They are the same thing here: `neant run` compiles
+the emitted C and runs the binary, passing it everything after `--` (it always had), so
+`neant run f.nt -- data.txt` and `neant build f.nt && ./f data.txt` do the same. A program that
+calls `arg` or `arg_count` gets `int main(int argc, char **argv)`, which hands argv to `rt.c`
+first; every other program keeps `main(void)`, so no emitted C changed. The four are
+`nt_arg_count`, `nt_arg`, `nt_read_file` and `nt_file_size` in `rt.c` — prefixed, because
+`read_file` is already `rt.c`'s older pair, and a program that declares its own `extern fn
+read_file(path, buf)` (the self-hosting tests do) keeps it: a builtin is added only under a name
+the program leaves free. An emitted builtin is told from a program's extern by line 0, which no
+function in a source has; that keeps `ir::Func` unchanged.
+
+**What the cost calculus sees.** The one new thing. An extern that returns an array names that
+array's length `result.len()` in its own declaration — an atom one past its parameters, so the
+declaration can price the read in it. At a call, an atom of the callee's that is none of its
+parameters is a new quantity: the caller gets an atom of its own for it, and the `let` names it
+after the local, `data.len()`. It is free the way a parameter's length is, and a loop over it is
+exact in it (`tests/golden/input_args.cost`: `main  work 6·b.len() + 6·a.len() + 13  moves
+2·b.len() + 2·a.len() + 2·B  exact, io`). The same rule carries it up through a function that
+reads and returns: `fn load(p: &[u8]) -> [u8] { let d = read_file(p); d }` hands its caller an
+atom of the caller's own. No new atom kind: it is `Atom::Var`, minted as a loop variable is, and
+`size.rs` and `piece.rs` are untouched. The price of a read is what the model charges for a
+sequential write of the same bytes — `[b'\0'; n]` is work `n`, moves `n` — because the bytes land
+in a fresh array once; the path is read once, the same way. The four are `declared`, so every
+caller's line says what it rests on: `rests on arg (declared, extern); read_file (declared,
+extern)`. The declaration is not confirmed by `neant measure` yet.
+
+**What is left.** Input inside a loop and the measured declarations were taken up on
+2026-09-26 (cost-model.md § Program input): `arg_count()` is an exact atom, `arg(k)` per lap a
+bound in `max(arg[_].len())`, a file per lap still unknown, and the four declarations are confirmed
+by `neant measure` after gaining the constants it found. The self-hosted compiler does not have
+the builtins; `neant parsedump` puts a program that calls one outside its slice, so the
+self-hosting comparisons skip it. A path is at most 4095 bytes.
+
 ## 8 — a block-like expression in statement position ends at its block
 
 **Decided 2026-09-23, after the same parse bit three times while writing the compiler in itself.**

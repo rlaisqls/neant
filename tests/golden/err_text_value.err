@@ -1,0 +1,1 @@
+a string literal is a `[u8]`, passed as `&[u8]`; `upper` takes `&mut [u8]` here

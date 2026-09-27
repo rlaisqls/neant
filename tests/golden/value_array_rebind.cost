@@ -1,0 +1,4 @@
+step             work 10                           moves 2·B                          exact
+                 footprint        s: [0, 16)   resident after if 16 < M
+run              work 14·n + 5                     moves 2·B·n + 2·B + 16             exact
+main             work 1458                         moves 210·B + 32                   exact, io

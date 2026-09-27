@@ -1,0 +1,53 @@
+// std/math.nt — small math. The scalar helpers are neant, each exact; the transcendental
+// functions are libm's through the C boundary, each with a declared cost (docs/cost-model.md
+// § declarations first): work is what `neant measure` counted per call on the development machine
+// (glibc, a Cortex-X925, arguments 0.5..100.5; docs/experiments.md § The standard library's
+// declarations), rounded up; moves 0, since they read no memory the program owns. `sqrt`, `floor`
+// and `ceil` are an instruction or a few once gcc inlines them; `sin` and `cos` cost more for a
+// large argument, where the reduction takes a longer path than was measured.
+
+fn abs_f64(x: f64) -> f64 {
+    if x < 0.0 { 0.0 - x } else { x }
+}
+
+fn abs_i64(x: i64) -> i64 {
+    if x < 0 { 0 - x } else { x }
+}
+
+// `x` held within `[lo, hi]`; `lo` wins when `lo > hi`.
+fn clamp_f64(x: f64, lo: f64, hi: f64) -> f64 {
+    max(lo, min(x, hi))
+}
+
+fn clamp_i64(x: i64, lo: i64, hi: i64) -> i64 {
+    max(lo, min(x, hi))
+}
+
+// −1, 0 or 1.
+fn sign_f64(x: f64) -> f64 {
+    if x > 0.0 { 1.0 } else if x < 0.0 { -1.0 } else { 0.0 }
+}
+
+#[cost(work_at_most = "5", moves_at_most = "0")]
+extern fn sqrt(x: f64) -> f64;
+
+#[cost(work_at_most = "2", moves_at_most = "0")]
+extern fn floor(x: f64) -> f64;
+
+#[cost(work_at_most = "2", moves_at_most = "0")]
+extern fn ceil(x: f64) -> f64;
+
+#[cost(work_at_most = "50", moves_at_most = "0")]
+extern fn exp(x: f64) -> f64;
+
+#[cost(work_at_most = "65", moves_at_most = "0")]
+extern fn log(x: f64) -> f64;
+
+#[cost(work_at_most = "140", moves_at_most = "0")]
+extern fn sin(x: f64) -> f64;
+
+#[cost(work_at_most = "140", moves_at_most = "0")]
+extern fn cos(x: f64) -> f64;
+
+#[cost(work_at_most = "130", moves_at_most = "0")]
+extern fn pow(x: f64, y: f64) -> f64;

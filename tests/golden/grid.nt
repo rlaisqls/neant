@@ -1,0 +1,29 @@
+// A grid of rows: `[[e; n]; m]` is stored flat and row-major, `g[i][j]` reads and writes
+// `g[i·n + j]` with `j` checked against the row length, `g.len()` is `m` and `g[i].len()` is `n`.
+// It costs what the flat idiom costs, term for term.
+fn transpose_sum(m: i64, n: i64) -> f64 {
+    let mut g = [[0.0; n]; m];
+    for i in 0..g.len() {
+        for j in 0..g[i].len() {
+            g[i][j] = (i * n + j) as f64;
+        }
+    }
+    let mut s = 0.0;
+    for j in 0..n {
+        for i in 0..m {
+            s += g[i][j];
+        }
+    }
+    s
+}
+
+fn main() {
+    let rows = 3;
+    let mut g = [[1; 4]; rows];
+    g[2][3] = 7;
+    g[0][0] += 5;
+    println(g[2][3] + g[0][0]);
+    println(g.len());
+    println(g[1].len());
+    println(transpose_sum(3, 5));
+}

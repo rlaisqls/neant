@@ -1,0 +1,3 @@
+use "a.nt";
+
+fn main() { println(a()); }

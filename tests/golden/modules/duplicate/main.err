@@ -1,0 +1,1 @@
+main.nt:3:1: function `area` is defined twice: at shapes.nt:2:1 and main.nt:3:1

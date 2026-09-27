@@ -20,11 +20,24 @@ pub fn check(prog: &ast::Program) -> Result<Module> {
         for (f, t, fl, fc) in &sd.fields {
             if fields.iter().any(|(g, _)| g == f) { return err(*fl, *fc, format!("field `{f}` is declared twice")); }
             let ty = resolve_type(t, &struct_ids, *fl, *fc)?;
+            // a fixed-size array of scalars is a field too: part of the value, copied with it
+            // (docs/arrays-by-value-design.md)
+            if let Ty::Array(e, Size::Const(k)) = &ty {
+                if e.is_scalar() {
+                    if *k < 1 { return err(*fl, *fc, format!("an array field has at least one element; `{f}` has none")); }
+                    fields.push((f.clone(), ty));
+                    continue;
+                }
+            }
             if !ty.is_scalar() { return err(*fl, *fc, format!("a field is a scalar (`i64 f64 bool u8`); `{f}` is not")); }
             fields.push((f.clone(), ty));
         }
         if fields.is_empty() { return err(sd.line, sd.col, format!("struct `{}` has no fields", sd.name)); }
         let (layout, fixed) = match sd.layout.as_deref() { Some("soa") => (Layout::Soa, true), Some(_) => (Layout::Aos, true), None => (Layout::Aos, false) };
+        // an array of a struct that holds an array field is laid out AoS only (§9)
+        if layout == Layout::Soa && fields.iter().any(|(_, t)| matches!(t, Ty::Array(..))) {
+            return err(sd.line, sd.col, format!("`{}` holds an array field, and an array of it is laid out AoS only; drop `#[layout(soa)]`", sd.name));
+        }
         struct_ids.insert(sd.name.clone(), structs.len());
         structs.push(StructDef { name: sd.name.clone(), fields, layout, fixed });
     }
@@ -34,13 +47,16 @@ pub fn check(prog: &ast::Program) -> Result<Module> {
         if sigs.contains_key(&f.name) {
             return err(f.line, f.col, format!("function `{}` is defined twice", f.name));
         }
-        if f.name == "println" {
-            return err(f.line, f.col, "`println` is a builtin");
+        if f.name == "println" || f.name == "print" {
+            return err(f.line, f.col, format!("`{}` is a builtin", f.name));
         }
         let mut ptys = Vec::new();
         for p in &f.params {
             let ty = resolve_type(&p.ty, &struct_ids, p.line, p.col)?;
             match ty {
+                // a fixed-size array of scalars is moved in whole (docs/arrays-by-value-design.md §7)
+                Ty::Array(ref e, Size::Const(k)) if k >= 1 && e.is_scalar() => ptys.push(ty),
+                Ty::Array(_, Size::Const(k)) if k >= 1 => return err(p.line, p.col, "an array passed by value holds scalars for now; pass a view: `&[T]` or `&mut [T]`"),
                 Ty::Array(..) => return err(p.line, p.col, "arrays are passed as views: write `&[T]` or `&mut [T]`"),
                 _ => ptys.push(ty),
             }
@@ -48,6 +64,11 @@ pub fn check(prog: &ast::Program) -> Result<Module> {
         let ret = resolve_type(&f.ret, &struct_ids, f.line, f.col)?;
         if matches!(ret, Ty::Slice(..)) {
             return err(f.line, f.col, "a function returns a value, not a view: write `[T]` for an owned array");
+        }
+        if let Ty::Array(e, Size::Const(k)) = &ret {
+            if *k >= 0 && (!e.is_scalar() || *k < 1) {
+                return err(f.line, f.col, "an array returned by value holds at least one scalar: `[T; k]`, `T` one of `i64 f64 bool u8`");
+            }
         }
         sigs.insert(f.name.clone(), (i, ptys, ret));
     }
@@ -143,6 +164,14 @@ struct Ctx<'a> {
     /// agree at runtime. A mutable local gets a fresh atom at every use instead (it may have
     /// changed between them), which is why this is keyed and not just "the local's own size".
     size_of_local: HashMap<LocalId, SizeVar>,
+    /// the array local being rebound by `s = f(…, s, …)`: moving it into the call is not a move
+    /// out of the loop, since the same statement gives it a value again
+    rebinding: Option<LocalId>,
+    /// a move into a call's by-value parameter, as the error names it: "into argument 2 of `f`"
+    moved_into: HashMap<LocalId, String>,
+    /// a grid of rows, `let g = [[e; n]; m]` (docs/decisions.md §11): the flat `[T; m·n]` local
+    /// and its row length `n` and row count `m`, each a literal, an immutable `i64` or a length
+    rows: HashMap<LocalId, (Expr, Expr)>,
 }
 
 fn check_func(f: &ast::Func, sigs: &HashMap<String, (FuncId, Vec<Ty>, Ty)>, structs: &[StructDef], struct_ids: &HashMap<String, StructId>) -> Result<Func> {
@@ -151,6 +180,7 @@ fn check_func(f: &ast::Func, sigs: &HashMap<String, (FuncId, Vec<Ty>, Ty)>, stru
         sigs, structs, struct_ids, locals: vec![], scopes: vec![HashMap::new()], sizes: vec![], ret: ret.clone(),
         in_loop: 0, in_closure: 0, fresh: 0, pending_lets: vec![], root: HashMap::new(), moved: HashMap::new(),
         loop_start: vec![], let_moves: vec![], reassigns: vec![], reassign_pending: vec![], size_of_local: HashMap::new(),
+        rebinding: None, moved_into: HashMap::new(), rows: HashMap::new(),
     };
     let mut params = Vec::new();
     for (p, ty) in f.params.iter().zip(ptys) {
@@ -190,6 +220,17 @@ fn check_func(f: &ast::Func, sigs: &HashMap<String, (FuncId, Vec<Ty>, Ty)>, stru
     // an owned array return carries the size of what is actually returned, so a caller can cost
     // its loops over the result
     let mut ret = ret.clone();
+    // `-> [T; k]`: what is returned has exactly `k` elements, and the signature is what callers see
+    if let Ty::Array(_, Size::Const(k)) = &ret {
+        if *k >= 0 {
+            if let Some(t) = &body.tail {
+                if t.ty.size() != Some(&Size::Const(*k)) {
+                    return err(t.line, 0, format!("`{}` returns `{ret}`, but its body's array does not have the literal length {k}", f.name));
+                }
+            }
+            return Ok(Func { name: f.name.clone(), params, ret, locals: cx.locals, sizes: cx.sizes, body: Some(body), uses: vec![], asserts: f.asserts.clone(), line: f.line, reassigns: cx.reassigns });
+        }
+    }
     if let Ty::Array(_, _) = &ret {
         let returned = body.tail.as_ref().map(|t| t.ty.clone())
             .or_else(|| body.stmts.iter().rev().find_map(|s| match s { Stmt::Return(Some(e)) => Some(e.ty.clone()), _ => None }));
@@ -216,6 +257,75 @@ impl<'a> Ctx<'a> {
         self.scopes.last_mut().unwrap().insert(name.to_string(), id);
         id
     }
+    /// `inner.fname` where the field is an array: the base, the field, its element type, its
+    /// length (docs/arrays-by-value-design.md).
+    fn array_field(&mut self, inner: &ast::Expr, fname: &str, line: u32, col: u32) -> Result<(Expr, usize, Ty, i64)> {
+        let cb = self.expr(inner)?;
+        let Ty::Struct(sid) = cb.ty else { return err(line, col, format!("`.{fname}` on a `{}`, which is not a struct", cb.ty)) };
+        let Some(fi) = self.structs[sid].field(fname) else { return err(line, col, format!("`{}` has no field `{fname}`", self.structs[sid].name)) };
+        match &self.structs[sid].fields[fi].1 {
+            Ty::Array(el, Size::Const(k)) => Ok((cb, fi, (**el).clone(), *k)),
+            t => err(line, col, format!("cannot index a value of type `{t}`")),
+        }
+    }
+    /// An array field's value in a struct literal: `[a, b, …]` with exactly `k` elements, or
+    /// `[e; k]` with `e` free of effects, since it is written once per element.
+    fn array_value(&mut self, v: &ast::Expr, el: &Ty, k: i64, f: &str) -> Result<Expr> {
+        let elems: Vec<Expr> = match &v.kind {
+            ast::ExprKind::ArrayLit(es) => {
+                if es.len() as i64 != k { return err(v.line, v.col, format!("field `{f}` is `[{el}; {k}]`, given {} element(s)", es.len())); }
+                let mut out = Vec::new();
+                for x in es { out.push(self.expr(x)?); }
+                out
+            }
+            ast::ExprKind::ArrayRepeat(x, n) => {
+                if !matches!(n.kind, ast::ExprKind::Int(m) if m == k) { return err(n.line, n.col, format!("field `{f}` is `[{el}; {k}]`: the count is the literal `{k}`")); }
+                let cx = self.expr(x)?;
+                if !matches!(cx.kind, ExprKind::Int(_) | ExprKind::Float(_) | ExprKind::Bool(_) | ExprKind::Byte(_) | ExprKind::Local(_)) {
+                    return err(x.line, x.col, format!("`[e; {k}]` in a field writes `e` {k} times; give it a literal or a variable"));
+                }
+                vec![cx; k as usize]
+            }
+            _ => return err(v.line, v.col, format!("field `{f}` is `[{el}; {k}]`: give it `[a, b, …]` or `[e; {k}]`")),
+        };
+        for x in &elems {
+            if x.ty != *el { return err(v.line, v.col, format!("field `{f}` holds `{el}`, given `{}`", x.ty)); }
+        }
+        Ok(Expr { kind: ExprKind::ArrayVal(elems), ty: Ty::Array(Box::new(el.clone()), Size::Const(k)), line: v.line })
+    }
+    /// A grid dimension: a literal, an immutable `i64` or a length — the same number at every
+    /// use, so the flat index built from it is the one the grid was sized by.
+    fn grid_dim(&mut self, d: &ast::Expr) -> Result<Expr> {
+        let c = self.expr(d)?;
+        let pure = match &c.kind {
+            ExprKind::Int(k) => *k >= 0,
+            ExprKind::Local(l) => c.ty == Ty::I64 && !self.locals[*l].mutable,
+            ExprKind::Len(_) => true,
+            _ => false,
+        };
+        if !pure { return err(d.line, d.col, "a grid's dimensions are literals, immutable `i64`s or lengths"); }
+        Ok(c)
+    }
+    /// `base` of `base[j]` when it is `g[i]`, `g` a grid of rows: `g`.
+    fn grid_of(&self, base: &ast::Expr) -> Option<LocalId> {
+        let ast::ExprKind::Index(g, _) = &base.kind else { return None };
+        let ast::ExprKind::Var(n) = &g.kind else { return None };
+        self.lookup(n).filter(|id| self.rows.contains_key(id))
+    }
+    /// `g[i][j]` as the flat index `i·n + j`, `j` checked below `n`: (g, index).
+    fn grid_index(&mut self, base: &ast::Expr, jdx: &ast::Expr) -> Result<(LocalId, Expr)> {
+        let ast::ExprKind::Index(g, idx) = &base.kind else { unreachable!() };
+        let id = self.local_by_expr(g, "the grid being indexed")?;
+        let (ci, cj) = (self.expr(idx)?, self.expr(jdx)?);
+        for (c, a) in [(&ci, &**idx), (&cj, jdx)] {
+            if c.ty != Ty::I64 { return err(a.line, a.col, format!("index must be `i64`, found `{}`", c.ty)); }
+        }
+        let n = self.rows[&id].0.clone();
+        let line = jdx.line;
+        let b = |k, x: Expr, y: Expr| Expr { kind: ExprKind::Binary(k, Box::new(x), Box::new(y)), ty: Ty::I64, line };
+        let j = Expr { kind: ExprKind::InRow(Box::new(cj), Box::new(n.clone())), ty: Ty::I64, line };
+        Ok((id, b(BinOp::Add, b(BinOp::Mul, ci, n), j)))
+    }
     fn lookup(&self, name: &str) -> Option<LocalId> {
         self.scopes.iter().rev().find_map(|s| s.get(name).copied())
     }
@@ -232,7 +342,8 @@ impl<'a> Ctx<'a> {
 
     fn check_moved(&self, id: LocalId, line: u32, col: u32) -> Result<()> {
         if let Some(&at) = self.moved.get(&id) {
-            return err(line, col, format!("`{}` was moved at line {at}; using it again is an error", self.locals[id].name));
+            let how = self.moved_into.get(&id).map_or(String::new(), |h| format!(" {h}"));
+            return err(line, col, format!("`{}` was moved{how} at line {at}; using it again is an error", self.locals[id].name));
         }
         Ok(())
     }
@@ -267,6 +378,14 @@ impl<'a> Ctx<'a> {
                 };
                 // arrays are born here and only here
                 match &init.kind {
+                    // `let s = "…"`: the literal's bytes as a `[u8; n]`, as `b"…"` (docs/decisions.md §12)
+                    ast::ExprKind::Str(t) => {
+                        let out: Vec<Expr> = t.bytes().map(|b| Expr { kind: ExprKind::Byte(b), ty: Ty::U8, line: init.line }).collect();
+                        let ty = Ty::Array(Box::new(Ty::U8), Size::Const(out.len() as i64));
+                        self.check_declared(&declared, &ty, *line, *col)?;
+                        let id = self.declare(name, ty, *mutable);
+                        Ok(Stmt::LetArray(id, out))
+                    }
                     ast::ExprKind::Bytes(bytes) => {
                         let out: Vec<Expr> = bytes.iter().map(|b| Expr { kind: ExprKind::Byte(*b), ty: Ty::U8, line: init.line }).collect();
                         let ty = Ty::Array(Box::new(Ty::U8), Size::Const(out.len() as i64));
@@ -322,6 +441,23 @@ impl<'a> Ctx<'a> {
                         let id = self.declare(name, ty, *mutable);
                         Ok(Stmt::LetBuild { id, len, var: k, body })
                     }
+                    // `[[e; n]; m]`: a grid of rows, stored flat and row-major (§11)
+                    ast::ExprKind::ArrayRepeat(row, m) if matches!(row.kind, ast::ExprKind::ArrayRepeat(..)) => {
+                        let ast::ExprKind::ArrayRepeat(e, n) = &row.kind else { unreachable!() };
+                        if matches!(e.kind, ast::ExprKind::ArrayRepeat(..)) {
+                            return err(e.line, e.col, "a grid has two dimensions; write a third as a flat index");
+                        }
+                        let ce = self.expr(e)?;
+                        if !ce.ty.is_scalar() { return err(e.line, e.col, "a grid's elements are scalars"); }
+                        let (cn, cm) = (self.grid_dim(n)?, self.grid_dim(m)?);
+                        let flat = Expr { kind: ExprKind::Binary(BinOp::Mul, Box::new(cm.clone()), Box::new(cn.clone())), ty: Ty::I64, line: init.line };
+                        let k = self.sizes.len();
+                        let ty = Ty::Array(Box::new(ce.ty.clone()), Size::Var(self.new_size(format!("{name}.len()#{k}"))));
+                        if declared.is_some() { return err(*line, *col, "a grid's type is not written; it is `[[T; n]; m]` by its literal"); }
+                        let id = self.declare(name, ty, *mutable);
+                        self.rows.insert(id, (cn, cm));
+                        Ok(Stmt::LetRepeat(id, ce, flat))
+                    }
                     ast::ExprKind::ArrayRepeat(e, n) => {
                         let ce = self.expr(e)?;
                         if !ce.ty.is_value() {
@@ -374,10 +510,13 @@ impl<'a> Ctx<'a> {
                         let ce = self.expr(init)?;
                         // a call that returns an owned array: the caller owns it, under a size of
                         // its own named after the call
-                        if let (Ty::Array(elem, _), ExprKind::Call(fid, _)) = (&ce.ty, &ce.kind) {
-                            let nm = format!("{name}.len()");
-                            let sv = self.new_size(nm);
-                            let ty = Ty::Array(elem.clone(), Size::Var(sv));
+                        if let (Ty::Array(elem, sz), ExprKind::Call(fid, _)) = (&ce.ty, &ce.kind) {
+                            // `-> [T; k]` says how many: the literal, not a size of its own
+                            let ty = if matches!(sz, Size::Const(k) if *k >= 0) { ce.ty.clone() } else {
+                                let nm = format!("{name}.len()");
+                                let sv = self.new_size(nm);
+                                Ty::Array(elem.clone(), Size::Var(sv))
+                            };
                             self.check_declared(&declared, &ty, *line, *col)?;
                             let id = self.declare(name, ty, *mutable);
                             self.root.insert(id, id);
@@ -398,6 +537,7 @@ impl<'a> Ctx<'a> {
                             self.check_declared(&declared, &ce.ty, *line, *col)?;
                             let id = self.declare(name, ce.ty.clone(), *mutable);
                             self.moved.insert(src, *line);
+                            self.moved_into.remove(&src);
                             self.let_moves.push((src, *line));
                             self.root.insert(id, id);
                             return Ok(Stmt::Let(id, ce));
@@ -418,7 +558,14 @@ impl<'a> Ctx<'a> {
                 if self.in_closure > 0 {
                     return err(*line, *col, "a closure in a chain cannot assign; it must be a pure function of its arguments");
                 }
-                let val = self.expr(value)?;
+                let rebind = match &target.kind {
+                    ast::ExprKind::Var(n) if op.is_none() => self.lookup(n).filter(|&id| matches!(self.locals[id].ty, Ty::Array(_, Size::Const(k)) if k >= 0)),
+                    _ => None,
+                };
+                let saved = std::mem::replace(&mut self.rebinding, rebind);
+                let val = self.expr(value);
+                self.rebinding = saved;
+                let val = val?;
                 let (lv, tty) = match &target.kind {
                     ast::ExprKind::Var(n) => {
                         let id = self.lookup(n).map_or_else(|| err(target.line, target.col, format!("unknown variable `{n}`")), Ok)?;
@@ -440,6 +587,7 @@ impl<'a> Ctx<'a> {
                                         if !forced_loop { self.reassign_pending.push(idx); }
                                         self.moved.remove(&id);
                                         self.moved.insert(src, *line);
+                                        self.moved_into.remove(&src);
                                         // `ys` denotes a value disjoint from anything else now,
                                         // in place or not: `xs` is dead either way (§3), so no
                                         // future code can observe whether the buffer is shared
@@ -448,9 +596,55 @@ impl<'a> Ctx<'a> {
                                     }
                                 }
                             }
+                            // `s = f(…)` with `f -> [T; k]`: the local takes the call's array, as a
+                            // `let` does (docs/arrays-by-value-design.md §7)
+                            if op.is_none() && matches!(val.kind, ExprKind::Call(..)) && matches!(l.ty, Ty::Array(_, Size::Const(k)) if k >= 0) && val.ty == l.ty {
+                                self.moved.remove(&id);
+                                self.root.insert(id, id);
+                                return Ok(Stmt::Assign(LValue::Var(id), None, val));
+                            }
                             return err(target.line, target.col, "cannot assign a whole array or view; assign elements");
                         }
                         (LValue::Var(id), l.ty.clone())
+                    }
+                    // `v.f[i] = e`
+                    ast::ExprKind::Index(base, idx) if matches!(&base.kind, ast::ExprKind::Field(inner, _) if matches!(inner.kind, ast::ExprKind::Var(_))) => {
+                        let ast::ExprKind::Field(inner, fname) = &base.kind else { unreachable!() };
+                        let ast::ExprKind::Var(n) = &inner.kind else { unreachable!() };
+                        let (cb, fi, elem, _) = self.array_field(inner, fname, base.line, base.col)?;
+                        let ExprKind::Local(id) = cb.kind else { unreachable!() };
+                        if !self.locals[id].mutable { return err(target.line, target.col, format!("`{n}` is not mutable; declare it with `let mut`")); }
+                        let ci = self.expr(idx)?;
+                        if ci.ty != Ty::I64 { return err(idx.line, idx.col, format!("index must be `i64`, found `{}`", ci.ty)); }
+                        (LValue::FieldIndex(id, ci, fi, target.line), elem)
+                    }
+                    // `xs[i].f[j] = e`, `xs` an array of holders (docs/arrays-by-value-design.md §9)
+                    ast::ExprKind::Index(base, jdx) if matches!(&base.kind, ast::ExprKind::Field(inner, _) if matches!(inner.kind, ast::ExprKind::Index(..))) => {
+                        let ast::ExprKind::Field(inner, fname) = &base.kind else { unreachable!() };
+                        let ast::ExprKind::Index(arr, idx) = &inner.kind else { unreachable!() };
+                        let id = self.local_by_expr(arr, "the array being indexed")?;
+                        let ci = self.expr(idx)?;
+                        if ci.ty != Ty::I64 { return err(idx.line, idx.col, format!("index must be `i64`, found `{}`", ci.ty)); }
+                        let l = &self.locals[id];
+                        let elem = match &l.ty {
+                            Ty::Array(e, _) => { if !l.mutable { return err(target.line, target.col, format!("`{}` is not mutable; declare it with `let mut`", l.name)); } (**e).clone() }
+                            Ty::Slice(e, true, _) => (**e).clone(),
+                            Ty::Slice(_, false, _) => return err(target.line, target.col, format!("`{}` is a `&[T]` view; writing needs `&mut [T]`", l.name)),
+                            t => return err(target.line, target.col, format!("cannot index a value of type `{t}`")),
+                        };
+                        let Ty::Struct(sid) = elem else { return err(target.line, target.col, format!("elements of `{}` are not structs; there is no field `{fname}`", l.name)) };
+                        let Some(fi) = self.structs[sid].field(fname) else { return err(target.line, target.col, format!("`{}` has no field `{fname}`", self.structs[sid].name)) };
+                        let Ty::Array(fel, _) = self.structs[sid].fields[fi].1.clone() else { return err(target.line, target.col, format!("`{fname}` is not an array field; write `xs[i].{fname} = …`")) };
+                        let cj = self.expr(jdx)?;
+                        if cj.ty != Ty::I64 { return err(jdx.line, jdx.col, format!("index must be `i64`, found `{}`", cj.ty)); }
+                        (LValue::IndexFieldIndex(id, ci, fi, cj, target.line), *fel)
+                    }
+                    // `g[i][j] = e` in a grid of rows: `g[i·n + j]`, `j` checked against `n` (§11)
+                    ast::ExprKind::Index(base, jdx) if self.grid_of(base).is_some() => {
+                        let (id, flat) = self.grid_index(base, jdx)?;
+                        let l = &self.locals[id];
+                        if !l.mutable { return err(target.line, target.col, format!("`{}` is not mutable; declare it with `let mut`", l.name)); }
+                        (LValue::Index(id, flat, target.line), l.ty.elem().unwrap().clone())
                     }
                     ast::ExprKind::Index(base, idx) => {
                         let id = self.local_by_expr(base, "the array being indexed")?;
@@ -572,7 +766,10 @@ impl<'a> Ctx<'a> {
                     None => None,
                 };
                 let ty = ce.as_ref().map_or(Ty::Unit, |e| e.ty.clone());
-                if let (Ty::Array(a, _), Ty::Array(b, _)) = (&ty, &self.ret) {
+                if let (Ty::Array(a, sz), Ty::Array(b, rsz)) = (&ty, &self.ret) {
+                    if matches!(rsz, Size::Const(k) if *k >= 0) && sz != rsz {
+                        return err(*line, *col, format!("returning `{ty}` from a function that returns `{}`: the length must be the literal one", self.ret));
+                    }
                     if a == b { return Ok(Stmt::Return(ce)); }
                 }
                 if !ty.same_shape(&self.ret) {
@@ -606,6 +803,7 @@ impl<'a> Ctx<'a> {
             ast::ExprKind::Bool(v) => mk(ExprKind::Bool(*v), Ty::Bool),
             ast::ExprKind::Byte(v) => mk(ExprKind::Byte(*v), Ty::U8),
             ast::ExprKind::Bytes(_) => err(e.line, e.col, "a byte string can only initialise a `let`"),
+            ast::ExprKind::Str(_) => err(e.line, e.col, "a string literal is text for `print` or `println`, a `[u8]` bound by `let`, or an argument where `&[u8]` is taken"),
             ast::ExprKind::Var(n) => {
                 let id = self.lookup(n).map_or_else(|| err(e.line, e.col, format!("unknown variable `{n}`")), Ok)?;
                 self.check_moved(id, e.line, e.col)?;
@@ -624,6 +822,22 @@ impl<'a> Ctx<'a> {
                     }
                     ca.ty.clone()
                 } else if op.is_cmp() {
+                    // `==`/`!=` on a whole value: a struct, or a fixed-size array of scalars held in
+                    // a variable, element by element (docs/arrays-by-value-design.md §8)
+                    if matches!(op, BinOp::Eq | BinOp::Ne) && !ca.ty.is_scalar() {
+                        match &ca.ty {
+                            Ty::Struct(_) => {}
+                            Ty::Array(el, Size::Const(k)) if *k >= 0 && el.is_scalar() => {
+                                if !matches!(ca.kind, ExprKind::Local(_)) || !matches!(cb.kind, ExprKind::Local(_)) {
+                                    return err(e.line, e.col, format!("`{}` on arrays compares two variables", op.c_str()));
+                                }
+                            }
+                            Ty::Array(..) | Ty::Slice(..) => return err(e.line, e.col, format!(
+                                "`{}` on `{}`: arrays compare whole only when their length is a literal and their elements are scalars", op.c_str(), ca.ty)),
+                            _ => return err(e.line, e.col, format!("`{}` on `{}`", op.c_str(), ca.ty)),
+                        }
+                        return mk(ExprKind::Binary(*op, Box::new(ca), Box::new(cb)), Ty::Bool);
+                    }
                     if !ca.ty.is_scalar() {
                         return err(e.line, e.col, format!("`{}` on `{}`", op.c_str(), ca.ty));
                     }
@@ -649,6 +863,22 @@ impl<'a> Ctx<'a> {
                 let ty = ca.ty.clone();
                 mk(ExprKind::Unary(*op, Box::new(ca)), ty)
             }
+            // `e.f[i]`: an element of an array field (docs/arrays-by-value-design.md)
+            ast::ExprKind::Index(base, idx) if matches!(base.kind, ast::ExprKind::Field(..)) => {
+                let ast::ExprKind::Field(inner, fname) = &base.kind else { unreachable!() };
+                let (cb, fi, elem, _) = self.array_field(inner, fname, base.line, base.col)?;
+                let ci = self.expr(idx)?;
+                if ci.ty != Ty::I64 {
+                    return err(idx.line, idx.col, format!("index must be `i64`, found `{}`", ci.ty));
+                }
+                mk(ExprKind::FieldIndex(Box::new(cb), Box::new(ci), fi), elem)
+            }
+            // `g[i][j]` in a grid of rows (§11)
+            ast::ExprKind::Index(base, jdx) if self.grid_of(base).is_some() => {
+                let (id, flat) = self.grid_index(base, jdx)?;
+                let elem = self.locals[id].ty.elem().unwrap().clone();
+                mk(ExprKind::Index(id, Box::new(flat)), elem)
+            }
             ast::ExprKind::Index(base, idx) => {
                 let id = self.local_by_expr(base, "the array being indexed")?;
                 let ci = self.expr(idx)?;
@@ -666,6 +896,9 @@ impl<'a> Ctx<'a> {
                 let Ty::Struct(sid) = cb.ty else { return err(e.line, e.col, format!("`.{fname}` on a `{}`, which is not a struct", cb.ty)) };
                 let Some(fi) = self.structs[sid].field(fname) else { return err(e.line, e.col, format!("`{}` has no field `{fname}`", self.structs[sid].name)) };
                 let ty = self.structs[sid].fields[fi].1.clone();
+                if let Ty::Array(..) = ty {
+                    return err(e.line, e.col, format!("`.{fname}` is an array held in `{}` by value; read an element (`.{fname}[i]`) or its length (`.{fname}.len()`), or copy the whole struct", self.structs[sid].name));
+                }
                 mk(ExprKind::Field(Box::new(cb), fi), ty)
             }
             ast::ExprKind::StructLit(name, fields) => {
@@ -675,6 +908,11 @@ impl<'a> Ctx<'a> {
                 for (f, v) in fields {
                     let Some(fi) = def.field(f) else { return err(v.line, v.col, format!("`{name}` has no field `{f}`")) };
                     if vals[fi].is_some() { return err(v.line, v.col, format!("field `{f}` is given twice")); }
+                    if let Ty::Array(el, Size::Const(k)) = &def.fields[fi].1 {
+                        let cv = self.array_value(v, el, *k, f)?;
+                        vals[fi] = Some(cv);
+                        continue;
+                    }
                     let cv = self.expr(v)?;
                     if cv.ty != def.fields[fi].1 { return err(v.line, v.col, format!("field `{f}` is `{}`, given `{}`", def.fields[fi].1, cv.ty)); }
                     vals[fi] = Some(cv);
@@ -697,6 +935,15 @@ impl<'a> Ctx<'a> {
                 mk(ExprKind::MinMax(name == "min", Box::new(a), Box::new(b)), ty)
             }
             ast::ExprKind::Call(name, args) => {
+                // `print("…")`, `println("…")`: a literal written out (docs/decisions.md §10)
+                if name == "println" || name == "print" {
+                    if let [ast::Expr { kind: ast::ExprKind::Str(t), .. }] = &args[..] {
+                        return mk(ExprKind::Text(t.clone(), name == "println"), Ty::Unit);
+                    }
+                    if name == "print" {
+                        return err(e.line, e.col, "`print` writes a string literal without a newline; a value is printed with `println`");
+                    }
+                }
                 if name == "println" {
                     if args.len() != 1 {
                         return err(e.line, e.col, "`println` takes one argument");
@@ -726,18 +973,61 @@ impl<'a> Ctx<'a> {
                     };
                     let Some(id) = (match &target.kind { ast::ExprKind::Var(n) => self.lookup(n), _ => None }) else { continue };
                     if !self.locals[id].ty.is_arrayish() { continue; }
-                    let mutable = explicit_mut.unwrap_or(matches!(self.locals[id].ty, Ty::Slice(_, true, _)));
+                    // an array moved in by value is the callee's to write
+                    let by_value = explicit_mut.is_none() && matches!(ptys.get(k), Some(Ty::Array(..)));
+                    let mutable = by_value || explicit_mut.unwrap_or(matches!(self.locals[id].ty, Ty::Slice(_, true, _)));
                     let r = self.root_of(id);
                     if let Some((_, _, k2)) = roots.iter().find(|(r2, m2, _)| *r2 == r && (mutable || *m2)) {
-                        return err(a.line, a.col, format!(
-                            "arguments {} and {} are both views of `{}` and one is `&mut`; a function's parameters must not overlap",
-                            k2 + 1, k + 1, self.locals[r].name));
+                        // a by-value argument is a move, not a view: say which argument moved what
+                        let moves = |j: usize| explicit_mut.is_none() && j == k && by_value
+                            || matches!(ptys.get(j), Some(Ty::Array(..))) && matches!(args[j].kind, ast::ExprKind::Var(_));
+                        let nm = &self.locals[r].name;
+                        let msg = match (moves(*k2), moves(k)) {
+                            (true, true) => format!("argument {} moves `{nm}` into `{name}`, which argument {} already moved; an array passed by value is passed once", k + 1, k2 + 1),
+                            (true, false) => format!("argument {} is a view of `{nm}`, which argument {} moves into `{name}`", k + 1, k2 + 1),
+                            (false, true) => format!("argument {} moves `{nm}` into `{name}` while argument {} is a view of it", k + 1, k2 + 1),
+                            (false, false) => format!("arguments {} and {} are both views of `{nm}` and one is `&mut`; a function's parameters must not overlap", k2 + 1, k + 1),
+                        };
+                        return err(a.line, a.col, msg);
                     }
                     roots.push((r, mutable, k));
                 }
+                // a string literal where a `&[u8]` is taken: bound to a local of its own just
+                // before the call, and the view of that passed (docs/decisions.md §12)
+                let mut texts: Vec<Stmt> = Vec::new();
                 for (a, pty) in args.iter().zip(&ptys) {
-                    let ca = self.expr(a)?;
+                    let ca = if let ast::ExprKind::Str(t) = &a.kind {
+                        if !matches!(pty, Ty::Slice(el, false, _) if **el == Ty::U8) {
+                            return err(a.line, a.col, format!("a string literal is a `[u8]`, passed as `&[u8]`; `{name}` takes `{pty}` here"));
+                        }
+                        if matches!(ret, Ty::Array(..)) {
+                            return err(a.line, a.col, format!("`{name}` returns an owned array; bind the literal with `let` first"));
+                        }
+                        let (id, st) = self.text_local(t, a.line);
+                        texts.push(st);
+                        let ty = self.locals[id].ty.clone();
+                        let Ty::Array(el, sz) = ty else { unreachable!() };
+                        Expr { kind: ExprKind::Ref(id, false), ty: Ty::Slice(el, false, sz), line: a.line }
+                    } else { self.expr(a)? };
                     let ok = match (&ca.ty, pty) {
+                        // `[T; k]` by value: the argument is moved in, as by `let` (§7)
+                        (_, Ty::Array(ep, Size::Const(k))) => {
+                            let ExprKind::Local(src) = ca.kind else {
+                                return err(a.line, a.col, format!("`{name}` takes `{pty}` by value, moved from a variable; pass the array itself"));
+                            };
+                            if !matches!(&ca.ty, Ty::Array(ea, sz) if ea == ep && *sz == Size::Const(*k)) {
+                                return err(a.line, a.col, format!("`{name}` takes `{pty}` by value; `{}` is `{}`", self.locals[src].name, ca.ty));
+                            }
+                            if let Some(&start) = self.loop_start.last() {
+                                if src < start && self.rebinding != Some(src) {
+                                    return err(a.line, a.col, format!("moving `{}` inside a loop would move it again on the next lap", self.locals[src].name));
+                                }
+                            }
+                            self.moved.insert(src, a.line);
+                            self.moved_into.insert(src, format!("into argument {} of `{name}`", cargs.len() + 1));
+                            self.let_moves.push((src, a.line));
+                            true
+                        }
                         (Ty::Slice(ea, ma, _), Ty::Slice(ep, mp, _)) => ea == ep && (*ma || !*mp),
                         (Ty::Array(..), Ty::Slice(..)) => return err(a.line, a.col, "pass a view of the array: `&name` or `&mut name`"),
                         (a, b) => a == b,
@@ -747,12 +1037,34 @@ impl<'a> Ctx<'a> {
                     }
                     cargs.push(ca);
                 }
+                if !texts.is_empty() {
+                    let call = Expr { kind: ExprKind::Call(fid, cargs), ty: ret.clone(), line };
+                    return mk(ExprKind::Block(Block { stmts: texts, tail: Some(Box::new(call)), ty: ret.clone() }), ret);
+                }
                 mk(ExprKind::Call(fid, cargs), ret)
             }
             ast::ExprKind::MethodCall(recv, name, args) => {
                 if name == "len" {
                     if !args.is_empty() {
                         return err(e.line, e.col, "`.len()` takes no arguments");
+                    }
+                    // an array field's length is its type's: a literal
+                    if let ast::ExprKind::Field(inner, fname) = &recv.kind {
+                        let (_, _, _, k) = self.array_field(inner, fname, recv.line, recv.col)?;
+                        return mk(ExprKind::Int(k), Ty::I64);
+                    }
+                    // a grid's `g.len()` is its row count, `g[i].len()` its row length (§11)
+                    if let Some(id) = self.grid_of(recv) {
+                        let ast::ExprKind::Index(_, i) = &recv.kind else { unreachable!() };
+                        let ci = self.expr(i)?;
+                        if ci.ty != Ty::I64 { return err(i.line, i.col, format!("index must be `i64`, found `{}`", ci.ty)); }
+                        return Ok(self.rows[&id].0.clone());
+                    }
+                    if let ast::ExprKind::Var(n) = &recv.kind {
+                        if let Some(id) = self.lookup(n).filter(|id| self.rows.contains_key(id)) {
+                            self.check_moved(id, recv.line, recv.col)?;
+                            return Ok(self.rows[&id].1.clone());
+                        }
                     }
                     let id = self.local_by_expr(recv, "the receiver of `.len()`")?;
                     if !self.locals[id].ty.is_arrayish() {
@@ -881,6 +1193,12 @@ impl<'a> Ctx<'a> {
     }
 
     /// A compiler-made local; the `#` keeps it out of the user's namespace.
+    /// A string literal as a `[u8; n]` local, and the `let` that builds it: its bytes as written.
+    fn text_local(&mut self, t: &str, line: u32) -> (LocalId, Stmt) {
+        let bytes: Vec<Expr> = t.bytes().map(|b| Expr { kind: ExprKind::Byte(b), ty: Ty::U8, line }).collect();
+        let id = self.fresh_local("text", Ty::Array(Box::new(Ty::U8), Size::Const(bytes.len() as i64)), false);
+        (id, Stmt::LetArray(id, bytes))
+    }
     fn fresh_local(&mut self, base: &str, ty: Ty, mutable: bool) -> LocalId {
         let n = self.next_fresh();
         self.declare(&format!("{base}#{n}"), ty, mutable)
@@ -1166,7 +1484,8 @@ fn last_uses_lvalue(lv: &LValue, line: u32, reassigns: &[Reassign], into: &mut H
         LValue::Var(_) => {}
         LValue::Index(id, idx, l) => { mark(*id, *l, into); last_uses_expr(idx, reassigns, into); }
         LValue::Field(id, _) => mark(*id, line, into),
-        LValue::IndexField(id, idx, _, l) => { mark(*id, *l, into); last_uses_expr(idx, reassigns, into); }
+        LValue::IndexField(id, idx, _, l) | LValue::FieldIndex(id, idx, _, l) => { mark(*id, *l, into); last_uses_expr(idx, reassigns, into); }
+        LValue::IndexFieldIndex(id, idx, _, j, l) => { mark(*id, *l, into); last_uses_expr(idx, reassigns, into); last_uses_expr(j, reassigns, into); }
     }
 }
 
@@ -1174,9 +1493,9 @@ fn last_uses_expr(e: &Expr, reassigns: &[Reassign], into: &mut HashMap<LocalId, 
     match &e.kind {
         ExprKind::Local(id) | ExprKind::Len(id) | ExprKind::Ref(id, _) => mark(*id, e.line, into),
         ExprKind::Index(id, idx) => { mark(*id, e.line, into); last_uses_expr(idx, reassigns, into); }
-        ExprKind::Binary(_, a, b) | ExprKind::MinMax(_, a, b) => { last_uses_expr(a, reassigns, into); last_uses_expr(b, reassigns, into); }
+        ExprKind::Binary(_, a, b) | ExprKind::MinMax(_, a, b) | ExprKind::FieldIndex(a, b, _) | ExprKind::InRow(a, b) => { last_uses_expr(a, reassigns, into); last_uses_expr(b, reassigns, into); }
         ExprKind::Unary(_, a) | ExprKind::Field(a, _) | ExprKind::Cast(a, _) | ExprKind::Println(a) => last_uses_expr(a, reassigns, into),
-        ExprKind::StructLit(_, es) => { for e2 in es { last_uses_expr(e2, reassigns, into); } }
+        ExprKind::StructLit(_, es) | ExprKind::ArrayVal(es) => { for e2 in es { last_uses_expr(e2, reassigns, into); } }
         ExprKind::Call(_, args) => { for a in args { last_uses_expr(a, reassigns, into); } }
         ExprKind::If(c, t, els) => {
             last_uses_expr(c, reassigns, into);
@@ -1184,6 +1503,6 @@ fn last_uses_expr(e: &Expr, reassigns: &[Reassign], into: &mut HashMap<LocalId, 
             if let Some(b) = els { last_uses(b, reassigns, into); }
         }
         ExprKind::Block(b) => last_uses(b, reassigns, into),
-        ExprKind::Int(_) | ExprKind::Float(_) | ExprKind::Bool(_) | ExprKind::Byte(_) => {}
+        ExprKind::Int(_) | ExprKind::Float(_) | ExprKind::Bool(_) | ExprKind::Byte(_) | ExprKind::Text(..) => {}
     }
 }

@@ -15,8 +15,9 @@ Or it gets one sentence saying why not, with a line number. It never gets nothin
 ## Size variables
 
 A function's atoms are its parameters, in order: a slice parameter `a: &[T]` contributes
-`a.len()`, an `i64` parameter `n` contributes `n`. The one other kind of atom is a value read
-from memory (§ A size read from memory) — every size inside the body must reduce to these and
+`a.len()`, an `i64` parameter `n` contributes `n`. The other kinds of atom are a value read from
+memory (§ A size read from memory), a value bound once to an immutable local (§ A size bound
+once), and program input (§ Program input) — every size inside the body must reduce to these and
 constants, or the function's cost is unknown.
 
 An `i64` expression is a **size expression** when it is built from integer literals, size
@@ -182,6 +183,13 @@ living in registers, costing nothing to move. What costs is an array of them, an
 that array is the compiler's, because nothing in the language can hold an address into it — there
 is no `&ps[i]` and no `&p.x`, only `ps[i]` and `p.x`, which are values.
 
+A field may be a fixed-size array `[T; k]` (docs/arrays-by-value-design.md), and then the value
+is not all registers: writing the field — `[a, b, …]` or `[e; k]` in a literal — costs `k` stores
+and `k·elem` bytes, as `let xs = [a, b, c]` does, and so does every copy of the struct where the
+program names a second place for it (`let t = s`, `t = s`, a by-value argument); `s.x[i]` is a
+load with no bytes, the value being resident. A struct with an array field is never an array
+element.
+
 **A site touches one thing and steps by another.** An access site records the bytes it reads or
 writes (`es`) and the bytes its address moves per unit of the index (`stride`). For a scalar array
 they are the same number. For one field of a struct array they are not, and the difference is
@@ -324,6 +332,81 @@ no later than either conjunct would, so the first conjunct that has a trip count
 The condition is evaluated once more than the body runs, and the memory it reads is charged each
 time; its work is the loop's compare-and-branch, as it always was.
 
+## A scan
+
+**Written 2026-09-26, before the code.** Text is read by a loop whose index advances by what it
+read:
+
+```neant
+while i < xs.len() {
+    let r = next_int(xs, i);      // r.end is at least i
+    …
+    i = r.end + 1;                // so i grows by at least 1 a lap
+}
+```
+
+and by a loop that steps by one but starts where an earlier loop left off, the second loop of
+`next_int`. Neither is an induction variable (§ Loops without a range). The first is not stepped by
+a constant, and the second has no known entry value. Both are bounded all the same, by the same
+argument a `decreasing` measure is.
+
+**The rule.** `while i < e` or `while i <= e` runs at most `(e − i₀)/d` times (`+ 1` for `<=`)
+when three things hold:
+- `e` is a size expression the body does not assign;
+- along every path through the body that comes back to the condition, `i` grows by at least `d`,
+  with `d ≥ 1`;
+- `i₀` is a lower bound on `i` at entry.
+
+It is the `decreasing e − i` argument, proved rather than promised. If `i₀` is `i`'s one entry
+value, it is that. If not, and every assignment to `i` in the whole function is an increase, `i` is
+at least what it was first bound to, and that is `i₀`: `let mut i = start` gives `start`.
+
+**What "grows by at least `d`" means.** The body is walked once, path by path, as the check on a
+`decreasing` measure is. What the walk accepts:
+- `i += c` and `i = i + c` grow `i` by `c`. `i -= c` shrinks it.
+- `i = x + c` grows it by `c + k` when `x` is known to be at least `i + k` at that point.
+- An `if` takes its smaller branch. A `break` or `return` leaves, and a path that leaves need not
+  grow `i`.
+- A nested loop may run zero times, so it counts `0` and must not shrink `i`.
+- Any other assignment to `i`, or one inside an expression the walk does not open, and the rule
+  does not apply.
+
+"`x` is at least `i + k`" comes from:
+- `let x = e`, immutable, with `e` built from `i`, constants and `+`;
+- a field `r.f` of `let r = g(…)`, from `g`'s summary.
+
+A fact about `i` stops holding at the next assignment to `i`.
+
+**The summary.** For every function it lists what it guarantees about what it returns: the
+result, or a field of the struct it returns, is at least one of its `i64` parameters plus a
+constant, or at least a constant. It is read off the returned expression, the body's tail, in a
+function with no `return`:
+- a parameter, a constant, or `+ c` of either;
+- a mutable local whose every assignment is an increase, which is at least what it was bound to;
+- a field of a callee's result, by the callee's summary.
+
+`next_int` returns `Num { …, end: i }` with `let mut i = start` and every assignment to `i` a `+= 1`,
+so its summary is `end ≥ start`. `after_header` returns `i + 1` from `let mut i = 0`, so it
+returns at least 1. Summaries depend on callees' summaries, so they are computed to a fixed point
+over the call graph, from nothing, as the fields a call may write are (§ A walk down a list).
+A cycle only ever adds facts that hold.
+
+**What the report says.** The loop's trip is an upper bound reached by an argument about values,
+not a count. So the line is `bound`, not `exact`, and a note says which loop and why: ``scan: `i` grows by at least 1 a lap, so the `while` at line 41 runs at most xs.len() times``. A caller whose
+cost rests on such a line is `bound` too, and its line says `rests on next_int (bound, a scan)`.
+The scan's index is not an induction variable, so its accesses are charged as not affine: a line
+each (§ Moves). That is an upper bound too.
+
+**Where it refuses.**
+- `!=`, where a step larger than one can jump the bound.
+- A descending scan.
+- A bound the body assigns.
+- An assignment to `i` the walk cannot follow: `i = xs[k]`, `i = f(i)` with no summary.
+- A path that can come back without growing `i`: "`i` does not grow on every path through the
+  body".
+- An entry value that is neither known nor bounded below because some assignment to `i` shrinks
+  it: "`i`'s entry value is not known and `i` is not only increased".
+
 ## Recursion
 
 A function that calls itself is a recurrence. The body's own cost `f` is computed with the
@@ -455,6 +538,81 @@ own array stays as `f.xs[…]`, a value the caller cannot name any better.
 What the atom is not yet: the expression the value was written from. `let k = n; xs[0] = k` then
 a loop to `xs[0]` is a loop to the atom `xs[0]`, not to `n` — following a store to its load is
 what plan § Stage D (2) left for later.
+
+## A size bound once
+
+**Added 2026-09-26.** An `i64` bound by `let n = e` — immutable, outside every loop — where `e` is
+nothing the calculus can name (a call's result, `parse_int(&a)`, `count_ints(&text)`, a division
+by a variable) is an atom of its own for the rest of the function, named after the local: `n`.
+Nothing is known of its value, so a cost in it is exact in it the way a cost in a parameter is.
+An array `[e; n]` has it as its length, and a loop to it has it as its trip
+(`bound_once.cost`: `squares  work 9·n + 5  exact`).
+
+**Why it is sound.** The local cannot be assigned, so it names one value for the rest of the
+run. That is all a parameter is to the calculus: a number fixed on entry and never known.
+The atom is minted where the `let` is and stands only for what follows it.
+
+**Where it is refused.**
+- **Bound inside a loop**: it is a new value every lap and stays no size (`bound_once_loop.cost`:
+  "the length of `t` is not a size expression").
+- **`let mut`**: it may change after it is bound, so it stays no size, as a mutable local always
+  has ("loop bound is not a size expression").
+- A value the calculus *can* name is left as it was: a size expression, an element read
+  (§ A size read from memory), an argument's or a file's length (§ Program input).
+
+**A negative value** is not ruled out, any more than for an `i64` parameter. A line is read for
+the atom at `0` or more. A negative `n` as a length never gets past the allocation, which exits
+101 ("negative array length"). A loop `0..n` with `n < 0` runs no lap, so it costs less than the
+line's constant.
+
+**At a call** the callee's atom is a new quantity at every call, so the caller gets an atom of its
+own for it, named `callee.local`: `main  work 9·squares.n + 11`. This is the rule § Program input
+gave `first_len.a.len()`. Inside a loop of the caller, a callee's atom used as a size is refused
+("calls `f` in a loop: `n`, a size it binds once, is a new value at every iteration"). One that
+only indexes an element the callee reads, `pols[nb].n_term`, is widened as a variable summed away
+is, to `max(pols[_].n_term)`, and the line is a bound. An unknown callee's argument is shown as `_`.
+
+## Program input
+
+The input builtins (decisions.md §9) are externs with declared costs, so a caller rests on them
+like on any declaration. What the calculus adds is the size of what they return, in three cases:
+
+- **`arg_count()` is exact.** The number of arguments is fixed for the run, so every call returns
+  the same value: one atom, `arg_count()`, minted once per function when the program has the
+  builtin, and the callee's `arg_count()` is its caller's own at a call rather than a new one. A
+  loop to it, directly or through an immutable `let`, is exact in it, as a loop to a parameter
+  is (`input_argc.cost`: `main  work 6·arg_count() + 28`).
+- **An array returned outside a loop is exact.** `let a = arg(0)` or `let d = read_file(&p)`: an
+  extern that returns `[T]` names its result's length `result.len()` in its declaration, and the
+  caller gets an atom of its own for it at the call, named after the local, `a.len()`
+  (`input_args.cost`). It is free the way a parameter's length is. Through a function that reads
+  and returns, the caller gets a new atom again (`first_len.a.len()` in `modules/input`).
+- **`arg(k)` inside a loop is a bound.** Each lap's argument has a length of its own, an atom that
+  would not survive the lap. What does survive is the longest argument: the lap's array is taken
+  at `max(arg[_].len())`, a read atom with no element (§ A size read from memory), shared by every
+  function, so the line is `bound` and a loop over all of them reads `arg_count()·max(arg[_].len())`
+  (`input_perlap.cost`). As for an array born in a loop by `[e; n]`, the lap's array is one local
+  to the calculus: where it fits, its read after the first lap is credited as resident.
+- **Anything else read inside a loop stays unknown**, with the call named: `read_file` per lap
+  (`input_perlap_file.cost`: "calls `read_file` in a loop: what it reads is a size of its own at
+  every iteration"). No whole bounds it: the files are not known to the run the way its arguments
+  are. So does a function that returns an argument it read, called per lap: the provenance of its
+  result's atom does not travel with it.
+
+**The declarations, measured.** `neant measure --fn arg_count|arg|read_file|file_size` runs each
+builtin on a real input of `n` bytes, an argument of `n` bytes or a file of `n` bytes, because the
+ordinary driver cannot build either and has no value for `result.len()`. Before this, a
+declaration the sweep could not evaluate was reported as confirmed; it is now reported as not.
+On the machine (`--cpu 5`, 10000 calls per size, n = 1000..32000) the first declarations failed
+for three of the four, and in the same place: they had no constant. `arg_count` measured 12.5
+instructions a call against a declared 1 — the call into `rt.c`, which the compiler cannot
+inline; opening a file measured about 2000 user-space instructions for `file_size` and about 2260
+for `read_file` at small `n`, against a declared `path.len()`. `arg` was confirmed as declared:
+it measured about `n/3 + 300` instructions and a few lines of traffic, well under `n` and `n`.
+The declarations now carry the constants, `10` and `+ 2500`, and all four are confirmed. The
+kernel's share of a read, the copy into the buffer among it, is not in the counter (it counts
+user space), so `moves` is confirmed here only as not exceeded; a file read streams through the
+page cache, which the model does not see.
 
 ## A walk down a list
 

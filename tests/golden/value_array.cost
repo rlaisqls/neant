@@ -1,0 +1,4 @@
+struct State     layout AoS  the model does not decide: no function's moves differ
+step             work 29                           moves 32                           exact
+norm1            work 16                           moves 0                            exact
+main             work 77                           moves 160                          exact, io

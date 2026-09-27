@@ -1,0 +1,8 @@
+count            work 12                           moves 0                            exact, io
+                 rests on         arg_count (declared, extern)
+first_len        work a.len() + 2                  moves a.len()                      exact, io
+                 rests on         arg (declared, extern)
+main             work first_len.a.len() + 36       moves first_len.a.len()            exact, io
+                 rests on         arg_count (declared, extern); arg (declared, extern)
+arg_count        work ≤ 10                         moves ≤ 0                          declared, io
+arg              work ≤ result.len()               moves ≤ result.len()               declared, io

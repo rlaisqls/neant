@@ -1,0 +1,7 @@
+use "sum.nt";
+
+fn main() {
+    let xs = [1, 2, 3, 4];
+    println(sum(&xs));
+    println(walk(&xs));
+}

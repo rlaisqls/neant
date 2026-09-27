@@ -1,0 +1,52 @@
+// Sensor log aggregation: a CSV file of `sensor,time,value` rows, a header line first. For each
+// sensor: how many readings, their mean and their largest value; then the busiest sensor. Sensor
+// ids are small integers, so the per-sensor tables are arrays indexed by id.
+
+use "../lib/parse.nt";
+
+// the byte just after the first newline: the header is skipped
+fn after_header(xs: &[u8]) -> i64 {
+    let mut i = 0;
+    while i < xs.len() && xs[i] != b'\n' {
+        i += 1;
+    }
+    i + 1
+}
+
+fn main() {
+    let path = arg(0);
+    let text = read_file(&path);
+    let sensors = 8;
+    let mut count = [0; sensors];
+    let mut sum = [0; sensors];
+    let mut top = [-1000000; sensors];
+    let mut i = after_header(&text);
+    let mut rows = 0;
+    while i < text.len() {
+        let s = next_int(&text, i);
+        if !s.ok {
+            break;
+        }
+        let t = next_int(&text, s.end + 1);
+        let v = next_int(&text, t.end + 1);
+        count[s.v] += 1;
+        sum[s.v] += v.v;
+        top[s.v] = max(top[s.v], v.v);
+        rows += 1;
+        i = v.end + 1;
+    }
+    println(rows);
+    let mut busiest = 0;
+    for k in 0..sensors {
+        if count[k] > 0 {
+            println(k);
+            println(count[k]);
+            println(sum[k] as f64 / count[k] as f64);
+            println(top[k]);
+        }
+        if count[k] > count[busiest] {
+            busiest = k;
+        }
+    }
+    println(busiest);
+}

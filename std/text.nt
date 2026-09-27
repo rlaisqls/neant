@@ -1,0 +1,157 @@
+// std/text.nt — numbers in text. A text is a `[u8]` (an argument, a file, a literal); a number is
+// found by walking it from an offset, and a parse says where it stopped.
+
+// An integer read from text: its value, the offset just after it, and whether there was one.
+struct Int { v: i64, end: i64, ok: bool }
+
+// A float read from text, the same way.
+struct Float { v: f64, end: i64, ok: bool }
+
+fn is_digit(c: u8) -> bool {
+    c >= b'0' && c <= b'9'
+}
+
+// A space, a tab, a newline or a carriage return.
+fn is_space(c: u8) -> bool {
+    c == b' ' || c == b'\t' || c == b'\n' || c == b'\r'
+}
+
+// The first offset at or after `at` that is not a space. It scans by what it reads — the parser
+// shape docs/corpus.md names — so its trip count is the run of spaces, which is data. The calculus
+// charges the rest of the text, `xs.len() − at`, the most the scan can take, and prints that as
+// exact; left as it reports it. A caller whose `at` is not a size expression is unknown for it.
+fn skip_space(xs: &[u8], at: i64) -> i64 {
+    let mut i = at;
+    while i < xs.len() && is_space(xs[i]) {
+        i += 1;
+    }
+    i
+}
+
+// The integer at `at`: an optional `-` and at most 18 digits, which is what an `i64` holds without
+// overflow. Nothing is skipped first; call `skip_space` for that. The digit loop is a `for` over
+// the 18 places that stops storing at the first non-digit, so its cost is a constant.
+fn parse_int(xs: &[u8], at: i64) -> Int {
+    let mut i = at;
+    let mut neg = false;
+    if i < xs.len() && xs[i] == b'-' {
+        neg = true;
+        i += 1;
+    }
+    let first = i;
+    let mut v = 0;
+    let mut going = true;
+    for k in 0..18 {
+        if going && i < xs.len() && is_digit(xs[i]) {
+            v = v * 10 + (xs[i] - b'0') as i64;
+            i += 1;
+        } else {
+            going = false;
+        }
+    }
+    if neg { v = 0 - v; }
+    Int { v: v, end: i, ok: i > first }
+}
+
+// The float at `at`: `[-]digits[.digits]`, at most 18 digits before the point and 18 after,
+// no exponent. The same fixed loops as `parse_int`, so a constant.
+fn parse_float(xs: &[u8], at: i64) -> Float {
+    let mut i = at;
+    let mut neg = false;
+    if i < xs.len() && xs[i] == b'-' {
+        neg = true;
+        i += 1;
+    }
+    let first = i;
+    let mut v = 0.0;
+    let mut going = true;
+    for k in 0..18 {
+        if going && i < xs.len() && is_digit(xs[i]) {
+            v = v * 10.0 + (xs[i] - b'0') as f64;
+            i += 1;
+        } else {
+            going = false;
+        }
+    }
+    let mut digits = i > first;
+    if i < xs.len() && xs[i] == b'.' {
+        i += 1;
+        let mut scale = 0.1;
+        going = true;
+        for k in 0..18 {
+            if going && i < xs.len() && is_digit(xs[i]) {
+                v = v + scale * (xs[i] - b'0') as f64;
+                scale = scale * 0.1;
+                i += 1;
+                digits = true;
+            } else {
+                going = false;
+            }
+        }
+    }
+    if neg { v = 0.0 - v; }
+    Float { v: v, end: i, ok: digits }
+}
+
+// `v` written in decimal into `out` at `at`, with a `-` when negative; returns the offset after
+// it. Nineteen places are computed, the leading zeros skipped when copying, so it is a constant;
+// `out` must have room (20 bytes at most), or the store is out of bounds and the program exits.
+fn format_int(v: i64, out: &mut [u8], at: i64) -> i64 {
+    let mut tmp = [b'0'; 19];
+    let mut u = v;
+    if u < 0 { u = 0 - u; }
+    let mut first = 18;
+    for k in 0..19 {
+        let p = 18 - k;
+        tmp[p] = b'0' + (u % 10) as u8;
+        if u % 10 != 0 || u >= 10 { first = p; }
+        u = u / 10;
+    }
+    let mut i = at;
+    if v < 0 {
+        out[i] = b'-';
+        i += 1;
+    }
+    for k in 0..19 {
+        if k >= first {
+            out[i] = tmp[k];
+            i += 1;
+        }
+    }
+    i
+}
+
+// `x` written with `places` digits after the point (at most 18), rounded half away from zero,
+// into `out` at `at`; returns the offset after it. The integer part is `format_int`'s, so `|x|`
+// must be below 2^63 once scaled.
+fn format_float(x: f64, places: i64, out: &mut [u8], at: i64) -> i64 {
+    let mut scale = 1.0;
+    for k in 0..18 {
+        if k < places { scale = scale * 10.0; }
+    }
+    let mut ax = x;
+    if ax < 0.0 { ax = 0.0 - ax; }
+    let n = (ax * scale + 0.5) as i64;
+    let p = scale as i64;
+    let mut i = at;
+    if x < 0.0 && n != 0 {
+        out[i] = b'-';
+        i += 1;
+    }
+    i = format_int(n / p, out, i);
+    if places > 0 {
+        out[i] = b'.';
+        i += 1;
+        let mut frac = n % p;
+        let mut div = p / 10;
+        for k in 0..18 {
+            if k < places {
+                out[i] = b'0' + (frac / div) as u8;
+                frac = frac % div;
+                div = div / 10;
+                i += 1;
+            }
+        }
+    }
+    i
+}

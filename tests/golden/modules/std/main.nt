@@ -1,0 +1,38 @@
+// The standard library from a directory that has none: `use "std/…"` finds it wherever the
+// program is. Reads a list of readings from a literal, and reports their mean and spread.
+use "std/text.nt";
+use "std/math.nt";
+
+fn main() {
+    let data = "  12 -3 7.5 40 0.25";
+    let mut xs = [0.0; 5];
+    let mut at = skip_space(&data, 0);
+    for k in 0..xs.len() {
+        let f = parse_float(&data, at);
+        xs[k] = f.v;
+        at = f.end + 1;
+    }
+    let mut sum = 0.0;
+    let mut lo = xs[0];
+    let mut hi = xs[0];
+    for k in 0..xs.len() {
+        sum += xs[k];
+        lo = min(lo, xs[k]);
+        hi = max(hi, xs[k]);
+    }
+    let mean = sum / xs.len() as f64;
+    let mut sq = 0.0;
+    for k in 0..xs.len() { sq += (xs[k] - mean) * (xs[k] - mean); }
+    let sd = sqrt(sq / xs.len() as f64);
+    let mut out = [b' '; 64];
+    let mut e = format_float(mean, 3, &mut out, 0);
+    e = format_float(sd, 3, &mut out, e + 1);
+    e = format_int(abs_i64(lo as i64), &mut out, e + 1);
+    e = format_int(clamp_i64(hi as i64, 0, 30), &mut out, e + 1);
+    print("mean, sd, |min|, clamped max: ");
+    print_bytes(&out, e);
+    println("");
+    let n = parse_int("-17 rest", 0);
+    println(n.v);
+    println(n.end);
+}
