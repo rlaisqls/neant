@@ -407,6 +407,33 @@ each (§ Moves). That is an upper bound too.
 - An entry value that is neither known nor bounded below because some assignment to `i` shrinks
   it: "`i`'s entry value is not known and `i` is not only increased".
 
+## A scan's accesses
+
+**Written 2026-09-27, after the corpus was timed.** § A scan bounds a scan's *trip*, but its index
+was still no induction variable, so every `xs[i]` in its body was not affine and § Moves charged it a
+line: 64 bytes for one byte of text, a line per access and never the stream it is. And since a
+non-affine site's footprint is the whole array, a parser handed a start was charged a cold read of
+all of the text at every call. In the corpus that made the text readers' moves quadratic and their
+predicted time 10³ to 10⁶ too high.
+
+**The rule.** A `while` bounded as a scan, with an integer least growth `d`, gives its index an
+affine form *for access sites only*: at lap `k` the index is at least `i₀ + d·k` and below the
+bound. Because it only grows, the lines it visits are visited in order, each once while it is being
+passed; so the lines the site touches over the loop are at most those of a stream at stride `d`
+over `[i₀, e)`, which is what § Moves computes from that form — `es·(e − i₀)/B`, or one a lap when a
+lap moves a line or more. A jump makes fewer laps, not more lines. Three places never read the form:
+- **Sizes.** The index's value is not `i₀ + d·k` but at least that, and a cost that grows with it
+  would be under-charged; `size_of` ignores the loop, as it did.
+- **Lower bounds.** The trip is an upper bound; an HBL or footprint *lower* bound built on it would be
+  inflated, so a scan's loop is left out of the nest they are counted over.
+- **Residue and exactness.** A jump skips elements, so the hull `[i₀, e)` is a range the scan stays
+  in, not one every byte of which was read: the footprint is not exact, no caller is credited for it,
+  and the residue a lap leaves is not assumed to be one step back.
+
+Scanners nest `while`s on one index; an access reads the innermost loop that moves it. `next_int`'s
+moves become `2·(xs.len() − start) + 3·B` in one regime, which has the distance form § An amortised
+scan needs, so a loop of calls is charged its text once in moves too.
+
 ## An amortised scan
 
 **Written 2026-09-27.** A scan bounds a loop that calls a parser once a lap, but it charges each
@@ -460,6 +487,12 @@ stopped in `xs`, so together they are charged 9·xs.len() once, not a scan of `x
 - a caller that moves `v` other than through what the call returned (`v += 1`), or assigns it twice;
 - a call not at the top level of the loop body, so perhaps more than once a lap;
 - `A`'s length or `v`'s entry not known where the loop starts.
+
+**A chain.** A lap may call several advancing functions in a row, each where the last stopped —
+`s = next_int(t, i)`, `t2 = next_int(t, s.end + 1)`, `v = next_int(t, t2.end + 1)`, `i = v.end + 1`, a
+CSV row. Each argument is at least the end before it, so the distances of all the calls of all the
+laps still telescope to `A.len() − v₀`; the chain is charged its calls' largest rate once for that
+distance, not once per call.
 
 Golden `amortised` has both sides: `fields` (`19·xs.len() + 1`, from quadratic) and `sum_fields`
 (`14·out.len() + 4·xs.len() + 1`), `hops` and `restart` refused and quadratic. In golden `scan`,

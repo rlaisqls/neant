@@ -207,3 +207,9 @@ through it.
 **After strings and rows (2026-09-26).** `rejected_string` is `report/` and `rejected_grid2d` is `rows/`, both accepted and exact; `rejected_vecparam` stays rejected, as a double move, and now says so.
 
 **After arrays by value part two (2026-09-26).** `rejected_plants` is accepted now (arrays of holders, AoS only) and was removed; `rejected_vecparam` is rejected for a different reason, a double move, under a message that still speaks of views.
+
+**After a scan's accesses (2026-09-27, cost-model § A scan's accesses).** The parse's *moves* are
+linear too: `next_int` is `2·(xs.len() − start) + 3·B` in one regime, and `csv`'s row of three chained
+calls is amortised as one chain, so its `main` is `146·text.len()/3 + …` where it was
+`≈ 9·text.len()²`. Timed against the machine (experiments.md), every program's predicted time is
+within 0.10–2.7 of its measured one. The tiers do not move: 18 exact, 10 bound, 0 unknown of 28.

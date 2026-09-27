@@ -486,6 +486,11 @@ struct Loop {
     /// in terms of this variable is seen to move with the outer loops too. `None` when the start
     /// is not affine, in which case any index using this variable is treated as non-affine.
     offset: Option<Affine>,
+    /// A scan (docs/cost-model.md § A scan's accesses): `var` only grows, by at least `step` a
+    /// lap, from at least `lo`, and stays below the bound — not an induction variable. Its affine
+    /// form is for access sites only, where `lo + step·k` for the `k`th lap is the densest the lines
+    /// can be; sizes, lower bounds and residue never read it.
+    monotone: bool,
 }
 
 enum Fail {
@@ -527,6 +532,7 @@ struct LoopRec {
     trip: Poly,
     lo: Poly,
     step: i128,
+    monotone: bool,
 }
 
 impl LoopRec {
@@ -546,7 +552,7 @@ impl LoopRec {
 /// the laps' distances telescope. `alpha` is what the callee charges per unit of distance, found
 /// at the call from its cost, and `(work, moves)`.
 #[derive(Debug, Clone)]
-struct Amort { line: u32, fid: FuncId, adv: super::scan::Advance, arr: LocalId, var: LocalId, alpha: Option<(Cost, Cost)> }
+struct Amort { line: u32, fid: FuncId, adv: super::scan::Advance, arr: LocalId, var: LocalId, alpha: Option<(Cost, Cost)>, group: usize }
 
 struct Fa<'a, 'b, 'c> {
     an: &'b mut Analyzer<'a>,
@@ -634,6 +640,8 @@ struct Fa<'a, 'b, 'c> {
     /// for each open `while` (by loop depth), the calls in its body whose laps are amortised
     /// against one index (docs/cost-model.md § An amortised scan)
     amort: Vec<(usize, Vec<Amort>)>,
+    /// the scan a `while`'s trip was just found by, as (index, least entry, least growth)
+    scan_ind: std::cell::RefCell<Option<(LocalId, Poly, i128)>>,
 }
 
 impl<'a, 'b, 'c> Fa<'a, 'b, 'c> {
@@ -643,7 +651,7 @@ impl<'a, 'b, 'c> Fa<'a, 'b, 'c> {
             local_size: HashMap::new(), local_affine: HashMap::new(), initial: HashMap::new(), at_entry: false,
             loops: vec![], work: Cost::zero(), moves: Cost::zero(), span: Cost::zero(), saved: vec![], branch: vec![], next_if: 0,
             local_root: HashMap::new(), resident: vec![], call_moves: Cost::zero(), saved_calls: vec![], replay: false, has_call: vec![], rests_on: vec![],
-            reads: Default::default(), loop_writes: vec![], scans: Default::default(), amort: vec![],
+            reads: Default::default(), loop_writes: vec![], scans: Default::default(), amort: vec![], scan_ind: Default::default(),
         };
         for (i, &p) in f.params.iter().enumerate() {
             let l = &f.locals[p];
@@ -872,7 +880,9 @@ impl<'a, 'b, 'c> Fa<'a, 'b, 'c> {
             };
             // a range whose end is the most or least an array holds is a hull over elements, not
             // a range every byte of which was read
-            let (lo, hi, exact) = match self.site_range(site) { Some((l, h)) => { let ex = !l.has_loose_read() && !h.has_loose_read(); (l, h, ex) } None => { let (l, h) = whole(root); (l, h, false) } };
+            // a scan's site is a hull too: a jump skips elements inside it (§ A scan's accesses)
+            let scanned = site.path.iter().any(|&l| self.loop_recs[l].monotone);
+            let (lo, hi, exact) = match self.site_range(site) { Some((l, h)) => { let ex = !scanned && !l.has_loose_read() && !h.has_loose_read(); (l, h, ex) } None => { let (l, h) = whole(root); (l, h, false) } };
             match feet.get_mut(&pi) {
                 None => { feet.insert(pi, (lo, hi, exact)); }
                 Some(e) => {
@@ -1053,7 +1063,7 @@ impl<'a, 'b, 'c> Fa<'a, 'b, 'c> {
     }
     /// Open a loop: push it and start a fresh accumulator frame for its body.
     fn enter_loop(&mut self, lp: Loop) {
-        self.loop_recs.push(LoopRec { var: lp.var, atom: lp.atom, trip: lp.trip.clone(), lo: lp.lo.clone(), step: lp.step });
+        self.loop_recs.push(LoopRec { var: lp.var, atom: lp.atom, trip: lp.trip.clone(), lo: lp.lo.clone(), step: lp.step, monotone: lp.monotone });
         let lp = Loop { id: self.loop_recs.len() - 1, ..lp };
         self.loops.push(lp);
         self.push_frame();
@@ -1100,7 +1110,10 @@ impl<'a, 'b, 'c> Fa<'a, 'b, 'c> {
                 // what the walk left resident is the *previous* iteration's: in the loop's own
                 // variable it is at `i − step`, or a call at `xs[i]` is credited for re-reading
                 // the element it reads for the first time
-                if let Some(a) = rec.atom {
+                // a scan's last lap is not `step` back: a jump leaves no residue to be sure of
+                if let (Some(a), true) = (rec.atom, rec.monotone) {
+                    self.resident.retain(|r| !(r.lo.mentions(a) || r.hi.mentions(a) || r.conds.iter().any(|c| c.ws.mentions(a))));
+                } else if let Some(a) = rec.atom {
                     let back = Poly::var(a).sub(&Poly::constant(rec.step));
                     for r in &mut self.resident {
                         r.lo = r.lo.subst(a, &back);
@@ -1180,7 +1193,7 @@ impl<'a, 'b, 'c> Fa<'a, 'b, 'c> {
         match &e.kind {
             ExprKind::Int(v) => Some(Poly::constant(*v as i128)),
             ExprKind::Local(l) => {
-                if let Some(lp) = self.loops.iter().find(|lp| lp.var == Some(*l)) {
+                if let Some(lp) = self.loops.iter().find(|lp| lp.var == Some(*l) && !lp.monotone) {
                     return lp.atom.map(Poly::var);
                 }
                 if self.at_entry && self.f.locals[*l].mutable { return self.entry_value(*l); }
@@ -1281,7 +1294,10 @@ impl<'a, 'b, 'c> Fa<'a, 'b, 'c> {
         match &e.kind {
             ExprKind::Int(v) => Some(Affine::constant(Poly::constant(*v as i128))),
             ExprKind::Local(l) => {
-                if let Some(lp) = self.loops.iter().find(|lp| lp.var == Some(*l)) {
+                // scanners nest `while`s on one index: the innermost is the one moving it
+                let mono = self.loops.iter().any(|lp| lp.var == Some(*l) && lp.monotone);
+                let lp = if mono { self.loops.iter().rev().find(|lp| lp.var == Some(*l)) } else { self.loops.iter().find(|lp| lp.var == Some(*l)) };
+                if let Some(lp) = lp {
                     return lp.offset.as_ref().map(|off| Affine::var(*l).add(off));
                 }
                 self.local_affine.get(l).cloned()
@@ -1614,7 +1630,7 @@ impl<'a, 'b, 'c> Fa<'a, 'b, 'c> {
         if refs.is_empty() { return; }
         let line = match s { Stmt::Assign(_, _, e) | Stmt::Let(_, e) | Stmt::Expr(e) => e.line, _ => 0 };
         // loop variables in scope with atoms, outermost first
-        let nest: Vec<(LocalId, usize, usize)> = self.loops.iter().enumerate().filter_map(|(k, l)| Some((l.var?, l.atom?, k))).collect();
+        let nest: Vec<(LocalId, usize, usize)> = self.loops.iter().enumerate().filter(|(_, l)| !l.monotone).filter_map(|(k, l)| Some((l.var?, l.atom?, k))).collect();
         let mut all_injective = true;
         let mut dim_sets: Vec<u32> = Vec::new();
         for (arr, idx, fi) in &refs {
@@ -1662,7 +1678,7 @@ impl<'a, 'b, 'c> Fa<'a, 'b, 'c> {
         let Some(mac) = bounds::as_mac(s) else { return };
         let (Some(aa), Some(ab)) = (self.affine(mac.ia), self.affine(mac.ib)) else { return };
         let es = self.elem_bytes(mac.a);
-        if let Some(inner) = self.loops.last().and_then(|l| l.var) {
+        if let Some(inner) = self.loops.last().filter(|l| !l.monotone).and_then(|l| l.var) {
             let m = self.machine();
             for (arr, aff) in [(mac.a, &aa), (mac.b, &ab)] {
                 let stride = aff.coeffs.get(&inner).cloned().unwrap_or_else(Poly::zero).scale(Rat::int(es));
@@ -1853,7 +1869,7 @@ impl<'a, 'b, 'c> Fa<'a, 'b, 'c> {
                 self.local_size.insert(*id, size.clone());
                 self.local_root.insert(*id, *id);
                 let atom = self.new_atom(&self.f.locals[*var].name.clone());
-                self.enter_loop(Loop { id: 0, var: Some(*var), atom: Some(atom), trip: size, lo: Poly::zero(), step: 1, offset: Some(Affine::constant(Poly::zero())) });
+                self.enter_loop(Loop { id: 0, var: Some(*var), atom: Some(atom), trip: size, lo: Poly::zero(), step: 1, offset: Some(Affine::constant(Poly::zero())), monotone: false });
                 self.add_work_n(3); // store, increment, compare-and-branch
                 let w = self.written_roots(body);
                 self.loop_writes.push(w);
@@ -1991,7 +2007,7 @@ impl<'a, 'b, 'c> Fa<'a, 'b, 'c> {
                 if let Some(c) = trip.as_const() { if c.n < 0 { trip = Poly::zero(); } }
                 let _ = hi;
                 let atom = self.new_atom(&self.f.locals[*var].name.clone());
-                self.enter_loop(Loop { id: 0, var: Some(*var), atom: Some(atom), trip, lo, step: 1, offset: a_lo });
+                self.enter_loop(Loop { id: 0, var: Some(*var), atom: Some(atom), trip, lo, step: 1, offset: a_lo, monotone: false });
                 self.add_work_n(2); // increment, compare-and-branch, per iteration
                 let w = self.written_roots(body);
                 self.loop_writes.push(w);
@@ -2010,7 +2026,7 @@ impl<'a, 'b, 'c> Fa<'a, 'b, 'c> {
                 let mut trip = hi;
                 if let Some(c) = trip.as_const() { if c.n < 0 { trip = Poly::zero(); } }
                 let atom = self.new_atom(&self.f.locals[*var].name.clone());
-                self.enter_loop(Loop { id: 0, var: Some(*var), atom: Some(atom), trip: trip.clone(), lo: Poly::zero(), step: 1, offset: Some(Affine::constant(Poly::zero())) });
+                self.enter_loop(Loop { id: 0, var: Some(*var), atom: Some(atom), trip: trip.clone(), lo: Poly::zero(), step: 1, offset: Some(Affine::constant(Poly::zero())), monotone: false });
                 self.add_work_n(2);
                 let w = self.written_roots(body);
                 self.loop_writes.push(w);
@@ -2022,6 +2038,7 @@ impl<'a, 'b, 'c> Fa<'a, 'b, 'c> {
             }
             Stmt::Break => Ok(()),
             Stmt::While { cond, decreasing, body, line } => {
+                self.scan_ind.borrow_mut().take();
                 self.expr(cond)?;
                 // the condition and the measure are read again every iteration: a size read from
                 // an array the body writes is not one
@@ -2059,14 +2076,20 @@ impl<'a, 'b, 'c> Fa<'a, 'b, 'c> {
                 let Some((trip, ind)) = found else {
                     return Err(Fail::Unknown("`while` has no measure the compiler can find; write `while cond decreasing <expr>` with an `i64` that goes down by at least one every iteration".into(), *line));
                 };
-                let (var, atom, lo, step, offset) = match ind {
-                    Some((v, i0, st)) => {
+                let scan = self.scan_ind.borrow_mut().take();
+                let (var, atom, lo, step, offset, monotone) = match (ind, scan) {
+                    (Some((v, i0, st)), _) => {
                         let a = self.new_atom(&self.f.locals[v].name.clone());
-                        (Some(v), Some(a), i0.clone(), st, Some(Affine::constant(i0)))
+                        (Some(v), Some(a), i0.clone(), st, Some(Affine::constant(i0)), false)
                     }
-                    None => (None, None, Poly::zero(), 1, None),
+                    // a scan: its index moves on, for the sites (§ A scan's accesses)
+                    (None, Some((v, i0, st))) => {
+                        let a = self.new_atom(&self.f.locals[v].name.clone());
+                        (Some(v), Some(a), i0.clone(), st, Some(Affine::constant(i0)), true)
+                    }
+                    (None, None) => (None, None, Poly::zero(), 1, None, false),
                 };
-                self.enter_loop(Loop { id: 0, var, atom, trip, lo, step, offset });
+                self.enter_loop(Loop { id: 0, var, atom, trip, lo, step, offset, monotone });
                 self.add_work_n(1);
                 // the condition runs once more than the body: the walk above was the last, failing
                 // test, and this one is the test before each iteration. Only its memory is
@@ -2084,9 +2107,25 @@ impl<'a, 'b, 'c> Fa<'a, 'b, 'c> {
                 let left = self.leave_loop(body);
                 let (_, done) = self.amort.pop().unwrap();
                 left?;
-                // the amortised calls' distance, charged once for the whole loop
+                // the amortised calls' distance, charged once for the whole loop: a chain shares
+                // one distance, so its calls' largest rate, once
+                let mut charged: Vec<usize> = Vec::new();
                 for (c, span) in done.iter().zip(&spans) {
-                    let Some((aw, am)) = &c.alpha else { continue };
+                    if charged.contains(&c.group) { continue; }
+                    let members: Vec<&Amort> = done.iter().filter(|d| d.group == c.group).collect();
+                    // a call of the chain the walk never reached leaves its rate unknown: charge
+                    // nothing amortised for the group only if none was stripped
+                    if members.iter().any(|d| d.alpha.is_none()) && members.iter().any(|d| d.alpha.is_some()) {
+                        // mixed: those stripped still need their distance — charge each its own
+                        for d in members.iter().filter(|d| d.alpha.is_some()) {
+                            let (aw, am) = d.alpha.as_ref().unwrap();
+                            if !self.replay { self.work = self.work.add(&aw.mul_poly(span)); self.span = self.span.add(&aw.mul_poly(span)); self.moves = self.moves.add(&am.mul_poly(span)); }
+                        }
+                        charged.push(c.group);
+                        continue;
+                    }
+                    charged.push(c.group);
+                    let Some((aw, am)) = members.iter().filter_map(|d| d.alpha.clone()).reduce(|(a, b), (x, y)| (a.max(&x), b.max(&y))) else { continue };
                     let (wc, mc) = (aw.mul_poly(span), am.mul_poly(span));
                     if !self.replay {
                         self.work = self.work.add(&wc);
@@ -2268,18 +2307,46 @@ impl<'a, 'b, 'c> Fa<'a, 'b, 'c> {
     /// `a`, and later `v = r.f + c` with `c ≥ 0`, the only assignment to `v` in the body; with what
     /// the loop's total adds, `α·(a.len() − v₀)`, needing `a`'s length and `v₀` known now.
     fn amortised_calls(&self, body: &Block) -> Vec<(Amort, Poly)> {
+        // a chain: `let r₁ = g(.., a, .., v, ..)`, then each next call at `rₖ.f + c` of the one
+        // before, and finally `v = r_last.f + c`, every `c ≥ 0` — the distances of all its calls,
+        // over all laps, still telescope to at most `a.len() − v₀`
         let mut out = Vec::new();
-        for (k, s) in body.stmts.iter().enumerate() {
-            let Stmt::Let(r, Expr { kind: ExprKind::Call(g, args), line, .. }) = s else { continue };
-            let Some(adv) = self.an.advances[*g] else { continue };
-            let Some(Expr { kind: ExprKind::Local(v), .. }) = args.get(adv.p) else { continue };
+        let mut group = 0;
+        let mut k = 0;
+        while k < body.stmts.len() {
+            let Stmt::Let(r0, Expr { kind: ExprKind::Call(g, args), line, .. }) = &body.stmts[k] else { k += 1; continue };
+            let Some(adv) = self.an.advances[*g] else { k += 1; continue };
+            let Some(Expr { kind: ExprKind::Local(v), .. }) = args.get(adv.p) else { k += 1; continue };
             let v = *v;
-            if !self.f.locals[v].mutable || self.f.locals[v].ty != Ty::I64 { continue; }
-            let arr = match args.get(adv.a).map(|a| &a.kind) { Some(ExprKind::Ref(x, _)) | Some(ExprKind::Local(x)) => *x, _ => continue };
-            let then = body.stmts[k + 1..].iter().any(|t| matches!(t, Stmt::Assign(LValue::Var(w), None, e) if *w == v && from_field(e, *r, adv.field)));
-            if !then || count_assigns(body, v) != 1 { continue; }
-            let (Some(len), Some(v0)) = (self.local_size.get(&arr).cloned(), self.start_of(v)) else { continue };
-            out.push((Amort { line: *line, fid: *g, adv, arr, var: v, alpha: None }, len.sub(&v0)));
+            if !self.f.locals[v].mutable || self.f.locals[v].ty != Ty::I64 { k += 1; continue; }
+            let arr_of = |args: &[Expr], a: usize| match args.get(a).map(|x| &x.kind) { Some(ExprKind::Ref(x, _)) | Some(ExprKind::Local(x)) => Some(*x), _ => None };
+            let Some(arr) = arr_of(args, adv.a) else { k += 1; continue };
+            let mut chain = vec![(*line, *g, adv)];
+            let (mut last_r, mut last_f) = (*r0, adv.field);
+            let mut closed = false;
+            let mut t = k + 1;
+            while t < body.stmts.len() {
+                match &body.stmts[t] {
+                    Stmt::Let(r, Expr { kind: ExprKind::Call(g2, a2), line: l2, .. }) => {
+                        if let Some(ad2) = self.an.advances[*g2] {
+                            if a2.get(ad2.p).is_some_and(|e| from_field(e, last_r, last_f)) && arr_of(a2, ad2.a) == Some(arr) {
+                                chain.push((*l2, *g2, ad2));
+                                (last_r, last_f) = (*r, ad2.field);
+                            }
+                        }
+                    }
+                    Stmt::Assign(LValue::Var(w), None, e) if *w == v => { closed = from_field(e, last_r, last_f); break; }
+                    _ => {}
+                }
+                t += 1;
+            }
+            if !closed || count_assigns(body, v) != 1 { k += 1; continue; }
+            let (Some(len), Some(v0)) = (self.local_size.get(&arr).cloned(), self.start_of(v)) else { k += 1; continue };
+            for (l, gid, ad) in chain {
+                out.push((Amort { line: l, fid: gid, adv: ad, arr, var: v, alpha: None, group }, len.sub(&v0)));
+            }
+            group += 1;
+            k = t + 1;
         }
         out
     }
@@ -2356,6 +2423,7 @@ impl<'a, 'b, 'c> Fa<'a, 'b, 'c> {
         let trip = span.scale(Rat::new(d.d, d.n));
         self.scans.borrow_mut().push(format!("scan: `{name}` grows by at least {} a lap, so the `while` at line {} runs at most {} times",
             d.to_f64(), cond.line, trip.display(&self.names)));
+        if d.is_int() { *self.scan_ind.borrow_mut() = Some((var, i0, d.n)); }
         Ok((trip, None))
     }
 

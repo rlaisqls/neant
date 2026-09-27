@@ -673,6 +673,31 @@ through a local the amortised scan does not follow. `heat` is 8× too high in mo
 of the stencil are counted as more streams than the rows they share. These are the next changes;
 each is a place the bound is loose, measured, not a constant to tune.
 
+## The corpus against the clock, after a scan's accesses (2026-09-27)
+
+Same harness, constants and machine as the table before; the calculus now charges a scan's accesses
+as a stream and amortises a chain of parser calls (cost-model § A scan's accesses, § An amortised
+scan).
+
+| program | size | bound | predicted ms | measured ms | measured/predicted |
+|---|---|---|---|---|---|
+| fir | 10⁴ / 10⁵ / 10⁶ integers | moves | 0.52 / 5.20 / 51.9 | 0.26 / 2.19 / 21.5 | 0.49 / 0.42 / 0.41 |
+| pid | 10⁴ / 10⁵ / 10⁶ integers | moves | 0.53 / 5.34 / 53.4 | 0.29 / 2.48 / 22.7 | 0.53 / 0.46 / 0.43 |
+| csv | 10³ / 10⁴ / 10⁵ rows | moves | 0.13 / 1.41 / 15.4 | 0.03 / 0.15 / 2.58 | 0.22 / 0.10 / 0.17 |
+| matmul | n = 100 / 300 / 600 | work / work / moves | 0.18 / 4.81 / 84.2 | 0.44 / 12.8 / 114 | 2.43 / 2.66 / 1.36 |
+| heat | n = 100 / 300 / 900, 50 steps | moves | 2.41 / 21.2 / 189 | 0.33 / 2.65 / 23.9 | 0.14 / 0.13 / 0.13 |
+
+**Every program is now within 0.10 to 2.7 of its measured time**, where the text readers were off
+by up to 10⁶; the geometric mean of measured over predicted is 0.41 — the prediction is an upper
+bound and errs high. What remains is the same short list, each a place the bound is loose and why:
+- `fir`, `pid`: 2.4× high. A call to `next_int` is charged `3·B` of partly used lines at its ends,
+  which consecutive calls share in fact.
+- `csv`: 5–10× high, the same `3·B` a call, three calls a row, on rows of a dozen bytes.
+- `heat`: 8× high in moves. The stencil's five reads are counted as more streams than the three rows
+  they share, a reuse between neighbouring sites § Moves does not yet see.
+- `matmul`: 1.4–2.7× low where it is work-bound at small `n`: its inner loop's `work·τ` uses a `τ`
+  fitted on a vectorised polynomial, and a strided dot product vectorises worse.
+
 ## The compiler's cost model, on the compiler — and the machine's answer
 
 The self-hosted cost reporter (`compiler/costdump.nt`, compiled by the self-hosted compiler) was

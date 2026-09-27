@@ -907,6 +907,16 @@ model lacks elsewhere: latency (`arena`, 5–31×, growing with the arena), a se
 page faults (small sizes, up to 6×), the TLB (`transpose`, 2–3×), and bandwidth that grows with the
 number of streams (`dot`, 0.64). Next is the corpus, program by program.
 
+**The corpus against the clock, 2026-09-27** (experiments.md, the two corpus tables;
+`tests/corpus/timing.py`). Timed with the fitted roofline, the kernels carried over (`matmul`
+1.3–2.6×) and the text readers did not, 10³–10⁶ too high: a scan's accesses were charged a line
+each and its footprint was the whole array, so the parse's moves were quadratic. A scan's index now
+has an affine form for access sites only (cost-model § A scan's accesses) — sizes, lower bounds and
+residue never read it — and a lap's chain of parser calls is amortised as one. Every corpus program
+is now predicted within 0.10–2.7 of its measured time, geometric mean 0.41, erring high as a bound
+should; what is left is listed where it is measured (`3·B` a call at a parse's ends, the stencil's
+shared rows, `τ` for code that vectorises worse).
+
 ## M7 — the constant factor
 
 Prove the asymptote, search the constant. A micro-architectural cost line (what llvm-mca and uiCA
@@ -972,6 +982,7 @@ docs/
   plan.md               this file
   cost-model.md         the calculus, as implemented
   experiments.md        what was measured against what prediction, and what it changed
+  evaluation.md         the claim, and every measurement that bears on it, side by side
   decisions.md          decisions with the reasoning that produced them
   corpus.md             the domain corpus's tiers and what blocks the rest
 ```

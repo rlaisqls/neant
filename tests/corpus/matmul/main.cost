@@ -1,30 +1,20 @@
 struct Num       layout AoS  the model does not decide: no function's moves differ
 is_digit         work 3                            moves 0                            exact
-next_int         work 9·xs.len() − 9·start + 29    moves                              bound  (2 regimes)
-                                               moves ≈ B·xs.len() + xs.len() − B·start − start if xs.len() ≥ M
-                                               moves 2·xs.len() − start + 2·B     if xs.len() < M
+next_int         work 9·xs.len() − 9·start + 29    moves 2·xs.len() − 2·start + 3·B   bound
                  footprint        xs: [0, xs.len()) (whole array)   no residue claimed
                  scan: `i` grows by at least 1 a lap, so the `while` at ../lib/parse.nt:23 runs at most xs.len() − start times
-parse_int        work 9·xs.len() + 31              moves                              bound  (2 regimes)
-                                               moves B·xs.len() + xs.len() + 2·B  if xs.len() ≥ M
-                                               moves 2·xs.len() + 2·B             if xs.len() < M
+parse_int        work 9·xs.len() + 31              moves 2·xs.len() + 3·B             bound
                  in `next_int`: scan: `i` grows by at least 1 a lap, so the `while` at ../lib/parse.nt:23 runs at most xs.len() − start times
                  rests on         next_int (bound, a scan)
-count_ints       work 44·xs.len() + 1              moves                              bound  (2 regimes)
-                                               moves B·xs.len()² + xs.len()² + 2·B·xs.len() if xs.len() ≥ M
-                                               moves 2·xs.len()² + 2·B·xs.len()   if xs.len() < M
+count_ints       work 44·xs.len() + 1              moves 3·B·xs.len() + 2·xs.len()    bound
                  in `next_int`: scan: `i` grows by at least 1 a lap, so the `while` at ../lib/parse.nt:23 runs at most xs.len() − start times
                  scan: `i` grows by at least 1 a lap, so the `while` at ../lib/parse.nt:41 runs at most xs.len() times
-                 scan: argument 2 to `next_int` is taken at its least, 0, and `next_int`'s cost falls as it grows
                  scan: the calls to `next_int` at ../lib/parse.nt:42 are amortised: `i` only moves on through where `next_int` stopped in `xs`, so together they are charged 9·xs.len() once, not a scan of `xs` a lap
                  rests on         next_int (bound, a scan)
-read_ints        work 35·out.len() + 9·xs.len() + 1 moves                              bound  (2 regimes)
-                                               moves ≈ B·xs.len()·out.len() + xs.len()·out.len() if xs.len() ≥ M
-                                               moves ≈ 2·xs.len()·out.len()       if xs.len() < M
-                 lower bound      moves 8·out.len()                  (footprint, every distinct element crosses once)
+read_ints        work 35·out.len() + 9·xs.len() + 1 moves ≈ 3·B·out.len() + 8·out.len() + 2·xs.len() bound
+                 lower bound      moves 8·out.len()                  (footprint, every distinct element crosses once)   gap 25× at M = 2 MiB, B = 64
                  footprint        out: [0, 8·out.len())   resident after if 8·out.len() < M
                  in `next_int`: scan: `i` grows by at least 1 a lap, so the `while` at ../lib/parse.nt:23 runs at most xs.len() − start times
-                 scan: argument 2 to `next_int` is taken at its least, 0, and `next_int`'s cost falls as it grows
                  scan: the calls to `next_int` at ../lib/parse.nt:56 are amortised: `i` only moves on through where `next_int` stopped in `xs`, so together they are charged 9·xs.len() once, not a scan of `xs` a lap
                  rests on         next_int (bound, a scan)
 fill             work 11·n² + 2·n                  moves                              exact  (2 regimes)
@@ -46,29 +36,13 @@ matmul           work 10·n³ + 5·n² + 2·n           moves                   
 trace            work 6·n                          moves B·n                          exact
                  lower bound      moves 8·n                          (footprint, every distinct element crosses once)   gap 8× at M = 2 MiB, B = 64
                  footprint        m: [0, 8·n²)   resident after if 8·n² < M
-main             work ≈ 10·n³                      moves                              bound, io  (22 regimes)
-                                               moves ≈ B·n³ + 8·n³                if ≈ 8·n ≥ M and a0.len() ≥ M and 24·n² < M
-                                               moves ≈ B·n³ + 8·n³                if ≈ 8·n ≥ M and a0.len() ≥ M and 8·n² ≥ M
-                                               moves ≈ 56·n²                      if ≈ 8·n² < M and a0.len() ≥ M and 24·n² < M
-                                               moves ≈ 8·n³                       if ≈ B·n + 8·n < M and a0.len() ≥ M and 8·n² ≥ M
-                                               moves ≈ 64·n²                      if ≈ 8·n² < M and a0.len() ≥ M and 24·n² ≥ M
-                                               moves ≈ B·n³ + 8·n³                if ≈ 8·n ≥ M and a0.len() < M and 24·n² < M
-                                               moves ≈ B·n³ + 8·n³                if ≈ 8·n ≥ M and a0.len() < M and 8·n² ≥ M
-                                               moves ≈ 56·n²                      if ≈ 8·n² < M and a0.len() < M and 24·n² < M
-                                               moves ≈ 8·n³                       if ≈ B·n + 8·n < M and a0.len() < M and 8·n² ≥ M
-                                               moves ≈ 64·n²                      if ≈ 8·n² < M and a0.len() < M and 24·n² ≥ M
-                                               moves ≈ B·n³ + 8·n³                if ≈ 8·n < M and ≈ B·n + 8·n ≥ M and a0.len() ≥ M and 24·n² < M
-                                               moves ≈ B·n³ + 8·n³                if ≈ 8·n ≥ M and a0.len() ≥ M and 8·n² < M and 24·n² ≥ M
-                                               moves ≈ B·n³ + 8·n³                if ≈ 8·n < M and ≈ B·n + 8·n ≥ M and a0.len() ≥ M and 8·n² ≥ M
-                                               moves ≈ 8·n³                       if ≈ B·n + 8·n < M and ≈ 8·n² ≥ M and a0.len() ≥ M and 24·n² < M
-                                               moves ≈ B·n³ + 8·n³                if ≈ 8·n < M and ≈ B·n + 8·n ≥ M and a0.len() < M and 24·n² < M
-                                               moves ≈ B·n³ + 8·n³                if ≈ 8·n ≥ M and a0.len() < M and 8·n² < M and 24·n² ≥ M
-                                               moves ≈ B·n³ + 8·n³                if ≈ 8·n < M and ≈ B·n + 8·n ≥ M and a0.len() < M and 8·n² ≥ M
-                                               moves ≈ 8·n³                       if ≈ B·n + 8·n < M and ≈ 8·n² ≥ M and a0.len() < M and 24·n² < M
-                                               moves ≈ B·n³ + 8·n³                if ≈ 8·n < M and ≈ B·n + 8·n ≥ M and a0.len() ≥ M and 8·n² < M and 24·n² ≥ M
-                                               moves ≈ 8·n³                       if ≈ B·n + 8·n < M and ≈ 8·n² ≥ M and a0.len() ≥ M and 8·n² < M and 24·n² ≥ M
-                                               moves ≈ B·n³ + 8·n³                if ≈ 8·n < M and ≈ B·n + 8·n ≥ M and a0.len() < M and 8·n² < M and 24·n² ≥ M
-                                               moves ≈ 8·n³                       if ≈ B·n + 8·n < M and ≈ 8·n² ≥ M and a0.len() < M and 8·n² < M and 24·n² ≥ M
+main             work ≈ 10·n³                      moves                              bound, io  (6 regimes)
+                                               moves ≈ B·n³ + 8·n³                if ≈ 8·n ≥ M
+                                               moves ≈ 56·n²                      if 24·n² < M
+                                               moves ≈ B·n³ + 8·n³                if ≈ 8·n < M and ≈ B·n + 8·n ≥ M
+                                               moves ≈ 8·n³                       if ≈ 8·n² ≥ M and 8·n² < M
+                                               moves ≈ 8·n³                       if ≈ B·n + 8·n < M and 8·n² ≥ M
+                                               moves ≈ 64·n²                      if ≈ 8·n² < M and 24·n² ≥ M
                  in `parse_int`: in `next_int`: scan: `i` grows by at least 1 a lap, so the `while` at ../lib/parse.nt:23 runs at most xs.len() − start times
                  in `matmul`: `b` moves by 8·n bytes per iteration of the innermost loop: a new line every time (main.nt:19)
                  rests on         arg (declared, extern); next_int (bound, a scan)
