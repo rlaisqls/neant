@@ -759,7 +759,7 @@ impl LoopRec {
 /// the laps' distances telescope. `alpha` is what the callee charges per unit of distance, found
 /// at the call from its cost, and `(work, moves)`.
 #[derive(Debug, Clone)]
-struct Amort { line: u32, fid: FuncId, adv: super::scan::Advance, arr: LocalId, var: LocalId, alpha: Option<(Cost, Cost)>, group: usize }
+struct Amort { line: u32, fid: FuncId, adv: super::scan::Advance, arr: LocalId, var: LocalId, alpha: Option<(Cost, Cost)>, group: usize, edge: Poly, rates: (Cost, Cost) }
 
 struct Fa<'a, 'b, 'c> {
     an: &'b mut Analyzer<'a>,
@@ -2559,18 +2559,28 @@ impl<'a, 'b, 'c> Fa<'a, 'b, 'c> {
                         // mixed: those stripped still need their distance — charge each its own
                         for d in members.iter().filter(|d| d.alpha.is_some()) {
                             let (aw, am) = d.alpha.as_ref().unwrap();
-                            if !self.replay { self.work = self.work.add(&aw.mul_poly(span)); self.span = self.span.add(&aw.mul_poly(span)); self.moves = self.moves.add(&am.mul_poly(span)); }
+                            if !self.replay {
+                                self.work = self.work.add(&aw.mul_poly(span)); self.span = self.span.add(&aw.mul_poly(span)); self.moves = self.moves.add(&am.mul_poly(span).add_poly(&d.edge));
+                                self.serial = self.serial.add(&d.rates.0.mul_poly(span)); self.divs = self.divs.add(&d.rates.1.mul_poly(span));
+                            }
                         }
                         charged.push(c.group);
                         continue;
                     }
                     charged.push(c.group);
                     let Some((aw, am)) = members.iter().filter_map(|d| d.alpha.clone()).reduce(|(a, b), (x, y)| (a.max(&x), b.max(&y))) else { continue };
-                    let (wc, mc) = (aw.mul_poly(span), am.mul_poly(span));
+                    // the chain's ends once: its calls' largest
+                    let edge = members.iter().map(|d| d.edge.clone()).fold(Poly::zero(), |a, e| if super::piece::dominates(&e, &a) { e } else { a });
+                    let (wc, mc) = (aw.mul_poly(span), am.mul_poly(span).add_poly(&edge));
                     if !self.replay {
                         self.work = self.work.add(&wc);
                         self.span = self.span.add(&wc);
                         self.moves = self.moves.add(&mc);
+                        // serial work and divisions: the chain's largest rate, once
+                        let pick = |f: &dyn Fn(&Amort) -> Cost| members.iter().map(|d| f(d)).reduce(|a, b| a.max(&b)).unwrap_or_default();
+                        let (rs, rd) = (pick(&|d| d.rates.0.clone()), pick(&|d| d.rates.1.clone()));
+                        self.serial = self.serial.add(&rs.mul_poly(span));
+                        self.divs = self.divs.add(&rd.mul_poly(span));
                     }
                     let callee = self.an.m.funcs[c.fid].name.clone();
                     let arr = self.f.locals[c.arr].name.clone();
@@ -2783,7 +2793,7 @@ impl<'a, 'b, 'c> Fa<'a, 'b, 'c> {
             if !closed || count_assigns(body, v) != 1 { k += 1; continue; }
             let (Some(len), Some(v0)) = (self.local_size.get(&arr).cloned(), self.start_of(v)) else { k += 1; continue };
             for (l, gid, ad) in chain {
-                out.push((Amort { line: l, fid: gid, adv: ad, arr, var: v, alpha: None, group }, len.sub(&v0)));
+                out.push((Amort { line: l, fid: gid, adv: ad, arr, var: v, alpha: None, group, edge: Poly::zero(), rates: (Cost::zero(), Cost::zero()) }, len.sub(&v0)));
             }
             group += 1;
             k = t + 1;
@@ -3275,7 +3285,11 @@ impl<'a, 'b, 'c> Fa<'a, 'b, 'c> {
                 // an amortised call (§ An amortised scan): a lap pays what the callee charges
                 // besides the distance it moves, and the loop pays the distance once
                 let depth = self.loops.len();
-                let mut amort_alpha: Option<(usize, Cost, Cost)> = None;
+                let mut amort_alpha: Option<(usize, Cost, Cost, Poly)> = None;
+                // the serial work and divisions of an amortised call, the same way: a lap pays
+                // what is not distance, the loop the distance once
+                let (mut c_serial, mut c_divs) = (callee.serial.clone(), callee.divs.clone());
+                let mut amort_rates: Option<(Cost, Cost)> = None;
                 if let Some((d, cands)) = self.amort.last() {
                     if *d == depth {
                         if let Some((ci, c)) = cands.iter().enumerate().find(|(_, c)| c.line == e.line && c.fid == *fid) {
@@ -3284,7 +3298,29 @@ impl<'a, 'b, 'c> Fa<'a, 'b, 'c> {
                             let (aw, asp, am) = (distance_rate(&w, c.adv), distance_rate(&sp, c.adv), distance_rate(&mv, c.adv));
                             let aw = match (aw, asp) { (Some(a), Some(b)) => { w = strip_distance(&w, c.adv); sp = strip_distance(&sp, c.adv); Some(a.max(&b)) } _ => None };
                             let am = am.map(|a| { mv = strip_distance(&mv, c.adv); a });
-                            if aw.is_some() || am.is_some() { amort_alpha = Some((ci, aw.unwrap_or_default(), am.unwrap_or_default())); }
+                            // the partly used lines at the two ends of a call's stretch: the next
+                            // call starts where this one stopped, so the chain shares them and the
+                            // loop pays them once — where the callee touches the scanned array
+                            // alone and has none of its own
+                            let mut edge = Poly::zero();
+                            if am.is_some() && !callee.internal && callee.footprint.iter().all(|f| f.param == c.adv.a) && mv.pieces.len() == 1 {
+                                let b1 = Poly::atom(Atom::B);
+                                let q = &mv.pieces[0].poly;
+                                let k = q.terms.iter().find(|(m, k)| Poly { terms: [((*m).clone(), Rat::one())].into_iter().collect() } == b1 && k.n > 0).map(|(_, k)| *k);
+                                if let Some(k) = k {
+                                    edge = b1.scale(k);
+                                    mv = mv.map(|q| q.sub(&edge));
+                                }
+                            }
+                            let has_w = aw.is_some();
+                            if aw.is_some() || am.is_some() { amort_alpha = Some((ci, aw.unwrap_or_default(), am.unwrap_or_default(), edge)); }
+                            if has_w {
+                                let rs = distance_rate(&c_serial, c.adv);
+                                let rd = distance_rate(&c_divs, c.adv);
+                                if rs.is_some() { c_serial = strip_distance(&c_serial, c.adv); }
+                                if rd.is_some() { c_divs = strip_distance(&c_divs, c.adv); }
+                                amort_rates = Some((rs.unwrap_or_default(), rd.unwrap_or_default()));
+                            }
                         }
                     }
                 }
@@ -3422,9 +3458,10 @@ impl<'a, 'b, 'c> Fa<'a, 'b, 'c> {
                 mv = mv.rename_roots(&rename).subst_many(&map);
                 sp = sp.rename_roots(&rename).subst_many(&map);
                 // the rate per unit of distance, in this function's sizes as the rest of the cost is
-                if let Some((ci, aw, am)) = amort_alpha {
+                if let Some((ci, aw, am, edge)) = amort_alpha {
                     let (aw, am) = (aw.rename_roots(&rename).subst_many(&map), am.rename_roots(&rename).subst_many(&map));
-                    if !self.replay { if let Some((_, cands)) = self.amort.last_mut() { cands[ci].alpha = Some((aw, am)); } }
+                    let rates = amort_rates.take().map(|(a, b)| (a.rename_roots(&rename).subst_many(&map), b.rename_roots(&rename).subst_many(&map))).unwrap_or_default();
+                    if !self.replay { if let Some((_, cands)) = self.amort.last_mut() { cands[ci].alpha = Some((aw, am)); cands[ci].edge = edge; cands[ci].rates = rates; } }
                 }
                 self.last_result = callee.result_size.as_ref().map(|p| p.subst_many(&map));
                 // the callee's footprint in this function's arrays (none is known of a declared callee)
@@ -3531,16 +3568,16 @@ impl<'a, 'b, 'c> Fa<'a, 'b, 'c> {
                         let c = callee.chase.hide_args(&hide);
                         if !c.pieces.iter().any(|pc| hide(&pc.poly)) { self.chase = self.chase.add(&c.rename_roots(&rename).subst_many(&map)); }
                     }
-                    if !declared_only && !opaque && !callee.serial.pieces.is_empty() {
+                    if !declared_only && !opaque && !c_serial.pieces.is_empty() {
                         let hide = |p: &Poly| unnamed.iter().any(|(i, _)| p.mentions(*i));
-                        let c = callee.serial.hide_args(&hide);
+                        let c = c_serial.hide_args(&hide);
                         if !c.pieces.iter().any(|pc| hide(&pc.poly)) { self.serial = self.serial.add(&c.rename_roots(&rename).subst_many(&map)); }
                     }
                     // a square root runs on the divider: counted as a division (cost-model § Time, divisions)
                     if cf.body.is_none() && cf.name == "sqrt" { self.divs = self.divs.add_poly(&Poly::constant(1)); }
-                    if !declared_only && !opaque && !callee.divs.pieces.is_empty() {
+                    if !declared_only && !opaque && !c_divs.pieces.is_empty() {
                         let hide = |p: &Poly| unnamed.iter().any(|(i, _)| p.mentions(*i));
-                        let c = callee.divs.hide_args(&hide);
+                        let c = c_divs.hide_args(&hide);
                         if !c.pieces.iter().any(|pc| hide(&pc.poly)) { self.divs = self.divs.add(&c.rename_roots(&rename).subst_many(&map)); }
                     }
                     if !declared_only && !opaque && !callee.paged.pieces.is_empty() {

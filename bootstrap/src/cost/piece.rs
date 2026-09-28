@@ -125,7 +125,18 @@ fn univariate_nonneg(d: &Poly) -> bool {
 /// that are both sound, which is what "the walk is longer than the arena" means in the region rule.
 pub fn dominates_eventually(q: &Poly, p: &Poly) -> bool {
     let pos = |x: &Poly| Poly { terms: x.terms.iter().filter(|(_, c)| c.n > 0).map(|(m, c)| (m.clone(), *c)).collect() };
-    dominates_as_written(&pos(q), &pos(p))
+    let (q, p) = (pos(q), pos(p));
+    if dominates_as_written(&q, &p) { return true; }
+    // as the sizes grow: every term `q − p` subtracts is outgrown by one it adds, a term with at
+    // least its exponent in every atom and more in some size — `n/3 − 1` is eventually positive,
+    // whatever the coefficients
+    let d = q.sub(&p);
+    let zero = Rat::zero();
+    d.terms.iter().filter(|(_, c)| c.n < 0).all(|(pm, _)| d.terms.iter().filter(|(_, c)| c.n > 0).any(|(qm, _)| {
+        let atoms = || qm.factors.keys().chain(pm.factors.keys());
+        atoms().all(|a| qm.factors.get(a).unwrap_or(&zero) >= pm.factors.get(a).unwrap_or(&zero))
+            && atoms().any(|a| a.is_size() && qm.factors.get(a).unwrap_or(&zero) > pm.factors.get(a).unwrap_or(&zero))
+    }))
 }
 
 /// The least value `p` takes over a few thousand samples in which every atom is a whole number

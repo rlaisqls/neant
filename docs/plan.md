@@ -1000,6 +1000,10 @@ first lap's value for every lap. Such calls are unknown now, and the compiler is
 `modulo` lines were wrong, one line more exact and one more bound from the cursor. A stale read
 that is only an unknown callee's argument is `_` there instead (95/45/44/94: the compiler's
 `pol_close(…, pst[1])` everywhere), and a resident call no longer zeroes an unknown callee's moves.
+Back to time (evaluation, next): an amortised call's line ends are charged once for the loop, the
+region rule's "longer than the array" is asked asymptotically, and serial work and divisions are
+amortised as work is — the corpus from 0.56 to 1.26, `csv` 0.10–0.22 to 0.81–0.95 (experiments.md,
+a parse's ends and its serial work); no report line changes but the moves of eight parse loops.
 
 ## M7 — the constant factor
 
@@ -1008,6 +1012,119 @@ compute for a block, as default output, applicable because the type system knows
 reassociated); schedules separate from algorithms; search over schedules pruned by the cost model
 and decided by measurement, persisted in `costs.lock`. An own backend is justified here and only
 here — as the search space LLVM does not expose, not as better heuristics.
+
+## Stage E — evidence for a reader outside
+
+**Why.** Every number in evaluation.md was taken by the people who wrote the rules it tests, on
+programs they chose or wrote, on one core of one machine, and every constant and most rules were
+added after a measurement showed they were missing. That makes a record of how the model was
+built, not evidence for it. The four questions (evaluation § The claim: bytes, time, reach, trust)
+are the right ones; what a reader outside needs is each answered on code, a machine and a
+threshold the model was not fitted to, beside what the tools that already exist would answer.
+Stage E does not wait on M7, and M7 does not need it; it does need the end of stage D, since reach
+is measured with the calculus frozen.
+
+**Claim.** On programs the project did not write and a machine it did not fit, the cost the
+compiler infers (1) predicts bytes and time within stated factors, (2) ranks alternative versions
+of a program the way the machine does, better than a count of operations, (3) reaches more of a
+program than a bound analyser reaches on the same program written in C, and (4) is never wrong
+where it says `exact`, on programs generated to find the case where it is.
+
+**Do.**
+
+1. **Thresholds before numbers.** A section of evaluation.md is written, and committed, before any
+   held-out program is costed or timed: for each question the number that counts as holding, the
+   number that counts as failing, and what is reported in between. Proposed, to be fixed there:
+   time within 2× geometric mean and 4× every run; ranking a Kendall τ of 0.8 or better and above
+   the work-only baseline's; reach, the stated share (exact, modulo and bound) at least the
+   compiler's own and exact no lower than the C baseline's; trust, no wrong `exact` in the
+   generated suite. The roofline's constants and the calculus are frozen at a commit named in the same
+   section; a rule added afterwards is measured on the held-out set as a separate row, never
+   folded into the first.
+2. **A held-out corpus.** Ported with its published structure, the port committed before it is
+   costed, its text never edited to suit the rules, every refusal kept as a rejected case with its
+   cause, as `tests/corpus` does:
+   - **PolyBench/C** (30 affine kernels): the suite IOLB, IOUB and Bao's exact count report on, so
+     the moves can be put beside theirs kernel by kernel;
+   - **the rest of the Benchmarks Game** (fasta, k-nucleotide, reverse-complement,
+     pidigits, regex-redux): the text- and hash-heavy half; those the language cannot express yet
+     count as refusals of the language, not skipped;
+   - **a few kernels from outside numerics**: a sort, a hash join, a trie or B-tree search, an LZ
+     style compressor — ordinary code shaped the way the compiler's own is, but not written here.
+   Reach is reported on this set by cause, as stage D reports the compiler; bytes and time on
+   every program that gets a cost.
+3. **Baselines, on the same programs.**
+   - *Bytes:* measured refills (as now), IOLB's lower bound (`--iolb`), and a cache simulator at
+     `M` with the machine's associativity, so a gap is split into the model's error and the
+     ideal-cache model's. On PolyBench, beside Bao's exact count where it is published.
+   - *Reach:* the same programs as C, the port's own emitted C and the upstream C, through a C
+     cost analyser (KoAT2 or Loopus, whichever runs on the emitted C), and the functional ones
+     through RAML where they translate. This is the scope argument (decisions §4) as a number: what
+     being a language buys over analysing its output.
+   - *Time:* the roofline against three smaller models — `work·τ` alone, `moves/BW` alone, and
+     the roofline without the latency, serial and division terms — so each term shows what it
+     earns on programs it was not fitted on.
+4. **Ablation of the calculus.** Each rule stage D added (read atoms, list walks, the scan rule,
+   worklists, tree and forest recursion, neighbouring sites, amortised calls) behind a switch
+   that turns it off, and the held-out reach and time re-measured with each off. A rule that
+   moves nothing on the held-out set is reported as fitted to the corpus it was found on.
+5. **A second and a third machine.** One x86 server core and one other ARM core (an Apple M-series
+   or a Neoverse). The constants refitted there by the kernels each was fitted on here and nothing else,
+   then every table re-taken: the claim is "two constants per machine", and a second machine is
+   where it is tested. The byte counter differs per machine (`l2d_cache_refill` here, LLC or
+   L2 misses on x86); which one is used, and why, is written down before the sweep. Past one
+   core: the M5 kernels and the `.par()` programs at P = 1…cores on both.
+6. **Ranking, the claim a user acts on.** For each corpus and held-out program, two to four
+   versions a person would plausibly write (AoS and SoA, tiled and not, a copy and in place, a
+   worklist and a recursion, a different loop order). The compiler's predicted order is compared
+   with the measured order per program (Kendall τ) and against the work-only baseline. A cost that
+   is 2× off but always orders versions right is useful; one within 1.3× that orders them wrong is
+   not. Pairs whose measured times differ by less than the run-to-run noise are reported apart.
+7. **Trust by construction, not by reading.** Two parts:
+   - *A counting emitter* (new): `neant emit --count` instruments the C with the calculus's own
+     work units and every array access, run through the cache simulator at `M` and `B`, so a
+     program's actual work and moves in the model's own units are a number the run prints.
+   - *A generator* of programs in the fragment the calculus claims: nests of counted and
+     `while` loops, calls with footprints and residues, arenas walked as lists and trees, scans
+     that step by what they read, sizes read from memory. Every line the compiler marks `exact`
+     is checked equal to the count at random sizes; every `bound` checked not below it. The
+     generator runs in CI at a small budget and at a large one before each count in evaluation.md.
+     The two-compiler parity check stays; this one does not depend on either compiler being right.
+   A mechanised proof of the whole calculus is not attempted; one of the composition rule alone
+   (stage A's four-part object: `g`'s moves reduced by `f.residue ∩ g.footprint`, loops as the
+   body composed with itself) over a small core, in Lean, is — it is the part the signature claim
+   rests on and the literature does not have (decisions §5).
+8. **The lockfile in review, replayed.** For every commit of the project's history that changed
+   `compiler/*.nt` or a corpus program, the `costs.lock` diff against the measured change in time
+   on the harness: how often a line that moved named a change the machine saw, and how often the
+   machine saw a change no line named. That is the claim that the lockfile belongs in code review,
+   taken on history rather than asserted.
+9. **One command per table.** `tests/eval/run.sh` rebuilds every table in evaluation.md from a
+   clean checkout, records machine, core, kernel, compiler versions and the frozen commit, and
+   writes the numbers the document quotes; the document's tables are generated, not typed. A
+   container for the parts that do not need the counters (reach, trust, simulator bytes), so they
+   run anywhere.
+
+**Exit.** evaluation.md re-written on the held-out set with the thresholds of (1) beside every
+number: each question holds, fails, or sits between, said in those words; each baseline's column
+beside the compiler's; the ablation table; the second machine's tables beside the first's.
+
+**Kill**, each on its own claim:
+- *Time.* If the constants refitted on the second machine do not bring its held-out programs
+  within the thresholds, the time claim is withdrawn to "on the machine it was fitted to", and the
+  bytes model is what remains.
+- *Ranking.* If the ranking is no better than the work-only baseline's, moves adds nothing a
+  user can act on, whatever its accuracy in bytes, and the README's first fact is not shown.
+- *Reach.* If the C analyser, run on the emitted C, reaches what the compiler reaches, being a
+  language buys no reach, and the positioning question (§ Who switches) is reopened with that
+  number, towards a whole-program analysis of C or the kernel DSL.
+- *Trust.* A wrong `exact` from the generator is fixed with a golden, as now; if they keep coming
+  at a rate that does not fall across three rounds, the tier is renamed `estimate`, the lockfile
+  stops claiming it, and budgets are checked against bounds only.
+
+**Not in it.** A user study: there is one author, and a study of one is an anecdote. If the
+ranking and the lockfile replay hold, a small one (people choosing between versions with and
+without the grey text) is where it would go next.
 
 ## Not scheduled
 

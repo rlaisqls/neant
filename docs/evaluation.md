@@ -71,17 +71,19 @@ fitted) and a compute-bound map 2.0–3.1, each flat in `P`: the model now tells
 the memory from one that scales, which M5 found it could not, and is off by one constant each.
 
 **The corpus's programs** (`tests/corpus/timing.py`, three generated input sizes each), after the
-changes the first timing forced (cost-model § A scan's accesses):
+changes the timings forced (cost-model § A scan's accesses, § An amortised scan; experiments.md):
 
 | program | measured / predicted |
 |---|---|
-| `fir`, `pid` (read 10⁴–10⁶ integers, filter / control loop) | 0.41 – 0.53 |
-| `csv` (10³–10⁵ rows) | 0.10 – 0.22 |
-| `matmul` (n = 100–600) | 1.36 – 2.66 |
-| `heat` (n = 300–900, 50 steps) | 0.48 – 0.51 |
+| `fir` (read 10⁴–10⁶ integers, filter) | 1.93 – 2.08 |
+| `pid` (read 10⁴–10⁶ integers, control loop) | 1.27 – 1.56 |
+| `csv` (10⁴–10⁵ rows) | 0.81 – 0.95 |
+| `matmul` (n = 100–600) | 1.35 – 2.66 |
+| `heat` (n = 300–900, 50 steps) | 0.45 – 0.51 |
 
-Every program is within **0.16 to 2.7** of its measured time, geometric mean 0.56 (0.41 before the
-stencil's neighbouring sites were grouped and `heat` moved from 0.13 to 0.50).
+Every program is within **0.45 to 2.7** of its measured time, geometric mean 1.26 (0.56 before a
+parse's per-call line ends were charged once and its serial work was carried through the
+amortised calls; the ends had hidden the dropped serial work, and the error changed side).
 
 **The Benchmarks Game's programs** (`tests/bench/timing.py`, experiments.md), none used in a fit:
 
@@ -173,8 +175,7 @@ constant to tune:
 - **Reuse between neighbouring sites, in part.** A stencil's five reads are three streams now, not
   five (cost-model § Neighbouring sites); the centre row is still counted apart from the rows it
   shares with its neighbours (`heat`, 2× high, from 8×).
-- **Per-call constants in a parse.** `3·B` of partly used lines at each end of a call, which
-  consecutive calls share (`csv`, 5–10× high).
+- **Compute in a filter** (`fir`, 2× low), charged at a `τ` fitted on a polynomial.
 - **A `τ` for code that vectorises worse** than the polynomial it was fitted on (`matmul` at small
   `n`, 2.4–2.7× low).
 - **Reach.** `while` loops with no measure the compiler finds, inside the walkers and in the
@@ -196,8 +197,9 @@ constant to tune:
   work were charged, each found by these programs and fitted elsewhere).
 - **Generated inputs.** Uniform random integers and rows; real data with long lines or skew would
   move the parse's constants.
-- **Bounds err high by design.** A geometric mean of 0.56 on the corpus is a bound behaving as one; it is also a
-  factor of about two of slack at the median.
+- **Bounds err high by design, and on the corpus no longer do.** Its geometric mean was 0.56 while
+  the parse overcharged its moves; with that removed it is 1.26, and three programs are predicted
+  faster than they run: the time is an estimate there, not a bound.
 - **Wall-clock, minimum of three to five runs,** on a machine shared at times with other sessions;
   the kernels' table was taken idle.
 
@@ -206,7 +208,7 @@ constant to tune:
 On its own domain the claim holds in the form plan § Who switches set for it: every program in the
 corpus has a cost the compiler inferred, the kernels' costs predict bytes to within the ideal-cache
 model's known limits and time to within about 30% where one term dominates, and the programs' costs
-predict their time within a small factor, erring high — and so do five programs the project did not
+predict their time within a small factor either way (0.45–2.7) — and so do five programs the project did not
 write, with constants fitted on none of them (0.50–1.77). What it does not yet do is reach the larger
 part of ordinary code *exactly* — the compiler is a third exact, a third stated as a bound or modulo
 a callee, a third unknown — and every place it is loose is a named term or shape, each with the
@@ -216,5 +218,5 @@ A second cache level was tried (`--M3`, experiments.md): it helps mid-size strea
 access in equal measure, so it is not the default. A TLB charge per paged line (`--tlb`) fits
 `transpose` and over-charges naive matmul fourfold, so it is off too. Next, in the order they would change these
 numbers: a bandwidth that depends on the access pattern (a stride, the number of streams) at each
-level (the small sizes, and a chase inside L3), the parse's per-call constants (`csv`),
+level (the small sizes, and a chase inside L3), `fir`'s filter and `matmul`'s strided dot product,
 a second machine for `τ`, `BW` and `L`, and, for reach, the `while` loops the walkers are waiting on.

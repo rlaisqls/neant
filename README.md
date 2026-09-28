@@ -201,7 +201,7 @@ cache of one size `M`, and `neant cost --eval` turns work and moves into a time 
 fitted once on one core (docs/cost-model.md § Time) — a roofline with a latency term for a pointer
 chase, a slower rate for work on a dependency chain and for division. Held fixed, they put five
 Benchmarks Game programs within 0.5–1.8× of their measured time and the project's own corpus within
-a few times, erring high as a bound should; that is a factor, not a number (docs/evaluation.md). The machine has three levels, a TLB the model does not mention that dominates at
+0.45–2.7×, geometric mean 1.26; that is a factor, not a number (docs/evaluation.md). The machine has three levels, a TLB the model does not mention that dominates at
 large strides, set associativity that made one tiled product 75× slower at a stride with a big
 power of two in it, and a transition from "fits" to "does not" that the model puts at one `n` and
 the hardware spreads over an octave. `O(·)` does not capture constants either: a function can meet

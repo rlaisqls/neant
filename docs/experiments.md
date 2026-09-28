@@ -750,6 +750,41 @@ bound and errs high. What remains is the same short list, each a place the bound
 - `matmul`: 1.4–2.7× low where it is work-bound at small `n`: its inner loop's `work·τ` uses a `τ`
   fitted on a vectorised polynomial, and a strided dot product vectorises worse.
 
+## The corpus against the clock, a parse's ends and its serial work (2026-09-28)
+
+Same harness, constants and machine. Two changes to the calculus, each found by the one before it.
+
+**The ends of a call's stretch, once.** An amortised call's moves are its distance, charged once
+for the loop, and a constant — `next_int`'s `3·B`, the partly used lines at the two ends of the
+stretch it reads. The next call starts where this one stopped, so the lines are the chain's, and the
+loop now pays them once where the callee touches the scanned array alone and has none of its own
+(cost-model § An amortised scan). And the region rule, which lets a data-indexed site on an array
+that fits cost at most that array (`csv`'s `count[s.v]`, eight elements), had not applied: whether
+the loop is longer than the array was decided by a test that compared coefficients as written, and
+`text.len()/3 − 1/3 ≥ 1` failed it. It asks now whether every term subtracted is outgrown by one
+added. `csv`'s `main` moves `4·text.len()` bytes, from `B·text.len() + 4·text.len()`; `count_ints`
+`3·B` in all, from `3·B` a number.
+
+With only that, the parsers went from 2–10× high to 2–2.8× **low** — `fir` 2.0–2.4, `pid` 2.7–4.5,
+`csv` 2.0–2.2: the overcharged moves had hidden a compute term. The number loop, `v = v·10 + d`, is
+serial work (cost-model § Time, serial work), and `next_int` alone has it — 7 units a digit — but
+an amortised call's serial work is in the distance it moves, which the call cannot name, and it was
+dropped. Serial work and divisions are now amortised as work is: a lap pays what is not distance,
+the loop the distance at the chain's largest rate, once.
+
+| program | size | bound | predicted ms | measured ms | measured/predicted |
+|---|---|---|---|---|---|
+| fir | 10⁴ / 10⁵ / 10⁶ integers | work | 0.11 / 1.14 / 11.4 | 0.22 / 2.37 / 23.3 | 1.93 / 2.08 / 2.04 |
+| pid | 10⁴ / 10⁵ / 10⁶ integers | work | 0.14 / 1.38 / 13.8 | 0.17 / 2.11 / 21.4 | 1.27 / 1.53 / 1.56 |
+| csv | 10⁴ / 10⁵ rows | work | 0.21 / 2.24 | 0.17 / 2.13 | 0.81 / 0.95 |
+| matmul | n = 100 / 300 / 600 | work / work / moves | 0.18 / 4.81 / 84.2 | 0.47 / 12.8 / 113 | 2.58 / 2.66 / 1.35 |
+| heat | n = 100 / 300 / 900, 50 steps | moves | 0.65 / 5.47 / 48.2 | 0.20 / 2.46 / 24.4 | 0.31 / 0.45 / 0.51 |
+
+**The programs are within 0.31 to 2.7** — the parsers from 0.10–0.53 to 0.81–2.1 — geometric mean
+1.26 over the runs past the harness's noise (`csv` at 10³ rows is shorter than a process's start).
+The error changed side: the prediction is no longer an upper bound on these programs. `fir`'s
+remaining 2× is its filter loop, compute the model charges at `τ`.
+
 ## Programs the project did not write: the Benchmarks Game (2026-09-28)
 
 **Why.** The corpus is the project's own (evaluation.md, threats). Five programs of the Computer

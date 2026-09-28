@@ -1,12 +1,12 @@
 word_end         work 2·xs.len() − 2·start + 4     moves xs.len() − start + 2·B       exact
                  footprint        xs: [0, xs.len()) (whole array)   no residue claimed
-words            work 13·xs.len() + 1              moves 2·B·xs.len() + xs.len()      bound
+words            work 13·xs.len() + 1              moves xs.len() + 2·B               bound
                  scan: `i` grows by at least 1 a lap, so the `while` at line 19 runs at most xs.len() times
                  scan: the calls to `word_end` at line 20 are amortised: `i` only moves on through where `word_end` stopped in `xs`, so together they are charged 2·xs.len() once, not a scan of `xs` a lap
 trimmed          work 5·xs.len() + 8               moves 2·xs.len() + 3·B             bound
                  footprint        xs: [0, xs.len()) (whole array)   no residue claimed
                  scan: `i` grows by at least 1 a lap, so the `while` at line 35 runs at most xs.len() times
-main             work 433                          moves 47·B + 88                    bound, io
+main             work 433                          moves 5·B + 88                     bound, io
                  in `words`: scan: `i` grows by at least 1 a lap, so the `while` at line 19 runs at most xs.len() times
                  in `words`: scan: the calls to `word_end` at line 20 are amortised: `i` only moves on through where `word_end` stopped in `xs`, so together they are charged 2·xs.len() once, not a scan of `xs` a lap
                  in `trimmed`: scan: `i` grows by at least 1 a lap, so the `while` at line 35 runs at most xs.len() times

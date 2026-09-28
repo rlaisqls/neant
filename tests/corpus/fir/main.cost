@@ -7,20 +7,20 @@ next_int         work 9·xs.len() − 9·start + 29    moves 2·xs.len() − 2·
 parse_int        work 9·xs.len() + 31              moves 2·xs.len() + 3·B             bound
                  in `next_int`: scan: `i` grows by at least 1 a lap, so the `while` at ../lib/parse.nt:23 runs at most xs.len() − start times
                  rests on         next_int (bound, a scan)
-count_ints       work 44·xs.len() + 1              moves 3·B·xs.len() + 2·xs.len()    bound
+count_ints       work 44·xs.len() + 1              moves 2·xs.len() + 3·B             bound
                  in `next_int`: scan: `i` grows by at least 1 a lap, so the `while` at ../lib/parse.nt:23 runs at most xs.len() − start times
                  scan: `i` grows by at least 1 a lap, so the `while` at ../lib/parse.nt:41 runs at most xs.len() times
                  scan: the calls to `next_int` at ../lib/parse.nt:42 are amortised: `i` only moves on through where `next_int` stopped in `xs`, so together they are charged 9·xs.len() once, not a scan of `xs` a lap
                  rests on         next_int (bound, a scan)
-read_ints        work 35·out.len() + 9·xs.len() + 1 moves ≈ 3·B·out.len() + 8·out.len() + 2·xs.len() bound
-                 lower bound      moves 8·out.len()                  (footprint, every distinct element crosses once)   gap 25× at M = 2 MiB, B = 64
+read_ints        work 35·out.len() + 9·xs.len() + 1 moves 8·out.len() + 2·xs.len() + 4·B bound
+                 lower bound      moves 8·out.len()                  (footprint, every distinct element crosses once)   gap 1× at M = 2 MiB, B = 64
                  footprint        out: [0, 8·out.len())   resident after if 8·out.len() < M
                  in `next_int`: scan: `i` grows by at least 1 a lap, so the `while` at ../lib/parse.nt:23 runs at most xs.len() − start times
                  scan: the calls to `next_int` at ../lib/parse.nt:56 are amortised: `i` only moves on through where `next_int` stopped in `xs`, so together they are charged 9·xs.len() once, not a scan of `xs` a lap
                  rests on         next_int (bound, a scan)
 push             work 14                           moves 64                           exact
 average          work 2                            moves 0                            exact
-main             work ≈ 82·n + 54·text.len() + 2·path.len() moves ≈ 3·B·n + 216·n + 3·B·text.len() + 5·text.len() + 2·path.len() bound, io
+main             work ≈ 82·n + 54·text.len() + 2·path.len() moves ≈ 216·n + 5·text.len() + 2·path.len() bound, io
                  in `count_ints`: in `next_int`: scan: `i` grows by at least 1 a lap, so the `while` at ../lib/parse.nt:23 runs at most xs.len() − start times
                  in `count_ints`: scan: `i` grows by at least 1 a lap, so the `while` at ../lib/parse.nt:41 runs at most xs.len() times
                  in `count_ints`: scan: the calls to `next_int` at ../lib/parse.nt:42 are amortised: `i` only moves on through where `next_int` stopped in `xs`, so together they are charged 9·xs.len() once, not a scan of `xs` a lap

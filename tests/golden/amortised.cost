@@ -2,13 +2,13 @@ struct Span      layout AoS  the model does not decide: no function's moves diff
 field            work 4·xs.len() − 4·start + 8     moves 2·xs.len() − 2·start + 3·B   bound
                  footprint        xs: [0, xs.len()) (whole array)   no residue claimed
                  scan: `i` grows by at least 1 a lap, so the `while` at line 19 runs at most xs.len() − start times
-fields           work 19·xs.len() + 1              moves 3·B·xs.len() + 2·xs.len()    bound
+fields           work 19·xs.len() + 1              moves 2·xs.len() + 3·B             bound
                  in `field`: scan: `i` grows by at least 1 a lap, so the `while` at line 19 runs at most xs.len() − start times
                  scan: `i` grows by at least 1 a lap, so the `while` at line 28 runs at most xs.len() times
                  scan: the calls to `field` at line 29 are amortised: `i` only moves on through where `field` stopped in `xs`, so together they are charged 4·xs.len() once, not a scan of `xs` a lap
                  rests on         field (bound, a scan)
-sum_fields       work 14·out.len() + 4·xs.len() + 1 moves ≈ 3·B·out.len() + 8·out.len() + 2·xs.len() bound
-                 lower bound      moves 8·out.len()                  (footprint, every distinct element crosses once)   gap 25× at M = 2 MiB, B = 64
+sum_fields       work 14·out.len() + 4·xs.len() + 1 moves 8·out.len() + 2·xs.len() + 4·B bound
+                 lower bound      moves 8·out.len()                  (footprint, every distinct element crosses once)   gap 1× at M = 2 MiB, B = 64
                  footprint        out: [0, 8·out.len())   resident after if 8·out.len() < M
                  in `field`: scan: `i` grows by at least 1 a lap, so the `while` at line 19 runs at most xs.len() − start times
                  scan: the calls to `field` at line 42 are amortised: `i` only moves on through where `field` stopped in `xs`, so together they are charged 4·xs.len() once, not a scan of `xs` a lap
@@ -20,7 +20,7 @@ hops             work xs.len()² + 6·xs.len() + 1   moves 0                    
 restart          work 2·xs.len()² + 16·xs.len() + 1 moves xs.len()² + 3·B·xs.len() + xs.len() bound
                  in `field`: scan: `i` grows by at least 1 a lap, so the `while` at line 19 runs at most xs.len() − start times
                  rests on         field (bound, a scan)
-main             work 725                          moves 67·B + 183                   bound, io
+main             work 725                          moves 37·B + 183                   bound, io
                  in `fields`: in `field`: scan: `i` grows by at least 1 a lap, so the `while` at line 19 runs at most xs.len() − start times
                  in `fields`: scan: `i` grows by at least 1 a lap, so the `while` at line 28 runs at most xs.len() times
                  in `fields`: scan: the calls to `field` at line 29 are amortised: `i` only moves on through where `field` stopped in `xs`, so together they are charged 4·xs.len() once, not a scan of `xs` a lap

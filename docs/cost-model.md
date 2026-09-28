@@ -571,6 +571,14 @@ Golden `amortised` has both sides: `fields` (`19·xs.len() + 1`, from quadratic)
 (`14·out.len() + 4·xs.len() + 1`), `hops` and `restart` refused and quadratic. In golden `scan`,
 `words` goes from `2·xs.len()² + 11·xs.len() + 1` to `13·xs.len() + 1`, moves too.
 
+
+**The ends of the stretch, and serial work (2026-09-28).** A call's moves past its distance — the
+partly used lines at the two ends of what it reads, `3·B` for `next_int` — are the chain's: the
+next call starts where this one stopped. Where the callee touches the scanned array alone and has
+no array of its own, the constant `k·B` of its moves is taken out of each lap and charged once for
+the loop, the chain's largest. And the callee's serial work and divisions (§ Time) are amortised as
+work is — without it they were in a distance the call cannot name, and dropped: the parse loop's
+`v = v·10 + d` chain was charged at `τ`, not `τ_s`.
 ## A scan to a sentinel
 
 `while xs[i].f >= 0 { …; i += c }` stops at a sentinel the data holds, and nothing in the program
