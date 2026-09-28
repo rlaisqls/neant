@@ -1052,9 +1052,11 @@ parser stays unknown; a declared cost on it would be an assumption the lockfile 
 ## M7 — the constant factor
 
 Prove the asymptote, search the constant. *First probe (2026-09-28, experiments.md):* llvm-mca's
-cycles an innermost loop, times one constant (0.125 ns on this core), fit the five compute kernels
-within 8% where the calculus needs four constants — and fail on a loop nest, whose short inner
-chains the core overlaps across outer iterations; the cost line has to be per nest. A micro-architectural cost line (what llvm-mca and uiCA
+latencies (`cortex-x4`) are this core's to a cycle of 0.257 ns on dependency chains, and its
+cycles an innermost loop fit the five compute kernels with one constant — once it is seen that gcc
+runs two of each kernel's repeats in one vector iteration, which the fitted `τ`s absorb too. It fails
+on a loop nest, whose short chains the core overlaps across outer iterations: the cost line has to
+be per nest, and read off the emitted assembly's vector width. A micro-architectural cost line (what llvm-mca and uiCA
 compute for a block, as default output, applicable because the type system knows what may be
 reassociated); schedules separate from algorithms; search over schedules pruned by the cost model
 and decided by measurement, persisted in `costs.lock`. An own backend is justified here and only

@@ -203,6 +203,9 @@ constant to tune:
 - **Bounds err high by design, and on the corpus no longer do.** Its geometric mean was 0.56 while
   the parse overcharged its moves; with that removed it is 1.26, and three programs are predicted
   faster than they run: the time is an estimate there, not a bound.
+- **The fitted constants are gcc's laps, not the core's.** The kernels they were fitted on repeat
+  one call, and gcc runs two repeats in one vector iteration (experiments.md, M7's first probe):
+  `τ`, `τ_s`, `τ_div` are half a chain's latency where a program's chains cannot be paired.
 - **Wall-clock, minimum of three to five runs,** on a machine shared at times with other sessions;
   the kernels' table was taken idle.
 

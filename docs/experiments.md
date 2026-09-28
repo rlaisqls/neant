@@ -876,18 +876,34 @@ timed in L1, a lap's nanoseconds its time over its laps, the empty repeat subtra
 | `logistic` | 0.746 | 6.00 | 0.124 |
 | `divide` | 0.254 | 2.03 | 0.125 |
 
-One constant, **0.125 ns an mca cycle**, fits the five kernels the four compute constants were
-fitted on, within 8%: the latency chains the calculus names one by one (the logistic map's
-multiplies, a reduction's add, a division's throughput) are what llvm-mca's scheduler simulates.
-It is about half of `cortex-x4`'s cycle at this core's clock — the X925's latencies are shorter than
-the model's — and it is one constant for the machine, where the calculus needs four.
+One constant, 0.125 ns an mca cycle, fits the five — but it is not the machine's. Dependency chains
+written in C (`tests/kernels/chains.c`, 10⁸ laps, timed inside the program) put llvm-mca's cycles
+against this core's directly:
+
+| chain | measured ns a lap | llvm-mca cycles | ns a cycle |
+|---|---|---|---|
+| `f64` add | 0.514 | 2 | 0.257 |
+| `f64` multiply | 0.771 | 3 | 0.257 |
+| multiply-add | 1.028 | 4 | 0.257 |
+| `f64` divide | 3.341 | 15 | 0.223 |
+| `i64` multiply-add | 0.770 | 3 | 0.257 |
+
+`cortex-x4`'s latencies are this core's, one cycle 0.257 ns (3.9 GHz), the divide two cycles
+shorter here. The kernels' 0.125 is half of it because gcc runs two of a kernel's repeats in one
+vector iteration — `sum`'s loop loads `xs[i]` into both lanes of a `dup` and adds both, two repeats'
+sums at once — so a lap measured is half an iteration. That reaches past this probe: `τ`, `τ_s` and
+`τ_div` were fitted on the same kernels, their repeats paired the same way, so they are a lap of
+work as gcc compiles those kernels, not one chain's latency; a program whose chains gcc cannot pair
+runs at up to twice what they say. A threat to the constants' meaning, which the programs' ratios
+(0.5–2.6) are consistent with and do not separate from the model's other errors.
 
 It does not survive a loop nest. The tiled `matmul`'s inner loop, a 64-long `acc += a·b` chain,
 is 6 cycles an iteration to llvm-mca and measures 0.165 ns (0.027 an mca cycle); the naive one 4.0
 and 0.276 (0.069). llvm-mca runs one loop in its steady state, and the core overlaps a short chain
 with the next outer iteration's — the effect the short-lap rule had to allow for. A cost line for
 M7 would be per nest, not per innermost block: the inner loop's latency against the outer
-iterations' independence, which is what the calculus's affine forms already know.
+iterations' independence, which is what the calculus's affine forms already know — and it
+would need the compiler's own vector width and repeat pairing, which only the emitted assembly shows.
 
 ## Programs the project did not write: the Benchmarks Game (2026-09-28)
 
