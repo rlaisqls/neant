@@ -1038,6 +1038,17 @@ bounds it, and what each piece must check:
 Then the invocations are at most `D·(toks.len() + 1)` and the laps `toks.len()`, and the component
 costs at most `(D + 1)·(toks.len() + 1)` times its members' own costs, settled as a forest's are.
 
+*Checked against the parser the same day, before building: it does not hold.* `block`'s loop
+calls `item` once a lap and never bumps itself — the statement it parses is what advances the
+cursor, inside the callee — and so do the argument and field loops of `primary` (`expr`, then
+`eat` of a comma). Counting a callee's advance is what the rule refuses on purpose: an advance deep
+in the stack would let every frame above it call again, and laps of loops in nested frames can end
+on the same token (`a || b && c`: the `&&` lap and the `||` lap end at `c`). A linear bound needs
+what the grammar guarantees and the rule cannot see — that nested laps are separated by a token of
+their own (`)`, `}`, `;`). What would hold without it is quadratic, invocations at most the tokens
+times the deepest stack, and the argument for even that needs the error path made precise. The
+parser stays unknown; a declared cost on it would be an assumption the lockfile names, not a proof.
+
 ## M7 — the constant factor
 
 Prove the asymptote, search the constant. A micro-architectural cost line (what llvm-mca and uiCA
