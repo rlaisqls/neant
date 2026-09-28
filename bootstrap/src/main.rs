@@ -44,6 +44,7 @@ fn main() {
     let mut out: Option<PathBuf> = None;
     let mut checked = true;
     let mut lines = false;
+    let mut show_laps = false;
     let mut passthrough: Vec<String> = Vec::new();
     let default_p = std::thread::available_parallelism().map(|n| n.get() as i128).unwrap_or(4);
     let mut machine = cost::Machine { m_bytes: 2 << 20, b_bytes: 64, p_cores: default_p, ns_per_work: 0.0176, bytes_per_ns: 20.8, ns_per_miss: 112.3, ns_per_page: 0.0, ns_per_serial: 0.1554, ns_per_div: 0.1484 };
@@ -92,6 +93,7 @@ fn main() {
             "--bw2" => { i += 1; outer.bytes_per_ns = args.get(i).and_then(|s| s.parse().ok()).unwrap_or(outer.bytes_per_ns); }
             "--lat3" => { i += 1; outer.ns_per_miss = args.get(i).and_then(|s| s.parse().ok()).unwrap_or(outer.ns_per_miss); }
             "--eval" => { i += 1; eval = args.get(i).cloned(); }
+            "--laps" => show_laps = true,
             "--apply" => { i += 1; applies.extend(args.get(i).map(|s| s.split(',').map(String::from).collect::<Vec<_>>()).unwrap_or_default()); }
             "--fn" => { i += 1; m_fn = args.get(i).cloned(); }
             "--sizes" => { i += 1; m_sizes = args.get(i).map(|s| s.split(',').filter_map(|x| x.trim().parse().ok()).collect()).unwrap_or_default(); }
@@ -253,6 +255,19 @@ fn main() {
                             }
                         }
                         println!();
+                        // each loop's laps at these sizes, by the file and line `emit --lines` gives it
+                        if show_laps {
+                            let mut by: Vec<(u32, f64)> = Vec::new();
+                            for (line, p) in &c.laps {
+                                let Some(v) = eval_one(c, &cost::Cost::poly(p.clone()), ev, &machine) else { continue };
+                                match by.iter_mut().find(|(l, _)| l == line) { Some(e) => e.1 += v, None => by.push((*line, v)) }
+                            }
+                            by.sort_by_key(|(l, _)| *l);
+                            for (line, v) in by {
+                                let at = sources.place(line).map_or(format!("line {line}"), |(p, l)| format!("{p}:{l}"));
+                                println!("                     laps {at} {v:.0}");
+                            }
+                        }
                     }
                 }
             }

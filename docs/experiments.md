@@ -911,12 +911,35 @@ loop's throughput at once; which calibration is right depends on which the code 
 the per-nest cost line M7 is for. The defaults stay as fitted; the unpaired set is
 `--tau 0.0291 --taus 0.3102 --tdiv 0.3447`.
 
-**Step 1 of the slice, and one loop of a program.** `neant emit --lines` puts `#line L "file"`
-before each loop, and `mca.py` names the loop each innermost assembly loop is (the `.loc` of its
-branch back). On spectral-norm, `main.nt:24` — `for j in 0..v.len() { s += eval_a(j, i) * v[j] }` —
-is a two-lane loop (`.2d`), 4.03 llvm-mca cycles an iteration, two laps an iteration: 2.01 cycles,
-**0.518 ns a lap** at the 0.257 ns cycle. Measured, 87 ms over the 1.6·10⁸ laps of that loop at
-n = 2000: **0.54 ns**. Within 4% on the program the calculus has at 1.26, where no fit was made.
+**Step 1 of the slice, and the programs.** `neant emit --lines` puts `#line L "file"` before each
+loop, `neant cost --eval … --laps` gives each loop's laps at those sizes, and `tests/kernels/m7.py`
+puts them together: each innermost assembly loop is the loop of the calculus at the line its
+branch back names, and its compute is laps × llvm-mca's cycles an iteration × 0.257 ns.
+
+| program | measured / llvm-mca's | measured / the calculus's |
+|---|---|---|
+| spectral-norm, n = 2000 | 0.53 | 1.28 |
+| n-body, 10⁶ steps | 0.65 | 1.81 |
+| mandelbrot, n = 800 | 0.17 | 0.53 |
+
+llvm-mca errs as far the other way. Spectral-norm's inner loop — `fmadd d1, d2, d0, d1` a lap,
+the sum `d1` its addend — is 4.03 cycles to llvm-mca and 2.1 on the core: Arm cores forward an
+accumulator late, so a chain through the addend of a multiply-add waits two cycles, where a chain
+through a multiplicand waits four (`chains.c`'s 1.03 ns). llvm-mca 18's `cortex-x4` model charges
+four either way. (A first reading here took the loop for a two-lane one and the agreement for 4%;
+the loop is scalar, and the agreement was the wrong factor of two.) Mandelbrot's laps are the
+calculus's upper bound, fifty a point, which is not what the loop runs. So the probe's latencies are
+right for the chains `chains.c` has and wrong for the one programs have most, and a cost line on
+llvm-mca needs accumulator forwarding before it is better than the calculus on programs.
+
+Writing each multiply-add into its own addend as a multiply and an add before llvm-mca sees it
+(`m7.py --forward`) puts the chain on the add: spectral-norm 0.53 → 0.71 of llvm-mca's time, and
+n-body 0.65 → 0.56 — its multiply-adds into their addends are mostly not carried from lap to lap,
+and split they only cost issue slots. Rewriting only those whose addend nothing earlier in the lap
+writes — carried from the last lap — keeps spectral-norm at 0.70 and n-body at 0.65. The rest of
+the gap is the core against the model it is not (`cortex-x4`), on work that is not a chain; llvm-mca
+on a model that is not this core's is not yet better than the calculus's four constants on programs,
+and M7 waits on a core model, not on the map, which works.
 
 It does not survive a loop nest. The tiled `matmul`'s inner loop, a 64-long `acc += a·b` chain,
 is 6 cycles an iteration to llvm-mca and measures 0.165 ns (0.027 an mca cycle); the naive one 4.0
