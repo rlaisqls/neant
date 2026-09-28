@@ -257,16 +257,17 @@ fn main() {
                         println!();
                         // each loop's laps at these sizes, by the file and line `emit --lines` gives it
                         if show_laps {
-                            let mut by: Vec<(u32, f64, f64)> = Vec::new();
-                            for (line, e, p) in &c.laps {
+                            println!("                     memory {:.3e} s", tm / 1e9);
+                            let mut by: Vec<(u32, f64, f64, bool)> = Vec::new();
+                            for (line, e, p, vary) in &c.laps {
                                 let Some(v) = eval_one(c, &cost::Cost::poly(p.clone()), ev, &machine) else { continue };
                                 let n = eval_one(c, &cost::Cost::poly(e.clone()), ev, &machine).unwrap_or(0.0);
-                                match by.iter_mut().find(|(l, _, _)| l == line) { Some(x) => { x.1 += v; x.2 += n; } None => by.push((*line, v, n)) }
+                                match by.iter_mut().find(|(l, _, _, _)| l == line) { Some(x) => { x.1 += v; x.2 += n; x.3 |= *vary; } None => by.push((*line, v, n, *vary)) }
                             }
-                            by.sort_by_key(|(l, _, _)| *l);
-                            for (line, v, n) in by {
+                            by.sort_by_key(|(l, _, _, _)| *l);
+                            for (line, v, n, vary) in by {
                                 let at = sources.place(line).map_or(format!("line {line}"), |(p, l)| format!("{p}:{l}"));
-                                println!("                     laps {at} {v:.0} entries {n:.0}");
+                                println!("                     laps {at} {v:.0} entries {n:.0}{}", if vary { " varies" } else { "" });
                             }
                         }
                     }

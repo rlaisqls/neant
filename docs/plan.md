@@ -1066,7 +1066,9 @@ be per nest, and read off the emitted assembly's vector width.
    from; an innermost loop of the assembly (`tests/kernels/mca.py` finds them) is then the loop of
    the calculus at those lines, whose trip count and nest the calculus has. Inline markers
    (`LLVM-MCA-BEGIN`) are out: a `volatile` asm is a barrier and changes what gcc vectorises.
-2. **A cycle count per nest, not per block.** For each innermost loop, llvm-mca's cycles an
+2. **A cycle count per nest, not per block** *(first cut in `m7.py --own --window`: this core's
+   latencies and pipes, a short loop's entries simulated inside the loop around it, a missed exit an
+   entry where the trip varies; spectral-norm, n-body, `matmul`, `heat` at a log error of 0.10)*. For each innermost loop, llvm-mca's cycles an
    iteration (its latency-bound steady state) and its block throughput. The loop runs at the latency
    when its carried chain is long — the loop is the whole of the work, or its trip is above what the
    core's window overlaps (a few hundred instructions) — and at the throughput when a short chain

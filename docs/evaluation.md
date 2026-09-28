@@ -185,6 +185,14 @@ constant to tune:
   parser's cursor loops, leave a third of the compiler unknown; a recursion over a tree in an arena
   is a bound, a promise the program does not state.
 
+**A per-loop cost line (M7's first slice, experiments.md).** Each innermost loop of the emitted
+assembly, mapped back to the calculus's loop (`neant emit --lines`), costed by a model of this core
+measured on dependency chains, independent chains, the divider and a missed exit, and multiplied by
+the laps and entries the calculus gives (`--eval --laps`): spectral-norm 1.07, n-body 0.95, the
+corpus's `matmul` 0.96 and 1.02, `heat` 0.82 — a log error of 0.10 against the calculus's 0.56 on
+the same runs, with no constant fitted on a program. It needs laps the calculus can state exactly;
+where they are a bound (mandelbrot) or amortised away (`fir`), it cannot be applied.
+
 ## Threats to validity
 
 - **One machine, one core.** `τ` and `BW` are this core's; nothing here is checked on a second

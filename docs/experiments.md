@@ -959,6 +959,44 @@ division, is fifty cycles from a cold start and 4.5 in the steady state, and the
 through the bodies' velocities allow. Neither bound is the time; the overlap between entries is the
 next term, and it is the one the out-of-order window sets.
 
+**The overlap, and the exits.** Two more measurements on the core: the divider takes one division or
+square root a cycle (sixteen chains, `dv.c`; the eight of `tp.c` had been latency-bound), a square
+root fourteen cycles; and a loop exit the predictor misses costs 13.5 cycles an entry (`br.c`, trips
+random in 0…4 against a constant 2). `m7.py --own --window` lays a short loop's laps (at most
+sixteen an entry) out inside one iteration of the loop around it and simulates forty such
+iterations — eight dispatched a cycle, none before the one six hundred earlier has finished, each
+on its pipe — and the calculus now says which loops' trips vary from one entry to the next (the
+trip moves with an outer loop, is read from memory, or is a scan's), each such entry charged a
+missed exit. And the assembly read is the unchecked one, as the binary timed is. Every constant
+here is a measurement of the core; none is fitted on a program:
+
+| program | this core's model | the calculus |
+|---|---|---|
+| spectral-norm, n = 2000 | **1.07** | 1.28 |
+| n-body, 10⁶ steps | **0.95** | 1.80 |
+| tiled `matmul`, n = 300 / 600 | **0.96 / 1.02** | 2.80 / 1.35 |
+| `heat`, n = 300 | 0.82 | 0.92 |
+
+The root-mean-square of `ln(measured / predicted)` over these five is **0.10**, where the
+calculus's four fitted constants give 0.56. Two programs are outside it: mandelbrot (0.41), whose
+laps are the calculus's bound of fifty a point, and `fir` (2.03), whose parse loops are amortised
+and have no laps the calculus can give — a scan's bound is the text's length, not the numbers'.
+The map works, the core model is fifteen numbers, and the calculus supplies what llvm-mca cannot:
+how many times each loop runs, how often it is entered, and whether its trip varies.
+
+On the kernels (`m7.py` on each at one check size, pinned to CPU 9): where compute binds it agrees
+with the calculus or does better — `divide` 1.04 (0.68), `logistic` 1.04 (1.04), `horner` 1.14 (1.04);
+where memory binds it is the calculus's memory term and says the same (`sum` 0.94, `dot` 1.30,
+`saxpy` 1.09, `transpose` 1.46, the struct kernels 1.49 and 2.87); and the naive `matmul` at
+n = 448 was worse, 2.25 against 1.65. An L2 hit's latency on a strided load was the first guess —
+measured (`l2.c`, a dependent load
+a step through a random cycle of lines): 4 cycles to 64 KB, the L1; 5–7 to 512 KB; 15–20 at 1–2 MB.
+It was not that: a column of the 448 matrix is 28 KB and stays in L1. gcc runs the loop two `j`s at a
+time, `fmla v0.2d, v2.2d, v1.2d` a lap, and the model read `v0` as written only, not as the addend it
+accumulates — no chain, 0.5 cycles a lap. Read as both, the chain is the addend's two cycles for two
+laps, and the naive `matmul` is **1.09** (the calculus 1.60); the programs' ratios do not move
+(spectral-norm 1.06, n-body 0.96, `matmul` 0.99 / 1.02, `heat` 0.85).
+
 It does not survive a loop nest. The tiled `matmul`'s inner loop, a 64-long `acc += a·b` chain,
 is 6 cycles an iteration to llvm-mca and measures 0.165 ns (0.027 an mca cycle); the naive one 4.0
 and 0.276 (0.069). llvm-mca runs one loop in its steady state, and the core overlaps a short chain
