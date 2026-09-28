@@ -1025,7 +1025,10 @@ of it is the calculus's loop at its line, and its cycles on a model of this core
 latencies and pipes measured by `tests/kernels/*.c`, a short loop's entries simulated inside the
 loop around it with an instruction window, a missed exit an entry where the trip varies) times its
 laps and entries make the compute; `T` is the longer of that and the memory term above. It is an
-estimate of the constant, next to the cost and never in it; experiments.md, M7.
+estimate of the constant, next to the cost and never in it; experiments.md, M7. Where a loop's laps
+are only a bound — a `break`, a condition of several parts, a scan — and that loop is more than a
+hundredth of the compute, the line is `m7 ≤ T`; where a callee's laps were left out, a size the call
+cannot name (an amortised scan's), it says M7 does not apply.
 
 **Divisions (2026-09-28).** An `f64` division is one unit of work to the calculus and several to
 the machine: its throughput is a fraction of an add's. Divisions are counted apart as `divs`,

@@ -45,8 +45,8 @@ def main():
             w, mv, pt, bound = p
             ratios.append(t / pt)
             m7 = corpus.predict_m7(nt, env)
-            if m7: ratios_m7.append(t / m7)
-            m7s = f"{m7*1e3:>9.3f} {t/m7:>8.2f}" if m7 else f"{'—':>9} {'—':>8}"
+            if m7 and not m7[1]: ratios_m7.append(t / m7[0])
+            m7s = f"{('≤' if m7[1] else '') + format(m7[0]*1e3, '.3f'):>9} {t/m7[0]:>8.2f}" if m7 else f"{'n/a':>9} {'—':>8}"
             print(f"  {name:<14} {s:>9} {bound:>6} {pt*1e3:>10.3f} {t*1e3:>10.2f} {t/pt:>9.2f} {m7s}")
     g = math.exp(sum(math.log(x) for x in ratios) / len(ratios))
     print(f"\ngeometric mean measured/predicted over {len(ratios)} runs: {g:.2f}  (range {min(ratios):.3g} … {max(ratios):.3g})")

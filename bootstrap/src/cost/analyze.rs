@@ -88,12 +88,16 @@ pub struct FuncCost {
     /// core runs two streams at twice one stream's rate, near what the memory gives (cost-model
     /// § Time, streams). Read only by a time.
     pub conc: Cost,
-    /// How many times each loop is entered and its body runs in one call, and whether its trip
-    /// varies from one entry to the next (its exit is then a branch the predictor misses), by the
-    /// loop's line (the line
+    /// How many times each loop is entered and its body runs in one call, whether its trip varies
+    /// from one entry to the next (its exit is then a branch the predictor misses), and whether the
+    /// laps are only a bound (a `break`, a condition of several parts, a scan), by the loop's line
+    /// (the line
     /// `neant emit --lines` puts before it): the laps a per-loop cycle count is multiplied by
     /// (plan § M7). Composed through calls; read only by `--eval`.
-    pub laps: Vec<(u32, Poly, Poly, bool)>,
+    pub laps: Vec<(u32, Poly, Poly, bool, bool)>,
+    /// A callee's laps were left out, a size it needs being one the call cannot name (an amortised
+    /// scan's): the laps above are not all the loops that run, and M7's line does not apply.
+    pub laps_dropped: bool,
     /// Bytes a store's lines take back to memory, a write-back `moves` does not count, in one
     /// stream's bytes: in a loop of two streams or more, half (cost-model § Time, streams).
     pub wback: Cost,
@@ -490,7 +494,7 @@ impl<'a> Analyzer<'a> {
         let names = param_names(f);
         let unknown = |reason: String| FuncCost {
             name: f.name.clone(), names: names.clone(), result: CostResult::Unknown { reason, line: f.line },
-            chase: Cost::zero(), paged: Cost::zero(), laps: vec![], conc: Cost::zero(), wback: Cost::zero(), serial: Cost::zero(), divs: Cost::zero(), internal: true,
+            chase: Cost::zero(), paged: Cost::zero(), laps: vec![], laps_dropped: false, conc: Cost::zero(), wback: Cost::zero(), serial: Cost::zero(), divs: Cost::zero(), internal: true,
             bounds: vec![], notes: vec![], suggestions: vec![], effects: vec![], violations: vec![], tier: "unknown", result_size: None,
             footprint: whole_arrays(self.m, f), resident: None, declared: Declared::default(), rests_on: vec![],
         };
@@ -600,7 +604,7 @@ impl<'a> Analyzer<'a> {
         let footprint = whole_arrays(self.m, f);
         Some(FuncCost {
             name: f.name.clone(), names, result: CostResult::Exact { span: work.clone(), work, moves },
-            chase, paged, laps: vec![], conc, wback, serial, divs, internal: true, bounds: vec![], notes: vec![note], suggestions: vec![],
+            chase, paged, laps: vec![], laps_dropped: true, conc, wback, serial, divs, internal: true, bounds: vec![], notes: vec![note], suggestions: vec![],
             effects: if io { vec!["io"] } else { vec![] }, violations: vec![], tier, result_size: None,
             footprint, resident: None, declared: Declared::default(), rests_on,
         })
@@ -616,7 +620,7 @@ impl<'a> Analyzer<'a> {
                 self.done[fid] = Some(FuncCost {
                     name: f.name.clone(),
                     names: param_names(f),
-                    result: CostResult::Unknown { reason: "mutually recursive with another function; only self-recursion is solved".into(), line: f.line }, chase: Cost::zero(), paged: Cost::zero(), laps: vec![], conc: Cost::zero(), wback: Cost::zero(), serial: Cost::zero(), divs: Cost::zero(), internal: true,
+                    result: CostResult::Unknown { reason: "mutually recursive with another function; only self-recursion is solved".into(), line: f.line }, chase: Cost::zero(), paged: Cost::zero(), laps: vec![], laps_dropped: false, conc: Cost::zero(), wback: Cost::zero(), serial: Cost::zero(), divs: Cost::zero(), internal: true,
                     bounds: vec![], notes: vec![], suggestions: vec![], effects: vec![], violations: vec![], tier: "unknown", result_size: None,
                     footprint: vec![], resident: None, declared: Declared::default(), rests_on: vec![],
                 });
@@ -883,8 +887,11 @@ struct Fa<'a, 'b, 'c> {
     /// an access being walked is a store
     storing: bool,
     /// each loop's laps, by line, and the line of the loop about to be entered
-    laps: Vec<(u32, Poly, Poly, bool)>,
+    laps: Vec<(u32, Poly, Poly, bool, bool)>,
+    laps_dropped: bool,
     pending_line: u32,
+    /// the loop about to be entered stops early or on a condition of several parts
+    pending_bounded: bool,
     /// the divisions, framed the same way
     divs: Cost,
     divs_saved: Vec<Cost>,
@@ -902,7 +909,7 @@ impl<'a, 'b, 'c> Fa<'a, 'b, 'c> {
             local_size: HashMap::new(), local_affine: HashMap::new(), initial: HashMap::new(), at_entry: false,
             loops: vec![], work: Cost::zero(), moves: Cost::zero(), span: Cost::zero(), saved: vec![], branch: vec![], next_if: 0,
             local_root: HashMap::new(), resident: vec![], call_moves: Cost::zero(), saved_calls: vec![], replay: false, has_call: vec![], rests_on: vec![],
-            reads: Default::default(), loop_writes: vec![], entry_read: Default::default(), scans: Default::default(), amort: vec![], scan_ind: Default::default(), chase: Cost::zero(), chase_saved: vec![], chase_vars: vec![], paged: Cost::zero(), paged_saved: vec![], conc: Cost::zero(), conc_saved: vec![], wback: Cost::zero(), wback_saved: vec![], storing: false, laps: vec![], pending_line: 0, divs: Cost::zero(), divs_saved: vec![], serial: Cost::zero(), serial_saved: vec![],
+            reads: Default::default(), loop_writes: vec![], entry_read: Default::default(), scans: Default::default(), amort: vec![], scan_ind: Default::default(), chase: Cost::zero(), chase_saved: vec![], chase_vars: vec![], paged: Cost::zero(), paged_saved: vec![], conc: Cost::zero(), conc_saved: vec![], wback: Cost::zero(), wback_saved: vec![], storing: false, laps: vec![], laps_dropped: false, pending_line: 0, pending_bounded: false, divs: Cost::zero(), divs_saved: vec![], serial: Cost::zero(), serial_saved: vec![],
         };
         for (i, &p) in f.params.iter().enumerate() {
             let l = &f.locals[p];
@@ -964,7 +971,7 @@ impl<'a, 'b, 'c> Fa<'a, 'b, 'c> {
                 _ if effects.contains(&"unbounded") => CostResult::Unknown { reason: "declared unbounded".into(), line: self.f.line },
                 _ => CostResult::Unknown { reason: "an extern needs `#[cost(work_at_most = …, moves_at_most = …)]` or `uses unbounded`".into(), line: self.f.line },
             };
-            return FuncCost { name: self.f.name.clone(), names: self.names, result, chase: Cost::zero(), paged: Cost::zero(), laps: vec![], conc: Cost::zero(), wback: Cost::zero(), serial: Cost::zero(), divs: Cost::zero(), internal: true, bounds: vec![], notes: vec![], suggestions: vec![], effects, violations, tier: "declared", footprint: vec![], resident: None, declared, rests_on: vec![], result_size: self.result_size.clone() };
+            return FuncCost { name: self.f.name.clone(), names: self.names, result, chase: Cost::zero(), paged: Cost::zero(), laps: vec![], laps_dropped: false, conc: Cost::zero(), wback: Cost::zero(), serial: Cost::zero(), divs: Cost::zero(), internal: true, bounds: vec![], notes: vec![], suggestions: vec![], effects, violations, tier: "declared", footprint: vec![], resident: None, declared, rests_on: vec![], result_size: self.result_size.clone() };
         };
         let mut tier = "exact";
         self.chase_vars = loaded_in_loops(body);
@@ -1090,7 +1097,7 @@ impl<'a, 'b, 'c> Fa<'a, 'b, 'c> {
         let serial = if matches!(result, CostResult::Exact { .. }) { self.serial.clone() } else { Cost::zero() };
         let divs = if matches!(result, CostResult::Exact { .. }) { self.divs.clone() } else { Cost::zero() };
         let internal = self.sites.iter().any(|st| { let r = self.local_root.get(&st.arr).copied().unwrap_or(st.arr); !self.f.params.contains(&r) });
-        FuncCost { name: self.f.name.clone(), names: self.names, result, chase, paged, laps, conc, wback, serial, divs, internal, bounds: self.bounds, notes: self.notes, suggestions: vec![], effects, violations, tier, footprint, resident, declared, rests_on: self.rests_on, result_size: self.result_size.clone() }
+        FuncCost { name: self.f.name.clone(), names: self.names, result, chase, paged, laps, laps_dropped: self.laps_dropped, conc, wback, serial, divs, internal, bounds: self.bounds, notes: self.notes, suggestions: vec![], effects, violations, tier, footprint, resident, declared, rests_on: self.rests_on, result_size: self.result_size.clone() }
     }
 
     /// The byte range one access site covers over its loop nest, from its affine index and the
@@ -1361,6 +1368,7 @@ impl<'a, 'b, 'c> Fa<'a, 'b, 'c> {
     /// Open a loop: push it and start a fresh accumulator frame for its body.
     fn enter_loop(&mut self, lp: Loop) {
         let entries = self.times_here();
+        let bounded = self.pending_bounded || lp.monotone || lp.trip.has_loose_read();
         // a trip that moves with a loop outside, is a value read from memory, or a scan's: the
         // exit branch is not the same each entry
         let varies = lp.monotone || self.loops.iter().any(|l| l.atom.is_some_and(|a| lp.trip.mentions(a)))
@@ -1368,7 +1376,7 @@ impl<'a, 'b, 'c> Fa<'a, 'b, 'c> {
         self.loop_recs.push(LoopRec { var: lp.var, atom: lp.atom, trip: lp.trip.clone(), lo: lp.lo.clone(), step: lp.step, monotone: lp.monotone });
         let lp = Loop { id: self.loop_recs.len() - 1, ..lp };
         self.loops.push(lp);
-        if !self.replay && self.pending_line > 0 { let t = self.times_here(); self.laps.push((self.pending_line, entries, t, varies)); }
+        if !self.replay && self.pending_line > 0 { let t = self.times_here(); self.laps.push((self.pending_line, entries, t, varies, bounded)); }
         self.push_frame();
     }
     fn push_frame(&mut self) {
@@ -2347,10 +2355,13 @@ impl<'a, 'b, 'c> Fa<'a, 'b, 'c> {
     fn stmt(&mut self, s: &Stmt) -> Result<(), Fail> {
         // the line `neant emit --lines` gives the loop, for its laps
         match s {
-            Stmt::For { start, end, .. } => self.pending_line = start.line.max(end.line),
-            Stmt::ParFor { end, .. } => self.pending_line = end.line,
-            Stmt::While { line, .. } => self.pending_line = *line,
-            Stmt::LetBuild { len, .. } => self.pending_line = len.line,
+            Stmt::For { start, end, body, .. } => { self.pending_line = start.line.max(end.line); self.pending_bounded = exits_early(body); }
+            Stmt::ParFor { end, body, .. } => { self.pending_line = end.line; self.pending_bounded = exits_early(body); }
+            Stmt::While { line, cond, body, .. } => {
+                self.pending_line = *line;
+                self.pending_bounded = exits_early(body) || matches!(cond.kind, ExprKind::Binary(BinOp::And | BinOp::Or, ..));
+            }
+            Stmt::LetBuild { len, .. } => { self.pending_line = len.line; self.pending_bounded = false; }
             _ => {}
         }
         match s {
@@ -3689,10 +3700,11 @@ impl<'a, 'b, 'c> Fa<'a, 'b, 'c> {
                     if !declared_only && !opaque {
                         let here = self.times_here();
                         let hide = |p: &Poly| unnamed.iter().any(|(i, _)| p.mentions(*i));
-                        for (line, e, c, v) in &callee.laps {
-                            if hide(c) || hide(e) { continue; }
+                        if callee.laps_dropped { self.laps_dropped = true; }
+                        for (line, e, c, v, b) in &callee.laps {
+                            if hide(c) || hide(e) { self.laps_dropped = true; continue; }
                             let sub = |p: &Poly| p.rename_roots(&rename).subst_many(&map).mul(&here);
-                            self.laps.push((*line, sub(e), sub(c), *v));
+                            self.laps.push((*line, sub(e), sub(c), *v, *b));
                         }
                     }
                     // a square root runs on the divider: counted as a division (cost-model § Time, divisions)
@@ -4259,6 +4271,23 @@ fn carried_chain(b: &Block) -> bool {
 /// that does not move with the loop: `xs[k] = xs[k] − …`, `bs[i].vx = bs[i].vx − dx·m` in a loop over
 /// `j`. Each lap's load waits for the last lap's store, whatever the operation (cost-model § Time,
 /// serial work, through memory).
+/// Whether a loop body may leave before its trip is done: a `break` of this loop (not of one
+/// nested in it) or a `return`, at any depth of `if`.
+fn exits_early(b: &Block) -> bool {
+    fn ex(e: &Expr) -> bool {
+        match &e.kind {
+            ExprKind::If(c, t, e2) => ex(c) || exits_early(t) || e2.as_ref().is_some_and(|b| exits_early(b)),
+            ExprKind::Block(b) => exits_early(b),
+            _ => false,
+        }
+    }
+    b.stmts.iter().any(|s| match s {
+        Stmt::Break | Stmt::Return(_) => true,
+        Stmt::Expr(e) | Stmt::Let(_, e) => ex(e),
+        _ => false,
+    }) || b.tail.as_ref().is_some_and(|t| ex(t))
+}
+
 /// How many `f64` locals a loop body carries from one lap to the next through an add or a
 /// subtract — `s += xs[i]`, `e = e − d` — a reduction the lap waits on for the add's latency, which
 /// a unit of work does not have: one unit of serial work each a lap (cost-model § Time, serial work).

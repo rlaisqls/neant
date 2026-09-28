@@ -267,23 +267,31 @@ fn main() {
                         // M7's time: the loops' cycles on this core's model, times their laps, beside the
                         // calculus's memory term — the longer
                         if let Some(asm) = &asm {
-                            let mut laps: std::collections::HashMap<(String, u32), (f64, f64, bool)> = std::collections::HashMap::new();
-                            for (line, e, p, vary) in &c.laps {
+                            let mut laps: std::collections::HashMap<(String, u32), (f64, f64, bool, bool)> = std::collections::HashMap::new();
+                            for (line, e, p, vary, b) in &c.laps {
                                 let Some(v) = eval_one(c, &cost::Cost::poly(p.clone()), ev, &machine) else { continue };
                                 let n = eval_one(c, &cost::Cost::poly(e.clone()), ev, &machine).unwrap_or(0.0);
                                 let Some((file, l)) = sources.place(*line).map(|(f, l)| (f.to_string(), l)).or(Some((sources.root_name(), *line))) else { continue };
                                 let key = (std::path::Path::new(&file).file_name().map_or(file.clone(), |n| n.to_string_lossy().to_string()), l);
-                                let x = laps.entry(key).or_insert((0.0, 0.0, false));
-                                x.0 += v; x.1 += n; x.2 |= *vary;
+                                let x = laps.entry(key).or_insert((0.0, 0.0, false, false));
+                                x.0 += v; x.1 += n; x.2 |= *vary; x.3 |= *b;
                             }
-                            let ns = m7::compute_ns(asm, &laps);
-                            println!("                     m7 {:.3e} s (compute {:.3e} s on this core's model, memory {:.3e} s)", ns.max(tm) / 1e9, ns / 1e9, tm / 1e9);
+                            // a loop whose laps are a bound makes the time one; one whose laps the
+                            // calculus left out makes it none
+                            if c.laps_dropped {
+                                println!("                     m7 does not apply: a callee's loops have laps this call cannot name (an amortised scan's)");
+                            } else {
+                                let (ns, in_bounds) = m7::compute_ns(asm, &laps);
+                                // a bound only where the loops it holds for are more than a trace of the time
+                                let bound = in_bounds > 0.01 * ns;
+                                println!("                     m7 {}{:.3e} s (compute {:.3e} s on this core's model, memory {:.3e} s)", if bound { "≤ " } else { "" }, ns.max(tm) / 1e9, ns / 1e9, tm / 1e9);
+                            }
                         }
                         // each loop's laps at these sizes, by the file and line `emit --lines` gives it
                         if show_laps {
                             println!("                     memory {:.3e} s", tm / 1e9);
                             let mut by: Vec<(u32, f64, f64, bool)> = Vec::new();
-                            for (line, e, p, vary) in &c.laps {
+                            for (line, e, p, vary, _) in &c.laps {
                                 let Some(v) = eval_one(c, &cost::Cost::poly(p.clone()), ev, &machine) else { continue };
                                 let n = eval_one(c, &cost::Cost::poly(e.clone()), ev, &machine).unwrap_or(0.0);
                                 match by.iter_mut().find(|(l, _, _, _)| l == line) { Some(x) => { x.1 += v; x.2 += n; x.3 |= *vary; } None => by.push((*line, v, n, *vary)) }

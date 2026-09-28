@@ -234,15 +234,16 @@ pub fn loops(asm: &str) -> Vec<Loop> {
 /// fewer) is costed inside the loop around it, with the window; any other as laps × its lap; an
 /// entry whose trip varies pays a missed exit. Of the assembly loops one source loop became — a
 /// vector loop and its scalar remainder — the widest does the laps.
-pub fn compute_ns(asm: &str, laps: &HashMap<(String, u32), (f64, f64, bool)>) -> f64 {
+/// Also returned: the part of it in loops whose laps are only a bound.
+pub fn compute_ns(asm: &str, laps: &HashMap<(String, u32), (f64, f64, bool, bool)>) -> (f64, f64) {
     let mut best: HashMap<(String, u32), Loop> = HashMap::new();
     for l in loops(asm) {
         let wider = best.get(&l.at).is_none_or(|b| l.lanes > b.lanes);
         if wider { best.insert(l.at.clone(), l); }
     }
-    let mut total = 0.0;
+    let (mut total, mut bounded) = (0.0, 0.0);
     for (at, l) in &best {
-        let Some(&(n, entries, varies)) = laps.get(at) else { continue };
+        let Some(&(n, entries, varies, bound)) = laps.get(at) else { continue };
         let trip = if entries > 0.0 { n / entries } else { 0.0 };
         let miss = if varies { entries * MISS } else { 0.0 };
         let cycles = match &l.nest {
@@ -254,9 +255,11 @@ pub fn compute_ns(asm: &str, laps: &HashMap<(String, u32), (f64, f64, bool)>) ->
             }
             _ => n * lap_cycles(&l.body).0 / l.lanes,
         };
-        total += (cycles + miss) * CYCLE_NS;
+        let ns = (cycles + miss) * CYCLE_NS;
+        total += ns;
+        if bound { bounded += ns; }
     }
-    total
+    (total, bounded)
 }
 
 #[cfg(test)]

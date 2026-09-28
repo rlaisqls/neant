@@ -51,14 +51,16 @@ PROGRAMS = {
 }
 
 def predict_m7(nt, env):
-    """M7's time for `main` (`neant cost --eval … --m7`, cost-model § M7's line), or None."""
+    """M7's time for `main` (`neant cost --eval … --m7`, cost-model § M7's line) and whether it is
+    a bound, or None where M7 does not apply. A bound or none is left out of M7's mean."""
     ev = ",".join(f"{k}={v}" for k, v in env.items()) + ",B=64"
     out = run([str(NEANT), "cost", nt.name, "--eval", ev, "--m7"], cwd=nt.parent).stdout
     sec = out.split("\nmain", 1)
     if len(sec) < 2: return None
     main = re.split(r"\n(?=\S)", sec[1], maxsplit=1)[0]
-    m = re.search(r" m7 (\S+) s", main)
-    return float(m.group(1)) if m else None
+    # a time, or a bound (`≤`), or none where M7 does not apply
+    m = re.search(r" m7 (≤ )?([0-9.e+-]+) s", main)
+    return (float(m.group(2)), bool(m.group(1))) if m else None
 
 def predict(nt, env):
     ev = ",".join(f"{k}={v}" for k, v in env.items()) + ",B=64"
@@ -110,8 +112,8 @@ def main():
             m7 = predict_m7(nt, env)
             if t > 0.5e-3:
                 ratios.append(t / pt)
-                if m7: ratios_m7.append(t / m7)
-            m7s = f"{m7*1e3:>9.3f} {t/m7:>8.2f}" if m7 else f"{'—':>9} {'—':>8}"
+                if m7 and not m7[1]: ratios_m7.append(t / m7[0])
+            m7s = f"{('≤' if m7[1] else '') + format(m7[0]*1e3, '.3f'):>9} {t/m7[0]:>8.2f}" if m7 else f"{'n/a':>9} {'—':>8}"
             print(f"  {name:<8} {s:>9} {w:>11.3e} {mv:>11.3e} {bound:>6} {pt*1e3:>10.3f} {t*1e3:>10.2f} {t/pt:>9.2f} {m7s}")
     if ratios:
         g = math.exp(sum(math.log(x) for x in ratios) / len(ratios))
