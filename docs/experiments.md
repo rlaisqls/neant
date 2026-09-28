@@ -850,6 +850,16 @@ cache against two independent streams' 0.29. The Benchmarks Game's programs are 
 of 1.00 (0.47–1.81; n-body 1.75–1.81, spectral-norm 0.96–1.26, mandelbrot 0.47–0.50), the corpus's
 1.33 (`heat` 0.63–0.75 from 0.45–0.51, the rest as before).
 
+## Where `fir`'s time goes (2026-09-28)
+
+`fir` at 10⁶ integers, 22.5 ms: reading and parsing 17.4 of it, the filter 5.0 (5 ns an element).
+The parse alone is predicted 11.9 ms, 1.46× fast; the filter about 1.4. The parse's gap is about
+what a mispredicted branch at the end of each number's digit loop costs, twice a number (counting,
+then reading) — the integers are uniform in −100…100, one to three digits and a sign, so the exit
+is not predictable. `csv`'s numbers are mostly of one length (a sensor id, a time growing a digit
+at a time) and its parse is predicted at 0.9. A branch that data decides is not in the calculus,
+and a per-exit charge would make `csv` wrong to make `fir` right; left as the reason for `fir`'s 2×.
+
 ## Programs the project did not write: the Benchmarks Game (2026-09-28)
 
 **Why.** The corpus is the project's own (evaluation.md, threats). Five programs of the Computer

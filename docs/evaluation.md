@@ -177,7 +177,8 @@ constant to tune:
 - **Reuse between neighbouring sites, in part.** A stencil's five reads are three streams now, not
   five (cost-model § Neighbouring sites); the centre row is still counted apart from the rows it
   shares with its neighbours (`heat`, 2× high, from 8×).
-- **Compute in a filter** (`fir`, 2× low), charged at a `τ` fitted on a polynomial.
+- **A branch the data decides** (`fir`, 2× low): its parse's digit loops end at a length that
+  varies number to number, a mispredict each, which `csv`'s regular numbers do not pay.
 - **A `τ` for code that vectorises worse** than the polynomial it was fitted on (`matmul` at small
   `n`, 2.4–2.7× low).
 - **Reach.** `while` loops with no measure the compiler finds, inside the walkers and in the
