@@ -205,7 +205,10 @@ constant to tune:
   faster than they run: the time is an estimate there, not a bound.
 - **The fitted constants are gcc's laps, not the core's.** The kernels they were fitted on repeat
   one call, and gcc runs two repeats in one vector iteration (experiments.md, M7's first probe):
-  `τ`, `τ_s`, `τ_div` are half a chain's latency where a program's chains cannot be paired.
+  `τ`, `τ_s`, `τ_div` are half a chain's latency where a program's chains cannot be paired. Fitted
+  on unpaired repeats they double, and the programs' log error falls from 0.48 to 0.27 (n-body
+  0.94, `fir` 1.12) while the kernels' rises from 0.53 to 0.72 (a tiled `matmul` 0.28): one `τ` is
+  either a chain's latency or a vectorised loop's throughput, not both.
 - **Wall-clock, minimum of three to five runs,** on a machine shared at times with other sessions;
   the kernels' table was taken idle.
 

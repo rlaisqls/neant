@@ -897,6 +897,20 @@ work as gcc compiles those kernels, not one chain's latency; a program whose cha
 runs at up to twice what they say. A threat to the constants' meaning, which the programs' ratios
 (0.5–2.6) are consistent with and do not separate from the model's other errors.
 
+**Refitted on repeats gcc cannot pair** (each repeat starting from the last one's result): τ 0.0176 →
+0.0291 ns, `τ_s` 0.155 → 0.310, `τ_div` 0.148 → 0.345 — a chain's own latency, twice what the
+paired kernels gave, as the probe said. With those constants the programs improve and the kernels
+do not. The Benchmarks Game and corpus runs (16, mandelbrot left out, whose 50 laps are the most a
+point takes and whose ratio is a bound's): root-mean-square of `ln(measured / predicted)` 0.48 → 0.27 —
+n-body 1.76 → 0.94, `fir` 2.0 → 1.12, small `matmul` 2.5 → 0.84, `pid` 1.5 → 0.87, spectral-norm 1.26
+→ 0.68, `csv` 0.9 → 0.6. The kernels, their repeats unpaired the same way: 0.53 → 0.72, the tiled
+`matmul` 0.9 → 0.28 (gcc vectorises its inner loop and the core overlaps its short chains, so a
+chain's `τ` overcharges it) and `sum` 1.5 at every size, its unpaired add chain slower than the
+memory even at 100 MB. Pooled, 0.51 → 0.60. One `τ` cannot be a chain's latency and a vectorised
+loop's throughput at once; which calibration is right depends on which the code is, and that is
+the per-nest cost line M7 is for. The defaults stay as fitted; the unpaired set is
+`--tau 0.0291 --taus 0.3102 --tdiv 0.3447`.
+
 It does not survive a loop nest. The tiled `matmul`'s inner loop, a 64-long `acc += a·b` chain,
 is 6 cycles an iteration to llvm-mca and measures 0.165 ns (0.027 an mca cycle); the naive one 4.0
 and 0.276 (0.069). llvm-mca runs one loop in its steady state, and the core overlaps a short chain
