@@ -764,7 +764,8 @@ worked around: there is no shift operator, so `1 << k` is a loop.
 reason already named: fannkuch's `main` (permutation state in `while` loops whose trips are the
 data's); binary-trees' `build` (two recursive calls each shrinking the depth by one — an exponential
 recurrence, which the calculus refuses), `check` (recursion over a tree in an arena, the compiler's
-largest unknown row) and `main`.
+largest unknown row) and `main`. Since 2026-09-28 `check` is a bound, `22·ns.len() + 11` (cost-model
+§ Recursion, a tree), and three remain unknown.
 
 **Against the clock** (`tests/bench/timing.py`, the fitted roofline, CPU 5):
 

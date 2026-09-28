@@ -1,6 +1,6 @@
 struct Int       layout AoS  the model does not decide: no function's moves differ
 struct Float     layout AoS  the model does not decide: no function's moves differ
-struct Node      layout AoS  the model does not decide: no function's moves differ
+struct Node      layout AoS  decided by check (4·B·ns.len() + 2·B, SoA 6·B·ns.len() + 3·B)
 is_digit         work 3                            moves 0                            exact
 is_space         work 7                            moves 0                            exact
 skip_space       work 2·xs.len() − 2·at + 12       moves xs.len() − at + 2·B          exact
@@ -15,8 +15,9 @@ format_float     work 716                          moves 44·B + 19             
                  footprint        out: [0, out.len()) (whole array)   no residue claimed
 build            unknown: 2 recursive calls each shrinking `depth` by a constant: exponential (main.nt:13)
                  footprint        ns: [16·next[0], 16·next[0] + 16)  next: [0, 8)   resident after if 24 < M
-check            unknown: no argument shrinks toward a base case across every recursive call; the measure must be an `i64` parameter, `xs.len() − p`, or `hi − lo` (main.nt:26)
+check            work 22·ns.len() + 11             moves 4·B·ns.len() + 2·B           bound
                  footprint        ns: [16·t, 16·t + 16)   resident after if 16 < M
+                 tree: every recursive call is on a child of `ns[t]`, 2 an invocation; over an arena that is a tree each node is reached once, so at most 2·ns.len() + 1 calls (a promise, as a walk's)
 pow2             work 3·k                          moves 0                            exact
 main             unknown: loop bound is not a size expression (main.nt:50), io
                  rests on         arg (declared, extern); build (unknown)

@@ -967,6 +967,12 @@ BW_max)`, `BW_max = 65.6 GB/s` on ten cores; the M5 kernels' measured / predicte
 (parallel sum 1.44–1.49, compute map 2.0–3.1), so a memory-bound chain's flattening is predicted.
 A read goes stale only where a loop may write its slot or its field, not anywhere in its array
 (cost-model § A size read from memory, by slot): the compiler is 94/51/36/97 (golden `slots`).
+A recursion on the children of the node it is handed, `f(xs, xs[t].l)`, `f(xs, xs[t].r)`, is at most
+`k·xs.len() + 1` invocations over an arena that is a tree — the promise a walk makes, and a bound
+(cost-model § Recursion, a tree): binary-trees' `check` gets a cost, 12 of 15, and the compiler is
+94/50/38/96, `same_ty` among them (golden `arena_tree`); `resolve_ty` goes down `.a` from three
+`if`s in a row, which the count of calls reads as three an invocation, and is refused. Mutual
+recursion, the larger row, is left.
 
 ## M7 — the constant factor
 

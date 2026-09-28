@@ -1,0 +1,67 @@
+// A recursion over a tree in an arena (docs/cost-model.md § Recursion, a tree): `sum` calls itself
+// on the two children of the node it is given, `ns[t].l` and `ns[t].r`, so over an arena that is a
+// tree it runs at most 2·ns.len() + 1 times — a promise, as a walk down a list promises no cycle.
+// Refused: `chase` recurses on `ns[t].l + 1`, not a child, and no argument shrinks. An invocation's
+// own cost may name another parameter only if every call passes it on unchanged: `same` does, and
+// is a bound; `deep` passes `d + 1`, so its invocations differ in cost and it is not. `twice` goes
+// down `l` twice, which enters each left child twice and doubles at every level: refused.
+
+struct N { l: i64, r: i64, v: i64 }
+
+fn sum(ns: &[N], t: i64) -> i64 {
+    if t < 0 {
+        0
+    } else {
+        ns[t].v + sum(ns, ns[t].l) + sum(ns, ns[t].r)
+    }
+}
+
+fn chase(ns: &[N], t: i64) -> i64 {
+    if t < 0 || t >= ns.len() {
+        0
+    } else {
+        ns[t].v + chase(ns, ns[t].l + 1)
+    }
+}
+
+fn same(ns: &[N], t: i64, d: i64) -> i64 {
+    if t < 0 {
+        0
+    } else {
+        let mut s = 0;
+        for i in 0..d { s += i; }
+        s + same(ns, ns[t].l, d) + same(ns, ns[t].r, d)
+    }
+}
+
+fn deep(ns: &[N], t: i64, d: i64) -> i64 {
+    if t < 0 {
+        0
+    } else {
+        let mut s = 0;
+        for i in 0..d { s += i; }
+        s + deep(ns, ns[t].l, d + 1) + deep(ns, ns[t].r, d + 1)
+    }
+}
+
+fn twice(ns: &[N], t: i64) -> i64 {
+    if t < 0 {
+        0
+    } else {
+        1 + twice(ns, ns[t].l) + twice(ns, ns[t].l)
+    }
+}
+
+fn main() {
+    let mut ns = [N { l: -1, r: -1, v: 1 }; 5];
+    ns[0] = N { l: 1, r: 2, v: 10 };
+    ns[1] = N { l: 3, r: 4, v: 20 };
+    println(sum(&ns, 0));
+    // for `chase` a leaf's link points past the end, where it stops
+    let mut cs = [N { l: 10, r: 10, v: 1 }; 5];
+    cs[0] = N { l: 1, r: 10, v: 10 };
+    println(chase(&cs, 0));
+    println(same(&ns, 0, 3));
+    println(deep(&ns, 0, 0));
+    println(twice(&ns, 0));
+}

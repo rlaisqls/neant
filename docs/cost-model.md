@@ -622,6 +622,29 @@ one call per level, not two. The function's line says `recurrence` instead of `e
 recursion is not solved; the message says so. A recursive callee is never specialised at a call
 site: its cost is the solved recurrence in its own parameters, substituted.
 
+### A tree in an arena
+
+When no measure shrinks, one more shape is tried: every self-call is handed the same array `xs`
+and, for an `i64` parameter `t`, a **child of the node `xs[t]`** — `xs[t].f` for some field, or
+`xs[t]` itself for an `[i64]`. That is a walk over a tree threaded through `xs` by index, the arena
+idiom of § A walk down a list with more than one link. With `k` self-calls an invocation (counted
+as above, the heavier branch of an `if`), and the arena a tree, each node is entered once and each
+entered node makes `k` calls, so there are at most `k·xs.len() + 1` invocations; the body's own
+cost, the self-calls charged their call only, times that is the function's cost, tier `bound`, and
+the line says it rests on the promise. With two or more calls an invocation, no two call sites may
+go down the same link: `f(xs, xs[t].l) + f(xs, xs[t].l)` enters each left child twice, which doubles
+at every level of a tree, and is refused; with one call an invocation the calls form a chain, and
+any link may repeat across branches. A cycle in the links breaks it as it breaks a walk; so does
+a DAG, where a shared node is entered once per parent.
+
+It applies only where an invocation's own cost does not depend on which one it is: it may not name
+`t`, and may name another parameter only if every self-call passes that parameter on unchanged.
+`binary-trees`' `check` is `22·ns.len() + 11`; golden `arena_tree` has `sum`, `same` (a loop to a
+depth handed down unchanged) and the three refused, `chase` (`ns[t].l + 1` is not a child), `deep`
+(it hands down `d + 1`, so its invocations differ) and `twice` (down `l` twice). The self-hosted pass does not have the rule
+and declines these; its footprint of a multi-field element read at a symbolic index is the first
+field's, a subset of the element (`FOOTPRINT_NARROWER`).
+
 ## Effects
 
 `io` is inferred: a function that prints, or calls one that does, carries `, io` on its line.

@@ -6,7 +6,7 @@ binary_trees parse_float      exact
 binary_trees format_int       exact
 binary_trees format_float     exact
 binary_trees build            unknown
-binary_trees check            unknown
+binary_trees check            bound
 binary_trees pow2             exact
 binary_trees main             unknown
 binary_trees arg              declared

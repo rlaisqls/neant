@@ -1,6 +1,6 @@
 # Evaluation
 
-What neant set out to show, what was measured, and where the measurements stand on 2026-09-27.
+What neant set out to show, what was measured, and where the measurements stand on 2026-09-28.
 Every number here is from a document that shows how it was taken; this file only puts them side by
 side. The machine throughout is one Cortex-X925 core (CPU 5) of the development machine, L2 2 MiB
 private, L3 16 MiB, pinned with `taskset`.
@@ -108,11 +108,13 @@ language, written to compile itself and not to suit the calculus:
 | the sign audit, a size bound once, the scan rule | 92 | 49 | 34 | 103 | 278 |
 | a loop that surely runs (the lexer) | 92 | 49 | 35 | 102 | 278 |
 | a `while` condition read right (`j > start`, `i + 1 < n`) | 94 | 51 | 35 | 98 | 278 |
-| reads stale by slot and by field, not by array, now | 94 | 51 | 36 | 97 | 278 |
+| reads stale by slot and by field, not by array | 94 | 51 | 36 | 97 | 278 |
+| recursion over a tree in an arena, now | 94 | 50 | 38 | 96 | 278 |
 
 Exact did not move after the first extensions; what moved is how much is stated at all, 81 of 276
-to 175 of 278, a third of it `bound`. The largest remaining row is mutual recursion over the
-compiler's own tree walks (plan § Stage D (3)). `lex` became a bound once a nested loop its guard
+to 182 of 278, a fifth of it `bound`. The largest remaining row is mutual recursion over the
+compiler's own tree walks (plan § Stage D (3)); a function that recurses on its own node's children
+is a bound now (cost-model § Recursion, a tree). `lex` became a bound once a nested loop its guard
 surely enters was counted, but its callers are unknown for their own reasons, so one line moved.
 
 **The domain corpus** (`tests/corpus`, docs/corpus.md): six programs of the kinds stage C names —
@@ -132,7 +134,7 @@ text, and a number read out of text is bounded, not counted.
 The calculus has been caught wrong, and saying so is part of the evaluation.
 
 - **Two compilers.** The self-hosted cost pass is checked column by column against the Rust one
-  (`bootstrap/tests/self_host_cost.rs`): 105 work, 103 moves, 141 footprint, 154 bound columns agree
+  (`bootstrap/tests/self_host_cost.rs`): 105 work, 91 moves, 142 footprint, 164 bound columns agree
   exactly, and every place one states less than the other is listed with its reason. The check has
   found bugs in both — most recently the self-hosted pass costing a worklist as one pass, because it
   did not see an assignment in an `if` at a block's tail (plan, 2026-09-27).
@@ -164,8 +166,8 @@ constant to tune:
   consecutive calls share (`csv`, 5–10× high).
 - **A `τ` for code that vectorises worse** than the polynomial it was fitted on (`matmul` at small
   `n`, 2.4–2.7× low).
-- **Reach.** Mutual recursion, recursion over a tree in an arena, and the lexer's scan shapes leave
-  a third of the compiler unknown.
+- **Reach.** Mutual recursion and the parser's cursor loops leave a third of the compiler
+  unknown; a recursion over a tree in an arena is a bound, a promise the program does not state.
 
 ## Threats to validity
 
@@ -175,9 +177,10 @@ constant to tune:
 - **The corpus is the project's own.** It was written the way someone would write those programs,
   not shaped to the rules, and what it had to be written around is kept as rejected cases — but it
   is not independent code, and eight programs are few. Five Benchmarks Game programs, ported with
-  their published structure (`tests/bench`, experiments.md), are 11 of 15 functions exact — the
-  unknowns an exponential recurrence, a tree recursion and data-driven permutation loops — and
-  their times are within 0.26–1.93 of the predicted (0.15–4.3 before a triangle's moves and serial
+  their published structure (`tests/bench`, experiments.md), are 11 of 15 functions exact and one
+  more a bound (a tree recursion) — the unknowns an exponential recurrence and data-driven
+  permutation loops — and
+  their times are within 0.50–1.77 of the predicted (0.15–4.3 before a triangle's moves and serial
   work were charged, each found by these programs and fitted elsewhere).
 - **Generated inputs.** Uniform random integers and rows; real data with long lines or skew would
   move the parse's constants.
@@ -202,4 +205,4 @@ access in equal measure, so it is not the default. A TLB charge per paged line (
 `transpose` and over-charges naive matmul fourfold, so it is off too. Next, in the order they would change these
 numbers: a bandwidth that depends on the access pattern (a stride, the number of streams) at each
 level (the small sizes, and a chase inside L3), the parse's per-call constants (`csv`),
-a second machine for `τ`, `BW` and `L`, and, for reach, recursion over an arena tree.
+a second machine for `τ`, `BW` and `L`, and, for reach, mutual recursion.

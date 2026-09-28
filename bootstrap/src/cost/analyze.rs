@@ -623,6 +623,8 @@ struct Fa<'a, 'b, 'c> {
     /// each self-call: the argument sizes by parameter (None when not a size), how many times
     /// the site runs per invocation, and its line
     rec_calls: Vec<(Vec<Option<Poly>>, Poly, u32)>,
+    /// each self-call's arguments, for a recursion over a tree (docs/cost-model.md § Recursion, a tree)
+    rec_args: Vec<Vec<Expr>>,
     /// size in elements of every array/slice local
     local_size: HashMap<LocalId, Poly>,
     /// value of every immutable i64 local that is an affine expression
@@ -695,7 +697,7 @@ struct Fa<'a, 'b, 'c> {
 impl<'a, 'b, 'c> Fa<'a, 'b, 'c> {
     fn new(an: &'b mut Analyzer<'a>, f: &'c Func, self_fid: Option<FuncId>) -> Self {
         let mut fa = Fa {
-            an, f, names: param_names(f), sites: vec![], loop_recs: vec![], bounds: vec![], images: HashMap::new(), result_size: None, last_result: None, last_result_atom: None, argc_atom: None, scalar_alias: HashMap::new(), alias_scopes: vec![], notes: vec![], io: false, self_fid, rec_calls: vec![],
+            an, f, names: param_names(f), sites: vec![], loop_recs: vec![], bounds: vec![], images: HashMap::new(), result_size: None, last_result: None, last_result_atom: None, argc_atom: None, scalar_alias: HashMap::new(), alias_scopes: vec![], notes: vec![], io: false, self_fid, rec_calls: vec![], rec_args: vec![],
             local_size: HashMap::new(), local_affine: HashMap::new(), initial: HashMap::new(), at_entry: false,
             loops: vec![], work: Cost::zero(), moves: Cost::zero(), span: Cost::zero(), saved: vec![], branch: vec![], next_if: 0,
             local_root: HashMap::new(), resident: vec![], call_moves: Cost::zero(), saved_calls: vec![], replay: false, has_call: vec![], rests_on: vec![],
@@ -790,7 +792,10 @@ impl<'a, 'b, 'c> Fa<'a, 'b, 'c> {
                         // span is not threaded through self-recursion (docs/m5-span-design.md
                         // does not attempt it); work stands in, always a safe over-approximation
                         Ok((work, moves)) => CostResult::Exact { span: work.clone(), work, moves },
-                        Err(reason) => CostResult::Unknown { reason, line: self.rec_calls[0].2 },
+                        Err(reason) => match self.tree_recursion() {
+                            Some((work, moves, note)) => { tier = "bound"; self.notes.push(note); CostResult::Exact { span: work.clone(), work, moves } }
+                            None => CostResult::Unknown { reason, line: self.rec_calls[0].2 },
+                        },
                     }
                 }
             }
@@ -1004,6 +1009,56 @@ impl<'a, 'b, 'c> Fa<'a, 'b, 'c> {
     /// or `hi − lo`. Shrinking by a constant with one call is a sum, `T = f·m/c`; with more
     /// calls it is exponential and refused. Shrinking by a factor `b` with `a` calls is the
     /// master theorem on the degree `d` of `f` in `m`.
+    /// A recursion over a tree in an arena (docs/cost-model.md § Recursion, a tree): every self-call
+    /// hands on a child of the node it was given — `f(ns, ns[t].left)`, the same array and a field of
+    /// the element at `t` — a fixed number `k` of times an invocation. Over an arena that is a tree
+    /// each node is reached once, so there are at most `k·ns.len() + 1` invocations, and the cost is
+    /// that times one invocation's own. That the arena is a tree is a promise, as a walk down a list
+    /// promises no cycle; the line is a bound.
+    fn tree_recursion(&self) -> Option<(Cost, Cost, String)> {
+        let mut k_poly = Poly::zero();
+        for (_, o, _) in &self.rec_calls { k_poly = k_poly.add(o); }
+        let k = k_poly.as_const().filter(|c| c.is_int() && c.n >= 1)?.n;
+        let ps = &self.f.params;
+        for (pi, &p) in ps.iter().enumerate() {
+            if self.f.locals[p].ty != Ty::I64 { continue; }
+            for (ai, &a) in ps.iter().enumerate() {
+                if !self.f.locals[a].ty.is_arrayish() { continue; }
+                let child = |e: &Expr| -> bool {
+                    let idx_is_p = |i: &Expr| matches!(i.kind, ExprKind::Local(l) if l == p);
+                    match &e.kind {
+                        ExprKind::Field(inner, _) => matches!(&inner.kind, ExprKind::Index(arr, i) if *arr == a && idx_is_p(i)),
+                        ExprKind::Index(arr, i) => *arr == a && idx_is_p(i),
+                        _ => false,
+                    }
+                };
+                let same_arr = |e: &Expr| matches!(&e.kind, ExprKind::Local(x) | ExprKind::Ref(x, _) if *x == a);
+                if !self.rec_args.iter().all(|args| args.get(pi).is_some_and(child) && args.get(ai).is_some_and(same_arr)) { continue; }
+                // two calls down the same link would enter a child twice and double at every
+                // level; with one call an invocation it is a chain, with more each site its own link
+                if k >= 2 {
+                    let link = |args: &Vec<Expr>| match &args[pi].kind { ExprKind::Field(_, f) => Some(*f), _ => None };
+                    let links: Vec<Option<usize>> = self.rec_args.iter().map(link).collect();
+                    if (0..links.len()).any(|i| links[..i].contains(&links[i])) { return None; }
+                }
+                // one invocation's own cost, the self-calls charged their call only; it must not
+                // depend on which node it is
+                if self.work.mentions(pi) || self.moves.mentions(pi) { return None; }
+                // nor on another parameter, unless every call passes it on unchanged
+                let passed = |q: usize| self.rec_args.iter().all(|args| args.get(q).is_some_and(|e|
+                    matches!(&e.kind, ExprKind::Local(x) | ExprKind::Ref(x, _) if *x == ps[q])));
+                if (0..ps.len()).any(|q| q != pi && q != ai && (self.work.mentions(q) || self.moves.mentions(q)) && !passed(q)) { return None; }
+                let calls = Poly::var(ai).scale(Rat::int(k)).add(&Poly::constant(1));
+                let an = &self.f.locals[a].name;
+                let pn = &self.f.locals[p].name;
+                let note = format!("tree: every recursive call is on a child of `{an}[{pn}]`, {k} an invocation; over an arena that is a tree each node is reached once, so at most {} calls (a promise, as a walk's)",
+                    calls.display(&self.names));
+                return Some((self.work.mul_poly(&calls), self.moves.mul_poly(&calls), note));
+            }
+        }
+        None
+    }
+
     fn solve_recurrence(&self) -> Result<(Cost, Cost), String> {
         let mut a_poly = Poly::zero();
         for (_, o, _) in &self.rec_calls { a_poly = a_poly.add(o); }
@@ -2927,6 +2982,7 @@ impl<'a, 'b, 'c> Fa<'a, 'b, 'c> {
                     }).collect();
                     let o = self.times_here();
                     self.rec_calls.push((sizes, o, e.line));
+                    self.rec_args.push(args.clone());
                     return Ok(());
                 }
                 // the callee's signature, and this call's argument sizes for its atoms
@@ -2975,7 +3031,7 @@ impl<'a, 'b, 'c> Fa<'a, 'b, 'c> {
                     }
                     for r in &callee.rests_on { if !self.rests_on.contains(r) { self.rests_on.push(r.clone()); } }
                     // a callee bounded by a scan of its own (§ A scan)
-                    if callee.notes.iter().any(|n| n.starts_with("scan: ") || n.starts_with("worklist: ")) {
+                    if callee.notes.iter().any(|n| n.starts_with("scan: ") || n.starts_with("worklist: ") || n.starts_with("tree: ")) {
                         let tag = format!("{} {SCAN_TAG}", callee.name);
                         if !self.rests_on.contains(&tag) { self.rests_on.push(tag); }
                     }

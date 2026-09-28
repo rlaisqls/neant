@@ -87,6 +87,9 @@ const RESIDENT_INSTEAD: &[(&str, &str)] = &[("arrayview.nt", "main"), ("chains.n
 /// it once did not do: it stated `grid`'s `xs[a]` alone as exact and resident, having stopped at
 /// `0..xs[a]` before reaching `xs[b]`.
 ///
+/// `arena_tree.nt`'s four read three fields of one AoS element; this pass states the first field's
+/// eight bytes of it, a subset of the element the Rust states.
+///
 /// `slots.nt`'s three loop to a bound read from the array they write, which this pass, with no
 /// read atoms at all, declines before recording it.
 ///
@@ -125,7 +128,9 @@ const FOOTPRINT_NARROWER: &[(&str, &str)] = &[("parse.nt", "number"), ("bfs.nt",
                                               ("worklist.nt", "reach"), ("lexer.nt", "words"),
                                               ("whileshapes.nt", "from_one"), ("whileshapes.nt", "sort_from"),
                                               ("particles.nt", "step"), ("tri.nt", "pairs"),
-                                              ("slots.nt", "count"), ("slots.nt", "fields"), ("slots.nt", "rewrite")];
+                                              ("slots.nt", "count"), ("slots.nt", "fields"), ("slots.nt", "rewrite"),
+                                              ("arena_tree.nt", "sum"), ("arena_tree.nt", "chase"),
+                                              ("arena_tree.nt", "same"), ("arena_tree.nt", "deep")];
 
 /// The same for the **footprint lower bound**: stated where `neant cost` states one and this pass
 /// states none. A `while` loop is given no loop atom by this pass — only a `for` mints one — so a
@@ -166,13 +171,13 @@ const EXACT_MOVES: usize = 91;
 /// whole of it is resident on return, whitespace-normalised so the report's column padding is not
 /// part of the comparison. Counted over every function, so one that should state no footprint and
 /// states none counts too.
-const EXACT_FOOT: usize = 140;
+const EXACT_FOOT: usize = 142;
 
 /// The same for the **footprint lower bound** — `moves` cannot be less than the distinct bytes a
 /// function's parameter arrays reach. Counted over every function, so a `main` that should have no
 /// bound and gets none counts too: a bound invented where `neant cost` states none is as wrong as
 /// a missing one, and only one of those two shows up as a difference.
-const EXACT_BOUNDS: usize = 158;
+const EXACT_BOUNDS: usize = 164;
 
 
 
@@ -265,9 +270,10 @@ fn rust_foot(out: &str) -> BTreeMap<String, String> {
 
 /// Whether footprint `g` names only arrays `w` names too, each with `w`'s range or the whole array,
 /// and claims no residue: what a walk that stopped early states of what a longer walk found. The
-/// whole array claims less than a range does — a fit test may use it, a credit may not.
+/// whole array claims less than a range does — a fit test may use it, a credit may not. A range
+/// from the same start and shorter is inside `w`'s, and then a residue no larger than `w`'s is too.
 fn foot_subset(w: &str, g: &str) -> bool {
-    fn entries(s: &str) -> (Vec<String>, bool) {
+    fn entries(s: &str) -> (Vec<String>, String) {
         let (es, res) = s.rsplit_once(" | ").map_or((s, s), |(a, b)| (a, b));
         let toks: Vec<&str> = es.split(' ').collect();
         let mut out: Vec<String> = Vec::new();
@@ -278,12 +284,25 @@ fn foot_subset(w: &str, g: &str) -> bool {
                 _ => out.push(t.to_string()),
             }
         }
-        (out, res == "none" || res == "| none")
+        (out, res.to_string())
     }
-    let ((we, _), (ge, none)) = (entries(w), entries(g));
+    // `x: [lo, lo + c)`, as the array, `lo` and `c`: a range this pass states shorter from the
+    // same start is inside the Rust's
+    fn span(e: &str) -> Option<(&str, &str, u64)> {
+        let (a, r) = e.split_once(": [")?;
+        let (lo, hi) = r.strip_suffix(')')?.split_once(", ")?;
+        let c = hi.strip_prefix(lo)?.strip_prefix(" + ")?.parse().ok()?;
+        Some((a, lo, c))
+    }
+    let resident = |r: &str| r.strip_prefix("resident ").and_then(|n| n.parse::<u64>().ok());
+    let ((we, wr), (ge, gr)) = (entries(w), entries(g));
+    let none = gr == "none" || gr == "| none"
+        || resident(&gr).is_some_and(|g| resident(&wr).is_some_and(|w| g <= w));
     let array = |e: &str| e.split(':').next().unwrap_or("").to_string();
     none && ge.iter().all(|e| we.contains(e)
-        || (e.ends_with("(whole array)") && we.iter().any(|x| array(x) == array(e))))
+        || (e.ends_with("(whole array)") && we.iter().any(|x| array(x) == array(e)))
+        || span(e).is_some_and(|(a, lo, c)| we.iter().any(|x| span(x)
+            .is_some_and(|(b, lo2, c2)| a == b && lo == lo2 && c <= c2))))
 }
 
 fn rust_bounds(out: &str) -> BTreeMap<String, String> {
