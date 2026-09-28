@@ -1,0 +1,9 @@
+struct P         layout AoS  decided by fields (2·B, SoA 4·B), main (moves[rewrite](3, 2) + 6·B + 56, SoA moves[rewrite](3, 2) + 8·B + 56)
+count            work 5·st[1] + 3                  moves 4·B                          exact
+                 footprint        st: [0, 16)   resident after if 16 < M
+fields           work 5·ps[k].n + 3                moves 2·B                          exact
+                 footprint        ps: [16·k, 16·k + 16)   resident after if 16 < M
+rewrite          unknown: the bound of `i` is not a size expression; `while` has no measure the compiler can find; write `while cond decreasing <expr>` with an `i64` that goes down by at least one every iteration (line 28)
+                 footprint        st: [8, 16)   resident after if 8 < M
+main             work ≈ 5·ps[1].n + 5·st[1] + work[rewrite](3, 2) moves moves[rewrite](3, 2) + 6·B + 56 modulo, io
+                 rests on         rewrite (unknown)

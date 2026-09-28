@@ -965,6 +965,8 @@ store chained through memory at a fixed index is a serial unit a lap: n-body 2.3
 Game programs within 0.50–1.77. And the roofline M5 decided and did not fit: `BW(P) = min(P·BW,
 BW_max)`, `BW_max = 65.6 GB/s` on ten cores; the M5 kernels' measured / predicted is flat in `P`
 (parallel sum 1.44–1.49, compute map 2.0–3.1), so a memory-bound chain's flattening is predicted.
+A read goes stale only where a loop may write its slot or its field, not anywhere in its array
+(cost-model § A size read from memory, by slot): the compiler is 94/51/36/97 (golden `slots`).
 
 ## M7 — the constant factor
 

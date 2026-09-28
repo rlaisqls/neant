@@ -107,7 +107,8 @@ language, written to compile itself and not to suit the calculus:
 | unknown callees as terms, sizes read from memory, list walks, the lockfile | 92 | 47 | 32 | 105 | 276 |
 | the sign audit, a size bound once, the scan rule | 92 | 49 | 34 | 103 | 278 |
 | a loop that surely runs (the lexer) | 92 | 49 | 35 | 102 | 278 |
-| a `while` condition read right (`j > start`, `i + 1 < n`), now | 94 | 51 | 35 | 98 | 278 |
+| a `while` condition read right (`j > start`, `i + 1 < n`) | 94 | 51 | 35 | 98 | 278 |
+| reads stale by slot and by field, not by array, now | 94 | 51 | 36 | 97 | 278 |
 
 Exact did not move after the first extensions; what moved is how much is stated at all, 81 of 276
 to 175 of 278, a third of it `bound`. The largest remaining row is mutual recursion over the

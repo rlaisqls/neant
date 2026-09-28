@@ -87,6 +87,9 @@ const RESIDENT_INSTEAD: &[(&str, &str)] = &[("arrayview.nt", "main"), ("chains.n
 /// it once did not do: it stated `grid`'s `xs[a]` alone as exact and resident, having stopped at
 /// `0..xs[a]` before reaching `xs[b]`.
 ///
+/// `slots.nt`'s three loop to a bound read from the array they write, which this pass, with no
+/// read atoms at all, declines before recording it.
+///
 /// `particles.nt`'s `step` and `tri.nt`'s `pairs` state a whole array here where the Rust states
 /// its ranges: two SoA fields kept apart, and a triangle's lanes widened to their hull (cost-model
 /// § Moves, footprint, 2026-09-28) — a whole array is the wider claim and credits nothing.
@@ -121,7 +124,8 @@ const FOOTPRINT_NARROWER: &[(&str, &str)] = &[("parse.nt", "number"), ("bfs.nt",
                                               ("amortised.nt", "field"), ("amortised.nt", "sum_fields"),
                                               ("worklist.nt", "reach"), ("lexer.nt", "words"),
                                               ("whileshapes.nt", "from_one"), ("whileshapes.nt", "sort_from"),
-                                              ("particles.nt", "step"), ("tri.nt", "pairs")];
+                                              ("particles.nt", "step"), ("tri.nt", "pairs"),
+                                              ("slots.nt", "count"), ("slots.nt", "fields"), ("slots.nt", "rewrite")];
 
 /// The same for the **footprint lower bound**: stated where `neant cost` states one and this pass
 /// states none. A `while` loop is given no loop atom by this pass — only a `for` mints one — so a
@@ -162,13 +166,13 @@ const EXACT_MOVES: usize = 91;
 /// whole of it is resident on return, whitespace-normalised so the report's column padding is not
 /// part of the comparison. Counted over every function, so one that should state no footprint and
 /// states none counts too.
-const EXACT_FOOT: usize = 139;
+const EXACT_FOOT: usize = 140;
 
 /// The same for the **footprint lower bound** — `moves` cannot be less than the distinct bytes a
 /// function's parameter arrays reach. Counted over every function, so a `main` that should have no
 /// bound and gets none counts too: a bound invented where `neant cost` states none is as wrong as
 /// a missing one, and only one of those two shows up as a difference.
-const EXACT_BOUNDS: usize = 154;
+const EXACT_BOUNDS: usize = 158;
 
 
 

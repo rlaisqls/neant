@@ -1,0 +1,41 @@
+// A size read from memory, by slot (docs/cost-model.md § A size read from memory): a loop that
+// writes `st[0]` still reads `st[1]` as a size, since a store to a constant slot changes only that
+// slot; and one that writes `ps[j].x` still reads `ps[k].n`, another field. `rewrite` stores to a
+// slot it computes, so its bound is stale and it stays unknown.
+
+struct P { x: i64, n: i64 }
+
+fn count(st: &mut [i64]) -> i64 {
+    let mut i = 0;
+    while i < st[1] {
+        st[0] = st[0] + i;
+        i += 1;
+    }
+    st[0]
+}
+
+fn fields(ps: &mut [P], k: i64) -> i64 {
+    let mut i = 0;
+    while i < ps[k].n {
+        ps[k].x = ps[k].x + 1;
+        i += 1;
+    }
+    ps[k].x
+}
+
+fn rewrite(st: &mut [i64], j: i64) -> i64 {
+    let mut i = 0;
+    while i < st[1] {
+        st[j] = i;
+        i += 1;
+    }
+    i
+}
+
+fn main() {
+    let mut st = [0, 5, 0];
+    println(count(&mut st));
+    let mut ps = [P { x: 0, n: 3 }; 2];
+    println(fields(&mut ps, 1));
+    println(rewrite(&mut st, 2));
+}

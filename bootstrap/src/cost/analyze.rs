@@ -668,7 +668,7 @@ struct Fa<'a, 'b, 'c> {
     reads: std::cell::RefCell<HashMap<(LocalId, Option<Poly>, Option<usize>, bool), Poly>>,
     /// for each open loop, the arrays its body writes: a read of one of them is a different value
     /// every iteration, and not a size
-    loop_writes: Vec<Vec<LocalId>>,
+    loop_writes: Vec<HashMap<LocalId, FieldWrites>>,
     /// the scans this function's loops are bounded by, as notes (docs/cost-model.md § A scan)
     scans: std::cell::RefCell<Vec<String>>,
     /// for each open `while` (by loop depth), the calls in its body whose laps are amortised
@@ -1389,7 +1389,14 @@ impl<'a, 'b, 'c> Fa<'a, 'b, 'c> {
     /// otherwise, which makes the atom the most any element holds.
     fn read(&self, arr: LocalId, idx: &Expr, field: Option<usize>, bound: Dir) -> Option<Poly> {
         let root = self.local_root.get(&arr).copied().unwrap_or(arr);
-        if self.loop_writes.iter().any(|w| w.contains(&root)) { return None; }
+        // stale where a loop around the read may write what it reads: its field, its constant slot,
+        // or, for a slot not constant, any slot of the array
+        let stale = self.loop_writes.iter().any(|w| w.get(&root).is_some_and(|fw| fw.all || match (field, &idx.kind) {
+            (Some(fi), _) => fw.fields.contains(&fi),
+            (None, ExprKind::Int(k)) if *k >= 0 => fw.fields.contains(&(IDX + *k as usize)),
+            (None, _) => !fw.fields.is_empty(),
+        }));
+        if stale { return None; }
         let index = self.exact_size(idx);
         let least = index.is_none() && bound == Dir::Lower;
         let key = (root, index.clone(), field, least);
@@ -1414,12 +1421,10 @@ impl<'a, 'b, 'c> Fa<'a, 'b, 'c> {
 
     /// The arrays a loop body writes, by root, for `loop_writes`.
     /// A call counts only where the callee may write what it is handed, by `field_writes`.
-    fn written_roots(&self, body: &Block) -> Vec<LocalId> {
+    fn written_roots(&self, body: &Block) -> HashMap<LocalId, FieldWrites> {
         let mut roots = self.local_root.clone();
-        let mut out: Vec<LocalId> = Vec::new();
-        stores_block(body, self.f, &mut roots, &self.an.field_writes, &mut |r, _| out.push(r));
-        out.sort();
-        out.dedup();
+        let mut out: HashMap<LocalId, FieldWrites> = HashMap::new();
+        stores_block(body, self.f, &mut roots, &self.an.field_writes, &mut |r, fld| out.entry(r).or_default().add(fld));
         out
     }
 
@@ -3455,6 +3460,11 @@ struct FieldWrites {
     fields: std::collections::BTreeSet<usize>,
 }
 
+/// A store to `a[k]`, `k` a literal and `a` an array of scalars, is recorded as the field `IDX + k`:
+/// a register file of constant slots (`wst[10]`) is written slot by slot, and a read of one slot is a
+/// size in a loop that writes only others (cost-model § A size read from memory, by slot).
+const IDX: usize = 1 << 40;
+
 impl FieldWrites {
     fn add(&mut self, field: Option<usize>) {
         match field { Some(fi) => { self.fields.insert(fi); } None => self.all = true }
@@ -3503,7 +3513,12 @@ fn stores_block(b: &Block, f: &Func, roots: &mut HashMap<LocalId, LocalId>, summ
             Stmt::LetBuild { len, body, .. } => { stores_expr(len, f, roots, summ, hit); stores_block(body, f, roots, summ, hit); }
             Stmt::Assign(lv, _, e) => {
                 match lv {
-                    LValue::Index(a, i, _) => { hit(roots.get(a).copied().unwrap_or(*a), None); stores_expr(i, f, roots, summ, hit); }
+                    LValue::Index(a, i, _) => {
+                        let scalar = f.locals[*a].ty.elem().is_some_and(|t| t.is_scalar());
+                        let slot = match &i.kind { ExprKind::Int(k) if scalar && *k >= 0 => Some(IDX + *k as usize), _ => None };
+                        hit(roots.get(a).copied().unwrap_or(*a), slot);
+                        stores_expr(i, f, roots, summ, hit);
+                    }
                     LValue::IndexField(a, i, fi, _) => { hit(roots.get(a).copied().unwrap_or(*a), Some(*fi)); stores_expr(i, f, roots, summ, hit); }
                     // an array local rebound by a call is written whole
                     LValue::Var(v) if f.locals[*v].ty.is_arrayish() => hit(roots.get(v).copied().unwrap_or(*v), None),

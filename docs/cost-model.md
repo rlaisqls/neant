@@ -732,6 +732,14 @@ What the atom is not yet: the expression the value was written from. `let k = n;
 a loop to `xs[0]` is a loop to the atom `xs[0]`, not to `n` — following a store to its load is
 what plan § Stage D (2) left for later.
 
+**By slot and by field (2026-09-28).** A read was stale inside any loop that wrote its array at
+all. A store to `a[k]`, `k` a literal and `a` an array of scalars, is now recorded as a write to slot
+`k` only — the compiler keeps its state in such arrays, `wst[10]`, `cst[12]` — and a store to
+`a[j].f` as one to field `f`, both carried through calls by the same fixed point the fields a call
+may write already were (§ A walk down a list). A read of `a[k]` is stale where a loop around it may
+write slot `k`, or any slot at an index it computes; a read of `a[i].f` where it may write field `f`
+or a whole element. The compiler moves by one (97 unknown, from 98); golden `slots`.
+
 ## A size bound once
 
 **Added 2026-09-26.** An `i64` bound by `let n = e` — immutable, outside every loop — where `e` is
