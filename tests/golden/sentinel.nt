@@ -1,0 +1,41 @@
+// A scan to a sentinel (docs/cost-model.md § A scan to a sentinel): `find`'s condition reads
+// `ss[i]`, and `i` grows by one a lap, so the loop runs at most `ss.len()` times — past the end the
+// read stops the program — a bound, since the sentinel may come first. Refused: `stuck` steps `i`
+// only in an `if`, so a lap may not move it.
+
+struct S { name: i64, v: i64 }
+
+fn find(ss: &[S], x: i64) -> i64 {
+    let mut i = 0;
+    let mut at = -1;
+    while ss[i].name >= 0 {
+        if ss[i].name == x { at = i; }
+        i += 1;
+    }
+    at
+}
+
+fn skip(xs: &[i64], from: i64) -> i64 {
+    let mut i = from;
+    while xs[i] != 0 {
+        i += 2;
+    }
+    i
+}
+
+fn stuck(ss: &[S]) -> i64 {
+    let mut i = 0;
+    while ss[i].name >= 0 {
+        if ss[i].v > 0 { i += 1; }
+    }
+    i
+}
+
+fn main() {
+    let mut ss = [S { name: 3, v: 1 }; 4];
+    ss[3] = S { name: -1, v: 0 };
+    println(find(&ss, 3));
+    let xs = [5, 1, 4, 1, 0, 9];
+    println(skip(&xs, 0));
+    println(stuck(&ss));
+}

@@ -1,0 +1,14 @@
+skip_sp          work 4·ds[1] − 4·ds[0] + 7        moves B·ds[1] − B·ds[0] + 5·B      exact
+                 footprint        src: [0, src.len()) (whole array)  ds: [0, 16)   no residue claimed
+bump             work 3                            moves B                            exact
+                 footprint        ds: [0, 8)   resident after if 8 < M
+via_call         unknown: `while` has no measure the compiler can find; write `while cond decreasing <expr>` with an `i64` that goes down by at least one every iteration (line 15)
+                 footprint        ds: [0, 16)   resident after if 16 < M
+moving_end       unknown: `while` has no measure the compiler can find; write `while cond decreasing <expr>` with an `i64` that goes down by at least one every iteration (line 19)
+                 footprint        ds: [0, 16)   resident after if 16 < M
+twice            unknown: calls `skip_sp` in a loop that writes `ds`, which its cost reads as a size (line 29)
+upto             work 3·xs[0] + 1                  moves B                            exact
+                 footprint        xs: [0, 8)   resident after if 8 < M
+many             unknown: calls `upto` in a loop that writes `xs`, which its cost reads as a size (line 45)
+main             work ≈ 4·ds[1] − 4·ds[0] + work[via_call](3) + work[twice](64, 3) + work[moving_end](3) + work[many](2) moves ≈ B·ds[1] − B·ds[0] + moves[via_call](3) + moves[twice](64, 3) + moves[moving_end](3) + moves[many](2) modulo, io
+                 rests on         via_call (unknown); moving_end (unknown); twice (unknown); many (unknown)

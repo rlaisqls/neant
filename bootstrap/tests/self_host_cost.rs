@@ -87,7 +87,7 @@ const RESIDENT_INSTEAD: &[(&str, &str)] = &[("arrayview.nt", "main"), ("chains.n
 /// it once did not do: it stated `grid`'s `xs[a]` alone as exact and resident, having stopped at
 /// `0..xs[a]` before reaching `xs[b]`.
 ///
-/// `arena_tree.nt`'s four read three fields of one AoS element; this pass states the first field's
+/// `arena_tree.nt`'s refused `chase` reads three fields of one AoS element; this pass states the first field's
 /// eight bytes of it, a subset of the element the Rust states.
 ///
 /// `slots.nt`'s three loop to a bound read from the array they write, which this pass, with no
@@ -129,8 +129,26 @@ const FOOTPRINT_NARROWER: &[(&str, &str)] = &[("parse.nt", "number"), ("bfs.nt",
                                               ("whileshapes.nt", "from_one"), ("whileshapes.nt", "sort_from"),
                                               ("particles.nt", "step"), ("tri.nt", "pairs"),
                                               ("slots.nt", "count"), ("slots.nt", "fields"), ("slots.nt", "rewrite"),
-                                              ("arena_tree.nt", "sum"), ("arena_tree.nt", "chase"),
-                                              ("arena_tree.nt", "same"), ("arena_tree.nt", "deep")];
+                                              ("arena_tree.nt", "chase")];
+
+/// Functions whose **cost this pass declines**, where the two footprints differ: a footprint
+/// without a cost is used by no caller, which is then without a cost too. `neant cost` states the
+/// whole arena for a recursion over a tree it costs, which visits every node it reaches
+/// (docs/cost-model.md § Recursion, a tree; a forest), where this pass states the body's own, one
+/// node, or none; and for a mutual recursion both decline, this pass states the whole arena where
+/// `neant cost` states the body's own. A scan to a sentinel, a cursor in a slot and a loop to an
+/// element read are costed there and declined here.
+const DECLINED_FOOT: &[(&str, &str)] = &[("arena_tree.nt", "sum"), ("arena_tree.nt", "same"),
+                                         ("arena_tree.nt", "deep"), ("forest.nt", "grow"),
+                                         ("forest.nt", "spell"),
+                                         ("forest.nt", "has"), ("forest.nt", "has_list"),
+                                         ("forest.nt", "size"), ("forest.nt", "size_list"),
+                                         ("forest.nt", "dup"), ("forest.nt", "dup2"),
+                                         ("forest.nt", "lap"), ("forest.nt", "lap_one"),
+                                         ("forest.nt", "deep"), ("forest.nt", "deep_list"), ("sentinel.nt", "find"),
+                                         ("sentinel.nt", "skip"), ("sentinel.nt", "stuck"),
+                                         ("cursor.nt", "skip_sp"), ("cursor.nt", "via_call"),
+                                         ("cursor.nt", "moving_end"), ("cursor.nt", "upto")];
 
 /// The same for the **footprint lower bound**: stated where `neant cost` states one and this pass
 /// states none. A `while` loop is given no loop atom by this pass — only a `for` mints one — so a
@@ -148,7 +166,7 @@ const BOUND_NARROWER: &[(&str, &str)] = &[("while.nt", "count_lt"), ("while.nt",
 
 /// The number of functions whose `work` the self-hosted pass reproduces exactly. In the test so
 /// that widening the slice means changing a number someone has to look at.
-const EXACT: usize = 105;
+const EXACT: usize = 106;
 
 /// The same for `moves`, whose slice is narrower: a function that calls anything is unknown,
 /// because a callee's traffic depends on what is already resident — which it now computes, so a
@@ -165,19 +183,19 @@ const EXACT: usize = 105;
 /// **Nothing is declined.** Every `moves` column either matches or is one of the four in
 /// `COPIES_INSTEAD` — a footprint is a range now, so a callee that reads two fields of a four-field
 /// particle leaves half the array resident and the next call over the other half pays in full.
-const EXACT_MOVES: usize = 91;
+const EXACT_MOVES: usize = 92;
 
 /// The same for the **footprint**: one entry per array parameter and the condition under which the
 /// whole of it is resident on return, whitespace-normalised so the report's column padding is not
 /// part of the comparison. Counted over every function, so one that should state no footprint and
 /// states none counts too.
-const EXACT_FOOT: usize = 142;
+const EXACT_FOOT: usize = 148;
 
 /// The same for the **footprint lower bound** — `moves` cannot be less than the distinct bytes a
 /// function's parameter arrays reach. Counted over every function, so a `main` that should have no
 /// bound and gets none counts too: a bound invented where `neant cost` states none is as wrong as
 /// a missing one, and only one of those two shows up as a difference.
-const EXACT_BOUNDS: usize = 164;
+const EXACT_BOUNDS: usize = 189;
 
 
 
@@ -422,6 +440,8 @@ fn self_hosted_work_agrees_with_bootstrap() {
                 (None, "none") => exact_foot += 1,
                 (None, other) => failures.push(format!("{name} {fname}: `neant cost` states no \
                     footprint, the self-hosted pass invented [{other}]")),
+                (Some(_), _) if DECLINED_FOOT.contains(&(name.as_str(), fname))
+                    && got.get(fname) == Some(&"unknown") => {}
                 (Some(_), "none") if listed => {}
                 (Some(w), "none") => failures.push(format!("{name} {fname}: `neant cost` states \
                     footprint [{w}], the self-hosted pass states none and is not listed as narrower")),

@@ -320,6 +320,35 @@ impl Poly {
         }
         Some(out)
     }
+    /// `widen_reads` for the reads whose element `bad` holds of, and only those.
+    pub fn widen_reads_where(&self, bad: &dyn Fn(&Poly) -> bool) -> Poly {
+        let mut out = Poly::zero();
+        for (m, c) in &self.terms {
+            let mut fs = BTreeMap::new();
+            for (a, e) in &m.factors {
+                let a = match a {
+                    Atom::Read(r) if r.index.as_ref().is_some_and(|i| bad(i)) => Atom::Read(Box::new(Read { index: None, least: (c.n < 0) != (e.n < 0), ..(**r).clone() }.canon())),
+                    other => other.clone(),
+                };
+                let ne = fs.get(&a).map_or(*e, |x: &Rat| x.add(*e));
+                if ne.is_zero() { fs.remove(&a); } else { fs.insert(a, ne); }
+            }
+            // gathered in place: two terms that widen to one add, and a sum to zero goes
+            let m = Mono { factors: fs };
+            let nc = out.terms.get(&m).map_or(*c, |x| x.add(*c));
+            if nc.is_zero() { out.terms.remove(&m); } else { out.terms.insert(m, nc); }
+        }
+        out
+    }
+    /// Every read this polynomial names, at any depth.
+    pub fn reads(&self, out: &mut Vec<Read>) {
+        for m in self.terms.keys() {
+            for a in m.factors.keys() {
+                if let Atom::Read(r) = a { out.push((**r).clone()); }
+                for q in a.inner() { q.reads(out); }
+            }
+        }
+    }
     /// Whether some term is the most or least an array holds rather than a value it holds.
     pub fn has_loose_read(&self) -> bool {
         fn loose(p: &Poly) -> bool {

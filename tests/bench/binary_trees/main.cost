@@ -16,8 +16,8 @@ format_float     work 716                          moves 44·B + 19             
 build            unknown: 2 recursive calls each shrinking `depth` by a constant: exponential (main.nt:13)
                  footprint        ns: [16·next[0], 16·next[0] + 16)  next: [0, 8)   resident after if 24 < M
 check            work 22·ns.len() + 11             moves 4·B·ns.len() + 2·B           bound
-                 footprint        ns: [16·t, 16·t + 16)   resident after if 16 < M
-                 tree: every recursive call is on a child of `ns[t]`, 2 an invocation; over an arena that is a tree each node is reached once, so at most 2·ns.len() + 1 calls (a promise, as a walk's)
+                 footprint        ns: [0, 16·ns.len()) (whole array)   no residue claimed
+                 tree: every call is on a node of `ns`, its own or one below it, down a different link each time; over an arena that is a tree at most 2·ns.len() + 1 groups of calls (a promise, as a walk's)
 pow2             work 3·k                          moves 0                            exact
 main             unknown: loop bound is not a size expression (main.nt:50), io
                  rests on         arg (declared, extern); build (unknown)

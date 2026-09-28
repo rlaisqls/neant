@@ -1,0 +1,35 @@
+struct Node      layout AoS  decided by has (18·B·nodes.len() + 6·B, SoA 24·B·nodes.len() + 8·B), has_list (18·B·nodes.len() + 6·B, SoA 24·B·nodes.len() + 8·B), size (9·B·nodes.len() + 3·B, SoA 12·B·nodes.len() + 4·B), size_list (9·B·nodes.len() + 3·B, SoA 12·B·nodes.len() + 4·B), spell (4·B·nodes.len() + 2·B, SoA 8·B·nodes.len() + 4·B), main (≈ moves[lap](6, 0) + moves[grow](6, 1, 0) + moves[dup](6, 0) + moves[deep](6, 0, 0) + 203·B + 232, SoA ≈ moves[lap](6, 0) + moves[grow](6, 1, 0) + moves[dup](6, 0) + moves[deep](6, 0, 0) + 304·B + 232)
+has              work 108·nodes.len() + 36         moves 18·B·nodes.len() + 6·B       bound
+                 footprint        nodes: [0, 32·nodes.len()) (whole array)   no residue claimed
+                 tree: with `has_list` every call is on a node of `nodes`, its own or one below it, down a different link each time; over an arena that is a tree at most 3·nodes.len() + 1 groups of calls (a promise, as a walk's)
+has_list         work 108·nodes.len() + 36         moves 18·B·nodes.len() + 6·B       bound
+                 footprint        nodes: [0, 32·nodes.len()) (whole array)   no residue claimed
+                 tree: with `has` every call is on a node of `nodes`, its own or one below it, down a different link each time; over an arena that is a tree at most 3·nodes.len() + 1 groups of calls (a promise, as a walk's)
+size             work ≈ 9·nodes.len()·w            moves 9·B·nodes.len() + 3·B        bound
+                 footprint        nodes: [0, 32·nodes.len()) (whole array)   no residue claimed
+                 tree: with `size_list` every call is on a node of `nodes`, its own or one below it, down a different link each time; over an arena that is a tree at most 3·nodes.len() + 1 groups of calls (a promise, as a walk's)
+size_list        work ≈ 9·nodes.len()·w            moves 9·B·nodes.len() + 3·B        bound
+                 footprint        nodes: [0, 32·nodes.len()) (whole array)   no residue claimed
+                 tree: with `size` every call is on a node of `nodes`, its own or one below it, down a different link each time; over an arena that is a tree at most 3·nodes.len() + 1 groups of calls (a promise, as a walk's)
+dup              unknown: calls `dup`, whose cost is unknown (mutually recursive with another function; only self-recursion is solved) (line 54)
+                 footprint        nodes: [32·n, 32·n + 8)   resident after if 8 < M
+dup2             unknown: calls `dup`, whose cost is unknown (mutually recursive with another function; only self-recursion is solved) (line 58)
+                 footprint        nodes: [32·n, 32·n + 8)   resident after if 8 < M
+lap              unknown: calls `lap`, whose cost is unknown (mutually recursive with another function; only self-recursion is solved) (line 64)
+                 footprint        nodes: [32·n, 32·n + 8)   resident after if 8 < M
+lap_one          unknown: calls `lap`, whose cost is unknown (mutually recursive with another function; only self-recursion is solved) (line 69)
+                 footprint        nodes: [32·n, 32·n + 8)   resident after if 8 < M
+deep             unknown: a recursion over the tree in `nodes`, but the cost of an invocation of `deep` depends on `d`, which not every call hands on unchanged (line 72)
+                 footprint        nodes: [0, 32·nodes.len()) (whole array)   no residue claimed
+deep_list        unknown: a recursion over the tree in `nodes`, but the cost of an invocation of `deep` depends on `d`, which not every call hands on unchanged (line 79)
+                 footprint        nodes: [0, 32·nodes.len()) (whole array)   no residue claimed
+spell            work ≈ 6·nodes.len()·max(ws[_])   moves 4·B·nodes.len() + 2·B        bound
+                 footprint        nodes: [0, 32·nodes.len()) (whole array)  ws: [0, 8·ws.len()) (whole array)   no residue claimed
+                 tree: every call is on a node of `nodes`, its own or one below it, down a different link each time; over an arena that is a tree at most 2·nodes.len() + 1 groups of calls (a promise, as a walk's)
+grow             unknown: a recursion over the tree in `nodes`, but the cost of an invocation of `grow` depends on `acc`, which the recursion writes (line 96)
+                 footprint        nodes: [0, 32·nodes.len()) (whole array)  acc: [0, 8·acc.len()) (whole array)   no residue claimed
+main             work ≈ 39·max(ws[_]) + work[lap](6, 0) + work[grow](6, 1, 0) + work[dup](6, 0) + work[deep](6, 0, 0) moves ≈ moves[lap](6, 0) + moves[grow](6, 1, 0) + moves[dup](6, 0) + moves[deep](6, 0, 0) + 203·B + 232 modulo, io
+                 in `has`: tree: with `has_list` every call is on a node of `nodes`, its own or one below it, down a different link each time; over an arena that is a tree at most 3·nodes.len() + 1 groups of calls (a promise, as a walk's)
+                 in `size`: tree: with `size_list` every call is on a node of `nodes`, its own or one below it, down a different link each time; over an arena that is a tree at most 3·nodes.len() + 1 groups of calls (a promise, as a walk's)
+                 in `spell`: tree: every call is on a node of `nodes`, its own or one below it, down a different link each time; over an arena that is a tree at most 2·nodes.len() + 1 groups of calls (a promise, as a walk's)
+                 rests on         has (bound, a scan); size (bound, a scan); dup (unknown); lap (unknown); deep (unknown); spell (bound, a scan); grow (unknown)

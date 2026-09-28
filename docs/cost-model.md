@@ -571,6 +571,20 @@ Golden `amortised` has both sides: `fields` (`19·xs.len() + 1`, from quadratic)
 (`14·out.len() + 4·xs.len() + 1`), `hops` and `restart` refused and quadratic. In golden `scan`,
 `words` goes from `2·xs.len()² + 11·xs.len() + 1` to `13·xs.len() + 1`, moves too.
 
+## A scan to a sentinel
+
+`while xs[i].f >= 0 { …; i += c }` stops at a sentinel the data holds, and nothing in the program
+says where. But the condition reads `xs[i]` every time it is evaluated, and an index past the end
+stops the program (the bounds check), so the loop runs at most `(xs.len() − i₀)/c` times, `i₀` the
+least `i` is on entry (§ A scan). It applies when the condition indexes the array at `i` outside
+any `&&` or `||` that may skip it — a conjunct of an `&&` counts, since the loop goes on only when
+every conjunct held — and `i` is a mutable `i64` stepped by a constant `c > 0` once, at the top level
+of the body, and nowhere else: a step inside an `if` may not happen, and then the loop never
+reaches the end. The line is a bound, since the sentinel may come first, and its note says which
+variable and array. The compiler's look-up of a signature by name, `while sigs[i].name >= 0`, is
+this shape (`call_arr_len`, `used_after`); golden `sentinel` has `find`, `skip` (a step of two) and
+`stuck`, refused. The self-hosted pass does not have the rule.
+
 ## A bounded worklist
 
 **Written 2026-09-27.** Breadth-first search keeps its frontier in an array: `while head < tail`,
@@ -619,31 +633,60 @@ solution at powers of two; binary search as `17·log(hi − lo) + 17`.
 
 Recursive calls under `if` are counted along the heavier branch, not summed — a binary search is
 one call per level, not two. The function's line says `recurrence` instead of `exact`. Mutual
-recursion is not solved; the message says so. A recursive callee is never specialised at a call
+recursion is not solved as a recurrence; over a tree in an arena it is bounded (below), and
+otherwise the message says so. A recursive callee is never specialised at a call
 site: its cost is the solved recurrence in its own parameters, substituted.
 
-### A tree in an arena
+### A tree in an arena, and a forest
 
-When no measure shrinks, one more shape is tried: every self-call is handed the same array `xs`
-and, for an `i64` parameter `t`, a **child of the node `xs[t]`** — `xs[t].f` for some field, or
-`xs[t]` itself for an `[i64]`. That is a walk over a tree threaded through `xs` by index, the arena
-idiom of § A walk down a list with more than one link. With `k` self-calls an invocation (counted
-as above, the heavier branch of an `if`), and the arena a tree, each node is entered once and each
-entered node makes `k` calls, so there are at most `k·xs.len() + 1` invocations; the body's own
-cost, the self-calls charged their call only, times that is the function's cost, tier `bound`, and
-the line says it rests on the promise. With two or more calls an invocation, no two call sites may
-go down the same link: `f(xs, xs[t].l) + f(xs, xs[t].l)` enters each left child twice, which doubles
-at every level of a tree, and is refused; with one call an invocation the calls form a chain, and
-any link may repeat across branches. A cycle in the links breaks it as it breaks a walk; so does
-a DAG, where a shared node is entered once per parent.
+When no measure shrinks, one more shape is tried, for one function or for a component of the call
+graph — functions that call one another however indirectly, which neither can be costed without
+the other: the members walk a tree threaded through one array `xs` by index, the arena idiom of
+§ A walk down a list with more than one link. The compiler's own walkers are this shape, a
+statement walker calling an expression walker calling a block walker. Each member has an `i64` node
+and the array as parameters, and every call inside the component hands on the array and, for the
+node, the caller's own node, one below it — `xs[t].f`, `xs[t]` of an `[i64]`, or a name bound to
+one, `let c = xs[t].b; … xs[c].a` — or the variable of a walk down a list,
+`while s >= 0 { …; s = xs[s].next }`, which is read as the recursion `W(s) = body(s) + W(xs[s].next)`
+(`forest.rs`).
 
-It applies only where an invocation's own cost does not depend on which one it is: it may not name
-`t`, and may name another parameter only if every self-call passes that parameter on unchanged.
-`binary-trees`' `check` is `22·ns.len() + 11`; golden `arena_tree` has `sum`, `same` (a loop to a
-depth handed down unchanged) and the three refused, `chase` (`ns[t].l + 1` is not a child), `deep`
-(it hands down `d + 1`, so its invocations differ) and `twice` (down `l` twice). The self-hosted pass does not have the rule
-and declines these; its footprint of a multi-field element read at a symbolic index is the first
-field's, a subset of the element (`FOOTPRINT_NARROWER`).
+An invocation together with the calls it makes on its own node, and theirs, is a **group**. Every
+path through a group is enumerated — one branch of each `if` at a time, an early `return` ending
+it — and on each, no chain of calls on one node comes back to where it began, and no path of links
+is a prefix of another, the same link twice included. Then over an arena that is a tree each node
+is entered by at most one group, the one on the ancestor its path of links starts from, and every
+group but the first is entered from a group on a node of the array: at most `L·xs.len() + 1`
+groups, `L` the most paths of links one group goes down. Each member `G` is costed on its own, the
+calls into the component charged their call only and a walk that calls into it charged one lap,
+its laps being invocations; a group costs at most `Σ m_G·cost(G)`, `m_G` the most invocations of `G`
+in one group; and each member's line is the product, tier `bound`, with the promise stated as a
+walk states it. A cycle in the links breaks it as it breaks a walk; so does a DAG, where a shared
+node is entered once per parent.
+
+It applies only where an invocation's own cost does not depend on which one it is, as the member's
+cost at the start stands for every invocation's. What moves from one invocation to the next — the
+node, a parameter some call does not hand on unchanged, a size an invocation binds once — is taken
+out first: an element read at an index that moves is the most its array holds (`ws[xs[t].kind]` is
+`max(ws[_])`), an unknown callee's argument that moves is `_`, and each regime of the cost is
+dropped for the sum of its pieces, since which one holds is an invocation's own. What is left may
+name none of them, and every array it reads must be one the component never writes: a read is a
+value at the start only if nothing between the start and the invocation changed it.
+`f(xs, xs[t].l) + f(xs, xs[t].l)` enters each left child twice and doubles at every level, and is
+refused; three calls down `.a` in three branches of a dispatch on the node's kind are one a path,
+and are not. The footprint of such a recursion is the whole arena, with no residue claimed: the
+body's own sites are one node, and what is in the cache after a walk is whatever it read last.
+
+`binary-trees`' `check` is `22·ns.len() + 11`. Golden `arena_tree` has `sum` and `same` (a loop to a
+depth handed down unchanged) and three refused, `chase` (`ns[t].l + 1` is below no node), `deep`
+(it hands down `d + 1`, so its invocations differ) and `twice` (down `l` twice); golden `forest` has
+`has`/`has_list`, `size`/`size_list` and `spell` (a loop to an element at the node), and four
+refused, `dup` (two members going down `.a` between them), `lap` (a call on the member's own node
+once a lap of a counted loop), `deep`, and `grow` (a loop to what the recursion writes).
+In the compiler, `same_ty`, `resolve_ty`, `expr_same`, `idx_coef`, `emit_type`, `has_assign` and
+`has_assign_list` get a bound. The cost walkers `w_*` and `m_*` have the shape, but their costs read
+the state they write (`wst`, `pst`), and their lines say so instead of "mutually recursive"; the checker's and the emitter's do not, since a member calls into the
+component once a lap of a counted loop, over a chain's stages or a struct's fields. The self-hosted pass does not have the rule and declines all of these; where
+its footprint of one then differs from the Rust's, nothing uses it (`DECLINED_FOOT`).
 
 ## Effects
 
@@ -762,6 +805,23 @@ all. A store to `a[k]`, `k` a literal and `a` an array of scalars, is now record
 may write already were (§ A walk down a list). A read of `a[k]` is stale where a loop around it may
 write slot `k`, or any slot at an index it computes; a read of `a[i].f` where it may write field `f`
 or a whole element. The compiler moves by one (97 unknown, from 98); golden `slots`.
+
+**Through a call, in a loop (2026-09-28, a fix).** A callee's cost that reads a size from an array
+it is handed names the value at the call. In a loop that writes that field or slot, every lap's
+call reads a value of its own, and one atom stood for them all: `many` calling `upto`, which loops
+to `xs[0]`, ten times while adding 100 to `xs[0]`, was costed `30·xs[0] + 90`, the first lap's ten
+times. Such a call is now unknown, and says which array. The compiler loses nine `modulo` lines,
+each through a callee that reads a slot of the state its loop writes (`pst`, `terms`, `wst`); golden
+`cursor`'s `many` and `twice`.
+
+**A cursor in a slot.** `while ds[0] < ds[1] { …; ds[0] = ds[0] + c }` counts as an induction
+variable does, the slot `ds[k]` of an array of scalars standing for the variable — a parser keeps
+its cursor so, to hand it to callees. It applies when the slot is stepped by a constant `c > 0` once,
+at the top level of the body, and written nowhere else in it, itself or through a callee (the slot
+writes above); and when the bound is a size nothing in the body writes. The trip is
+`(bound − ds[k])/c`, both read at entry to the loop, before its own writes. `c_space`, the cost
+attribute's reader skipping blanks, is exact; golden `cursor`'s `skip_sp`, and `via_call` (stepped in
+a callee) and `moving_end` (the end moves) refused.
 
 ## A size bound once
 

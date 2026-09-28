@@ -187,6 +187,7 @@ pub struct LayoutChoice {
 /// type and the model is not asked. A tie is AoS, and the report says the model did not decide.
 pub fn choose_layouts(m: &mut Module, machine: &Machine) -> Vec<LayoutChoice> {
     let mut out = Vec::new();
+    let mut refused: std::collections::HashSet<FuncId> = Default::default();
     for sid in 0..m.structs.len() {
         if m.structs[sid].fixed {
             out.push(LayoutChoice { name: m.structs[sid].name.clone(), layout: m.structs[sid].layout, fixed: true, decided_by: vec![], why: None });
@@ -208,7 +209,9 @@ pub fn choose_layouts(m: &mut Module, machine: &Machine) -> Vec<LayoutChoice> {
         for (k, l) in [Layout::Aos, Layout::Soa].into_iter().enumerate() {
             m.structs[sid].layout = l;
             let mut an = Analyzer::new(m, machine);
+            an.forest_skip = refused.clone();
             for (fi, t) in touches.iter().enumerate() { if *t { an.func(fi); } }
+            refused.extend(an.forest_refused.iter().copied());
             costs[k] = an.done;
         }
         // functions that touch this type, and what each moves under the two layouts
@@ -411,6 +414,13 @@ struct Analyzer<'a> {
     /// which functions advance an index through an array and return where it stopped, for an
     /// amortised scan in a caller (docs/cost-model.md § An amortised scan)
     advances: Vec<Option<super::scan::Advance>>,
+    /// a member of a component of mutual recursion costed on its own, the calls into the
+    /// component charged their call only (§ Recursion, a forest)
+    scc_raw: HashMap<FuncId, FuncCost>,
+    /// components refused as a recursion over a tree, by the function they were tried from: the
+    /// verdict does not depend on a layout, so the layout pass tries each once
+    forest_refused: std::collections::HashSet<FuncId>,
+    forest_skip: std::collections::HashSet<FuncId>,
 }
 
 impl<'a> Analyzer<'a> {
@@ -433,12 +443,159 @@ impl<'a> Analyzer<'a> {
         }).collect();
         let summ = super::scan::summaries(m);
         let advances: Vec<Option<super::scan::Advance>> = m.funcs.iter().map(|f| super::scan::advance(f, &summ)).collect();
-        Analyzer { m, machine: *machine, done: vec![None; n], active: vec![false; n], reach, field_writes: field_writes(m), scan_summ: summ, advances }
+        Analyzer { m, machine: *machine, done: vec![None; n], active: vec![false; n], reach, field_writes: field_writes(m), scan_summ: summ, advances, scc_raw: HashMap::new(), forest_refused: Default::default(), forest_skip: Default::default() }
     }
     /// Two distinct functions that call each other, however indirectly: a cost of either is a
     /// system of recurrences, and neither can stand as a named term in the other.
     fn mutual(&self, f: FuncId, g: FuncId) -> bool { f != g && self.reach[f][g] && self.reach[g][f] }
+
+    /// **A component of mutual recursion over a tree in an arena** (docs/cost-model.md
+    /// § Recursion, a forest): where `forest::shape` finds the members calling one another on the
+    /// nodes of one array, each member costed on its own with those calls charged their call only,
+    /// and the whole at most `L·xs.len() + 1` groups of calls, each of at most `m_G` invocations of
+    /// each member `G`. `None` where the component is not that shape, and it stays unknown.
+    fn forest(&mut self, fid: FuncId) -> Option<FuncCost> {
+        if self.forest_skip.contains(&fid) { return None; }
+        let n = self.m.funcs.len();
+        let members = (0..n).filter(|&g| g == fid || self.mutual(fid, g)).count();
+        // one function recursing on its own is a component of one, tried once its recurrence is
+        // not solved (`func`)
+        if members < 2 && !(self.reach[fid][fid] && self.done[fid].as_ref().is_some_and(|c| matches!(c.result, CostResult::Unknown { .. }))) { return None; }
+        let r = self.forest_try(fid);
+        if !r.as_ref().is_some_and(|c| matches!(c.result, CostResult::Exact { .. })) { self.forest_refused.insert(fid); }
+        r
+    }
+
+    fn forest_try(&mut self, fid: FuncId) -> Option<FuncCost> {
+        let n = self.m.funcs.len();
+        let members: Vec<FuncId> = (0..n).filter(|&g| g == fid || self.mutual(fid, g)).collect();
+        let f = &self.m.funcs[fid];
+        if !f.asserts.is_empty() || matches!(f.ret, Ty::Array(..)) { return None; }
+        if std::env::var("NEANT_DEBUG_FOREST").is_ok() { eprintln!("forest {}: {} members", f.name, members.len()); }
+        let shape = super::forest::shape(self.m, fid, &members)?;
+        let (_, ai) = shape.node[&fid];
+        let names = param_names(f);
+        let unknown = |reason: String| FuncCost {
+            name: f.name.clone(), names: names.clone(), result: CostResult::Unknown { reason, line: f.line },
+            chase: Cost::zero(), paged: Cost::zero(), serial: Cost::zero(), divs: Cost::zero(), internal: true,
+            bounds: vec![], notes: vec![], suggestions: vec![], effects: vec![], violations: vec![], tier: "unknown", result_size: None,
+            footprint: whole_arrays(self.m, f), resident: None, declared: Declared::default(), rests_on: vec![],
+        };
+        let unknown = |reason: String, rests: &[String]| FuncCost { rests_on: rests.to_vec(), ..unknown(reason) };
+        let mut cols = [Cost::zero(), Cost::zero(), Cost::zero(), Cost::zero(), Cost::zero(), Cost::zero()];
+        let mut rests_on: Vec<String> = Vec::new();
+        let mut io = false;
+        for &g in &members {
+            // each member costed on its own and checked before the next, so a component refused
+            // at its first member is not costed through
+            if !self.scc_raw.contains_key(&g) {
+                let gf = &self.m.funcs[g];
+                self.active[g] = true;
+                let mut fa = Fa::new(self, gf, Some(g));
+                fa.scc = Some(members.clone());
+                let fc = fa.run();
+                self.active[g] = false;
+                self.scc_raw.insert(g, fc);
+            }
+            let raw = &self.scc_raw[&g];
+            let gf = &self.m.funcs[g];
+            let CostResult::Exact { work, moves, .. } = &raw.result else {
+                let CostResult::Unknown { reason, .. } = &raw.result else { unreachable!() };
+                if g == fid { return Some(unknown(reason.clone(), &raw.rests_on)); }
+                return Some(unknown(format!("calls `{}`, whose cost is unknown ({reason})", gf.name), &raw.rests_on));
+            };
+            let (pg, _) = shape.node[&g];
+            let map = &shape.map[&g];
+            let np = gf.params.len();
+            // what one invocation's cost says of the data it is handed holds of that invocation
+            // only: a regime is dropped for the sum of its pieces, an element read at an index
+            // that moves from one invocation to the next is the most its array holds, and an
+            // unknown callee's argument that moves is `_`
+            let moving = |p: &Poly| p.mentions(pg) || (0..np).any(|j| p.mentions(j) && !matches!(map[j], super::forest::From::Param(_))) || p.max_var().is_some_and(|v| v >= np);
+            let settle = |c: &Cost| -> Cost {
+                // the regimes' sum: each is no less than zero, so no less than the one that holds,
+                // and a sum is cheap where a `max` of large pieces is not
+                let c = Cost::poly(c.pieces.iter().fold(Poly::zero(), |a, p| a.add(&p.poly)));
+                c.hide_args(&moving).map(|q| q.widen_reads_where(&moving))
+            };
+            let own = [settle(work), settle(moves), settle(&raw.chase), settle(&raw.paged), settle(&raw.serial), settle(&raw.divs)];
+            // an invocation's own cost may not depend on which node it is on, nor on a parameter
+            // that is not handed on unchanged from the start
+            for c in &own {
+                // refused with the reason: the component is the shape, and one member's cost is not
+                let why = if c.mentions(pg) { Some(format!("on its node `{}`", raw.names[pg])) }
+                    else if let Some(j) = (0..np).find(|&j| c.mentions(j) && !matches!(map[j], super::forest::From::Param(_))) { Some(format!("on `{}`, which not every call hands on unchanged", raw.names[j])) }
+                    else if c.max_var().is_some_and(|v| v >= np) { Some(format!("on `{}`, a size it binds once", raw.names.get(c.max_var().unwrap()).cloned().unwrap_or_default())) }
+                    else { None };
+                // a read is a value at the start only where nothing in the component writes it
+                let why = why.or_else(|| {
+                    let mut rs = Vec::new();
+                    for pc in &c.pieces { pc.poly.reads(&mut rs); }
+                    rs.into_iter().find_map(|r| match &r.root {
+                        Root::Param(j, nm) => {
+                            let w = self.field_writes[g].get(*j)?;
+                            let fi = r.field.as_ref().and_then(|fname| match gf.locals[gf.params[*j]].ty.elem() {
+                                Some(Ty::Struct(sid)) => self.m.structs[*sid].fields.iter().position(|(n, _)| n == fname),
+                                _ => None,
+                            });
+                            let slot = match (&r.field, &r.index) { (None, Some(i)) => i.as_const().filter(|c| c.is_int() && c.n >= 0).map(|c| IDX + c.n as usize), _ => None };
+                            let hit = w.all || match (fi, slot) {
+                                (Some(f), _) | (None, Some(f)) => w.fields.contains(&f),
+                                (None, None) => !w.fields.is_empty(),
+                            };
+                            hit.then(|| format!("on `{nm}`, which the recursion writes"))
+                        }
+                        Root::Local(nm) => Some(format!("on `{nm}`, an array of an invocation's own")),
+                    })
+                });
+                if why.is_some() && std::env::var("NEANT_DEBUG_FOREST").is_ok() {
+                    for pc in &c.pieces { if pc.poly.mentions(pg) || (0..np).any(|j| pc.poly.mentions(j) && !matches!(map[j], super::forest::From::Param(_))) { eprintln!("  term of {}: {}", gf.name, pc.poly.display(&raw.names).to_string().chars().take(600).collect::<String>()); break; } }
+                }
+                if let Some(why) = why {
+                    return Some(unknown(format!("a recursion over the tree in `{}`, but the cost of an invocation of `{}` depends {why}", f.locals[f.params[ai]].name, gf.name), &raw.rests_on));
+                }
+            }
+            let subst: Vec<(usize, Poly)> = (0..np).filter_map(|j| match map[j] { super::forest::From::Param(k) => Some((j, Poly::var(k))), _ => None }).collect();
+            let bad = std::cell::Cell::new(false);
+            let rename = |r: &Root| -> Root {
+                match r {
+                    Root::Param(j, nm) => match map.get(*j) {
+                        Some(super::forest::From::Param(k)) => Root::Param(*k, f.locals[f.params[*k]].name.clone()),
+                        _ => { bad.set(true); Root::Param(*j, nm.clone()) }
+                    },
+                    Root::Local(nm) if g != fid && !nm.contains('.') => Root::Local(format!("{}.{nm}", gf.name)),
+                    other => other.clone(),
+                }
+            };
+            let m_g = Rat::int(*shape.mult.get(&g).unwrap_or(&1) as i128);
+            for (k, c) in own.iter().enumerate() {
+                let c = if g == fid { c.clone() } else { c.rename_roots(&rename).subst_many(&subst) };
+                cols[k] = cols[k].add(&c.scale(m_g));
+            }
+            if bad.get() { return None; }
+            for r in &raw.rests_on { if !rests_on.contains(r) { rests_on.push(r.clone()); } }
+            if raw.effects.contains(&"io") { io = true; }
+        }
+        let groups = Poly::var(ai).scale(Rat::int(shape.links as i128)).add(&Poly::constant(1));
+        let [work, moves, chase, paged, serial, divs] = cols.map(|c| c.mul_poly(&groups));
+        let an = &f.locals[f.params[ai]].name;
+        let others: Vec<String> = members.iter().filter(|&&g| g != fid).map(|&g| format!("`{}`", self.m.funcs[g].name)).collect();
+        let with = if others.is_empty() { String::new() } else { format!("with {} ", others.join(", ")) };
+        let note = format!("tree: {with}every call is on a node of `{an}`, its own or one below it, down a different link each time; over an arena that is a tree at most {} groups of calls (a promise, as a walk's)",
+            groups.display(&names));
+        let tier = if work.has_opaque() || moves.has_opaque() { "modulo" } else { "bound" };
+        let footprint = whole_arrays(self.m, f);
+        Some(FuncCost {
+            name: f.name.clone(), names, result: CostResult::Exact { span: work.clone(), work, moves },
+            chase, paged, serial, divs, internal: true, bounds: vec![], notes: vec![note], suggestions: vec![],
+            effects: if io { vec!["io"] } else { vec![] }, violations: vec![], tier, result_size: None,
+            footprint, resident: None, declared: Declared::default(), rests_on,
+        })
+    }
     fn func(&mut self, fid: FuncId) -> &FuncCost {
+        if self.done[fid].is_none() && !self.active[fid] {
+            if let Some(fc) = self.forest(fid) { self.done[fid] = Some(fc); }
+        }
         if self.done[fid].is_none() {
             let f = &self.m.funcs[fid];
             if self.active[fid] {
@@ -452,13 +609,29 @@ impl<'a> Analyzer<'a> {
                 });
             } else {
                 self.active[fid] = true;
-                let fc = Fa::new(self, f, Some(fid)).run();
+                let mut fc = Fa::new(self, f, Some(fid)).run();
+                // a recursion no measure solves may be one over a tree in an arena
+                if self.reach[fid][fid] && matches!(fc.result, CostResult::Unknown { .. }) && (0..self.m.funcs.len()).all(|g| g == fid || !self.mutual(fid, g)) {
+                    self.done[fid] = Some(fc.clone());
+                    // the shape found: its verdict, a bound or the reason one member's cost is not one
+                    if let Some(t) = self.forest(fid) { fc = t; }
+                    self.done[fid] = None;
+                }
                 self.active[fid] = false;
                 self.done[fid] = Some(fc);
             }
         }
         self.done[fid].as_ref().unwrap()
     }
+}
+
+/// Every array parameter of `f`, whole and inexact: a footprint that credits nothing and claims no
+/// residue.
+fn whole_arrays(m: &Module, f: &Func) -> Vec<Foot> {
+    f.params.iter().enumerate().filter(|(_, p)| f.locals[**p].ty.is_arrayish()).map(|(i, &p)| {
+        let es = f.locals[p].ty.elem().map_or(8, |t| m.size_of(t));
+        Foot { param: i, lo: Poly::zero(), hi: Poly::var(i).scale(Rat::int(es)), exact: false }
+    }).collect()
 }
 
 fn param_names(f: &Func) -> Vec<String> {
@@ -620,11 +793,12 @@ struct Fa<'a, 'b, 'c> {
     io: bool,
     /// the function being analysed, when it may call itself
     self_fid: Option<FuncId>,
+    /// costing one member of a component on its own: calls into it charge their call only
+    scc: Option<Vec<FuncId>>,
     /// each self-call: the argument sizes by parameter (None when not a size), how many times
     /// the site runs per invocation, and its line
     rec_calls: Vec<(Vec<Option<Poly>>, Poly, u32)>,
     /// each self-call's arguments, for a recursion over a tree (docs/cost-model.md § Recursion, a tree)
-    rec_args: Vec<Vec<Expr>>,
     /// size in elements of every array/slice local
     local_size: HashMap<LocalId, Poly>,
     /// value of every immutable i64 local that is an affine expression
@@ -671,6 +845,8 @@ struct Fa<'a, 'b, 'c> {
     /// for each open loop, the arrays its body writes: a read of one of them is a different value
     /// every iteration, and not a size
     loop_writes: Vec<HashMap<LocalId, FieldWrites>>,
+    /// reading at entry to the innermost loop: its own writes have not happened yet
+    entry_read: std::cell::Cell<bool>,
     /// the scans this function's loops are bounded by, as notes (docs/cost-model.md § A scan)
     scans: std::cell::RefCell<Vec<String>>,
     /// for each open `while` (by loop depth), the calls in its body whose laps are amortised
@@ -697,11 +873,11 @@ struct Fa<'a, 'b, 'c> {
 impl<'a, 'b, 'c> Fa<'a, 'b, 'c> {
     fn new(an: &'b mut Analyzer<'a>, f: &'c Func, self_fid: Option<FuncId>) -> Self {
         let mut fa = Fa {
-            an, f, names: param_names(f), sites: vec![], loop_recs: vec![], bounds: vec![], images: HashMap::new(), result_size: None, last_result: None, last_result_atom: None, argc_atom: None, scalar_alias: HashMap::new(), alias_scopes: vec![], notes: vec![], io: false, self_fid, rec_calls: vec![], rec_args: vec![],
+            an, f, names: param_names(f), sites: vec![], loop_recs: vec![], bounds: vec![], images: HashMap::new(), result_size: None, last_result: None, last_result_atom: None, argc_atom: None, scalar_alias: HashMap::new(), alias_scopes: vec![], notes: vec![], io: false, self_fid, scc: None, rec_calls: vec![],
             local_size: HashMap::new(), local_affine: HashMap::new(), initial: HashMap::new(), at_entry: false,
             loops: vec![], work: Cost::zero(), moves: Cost::zero(), span: Cost::zero(), saved: vec![], branch: vec![], next_if: 0,
             local_root: HashMap::new(), resident: vec![], call_moves: Cost::zero(), saved_calls: vec![], replay: false, has_call: vec![], rests_on: vec![],
-            reads: Default::default(), loop_writes: vec![], scans: Default::default(), amort: vec![], scan_ind: Default::default(), chase: Cost::zero(), chase_saved: vec![], chase_vars: vec![], paged: Cost::zero(), paged_saved: vec![], divs: Cost::zero(), divs_saved: vec![], serial: Cost::zero(), serial_saved: vec![],
+            reads: Default::default(), loop_writes: vec![], entry_read: Default::default(), scans: Default::default(), amort: vec![], scan_ind: Default::default(), chase: Cost::zero(), chase_saved: vec![], chase_vars: vec![], paged: Cost::zero(), paged_saved: vec![], divs: Cost::zero(), divs_saved: vec![], serial: Cost::zero(), serial_saved: vec![],
         };
         for (i, &p) in f.params.iter().enumerate() {
             let l = &f.locals[p];
@@ -792,10 +968,7 @@ impl<'a, 'b, 'c> Fa<'a, 'b, 'c> {
                         // span is not threaded through self-recursion (docs/m5-span-design.md
                         // does not attempt it); work stands in, always a safe over-approximation
                         Ok((work, moves)) => CostResult::Exact { span: work.clone(), work, moves },
-                        Err(reason) => match self.tree_recursion() {
-                            Some((work, moves, note)) => { tier = "bound"; self.notes.push(note); CostResult::Exact { span: work.clone(), work, moves } }
-                            None => CostResult::Unknown { reason, line: self.rec_calls[0].2 },
-                        },
+                        Err(reason) => CostResult::Unknown { reason, line: self.rec_calls[0].2 },
                     }
                 }
             }
@@ -1009,56 +1182,6 @@ impl<'a, 'b, 'c> Fa<'a, 'b, 'c> {
     /// or `hi − lo`. Shrinking by a constant with one call is a sum, `T = f·m/c`; with more
     /// calls it is exponential and refused. Shrinking by a factor `b` with `a` calls is the
     /// master theorem on the degree `d` of `f` in `m`.
-    /// A recursion over a tree in an arena (docs/cost-model.md § Recursion, a tree): every self-call
-    /// hands on a child of the node it was given — `f(ns, ns[t].left)`, the same array and a field of
-    /// the element at `t` — a fixed number `k` of times an invocation. Over an arena that is a tree
-    /// each node is reached once, so there are at most `k·ns.len() + 1` invocations, and the cost is
-    /// that times one invocation's own. That the arena is a tree is a promise, as a walk down a list
-    /// promises no cycle; the line is a bound.
-    fn tree_recursion(&self) -> Option<(Cost, Cost, String)> {
-        let mut k_poly = Poly::zero();
-        for (_, o, _) in &self.rec_calls { k_poly = k_poly.add(o); }
-        let k = k_poly.as_const().filter(|c| c.is_int() && c.n >= 1)?.n;
-        let ps = &self.f.params;
-        for (pi, &p) in ps.iter().enumerate() {
-            if self.f.locals[p].ty != Ty::I64 { continue; }
-            for (ai, &a) in ps.iter().enumerate() {
-                if !self.f.locals[a].ty.is_arrayish() { continue; }
-                let child = |e: &Expr| -> bool {
-                    let idx_is_p = |i: &Expr| matches!(i.kind, ExprKind::Local(l) if l == p);
-                    match &e.kind {
-                        ExprKind::Field(inner, _) => matches!(&inner.kind, ExprKind::Index(arr, i) if *arr == a && idx_is_p(i)),
-                        ExprKind::Index(arr, i) => *arr == a && idx_is_p(i),
-                        _ => false,
-                    }
-                };
-                let same_arr = |e: &Expr| matches!(&e.kind, ExprKind::Local(x) | ExprKind::Ref(x, _) if *x == a);
-                if !self.rec_args.iter().all(|args| args.get(pi).is_some_and(child) && args.get(ai).is_some_and(same_arr)) { continue; }
-                // two calls down the same link would enter a child twice and double at every
-                // level; with one call an invocation it is a chain, with more each site its own link
-                if k >= 2 {
-                    let link = |args: &Vec<Expr>| match &args[pi].kind { ExprKind::Field(_, f) => Some(*f), _ => None };
-                    let links: Vec<Option<usize>> = self.rec_args.iter().map(link).collect();
-                    if (0..links.len()).any(|i| links[..i].contains(&links[i])) { return None; }
-                }
-                // one invocation's own cost, the self-calls charged their call only; it must not
-                // depend on which node it is
-                if self.work.mentions(pi) || self.moves.mentions(pi) { return None; }
-                // nor on another parameter, unless every call passes it on unchanged
-                let passed = |q: usize| self.rec_args.iter().all(|args| args.get(q).is_some_and(|e|
-                    matches!(&e.kind, ExprKind::Local(x) | ExprKind::Ref(x, _) if *x == ps[q])));
-                if (0..ps.len()).any(|q| q != pi && q != ai && (self.work.mentions(q) || self.moves.mentions(q)) && !passed(q)) { return None; }
-                let calls = Poly::var(ai).scale(Rat::int(k)).add(&Poly::constant(1));
-                let an = &self.f.locals[a].name;
-                let pn = &self.f.locals[p].name;
-                let note = format!("tree: every recursive call is on a child of `{an}[{pn}]`, {k} an invocation; over an arena that is a tree each node is reached once, so at most {} calls (a promise, as a walk's)",
-                    calls.display(&self.names));
-                return Some((self.work.mul_poly(&calls), self.moves.mul_poly(&calls), note));
-            }
-        }
-        None
-    }
-
     fn solve_recurrence(&self) -> Result<(Cost, Cost), String> {
         let mut a_poly = Poly::zero();
         for (_, o, _) in &self.rec_calls { a_poly = a_poly.add(o); }
@@ -1446,7 +1569,8 @@ impl<'a, 'b, 'c> Fa<'a, 'b, 'c> {
         let root = self.local_root.get(&arr).copied().unwrap_or(arr);
         // stale where a loop around the read may write what it reads: its field, its constant slot,
         // or, for a slot not constant, any slot of the array
-        let stale = self.loop_writes.iter().any(|w| w.get(&root).is_some_and(|fw| fw.all || match (field, &idx.kind) {
+        let n = self.loop_writes.len() - (self.entry_read.get() && !self.loop_writes.is_empty()) as usize;
+        let stale = self.loop_writes[..n].iter().any(|w| w.get(&root).is_some_and(|fw| fw.all || match (field, &idx.kind) {
             (Some(fi), _) => fw.fields.contains(&fi),
             (None, ExprKind::Int(k)) if *k >= 0 => fw.fields.contains(&(IDX + *k as usize)),
             (None, _) => !fw.fields.is_empty(),
@@ -2743,6 +2867,113 @@ impl<'a, 'b, 'c> Fa<'a, 'b, 'c> {
         Ok((trip, None))
     }
 
+    /// **A scan to a sentinel** (docs/cost-model.md § A scan to a sentinel): `while xs[i].f >= 0 { …;
+    /// i += c }` reads `xs[i]` every time its condition is evaluated, and an index past the end
+    /// stops the program, so the loop runs at most `(xs.len() − i₀)/c` times, `i₀` the least `i`
+    /// is on entry — when `i` is a mutable `i64` stepped by a constant `c > 0` once, at the top
+    /// level of the body, and nowhere else. A bound: the sentinel may come first.
+    fn sentinel_trip(&self, cond: &Expr, body: &Block) -> Option<Poly> {
+        fn indexed(e: &Expr, out: &mut Vec<(LocalId, LocalId)>) {
+            match &e.kind {
+                ExprKind::Index(arr, i) => {
+                    if let ExprKind::Local(v) = i.kind { out.push((*arr, v)); }
+                    indexed(i, out);
+                }
+                ExprKind::Binary(op, a, b) if !matches!(op, BinOp::And | BinOp::Or) => { indexed(a, out); indexed(b, out); }
+                ExprKind::Unary(_, a) | ExprKind::Field(a, _) | ExprKind::Cast(a, _) => indexed(a, out),
+                _ => {}
+            }
+        }
+        let mut sites = Vec::new();
+        indexed(cond, &mut sites);
+        for (arr, v) in sites {
+            let l = &self.f.locals[v];
+            if !l.mutable || l.ty != Ty::I64 { continue; }
+            let Some(c) = single_step(body, v).filter(|&c| c > 0) else { continue };
+            let top = body.stmts.iter().any(|st| matches!(st, Stmt::Assign(LValue::Var(x), _, _) if *x == v));
+            if !top { continue; }
+            let root = self.local_root.get(&arr).copied().unwrap_or(arr);
+            let Some(len) = self.local_size.get(&root) else { continue };
+            let Some(i0) = self.start_of(v) else { continue };
+            let span = len.sub(&i0).add(&Poly::constant(c as i128 - 1));
+            let trip = span.scale(Rat::new(1, c as i128));
+            self.scans.borrow_mut().push(format!("scan: `{}` indexes `{}` in the `while` condition at line {} and grows by {c} a lap, so the loop runs at most {} times",
+                l.name, self.f.locals[root].name, cond.line, trip.display(&self.names)));
+            return Some(trip);
+        }
+        None
+    }
+
+    /// **A cursor in a slot** (docs/cost-model.md § A cursor in a slot): `while ds[0] < ds[1] { …;
+    /// ds[0] = ds[0] + c }` counts as an induction variable does, the slot `ds[k]` of an array of
+    /// scalars standing for the variable — a parser keeps its cursor so, to hand it to callees. It
+    /// applies when the slot is stepped by a constant `c > 0` once, at the top level of the body, and
+    /// written nowhere else in it, itself or through a callee; and when the bound is a size nothing
+    /// in the body writes. `(bound − ds[k])/c` laps, each read at entry to the loop.
+    fn slot_trip(&self, cond: &Expr, body: &Block) -> Option<Poly> {
+        let ExprKind::Binary(op, l, r) = &cond.kind else { return None };
+        let slot = |e: &Expr| match &e.kind {
+            ExprKind::Index(a, i) => match i.kind { ExprKind::Int(k) if k >= 0 && self.f.locals[*a].ty.elem().is_some_and(|t| t.is_scalar()) => Some((*a, k)), _ => None },
+            _ => None,
+        };
+        let (cur, bound, le) = match (op, slot(l), slot(r)) {
+            (BinOp::Lt, Some(s), _) => (s, &**r, false),
+            (BinOp::Le, Some(s), _) => (s, &**r, true),
+            (BinOp::Gt, _, Some(s)) => (s, &**l, false),
+            (BinOp::Ge, _, Some(s)) => (s, &**l, true),
+            _ => return None,
+        };
+        let (arr, k) = cur;
+        let is_cur = |e: &Expr| slot(e) == Some((arr, k));
+        // the step, once at the top level
+        let steps: Vec<i64> = body.stmts.iter().filter_map(|st| match st {
+            Stmt::Assign(LValue::Index(a, i, _), op, e) if *a == arr && matches!(i.kind, ExprKind::Int(x) if x == k) => match (op, &e.kind) {
+                (Some(BinOp::Add), ExprKind::Int(c)) => Some(*c),
+                (None, ExprKind::Binary(BinOp::Add, x, c)) if is_cur(x) => if let ExprKind::Int(c) = c.kind { Some(c) } else { Some(0) },
+                _ => Some(0),
+            },
+            _ => None,
+        }).collect();
+        let [c] = steps[..] else { return None };
+        if c <= 0 { return None; }
+        // nothing else writes the slot, and nothing writes what the bound reads
+        let mut roots = self.local_root.clone();
+        let root = roots.get(&arr).copied().unwrap_or(arr);
+        let mut bound_slots: Vec<(LocalId, Option<usize>)> = Vec::new();
+        fn reads(e: &Expr, out: &mut Vec<(LocalId, Option<usize>)>, bad: &mut bool) {
+            match &e.kind {
+                ExprKind::Index(a, i) => { out.push((*a, match i.kind { ExprKind::Int(k) if k >= 0 => Some(IDX + k as usize), _ => None })); reads(i, out, bad); }
+                ExprKind::Binary(_, a, b) | ExprKind::MinMax(_, a, b) => { reads(a, out, bad); reads(b, out, bad); }
+                ExprKind::Unary(_, a) | ExprKind::Cast(a, _) => reads(a, out, bad),
+                ExprKind::Field(..) | ExprKind::Call(..) | ExprKind::If(..) | ExprKind::Block(_) => *bad = true,
+                _ => {}
+            }
+        }
+        let mut bad = false;
+        reads(bound, &mut bound_slots, &mut bad);
+        if bad { return None; }
+        let bound_roots: Vec<(LocalId, Option<usize>)> = bound_slots.iter().map(|(a, s)| (self.local_root.get(a).copied().unwrap_or(*a), *s)).collect();
+        let mut own = 0;
+        let mut clash = false;
+        stores_block(body, self.f, &mut roots, &self.an.field_writes, &mut |rt, fi| {
+            if rt == root && (fi.is_none() || fi == Some(IDX + k as usize)) { own += 1; }
+            if bound_roots.iter().any(|(br, bs)| *br == rt && (fi.is_none() || bs.is_none() || *bs == fi)) { clash = true; }
+        });
+        if own != 1 || clash { return None; }
+        let mut w = Writes::default();
+        w.block(body);
+        if w.locals.iter().any(|&lc| bound_mentions(bound, lc)) { return None; }
+        let e = self.size_of(bound, Dir::Upper)?;
+        // the slot at entry to the loop, before its own writes
+        self.entry_read.set(true);
+        let i0 = self.size_of(match l.kind { ExprKind::Index(..) if slot(l) == Some(cur) => l, _ => r }, Dir::Lower);
+        self.entry_read.set(false);
+        let i0 = i0?;
+        let span = e.sub(&i0);
+        let span = if le { span.add(&Poly::constant(c as i128)) } else { span.add(&Poly::constant(c as i128 - 1)) };
+        Some(span.scale(Rat::new(1, c as i128)))
+    }
+
     /// The least an `i64` argument can be, as a size (§ A scan).
     fn least_of(&self, a: &Expr) -> Option<Poly> {
         use super::scan::{least, Base};
@@ -2766,6 +2997,8 @@ impl<'a, 'b, 'c> Fa<'a, 'b, 'c> {
                 Err(ea) => self.induction_trip(b, body).map_err(|eb| if eb == ask { ea } else { eb }),
             };
         }
+        if let Some(t) = self.sentinel_trip(cond, body) { return Ok((t, None)); }
+        if let Some(t) = self.slot_trip(cond, body) { return Ok((t, None)); }
         let ExprKind::Binary(op, l, r) = &cond.kind else { return Err(ask) };
         // `i + c < e` is `i < e − c`, on either side: the variable alone on its side
         let unshift = |x: &Expr, y: &Expr| -> Option<(Expr, Expr)> {
@@ -2804,6 +3037,9 @@ impl<'a, 'b, 'c> Fa<'a, 'b, 'c> {
         let to_negative = matches!((&l.kind, &r.kind, op), (ExprKind::Local(_), ExprKind::Int(0), BinOp::Ge) | (ExprKind::Int(0), ExprKind::Local(_), BinOp::Le));
         if to_negative {
             match self.walk_trip(var, body) {
+                // a walk that calls into the component being costed is its recursion, its laps
+                // counted as invocations (§ Recursion, a forest): one lap here
+                Ok(_) if self.scc.as_ref().is_some_and(|ms| { let mut o = Vec::new(); callees_block(body, &mut o); o.iter().any(|g| ms.contains(g)) }) => return Ok((Poly::constant(1), None)),
                 Ok(t) => return Ok((t, None)),
                 Err(Some(why)) => return Err(format!("{why}; {ask}")),
                 Err(None) => {}
@@ -2972,6 +3208,7 @@ impl<'a, 'b, 'c> Fa<'a, 'b, 'c> {
                     }
                 }
                 self.add_work_n(2); // call and return; arguments are register moves
+                if self.scc.as_ref().is_some_and(|ms| ms.contains(fid)) { return Ok(()); }
                 if Some(*fid) == self.self_fid {
                     if self.replay { return Ok(()); }
                     let cf = &self.an.m.funcs[*fid];
@@ -2982,7 +3219,6 @@ impl<'a, 'b, 'c> Fa<'a, 'b, 'c> {
                     }).collect();
                     let o = self.times_here();
                     self.rec_calls.push((sizes, o, e.line));
-                    self.rec_args.push(args.clone());
                     return Ok(());
                 }
                 // the callee's signature, and this call's argument sizes for its atoms
@@ -3151,6 +3387,29 @@ impl<'a, 'b, 'c> Fa<'a, 'b, 'c> {
                         other => other.clone(),
                     }
                 };
+                // a size the callee reads from an array it is handed is the value at the call; in a
+                // loop that writes that field or slot, each lap's call reads a value of its own, and
+                // one atom does not stand for them all
+                if !self.loop_writes.is_empty() && !self.replay {
+                    let mut rs = Vec::new();
+                    for c in [&w, &mv, &sp] { for pc in &c.pieces { pc.poly.reads(&mut rs); } }
+                    for r in &rs {
+                        let Root::Param(i, _) = &r.root else { continue };
+                        let Some(rt) = roots.get(*i).copied().flatten() else { continue };
+                        let fi = r.field.as_ref().and_then(|fname| match self.f.locals[rt].ty.elem() {
+                            Some(Ty::Struct(sid)) => self.an.m.structs[*sid].fields.iter().position(|(n, _)| n == fname),
+                            _ => None,
+                        });
+                        let slot = match (&r.field, &r.index) { (None, Some(ix)) => ix.as_const().filter(|c| c.is_int() && c.n >= 0).map(|c| IDX + c.n as usize), _ => None };
+                        let stale = self.loop_writes.iter().any(|lw| lw.get(&rt).is_some_and(|fw| fw.all || match (fi, slot) {
+                            (Some(f), _) | (None, Some(f)) => fw.fields.contains(&f),
+                            (None, None) => !fw.fields.is_empty(),
+                        }));
+                        if stale {
+                            return Err(Fail::Unknown(format!("calls `{}` in a loop that writes `{}`, which its cost reads as a size", callee.name, self.f.locals[rt].name), e.line));
+                        }
+                    }
+                }
                 w = w.rename_roots(&rename).subst_many(&map);
                 mv = mv.rename_roots(&rename).subst_many(&map);
                 sp = sp.rename_roots(&rename).subst_many(&map);
@@ -3424,6 +3683,8 @@ fn collect_scalars(e: &Expr, out: &mut Vec<LocalId>) {
 
 
 /// Every function a block calls directly.
+pub(super) fn callees_block_pub(b: &Block, out: &mut Vec<FuncId>) { callees_block(b, out) }
+
 fn callees_block(b: &Block, out: &mut Vec<FuncId>) {
     for st in &b.stmts {
         match st {

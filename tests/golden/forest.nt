@@ -1,0 +1,121 @@
+// Mutual recursion over a tree in an arena (docs/cost-model.md § Recursion, a forest): `has` and
+// `has_list` call each other on the nodes of `nodes` — a child's (`nodes[n].a`, `.b`), a
+// grandchild's through a name (`let c = nodes[n].b`), or each node of a list down `.next` — and no
+// path through their calls on one node goes down a link twice, so over an arena that is a tree the
+// calls are at most a few per node: a bound, a promise as a walk's is. `size` and `size_list` the same
+// with a cost of their own per node. Refused: `dup` and `dup2` go down `.a` twice between them; `lap`
+// calls `lap_one` on its own node once a lap of a counted loop; `deep` hands down `d + 1`.
+// `spell` loops to `ws[nodes[n].kind]`, an element at the node, which is the most `ws` holds in
+// every invocation: a bound. `grow` loops to `acc[0]`, which the recursion itself writes: refused.
+
+struct Node { kind: i64, a: i64, b: i64, next: i64 }
+
+fn has(nodes: &[Node], n: i64) -> bool {
+    if n < 0 { return false; }
+    let k = nodes[n].kind;
+    if k == 1 { return true; }
+    if k == 2 { return has_list(nodes, nodes[n].a) || has(nodes, nodes[n].b); }
+    if k == 3 {
+        let c = nodes[n].b;
+        return has(nodes, nodes[n].a) || has(nodes, nodes[c].a);
+    }
+    false
+}
+
+fn has_list(nodes: &[Node], n: i64) -> bool {
+    let mut i = n;
+    let mut hit = false;
+    while i >= 0 {
+        if has(nodes, i) { hit = true; };
+        i = nodes[i].next;
+    }
+    hit
+}
+
+fn size(nodes: &[Node], w: i64, n: i64) -> i64 {
+    if n < 0 { return 0; }
+    let mut s = 0;
+    for j in 0..w { s += j; }
+    s + 1 + size_list(nodes, w, nodes[n].a) + size(nodes, w, nodes[n].b)
+}
+
+fn size_list(nodes: &[Node], w: i64, n: i64) -> i64 {
+    let mut i = n;
+    let mut t = 0;
+    while i >= 0 {
+        t += size(nodes, w, i);
+        i = nodes[i].next;
+    }
+    t
+}
+
+fn dup(nodes: &[Node], n: i64) -> i64 {
+    if n < 0 { return 0; }
+    1 + dup2(nodes, nodes[n].a) + dup2(nodes, nodes[n].a)
+}
+
+fn dup2(nodes: &[Node], n: i64) -> i64 {
+    if n < 0 { 0 } else { dup(nodes, nodes[n].b) }
+}
+
+fn lap(nodes: &[Node], n: i64) -> i64 {
+    if n < 0 { return 0; }
+    let mut s = 0;
+    for j in 0..nodes[n].kind { s += lap_one(nodes, n) + j; }
+    s
+}
+
+fn lap_one(nodes: &[Node], n: i64) -> i64 {
+    if n < 0 { 0 } else { 1 + lap(nodes, nodes[n].a) }
+}
+
+fn deep(nodes: &[Node], d: i64, n: i64) -> i64 {
+    if n < 0 { return 0; }
+    let mut s = 0;
+    for j in 0..d { s += j; }
+    s + deep_list(nodes, d + 1, nodes[n].a)
+}
+
+fn deep_list(nodes: &[Node], d: i64, n: i64) -> i64 {
+    let mut i = n;
+    let mut t = 0;
+    while i >= 0 {
+        t += deep(nodes, d, i);
+        i = nodes[i].next;
+    }
+    t
+}
+
+fn spell(nodes: &[Node], ws: &[i64], n: i64) -> i64 {
+    if n < 0 { return 0; }
+    let mut s = 0;
+    for j in 0..ws[nodes[n].kind] { s += j; }
+    s + spell(nodes, ws, nodes[n].a) + spell(nodes, ws, nodes[n].b)
+}
+
+fn grow(nodes: &[Node], acc: &mut [i64], n: i64) -> i64 {
+    if n < 0 { return 0; }
+    let mut s = 0;
+    for j in 0..acc[0] { s += j; }
+    acc[0] = acc[0] + 1;
+    s + grow(nodes, acc, nodes[n].a) + grow(nodes, acc, nodes[n].b)
+}
+
+fn main() {
+    let mut ns = [Node { kind: 0, a: -1, b: -1, next: -1 }; 6];
+    ns[0] = Node { kind: 2, a: 1, b: 3, next: -1 };
+    ns[1] = Node { kind: 0, a: -1, b: -1, next: 2 };
+    ns[2] = Node { kind: 1, a: -1, b: -1, next: -1 };
+    ns[3] = Node { kind: 3, a: -1, b: 4, next: -1 };
+    ns[4] = Node { kind: 0, a: 5, b: -1, next: -1 };
+    ns[5] = Node { kind: 1, a: -1, b: -1, next: -1 };
+    println(has(&ns, 0));
+    println(size(&ns, 3, 0));
+    println(dup(&ns, 0));
+    println(lap(&ns, 0));
+    println(deep(&ns, 0, 0));
+    let ws = [1, 2, 3, 4];
+    println(spell(&ns, &ws, 0));
+    let mut acc = [0];
+    println(grow(&ns, &mut acc, 0));
+}

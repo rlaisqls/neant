@@ -971,8 +971,33 @@ A recursion on the children of the node it is handed, `f(xs, xs[t].l)`, `f(xs, x
 `k·xs.len() + 1` invocations over an arena that is a tree — the promise a walk makes, and a bound
 (cost-model § Recursion, a tree): binary-trees' `check` gets a cost, 12 of 15, and the compiler is
 94/50/38/96, `same_ty` among them (golden `arena_tree`); `resolve_ty` goes down `.a` from three
-`if`s in a row, which the count of calls reads as three an invocation, and is refused. Mutual
-recursion, the larger row, is left.
+`if`s in a row, which the count of calls reads as three an invocation, and is refused. Then the
+same for a component of mutual recursion, a path at a time (cost-model § A tree in an arena, and a
+forest; `forest.rs`, golden `forest`): a group of calls on one node goes down each path of links at
+most once, so over a tree at most `L·xs.len() + 1` groups; the one-function rule is its case of
+one, which `resolve_ty` now passes. The compiler is 94/49/42/93. The cost walkers (`w_*`, `m_*`)
+have the shape and are unknown for one member's `while` with no measure; the checker's and emitter's (`check_*`,
+`emit_*`) call back in once a lap of a counted loop over stages or fields, which the rule refuses.
+A `while` that reads `xs[i]` in its condition and steps `i` up once a lap stops by the array's end
+at the latest (cost-model § A scan to a sentinel; golden `sentinel`): `call_arr_len` and
+`used_after` get a cost, 94/50/42/92, and with it the cost walkers' members are costed through and
+refused for the reason that is theirs — `m_expr`'s cost depends on its node, `w_expr`'s on a size
+bound once — which their lines now say. Costing them through doubled the lock's time, 9 s to 19 s.
+Then an invocation's cost is taken apart from its node (cost-model § A tree in an arena, and a
+forest): a read at an index that moves is its array's most, an unknown callee's moving argument is
+`_`, a regime is dropped for the sum of its pieces — and every array the cost still reads must be
+one the component never writes, which the composition had not checked. `expr_same`, `idx_coef`
+and `emit_type` get a bound, 94/52/43/89 (golden `forest`'s `spell` and `grow`), and the walkers are
+refused for reading the state they write. A `max` of the regimes instead of their sum took a
+walker's moves, 5216 terms, 94 s to settle, and the lock six minutes; the sum takes 16 s. And the
+layout pass, which costs the program twice per struct, tried each refused component every time:
+a refusal does not depend on a layout, so it is tried once, and compiling the compiler is back to
+8.5 s from 18.
+A cursor in a slot, `while ds[0] < ds[1] { …; ds[0] += 1 }`, counts as a variable does (cost-model
+§ A size read from memory, a cursor in a slot; golden `cursor`), and writing its test found a hole
+in the committed calculus: a callee's size read from an array its caller's loop writes was the
+first lap's value for every lap. Such calls are unknown now, and the compiler is 95/43/44/96 — nine
+`modulo` lines were wrong, one line more exact and one more bound from the cursor.
 
 ## M7 — the constant factor
 

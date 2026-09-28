@@ -109,12 +109,17 @@ language, written to compile itself and not to suit the calculus:
 | a loop that surely runs (the lexer) | 92 | 49 | 35 | 102 | 278 |
 | a `while` condition read right (`j > start`, `i + 1 < n`) | 94 | 51 | 35 | 98 | 278 |
 | reads stale by slot and by field, not by array | 94 | 51 | 36 | 97 | 278 |
-| recursion over a tree in an arena, now | 94 | 50 | 38 | 96 | 278 |
+| recursion over a tree in an arena | 94 | 50 | 38 | 96 | 278 |
+| and over a forest: mutual recursion on one arena, a path at a time | 94 | 49 | 42 | 93 | 278 |
+| a scan to a sentinel, bounded by the array's end | 94 | 50 | 42 | 92 | 278 |
+| a tree's invocations costed apart from their node: reads widened, writes refused | 94 | 52 | 43 | 89 | 278 |
+| a callee's size in a loop that writes it, refused (a fix); a cursor in a slot, now | 95 | 43 | 44 | 96 | 278 |
 
 Exact did not move after the first extensions; what moved is how much is stated at all, 81 of 276
-to 182 of 278, a fifth of it `bound`. The largest remaining row is mutual recursion over the
-compiler's own tree walks (plan § Stage D (3)); a function that recurses on its own node's children
-is a bound now (cost-model § Recursion, a tree). `lex` became a bound once a nested loop its guard
+to 182 of 278, a fifth of it `bound`. A recursion over a tree in an arena, one function's or a
+component's, is a bound now (cost-model § Recursion, a tree in an arena, and a forest); the cost
+walkers have that shape but are unknown because their costs read state the walk writes, which
+their lines now name, and the checker's and emitter's call back in once a lap of a counted loop. `lex` became a bound once a nested loop its guard
 surely enters was counted, but its callers are unknown for their own reasons, so one line moved.
 
 **The domain corpus** (`tests/corpus`, docs/corpus.md): six programs of the kinds stage C names —
@@ -134,10 +139,15 @@ text, and a number read out of text is bounded, not counted.
 The calculus has been caught wrong, and saying so is part of the evaluation.
 
 - **Two compilers.** The self-hosted cost pass is checked column by column against the Rust one
-  (`bootstrap/tests/self_host_cost.rs`): 105 work, 91 moves, 142 footprint, 164 bound columns agree
+  (`bootstrap/tests/self_host_cost.rs`): 106 work, 92 moves, 148 footprint, 189 bound columns agree
   exactly, and every place one states less than the other is listed with its reason. The check has
   found bugs in both — most recently the self-hosted pass costing a worklist as one pass, because it
   did not see an assignment in an `if` at a block's tail (plan, 2026-09-27).
+- **A size through a call.** A callee's size read from an array its caller's loop writes stood for
+  every lap's value, the first's: nine `modulo` lines of the compiler were wrong, and are unknown
+  now (cost-model § A size read from memory, through a call). The same session found the mutual
+  recursion rule composing invocations whose reads the recursion itself writes, before it was
+  committed.
 - **The sign audit** (`NEANT_SIGNS=1`) samples every cost piece the prover cannot show non-negative.
   It found a rewrite that dropped a factor from an upper bound; four other places the calculus had
   said `exact` while wrong were found by reading the lockfile (plan § Stage D, "What the lockfile
@@ -166,8 +176,9 @@ constant to tune:
   consecutive calls share (`csv`, 5–10× high).
 - **A `τ` for code that vectorises worse** than the polynomial it was fitted on (`matmul` at small
   `n`, 2.4–2.7× low).
-- **Reach.** Mutual recursion and the parser's cursor loops leave a third of the compiler
-  unknown; a recursion over a tree in an arena is a bound, a promise the program does not state.
+- **Reach.** `while` loops with no measure the compiler finds, inside the walkers and in the
+  parser's cursor loops, leave a third of the compiler unknown; a recursion over a tree in an arena
+  is a bound, a promise the program does not state.
 
 ## Threats to validity
 
@@ -205,4 +216,4 @@ access in equal measure, so it is not the default. A TLB charge per paged line (
 `transpose` and over-charges naive matmul fourfold, so it is off too. Next, in the order they would change these
 numbers: a bandwidth that depends on the access pattern (a stride, the number of streams) at each
 level (the small sizes, and a chase inside L3), the parse's per-call constants (`csv`),
-a second machine for `τ`, `BW` and `L`, and, for reach, mutual recursion.
+a second machine for `τ`, `BW` and `L`, and, for reach, the `while` loops the walkers are waiting on.

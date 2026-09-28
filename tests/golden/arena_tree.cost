@@ -1,17 +1,17 @@
 struct N         layout AoS  decided by sum (2·B·ns.len() + B, SoA 6·B·ns.len() + 3·B), same (2·B·ns.len() + B, SoA 4·B·ns.len() + 2·B), main (≈ moves[twice](5, 0) + moves[deep](5, 0, 0) + moves[chase](5, 0) + 25·B + 240, SoA ≈ moves[twice](5, 0) + moves[deep](5, 0, 0) + moves[chase](5, 0) + 64·B + 240)
 sum              work 22·ns.len() + 11             moves 2·B·ns.len() + B             bound
-                 footprint        ns: [24·t, 24·t + 24)   resident after if 24 < M
-                 tree: every recursive call is on a child of `ns[t]`, 2 an invocation; over an arena that is a tree each node is reached once, so at most 2·ns.len() + 1 calls (a promise, as a walk's)
+                 footprint        ns: [0, 24·ns.len()) (whole array)   no residue claimed
+                 tree: every call is on a node of `ns`, its own or one below it, down a different link each time; over an arena that is a tree at most 2·ns.len() + 1 groups of calls (a promise, as a walk's)
 chase            unknown: no argument shrinks toward a base case across every recursive call; the measure must be an `i64` parameter, `xs.len() − p`, or `hi − lo` (line 23)
                  footprint        ns: [24·t, 24·t + 24)   resident after if 24 < M
 same             work ≈ 6·ns.len()·d               moves 2·B·ns.len() + B             bound
-                 footprint        ns: [24·t, 24·t + 24)   resident after if 24 < M
-                 tree: every recursive call is on a child of `ns[t]`, 2 an invocation; over an arena that is a tree each node is reached once, so at most 2·ns.len() + 1 calls (a promise, as a walk's)
-deep             unknown: 2 recursive calls each shrinking `ns.len() − d` by a constant: exponential (line 43)
-                 footprint        ns: [24·t, 24·t + 24)   resident after if 24 < M
+                 footprint        ns: [0, 24·ns.len()) (whole array)   no residue claimed
+                 tree: every call is on a node of `ns`, its own or one below it, down a different link each time; over an arena that is a tree at most 2·ns.len() + 1 groups of calls (a promise, as a walk's)
+deep             unknown: a recursion over the tree in `ns`, but the cost of an invocation of `deep` depends on `d`, which not every call hands on unchanged (line 37)
+                 footprint        ns: [0, 24·ns.len()) (whole array)   no residue claimed
 twice            unknown: no argument shrinks toward a base case across every recursive call; the measure must be an `i64` parameter, `xs.len() − p`, or `hi − lo` (line 51)
                  footprint        ns: [24·t, 24·t + 8)   resident after if 8 < M
 main             work ≈ work[twice](5, 0) + work[deep](5, 0, 0) + work[chase](5, 0) + 360 moves ≈ moves[twice](5, 0) + moves[deep](5, 0, 0) + moves[chase](5, 0) + 25·B + 240 modulo, io
-                 in `sum`: tree: every recursive call is on a child of `ns[t]`, 2 an invocation; over an arena that is a tree each node is reached once, so at most 2·ns.len() + 1 calls (a promise, as a walk's)
-                 in `same`: tree: every recursive call is on a child of `ns[t]`, 2 an invocation; over an arena that is a tree each node is reached once, so at most 2·ns.len() + 1 calls (a promise, as a walk's)
+                 in `sum`: tree: every call is on a node of `ns`, its own or one below it, down a different link each time; over an arena that is a tree at most 2·ns.len() + 1 groups of calls (a promise, as a walk's)
+                 in `same`: tree: every call is on a node of `ns`, its own or one below it, down a different link each time; over an arena that is a tree at most 2·ns.len() + 1 groups of calls (a promise, as a walk's)
                  rests on         sum (bound, a scan); chase (unknown); same (bound, a scan); deep (unknown); twice (unknown)

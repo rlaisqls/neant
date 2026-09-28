@@ -3,6 +3,7 @@
 pub mod analyze;
 pub mod assert;
 pub mod bounds;
+pub mod forest;
 pub mod iolb;
 pub mod lock;
 pub mod measure;

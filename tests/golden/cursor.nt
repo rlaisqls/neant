@@ -1,0 +1,64 @@
+// A cursor in a slot (docs/cost-model.md § A cursor in a slot): `skip_sp` keeps its cursor in
+// `ds[0]` and its end in `ds[1]`, as a parser hands both to callees, and steps the cursor once a lap:
+// `ds[1] − ds[0]` laps at most, read at entry. Refused: `via_call` steps it inside a callee, and
+// `moving_end` moves the end. And a callee's size in a loop that writes it (§ A size read from
+// memory, through a call): `upto` loops to `xs[0]`, and `many` calls it ten times while adding to
+// `xs[0]` — each call reads a value of its own, so `many` is unknown, as `twice` is for `skip_sp`.
+
+fn skip_sp(src: &[u8], ds: &mut [i64]) {
+    while ds[0] < ds[1] && src[ds[0]] == b' ' { ds[0] = ds[0] + 1; }
+}
+
+fn bump(ds: &mut [i64]) { ds[0] = ds[0] + 1; }
+
+fn via_call(ds: &mut [i64]) {
+    while ds[0] < ds[1] { bump(ds); }
+}
+
+fn moving_end(ds: &mut [i64]) {
+    while ds[0] < ds[1] {
+        ds[0] = ds[0] + 1;
+        ds[1] = ds[1] + 1;
+        if ds[1] > 100 { return; }
+    }
+}
+
+fn twice(src: &[u8], ds: &mut [i64]) {
+    let mut k = 0;
+    while k < 3 {
+        skip_sp(src, ds);
+        ds[0] = 0;
+        ds[1] = ds[1] + 10;
+        k += 1;
+    }
+}
+
+fn upto(xs: &[i64]) -> i64 {
+    let mut s = 0;
+    for i in 0..xs[0] { s += i; }
+    s
+}
+
+fn many(xs: &mut [i64]) -> i64 {
+    let mut t = 0;
+    for k in 0..10 {
+        t += upto(xs) + k;
+        xs[0] = xs[0] + 100;
+    }
+    t
+}
+
+fn main() {
+    let src = [b' '; 64];
+    let mut ds = [0, 5, 0];
+    skip_sp(&src, &mut ds);
+    println(ds[0]);
+    via_call(&mut ds);
+    println(ds[0]);
+    moving_end(&mut ds);
+    println(ds[1]);
+    twice(&src, &mut ds);
+    println(ds[1]);
+    let mut xs = [5, 0];
+    println(many(&mut xs));
+}

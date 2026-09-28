@@ -1,0 +1,17 @@
+struct S         layout AoS  decided by main (moves[stuck](4) + 3·B + 224, SoA moves[stuck](4) + 4·B + 224)
+find             work 5·ss.len() + 3               moves                              bound  (2 regimes)
+                                               moves 16·ss.len() + B              if 16·ss.len() < M
+                                               moves B·ss.len() + B               if 16·ss.len() ≥ M
+                 footprint        ss: [0, 16·ss.len()) (whole array)   no residue claimed
+                 scan: `i` indexes `ss` in the `while` condition at line 11 and grows by 1 a lap, so the loop runs at most ss.len() times
+skip             work xs.len() − from + 3          moves                              bound  (2 regimes)
+                                               moves 8·xs.len() + B               if 8·xs.len() < M
+                                               moves B·xs.len()/2 − B·from/2 + 3·B/2 if 8·xs.len() ≥ M
+                 footprint        xs: [0, 8·xs.len()) (whole array)   no residue claimed
+                 scan: `i` indexes `xs` in the `while` condition at line 20 and grows by 2 a lap, so the loop runs at most xs.len()/2 − from/2 + 1/2 times
+stuck            unknown: `while` has no measure the compiler can find; write `while cond decreasing <expr>` with an `i64` that goes down by at least one every iteration (line 28)
+                 footprint        ss: [0, 16·ss.len()) (whole array)   no residue claimed
+main             work work[stuck](4) + 53          moves moves[stuck](4) + 3·B + 224  modulo, io
+                 in `find`: scan: `i` indexes `ss` in the `while` condition at line 11 and grows by 1 a lap, so the loop runs at most ss.len() times
+                 in `skip`: scan: `i` indexes `xs` in the `while` condition at line 20 and grows by 2 a lap, so the loop runs at most xs.len()/2 − from/2 + 1/2 times
+                 rests on         find (bound, a scan); skip (bound, a scan); stuck (unknown)
