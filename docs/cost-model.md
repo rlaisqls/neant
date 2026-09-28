@@ -985,7 +985,7 @@ loop's `v ← 10·v + d` — cannot overlap its laps: each waits for the last on
 work (its whole body's, nested loops' included) is counted as `serial`, composed through calls as work
 is, and the compute term becomes `(work − serial)·τ + serial·τ_s`, with `τ_s` fitted on the logistic
 map: **τ_s = 0.155 ns**, nine times `τ`. A reduction, `s += f(x[i])`, carries only an add and is not
-serial. Mandelbrot goes from 4.2× too fast to 0.50, the half an upper bound's: its 50 laps are the most
+serial — unless its lap is short (below). Mandelbrot goes from 4.2× too fast to 0.50, the half an upper bound's: its 50 laps are the most
 a point can take. Only a time reads `serial`.
 
 *Through memory.* A store to an array element of a value read from that same element, at an index
@@ -994,6 +994,16 @@ for the last lap's store, whatever the operation. Such a store is one unit of se
 the chained operation waits; the rest of the lap overlaps), where a scalar multiply chain makes the
 whole loop serial. Charging the whole loop for a memory chain was tried first and took n-body from
 2.3× too fast to 2.7× too slow.
+
+*Through an add (2026-09-28).* An `f64` a lap carries through an add or a subtract — `s += xs[i]`,
+`e = e − d` — waits for the add, whose latency a unit of work does not have: measured, the `sum`
+kernel in L1 takes 0.25 ns a lap against 0.07 predicted. The core runs a lap's other work while the
+add waits, so the add binds only a lap with less work than one unit of serial work takes,
+`work·τ < τ_s`; such a lap's carried `f64` is one unit of serial work each (`sum` in L1: 1.2× from
+3.6×). Charged whatever the lap, it took `horner`, eight multiplies a lap, to 0.70 and a tiled
+`matmul`, whose next `j` starts the next chain, to 0.51, and brought spectral-norm, a division a
+lap, from 1.26 to 0.96: with the rule as it is, spectral-norm stays at 1.26, a lap with more work
+than the add that still waits on something the model does not name.
 
 **Divisions (2026-09-28).** An `f64` division is one unit of work to the calculus and several to
 the machine: its throughput is a fraction of an add's. Divisions are counted apart as `divs`,

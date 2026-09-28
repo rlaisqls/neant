@@ -47,10 +47,11 @@ cost-model § Time, experiments.md § The roofline, § The corpus against the cl
 `BW = 20.8 GB/s`, fitted once — `τ` on a polynomial in L1, `BW` on a 100 MB stream — and then held
 fixed for everything else; and a latency term, `chase/B · L` in place of `chase/BW` for the lines a
 pointer chase fetches, with `L = 112 ns` fitted on a chase over 64 MB; and serial work, `τ_s = 0.155
-ns` for work on a chain each lap waits on, fitted on a logistic map; and `τ_div = 0.148 ns` more for an
+ns` for work on a chain each lap waits on, fitted on a logistic map, and charged too for an `f64` a
+short lap carries through an add; and `τ_div = 0.148 ns` more for an
 `f64` division, fitted on a sum of reciprocals. Five constants in all, each
 fitted on one kernel written for it and then held fixed. The geometric mean of measured over predicted
-over the kernels' 31 runs is 1.12 (1.56 before the latency term, when `arena` was 5–31× too low).
+over the kernels' 31 runs is 1.09 (1.12 before a short lap's carried add) (1.56 before the latency term, when `arena` was 5–31× too low).
 
 **Kernels** (31 runs, `tests/kernels/roofline.py`):
 
@@ -89,11 +90,11 @@ amortised calls; the ends had hidden the dropped serial work, and the error chan
 
 | program | measured / predicted |
 |---|---|
-| `nbody` (10⁵–5·10⁶ steps) | 1.76 – 1.77 |
-| `spectral_norm` (n = 200–2000) | 1.26 – 1.28 |
-| `mandelbrot` (n = 200–2000) | 0.47 – 0.51 |
+| `nbody` (10⁵–5·10⁶ steps) | 1.76 – 1.79 |
+| `spectral_norm` (n = 200–2000) | 1.26 – 1.33 |
+| `mandelbrot` (n = 200–2000) | 0.50 – 0.59 |
 
-Geometric mean 1.09, range 0.50 to 1.77 — n-body errs the other way from before, its per-step moves
+Geometric mean 1.07, range 0.50 to 1.79 — n-body errs the other way from before, its per-step moves
 gone (the L2 refills agree) and its compute a little under-counted: laps of four or fewer. Before the scan's
 accesses were charged as a stream, the text readers were 10³ to 10⁶ too high — a bound, and a
 useless time; the first timing is kept in experiments.md because it is what found that.

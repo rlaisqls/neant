@@ -785,6 +785,20 @@ the loop the distance at the chain's largest rate, once.
 The error changed side: the prediction is no longer an upper bound on these programs. `fir`'s
 remaining 2× is its filter loop, compute the model charges at `τ`.
 
+## A carried add in a short lap (2026-09-28)
+
+`sum` in L1 (3000 elements, 2·10⁵ repeats) measured 0.150 s where the model said 0.042: 0.25 ns a
+lap, the latency of the `f64` add the lap carries, against four units of work at `τ`. Counting a
+carried `f64` add as a unit of serial work in every lap brought it to 1.2× and spectral-norm from
+1.26 to 0.96, but took `horner` (eight multiplies a lap beside the add) to 0.70 and the tiled
+`matmul` (a 64-long chain, then the next `j`'s) to 0.51 — the core overlaps an add's wait with the
+lap's other work, and with the next chain. Counted only where the lap's work is less than a unit
+of serial work's, `work·τ < τ_s`: the kernels' geometric mean is 1.09 (31 runs, 0.27–6.4; `horner`
+0.99–1.26, tiled `matmul` 0.89–0.95, `sum` 0.88–2.1), the Benchmarks Game's 1.07 (0.50–1.79;
+spectral-norm back at 1.26), the corpus's 1.25. The check's sizes are all past L1, so the tables
+barely move; the kernel it fixes is the one the fit's sizes skip. `roofline.py` now reads a
+prediction line whatever time terms it carries.
+
 ## Programs the project did not write: the Benchmarks Game (2026-09-28)
 
 **Why.** The corpus is the project's own (evaluation.md, threats). Five programs of the Computer

@@ -1391,8 +1391,13 @@ impl<'a, 'b, 'c> Fa<'a, 'b, 'c> {
         self.paged = self.paged.add(&rec.sum_cost(&body_paged));
         self.divs = self.divs.add(&rec.sum_cost(&body_divs));
         // a loop whose lap waits on the last one: all its work is serial, nested loops' included
-        // through memory only the chained stores wait, one unit each a lap
-        let chained = memory_chain(body, rec.var);
+        // through memory only the chained stores wait, one unit each a lap, and an `f64` carried
+        // through an add waits for the add, one unit a lap, in a short lap
+        // an add's latency binds only a lap with less work than it: more, and the core runs the
+        // lap's other work while the add waits (`horner`'s eight multiplies; `matmul`'s next `j`)
+        let mach = self.machine();
+        let short = w.pieces.len() == 1 && w.pieces[0].poly.as_const().is_some_and(|c| c.to_f64() * mach.ns_per_work < mach.ns_per_serial);
+        let chained = memory_chain(body, rec.var) + if short { float_chain(body, self.f) } else { 0 };
         self.serial = self.serial.add(&rec.sum_cost(&if carried_chain(body) { w.clone() } else { body_serial.add_poly(&Poly::constant(chained as i128)) }));
         // an ordinary loop is sequential: its span sums the same way work does
         self.span = self.span.add(&rec.sum_cost(&sp));
@@ -4129,6 +4134,36 @@ fn carried_chain(b: &Block) -> bool {
 /// that does not move with the loop: `xs[k] = xs[k] − …`, `bs[i].vx = bs[i].vx − dx·m` in a loop over
 /// `j`. Each lap's load waits for the last lap's store, whatever the operation (cost-model § Time,
 /// serial work, through memory).
+/// How many `f64` locals a loop body carries from one lap to the next through an add or a
+/// subtract — `s += xs[i]`, `e = e − d` — a reduction the lap waits on for the add's latency, which
+/// a unit of work does not have: one unit of serial work each a lap (cost-model § Time, serial work).
+/// A chain through a multiply is `carried_chain`'s, and all of the lap's work serial.
+fn float_chain(b: &Block, f: &Func) -> usize {
+    fn top(e: &Expr, v: LocalId) -> bool {
+        match &e.kind {
+            ExprKind::Local(l) => *l == v,
+            ExprKind::Binary(BinOp::Add, a, c) => top(a, v) || top(c, v),
+            ExprKind::Binary(BinOp::Sub, a, _) => top(a, v),
+            _ => false,
+        }
+    }
+    fn walk(b: &Block, f: &Func, out: &mut Vec<LocalId>) {
+        for s in &b.stmts {
+            match s {
+                Stmt::Assign(LValue::Var(v), op, e) if f.locals[*v].ty == Ty::F64 => {
+                    let carried = match op { Some(BinOp::Add | BinOp::Sub) => true, None => !matches!(e.kind, ExprKind::Local(_)) && top(e, *v), _ => false };
+                    if carried && !out.contains(v) { out.push(*v); }
+                }
+                Stmt::Expr(Expr { kind: ExprKind::If(_, t, e), .. }) => { walk(t, f, out); if let Some(e) = e { walk(e, f, out); } }
+                _ => {}
+            }
+        }
+    }
+    let mut out = Vec::new();
+    walk(b, f, &mut out);
+    out.len()
+}
+
 fn memory_chain(b: &Block, var: Option<LocalId>) -> usize {
     fn same(a: &Expr, b: &Expr) -> bool {
         match (&a.kind, &b.kind) {

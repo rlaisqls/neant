@@ -1004,6 +1004,9 @@ Back to time (evaluation, next): an amortised call's line ends are charged once 
 region rule's "longer than the array" is asked asymptotically, and serial work and divisions are
 amortised as work is — the corpus from 0.56 to 1.26, `csv` 0.10–0.22 to 0.81–0.95 (experiments.md,
 a parse's ends and its serial work); no report line changes but the moves of eight parse loops.
+And an `f64` a short lap carries through an add is a unit of serial work (cost-model § Time, through
+an add): `sum` in L1 1.2× from 3.6×; with no bound on the lap's work it broke `horner` and a tiled
+`matmul`, which overlap the add's wait (experiments.md, a carried add in a short lap).
 
 ## M7 — the constant factor
 

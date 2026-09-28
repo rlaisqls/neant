@@ -50,8 +50,9 @@ def predict(nt, extra=()):
     lines = out.splitlines()
     start = next((i for i, l in enumerate(lines) if l.startswith("main")), None)
     for l in lines[(start or 0) + 1:]:
-        m = re.search(r"at .*?: work (\S+)\s+moves (\S+) bytes(?:\s+chase (\S+) bytes)?(?:\s+paged (\S+) bytes)?(?:\s+time (\S+) s)?", l)
-        if m: return float(m.group(1)), float(m.group(2)), (float(m.group(5)) if m.group(5) else None), float(m.group(3) or 0)
+        # the terms between moves and time (chase, paged, serial, divs) come and go with the kernel
+        m = re.search(r"at .*?: work (\S+)\s+moves (\S+) bytes(?:\s+chase (\S+) bytes)?(?:.*?\btime (\S+) s)?", l)
+        if m: return float(m.group(1)), float(m.group(2)), (float(m.group(4)) if m.group(4) else None), float(m.group(3) or 0)
         if l and not l.startswith(" "): break
     sys.exit("could not read prediction from:\n" + out)
 
