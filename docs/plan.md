@@ -1056,7 +1056,27 @@ latencies (`cortex-x4`) are this core's to a cycle of 0.257 ns on dependency cha
 cycles an innermost loop fit the five compute kernels with one constant — once it is seen that gcc
 runs two of each kernel's repeats in one vector iteration, which the fitted `τ`s absorb too. It fails
 on a loop nest, whose short chains the core overlaps across outer iterations: the cost line has to
-be per nest, and read off the emitted assembly's vector width. A micro-architectural cost line (what llvm-mca and uiCA
+be per nest, and read off the emitted assembly's vector width.
+
+*The first slice, as the probes leave it (2026-09-28):*
+1. **A map from assembly to the calculus's loops.** The emitter writes `#line` directives into
+   the C it emits, so that `gcc -O2 -g -S` puts each instruction's `.loc` on the `.nt` line it came
+   from; an innermost loop of the assembly (`tests/kernels/mca.py` finds them) is then the loop of
+   the calculus at those lines, whose trip count and nest the calculus has. Inline markers
+   (`LLVM-MCA-BEGIN`) are out: a `volatile` asm is a barrier and changes what gcc vectorises.
+2. **A cycle count per nest, not per block.** For each innermost loop, llvm-mca's cycles an
+   iteration (its latency-bound steady state) and its block throughput. The loop runs at the latency
+   when its carried chain is long — the loop is the whole of the work, or its trip is above what the
+   core's window overlaps (a few hundred instructions) — and at the throughput when a short chain
+   restarts each outer iteration, as the tiled `matmul`'s does. An iteration may be several laps
+   (gcc's vector width, or two repeats in two lanes): the laps an iteration are read off the loop's
+   step in the assembly, not assumed.
+3. **One constant: the clock.** Time is cycles × 0.257 ns on this core, where `τ`, `τ_s`, `τ_div`
+   and the short lap's rule stood; the memory term stays the calculus's. Checked on the kernels and
+   programs as they are, with no repeat unpaired to suit the model: the test is whether the
+   programs' 0.27 and the kernels' 0.53 are both reached with the one constant.
+4. **Where it goes.** A report column beside `time`, not the cost: a cost is the calculus's and
+   proved; the cycle count is the compiler's and measured once per build. A micro-architectural cost line (what llvm-mca and uiCA
 compute for a block, as default output, applicable because the type system knows what may be
 reassociated); schedules separate from algorithms; search over schedules pruned by the cost model
 and decided by measurement, persisted in `costs.lock`. An own backend is justified here and only
