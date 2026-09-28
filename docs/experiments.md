@@ -827,6 +827,29 @@ the memory, sets its pace (0.54 ns a lap, where two independent `i64` streams ru
 multiply-add's latency, write-backs — was covering for the others, and one of them alone makes the
 model worse; they go in together or not at all. Reverted.
 
+Then streams and write-backs together (cost-model § Time, streams and write-backs), the carried
+add already charged in a short lap. The first run took n-body from 1.77 to 0.93 for the wrong
+reason — 72 MB of write-backs of five bodies that never leave the cache, charged a call at a time
+though the calls' moves were credited as resident — and a call whose lines the caller holds now
+takes none back. With that, over the kernels' 31 runs, the root-mean-square of `ln(measured /
+predicted)` goes from 0.605 to 0.526:
+
+| kernel | before | after |
+|---|---|---|
+| `sum` | 0.88 – 2.09 | 0.87 – 1.75 |
+| `dot` | 0.53 – 0.73 | 1.31 – 1.41 |
+| `saxpy` | 0.61 – 0.96 | 0.71 – 1.25 |
+| `horner` | 0.99 – 1.29 | 1.00 – 1.21 |
+| `transpose` | 1.85 – 3.05 | 1.25 – 2.19 |
+| naive / tiled `matmul` | 0.94 – 1.52 / 0.89 – 0.93 | 0.94 – 1.61 / 0.89 – 0.93 |
+| `struct_aos` / `struct_soa` | 1.40 – 1.68 / 2.97 – 6.36 | 1.46 – 1.53 / 2.79 – 4.88 |
+| `arena` | 0.27 – 1.00 | 0.22 – 0.99 |
+
+`dot` changes side, 1.3–1.4 now: it is paced by its multiply-add's latency, 0.54 ns a lap past the
+cache against two independent streams' 0.29. The Benchmarks Game's programs are at a geometric mean
+of 1.00 (0.47–1.81; n-body 1.75–1.81, spectral-norm 0.96–1.26, mandelbrot 0.47–0.50), the corpus's
+1.33 (`heat` 0.63–0.75 from 0.45–0.51, the rest as before).
+
 ## Programs the project did not write: the Benchmarks Game (2026-09-28)
 
 **Why.** The corpus is the project's own (evaluation.md, threats). Five programs of the Computer

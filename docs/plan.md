@@ -1007,6 +1007,10 @@ a parse's ends and its serial work); no report line changes but the moves of eig
 And an `f64` a short lap carries through an add is a unit of serial work (cost-model § Time, through
 an add): `sum` in L1 1.2× from 3.6×; with no bound on the lap's work it broke `horner` and a tiled
 `matmul`, which overlap the add's wait (experiments.md, a carried add in a short lap).
+Then the memory side (cost-model § Time, streams and write-backs): two streams move at twice one's
+rate and a stored line's write-back is charged — together, since either alone made the kernels
+worse — and the kernels' root-mean-square log error goes from 0.61 to 0.53, the Benchmarks Game to
+a geometric mean of 1.00.
 
 ## M7 — the constant factor
 

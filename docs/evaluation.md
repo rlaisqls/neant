@@ -51,18 +51,19 @@ ns` for work on a chain each lap waits on, fitted on a logistic map, and charged
 short lap carries through an add; and `τ_div = 0.148 ns` more for an
 `f64` division, fitted on a sum of reciprocals. Five constants in all, each
 fitted on one kernel written for it and then held fixed. The geometric mean of measured over predicted
-over the kernels' 31 runs is 1.09 (1.12 before a short lap's carried add) (1.56 before the latency term, when `arena` was 5–31× too low).
+over the kernels' 31 runs is 1.1, and the root-mean-square of the log ratio 0.53 (0.61 before
+streams and write-backs were charged) (1.56 before the latency term, when `arena` was 5–31× too low).
 
 **Kernels** (31 runs, `tests/kernels/roofline.py`):
 
 | where | measured / predicted |
 |---|---|
-| streams past the cache (`sum`, large `saxpy`) | 0.87 – 1.02 |
-| tiled `matmul`, every size | 0.89 – 0.90 |
-| naive `matmul` past the cache | 0.93 – 1.15 |
-| two or three streams (`dot`, small `saxpy`) | 0.60 – 0.71 |
-| `transpose` (a new page a column) | 1.9 – 2.9 |
-| data that fits in `M`, and fresh allocations | up to 6 |
+| streams past the cache (`sum`, large `saxpy`) | 0.87 – 1.25 |
+| tiled `matmul`, every size | 0.89 – 0.93 |
+| naive `matmul` past the cache | 0.94 – 1.16 |
+| two streams, a multiply-add chain (`dot`) | 1.31 – 1.41 |
+| `transpose` (a new page a column) | 1.25 – 2.19 |
+| data that fits in `M`, and fresh allocations | up to 5 |
 | `arena`, a pointer chase past L3, with the latency term | 1.00 |
 | `arena` inside L3 / inside L2 | 0.58 / 0.28 |
 
@@ -80,9 +81,9 @@ changes the timings forced (cost-model § A scan's accesses, § An amortised sca
 | `pid` (read 10⁴–10⁶ integers, control loop) | 1.27 – 1.56 |
 | `csv` (10⁴–10⁵ rows) | 0.81 – 0.95 |
 | `matmul` (n = 100–600) | 1.35 – 2.66 |
-| `heat` (n = 300–900, 50 steps) | 0.45 – 0.51 |
+| `heat` (n = 300–900, 50 steps) | 0.63 – 0.75 |
 
-Every program is within **0.45 to 2.7** of its measured time, geometric mean 1.26 (0.56 before a
+Every program is within **0.6 to 2.6** of its measured time, geometric mean 1.33 (0.56 before a
 parse's per-call line ends were charged once and its serial work was carried through the
 amortised calls; the ends had hidden the dropped serial work, and the error changed side).
 
@@ -90,11 +91,11 @@ amortised calls; the ends had hidden the dropped serial work, and the error chan
 
 | program | measured / predicted |
 |---|---|
-| `nbody` (10⁵–5·10⁶ steps) | 1.76 – 1.79 |
-| `spectral_norm` (n = 200–2000) | 1.26 – 1.33 |
-| `mandelbrot` (n = 200–2000) | 0.50 – 0.59 |
+| `nbody` (10⁵–5·10⁶ steps) | 1.75 – 1.81 |
+| `spectral_norm` (n = 200–2000) | 0.96 – 1.26 |
+| `mandelbrot` (n = 200–2000) | 0.47 – 0.50 |
 
-Geometric mean 1.07, range 0.50 to 1.79 — n-body errs the other way from before, its per-step moves
+Geometric mean 1.00, range 0.47 to 1.81 — n-body errs the other way from before, its per-step moves
 gone (the L2 refills agree) and its compute a little under-counted: laps of four or fewer. Before the scan's
 accesses were charged as a stream, the text readers were 10³ to 10⁶ too high — a bound, and a
 useless time; the first timing is kept in experiments.md because it is what found that.
@@ -171,9 +172,8 @@ constant to tune:
 - **One cache level.** Data inside `M` moves nothing in the model; L2 bandwidth and page faults are
   real (small sizes, up to 6×), and a chase inside L3 waits for L3 rather than memory (`arena`,
   0.28–0.58 there). The latency term closed the chase's gap past the last cache (5–31× → 1.00).
-- **Strides and the TLB** (`transpose`, 2–3×), and **bandwidth that grows with the number of
-  streams** (`dot`, 0.6×): one core reads 30 GB/s from one stream and about 60 from two or more
-  (experiments.md, bandwidth by the number of streams), and a write-back is not counted.
+- **Strides and the TLB** (`transpose`, 1.3–2.2× with its write-backs counted), and **a
+  multiply-add's latency** (`dot`, 1.3–1.4×), which the short-lap rule charges as an add's.
 - **Reuse between neighbouring sites, in part.** A stencil's five reads are three streams now, not
   five (cost-model § Neighbouring sites); the centre row is still counted apart from the rows it
   shares with its neighbours (`heat`, 2× high, from 8×).

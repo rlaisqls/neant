@@ -223,12 +223,21 @@ fn main() {
                         let from_outer = ((m - m3) - (ch - ch3)).max(0.0) / outer.bytes_per_ns + (ch - ch3) / b * outer.ns_per_miss;
                         // a parallel chain's P cores each pull a core's bandwidth, up to what memory gives them all
                         let bw = if span != work { (machine.bytes_per_ns * p).min(bw_max.max(machine.bytes_per_ns)) } else { machine.bytes_per_ns };
-                        let from_memory = (m3 - ch3) / bw + ch3 / b * machine.ns_per_miss;
+                        // two streams or more at once move at twice one's rate, up to what the memory
+                        // gives, and a store's lines go back as well (cost-model § Time, streams); a
+                        // parallel chain's bandwidth is already its cores'
+                        let seq = span == work;
+                        let cc = if !seq || c.conc.pieces.is_empty() { 0.0 } else { eval_one(c, &c.conc, ev, &machine).unwrap_or(0.0) }.min(m3 - ch3).max(0.0);
+                        let wb = if !seq || c.wback.pieces.is_empty() { 0.0 } else { eval_one(c, &c.wback, ev, &machine).unwrap_or(0.0) }.max(0.0);
+                        let bw_cc = (2.0 * bw).min(bw_max.max(bw));
+                        let from_memory = (m3 - ch3 - cc) / bw + cc / bw_cc + wb / bw + ch3 / b * machine.ns_per_miss;
                         // a line on a page of its own waits for the TLB walk first
                         let pg = if c.paged.pieces.is_empty() { 0.0 } else { eval_one(c, &c.paged, ev, &machine).unwrap_or(0.0) }.min(m - ch).max(0.0);
                         let tm = from_outer + from_memory + pg / b * machine.ns_per_page;
                         if ch > 0.0 { print!("  chase {ch:.0} bytes"); }
                         if pg > 0.0 { print!("  paged {pg:.0} bytes"); }
+                        if cc > 0.0 { print!("  streams {cc:.0} bytes"); }
+                        if wb > 0.0 { print!("  write-back {wb:.0} bytes"); }
                         if ser > 0.0 { print!("  serial {ser:.0}"); }
                         if dv > 0.0 { print!("  divs {dv:.0}"); }
                         print!("  time {:.3e} s ({}-bound)", tw.max(tm) / 1e9, if tw >= tm { "work" } else { "moves" });

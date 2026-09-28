@@ -1,7 +1,8 @@
 //! The roofline line of `neant cost --eval` (docs/cost-model.md § Time): the predicted time is the
 //! longer of `work·τ` and `moves/BW`, and says which term bound it. `dot` at a size in cache is
 //! work-bound; at the same size with a tiny `BW` it is moves-bound; with `--tau 1 --bw 1` the time
-//! is exactly `max(work, moves)` nanoseconds, so the arithmetic is pinned, not only the shape.
+//! is exactly `max(work, moves − streams/2)` nanoseconds — `dot`'s two streams move at twice one's
+//! rate (cost-model § Time, streams) — so the arithmetic is pinned, not only the shape.
 
 use std::path::Path;
 use std::process::Command;
@@ -18,6 +19,10 @@ fn eval_line(extra: &[&str]) -> String {
     text.lines().find(|l| l.trim_start().starts_with("at ") && l.contains("time")).unwrap_or_else(|| panic!("no time line in:\n{text}")).to_string()
 }
 
+fn field_or(line: &str, key: &str) -> f64 {
+    if line.contains(key) { field(line, key) } else { 0.0 }
+}
+
 fn field(line: &str, key: &str) -> f64 {
     let at = line.find(key).unwrap_or_else(|| panic!("no `{key}` in {line}")) + key.len();
     line[at..].split_whitespace().next().unwrap().parse().unwrap()
@@ -27,7 +32,10 @@ fn field(line: &str, key: &str) -> f64 {
 fn roofline() {
     let unit = eval_line(&["--tau", "1", "--bw", "1"]);
     let (w, m, t) = (field(&unit, "work "), field(&unit, "moves "), field(&unit, "time "));
-    assert!((t - w.max(m) / 1e9).abs() <= 1e-3 * t, "time {t} is not max(work {w}, moves {m}) ns: {unit}");
+    let (st, wb) = (field_or(&unit, "streams "), field_or(&unit, "write-back "));
+    assert!(st > 0.0, "dot's two streams are not seen: {unit}");
+    let mem = m - st / 2.0 + wb;
+    assert!((t - w.max(mem) / 1e9).abs() <= 1e-3 * t, "time {t} is not max(work {w}, moves {m} − streams {st}/2 + write-back {wb}) ns: {unit}");
     assert!(eval_line(&["--tau", "1", "--bw", "1000000"]).contains("(work-bound)"));
     assert!(eval_line(&["--tau", "0.000001", "--bw", "0.001"]).contains("(moves-bound)"));
 }

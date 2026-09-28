@@ -1005,6 +1005,20 @@ add waits, so the add binds only a lap with less work than one unit of serial wo
 lap, from 1.26 to 0.96: with the rule as it is, spectral-norm stays at 1.26, a lap with more work
 than the add that still waits on something the model does not name.
 
+**Streams and write-backs (2026-09-28).** One core reads one stream at about 30 GB/s and two or
+more at about 60 (experiments.md, bandwidth by the number of streams), and a stored line goes back
+to memory when it leaves the cache, bytes `moves` does not count. Two time-only columns carry this.
+`conc` is the part of `moves` whose site streams in its innermost loop — an address that moves with
+it by less than a line a lap — in a loop with two such streams or more, one per array and a field
+under SoA its own; those bytes move at `min(2·BW, BW_max)`. `wback` is the lines of the stored
+sites, at one stream's rate alone and half their bytes in a loop of two streams or more. A call
+whose lines the caller already holds — credited, or moving nothing because all of it is resident —
+takes nothing back: its stores stay in the cache with it. So the memory term of a sequential
+program is `(moves − chase − conc)/BW + conc/min(2·BW, BW_max) + wback/BW` and the chase's latency.
+`BW` is fitted on one stream, and stands. Alone, the stream term made the kernels worse: `dot`
+waits on its multiply-add's latency as much as on the memory, and `saxpy`'s write-backs had covered
+for its missing stream (experiments.md).
+
 **Divisions (2026-09-28).** An `f64` division is one unit of work to the calculus and several to
 the machine: its throughput is a fraction of an add's. Divisions are counted apart as `divs`,
 composed as work is, and charged `τ_div = 0.148 ns` each beyond their unit, fitted on a sum of
