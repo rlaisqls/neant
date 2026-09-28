@@ -860,6 +860,35 @@ is not predictable. `csv`'s numbers are mostly of one length (a sensor id, a tim
 at a time) and its parse is predicted at 0.9. A branch that data decides is not in the calculus,
 and a per-exit charge would make `csv` wrong to make `fir` right; left as the reason for `fir`'s 2×.
 
+## M7's first probe: llvm-mca against the kernels' laps (2026-09-28)
+
+The calculus's compute term is `work·τ`, and three more constants (`τ_s`, `τ_div`, the short
+lap's carried add) each patch one way a lap is not its work. M7 proposes a per-block cost line from
+a machine model instead. `tests/kernels/mca.py` finds the innermost loops of `gcc -O2 -S` output and
+runs each through llvm-mca 18 (`cortex-x4`, the nearest model to the X925 it has); each kernel was
+timed in L1, a lap's nanoseconds its time over its laps, the empty repeat subtracted:
+
+| kernel | measured ns a lap | llvm-mca cycles an iteration | ns an mca cycle |
+|---|---|---|---|
+| `sum` | 0.254 | 2.01 | 0.126 |
+| `dot` | 0.254 | 2.01 | 0.126 |
+| `horner` | 0.350 | 3.02 | 0.116 |
+| `logistic` | 0.746 | 6.00 | 0.124 |
+| `divide` | 0.254 | 2.03 | 0.125 |
+
+One constant, **0.125 ns an mca cycle**, fits the five kernels the four compute constants were
+fitted on, within 8%: the latency chains the calculus names one by one (the logistic map's
+multiplies, a reduction's add, a division's throughput) are what llvm-mca's scheduler simulates.
+It is about half of `cortex-x4`'s cycle at this core's clock — the X925's latencies are shorter than
+the model's — and it is one constant for the machine, where the calculus needs four.
+
+It does not survive a loop nest. The tiled `matmul`'s inner loop, a 64-long `acc += a·b` chain,
+is 6 cycles an iteration to llvm-mca and measures 0.165 ns (0.027 an mca cycle); the naive one 4.0
+and 0.276 (0.069). llvm-mca runs one loop in its steady state, and the core overlaps a short chain
+with the next outer iteration's — the effect the short-lap rule had to allow for. A cost line for
+M7 would be per nest, not per innermost block: the inner loop's latency against the outer
+iterations' independence, which is what the calculus's affine forms already know.
+
 ## Programs the project did not write: the Benchmarks Game (2026-09-28)
 
 **Why.** The corpus is the project's own (evaluation.md, threats). Five programs of the Computer
