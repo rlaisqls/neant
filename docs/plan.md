@@ -1012,6 +1012,32 @@ rate and a stored line's write-back is charged — together, since either alone 
 worse — and the kernels' root-mean-square log error goes from 0.61 to 0.53, the Benchmarks Game to
 a geometric mean of 1.00.
 
+**Next for reach: a recursion over a cursor (designed, not built).** The parser — `or_level` down to
+`primary`, `block`, `type_expr`, and the cost attribute's `c_*` reader — is the largest block of the
+compiler left unknown, and it is a mutual recursion over a token cursor, not a tree: `st[0]` only
+grows, `bump` moves it one, and every loop reads `toks[st[0]]` before it bumps. The argument that
+bounds it, and what each piece must check:
+
+- *the cursor*: a slot `st[k]` of an `i64` array every member hands on, only ever increased,
+  directly or through callees (a per-function summary: never writes it, only increases it, always
+  increases it by at least one on every path, or increases it or sets an error slot);
+- *own bumps*: an increase the invocation itself makes, directly or through an always-increasing
+  helper, after a read of `toks[st[k]]` in the same invocation — so each happens at a cursor below
+  `toks.len()`, and there are at most `toks.len()` of them in the run;
+- *calls*: every call into the component but an invocation's first is preceded, since its last
+  such call, by an own bump; the first calls, made at the entry position, form an acyclic graph of
+  depth `D` (`or_level → and_level → … → primary`, nine). An advance a callee made does not count:
+  it would let every frame on the stack call again, and the count is no longer linear;
+- *laps*: a loop that calls into the component, or has no other measure, bumps in every lap before
+  its calls, and is charged one lap, its laps counted with the bumps;
+- *the error slot*: an advance-or-flag helper (`expect`) counts as a bump only where the loop or the
+  next call is guarded by the flag being clear, and a member entered with the flag set returns
+  without calling in — the part of the proof that is easiest to get wrong, and why this is written
+  down before it is built.
+
+Then the invocations are at most `D·(toks.len() + 1)` and the laps `toks.len()`, and the component
+costs at most `(D + 1)·(toks.len() + 1)` times its members' own costs, settled as a forest's are.
+
 ## M7 — the constant factor
 
 Prove the asymptote, search the constant. A micro-architectural cost line (what llvm-mca and uiCA
