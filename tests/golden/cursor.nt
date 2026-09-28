@@ -4,6 +4,8 @@
 // `moving_end` moves the end. And a callee's size in a loop that writes it (§ A size read from
 // memory, through a call): `upto` loops to `xs[0]`, and `many` calls it ten times while adding to
 // `xs[0]` — each call reads a value of its own, so `many` is unknown, as `twice` is for `skip_sp`.
+// Where the read is only an unknown callee's argument, it is `_` there: `pass` hands `xs[0]` to
+// `wander`, whose cost is unknown, and `repeat`, calling `pass` so, is costed modulo `wander`.
 
 fn skip_sp(src: &[u8], ds: &mut [i64]) {
     while ds[0] < ds[1] && src[ds[0]] == b' ' { ds[0] = ds[0] + 1; }
@@ -48,6 +50,23 @@ fn many(xs: &mut [i64]) -> i64 {
     t
 }
 
+fn wander(n: i64) -> i64 {
+    let mut k = n;
+    while k != 1 { if k % 2 == 0 { k = k / 2; } else { k = 3 * k + 1; } }
+    k
+}
+
+fn pass(xs: &[i64]) -> i64 { wander(xs[0]) }
+
+fn repeat(xs: &mut [i64]) -> i64 {
+    let mut t = 0;
+    for k in 0..4 {
+        t += pass(xs) + k;
+        xs[0] = xs[0] + 1;
+    }
+    t
+}
+
 fn main() {
     let src = [b' '; 64];
     let mut ds = [0, 5, 0];
@@ -61,4 +80,6 @@ fn main() {
     println(ds[1]);
     let mut xs = [5, 0];
     println(many(&mut xs));
+    let mut ys = [6, 0];
+    println(repeat(&mut ys));
 }

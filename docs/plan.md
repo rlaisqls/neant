@@ -997,7 +997,9 @@ A cursor in a slot, `while ds[0] < ds[1] { …; ds[0] += 1 }`, counts as a varia
 § A size read from memory, a cursor in a slot; golden `cursor`), and writing its test found a hole
 in the committed calculus: a callee's size read from an array its caller's loop writes was the
 first lap's value for every lap. Such calls are unknown now, and the compiler is 95/43/44/96 — nine
-`modulo` lines were wrong, one line more exact and one more bound from the cursor.
+`modulo` lines were wrong, one line more exact and one more bound from the cursor. A stale read
+that is only an unknown callee's argument is `_` there instead (95/45/44/94: the compiler's
+`pol_close(…, pst[1])` everywhere), and a resident call no longer zeroes an unknown callee's moves.
 
 ## M7 — the constant factor
 

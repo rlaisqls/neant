@@ -810,9 +810,14 @@ or a whole element. The compiler moves by one (97 unknown, from 98); golden `slo
 it is handed names the value at the call. In a loop that writes that field or slot, every lap's
 call reads a value of its own, and one atom stood for them all: `many` calling `upto`, which loops
 to `xs[0]`, ten times while adding 100 to `xs[0]`, was costed `30·xs[0] + 90`, the first lap's ten
-times. Such a call is now unknown, and says which array. The compiler loses nine `modulo` lines,
-each through a callee that reads a slot of the state its loop writes (`pst`, `terms`, `wst`); golden
-`cursor`'s `many` and `twice`.
+times. Such a call is now unknown, and says which array — unless the read is only an unknown
+callee's argument, where it is `_`, as an argument a call cannot name is: `pass` hands `xs[0]` to
+`wander`, and `repeat`, calling `pass` while it writes `xs[0]`, is `4·work[wander] + 48`. The
+compiler loses seven `modulo` lines, each through a callee that reads a size from state its loop
+writes (`pols`, `wst`, `cks`); golden `cursor`'s `many`, `twice` and `repeat`.
+
+A call whose every access is resident moves nothing (§ Moves) — but not one that calls an unknown
+callee, which may have arrays of its own: `repeat`'s moves were one `moves[wander]` for four calls.
 
 **A cursor in a slot.** `while ds[0] < ds[1] { …; ds[0] = ds[0] + c }` counts as an induction
 variable does, the slot `ds[k]` of an array of scalars standing for the variable — a parser keeps

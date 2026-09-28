@@ -3390,24 +3390,32 @@ impl<'a, 'b, 'c> Fa<'a, 'b, 'c> {
                 // a size the callee reads from an array it is handed is the value at the call; in a
                 // loop that writes that field or slot, each lap's call reads a value of its own, and
                 // one atom does not stand for them all
-                if !self.loop_writes.is_empty() && !self.replay {
-                    let mut rs = Vec::new();
-                    for c in [&w, &mv, &sp] { for pc in &c.pieces { pc.poly.reads(&mut rs); } }
-                    for r in &rs {
-                        let Root::Param(i, _) = &r.root else { continue };
-                        let Some(rt) = roots.get(*i).copied().flatten() else { continue };
+                if !self.loop_writes.is_empty() {
+                    // the array of the caller's a callee's read looks into, when a loop around the
+                    // call writes what it reads
+                    let stale = |r: &Read| -> Option<LocalId> {
+                        let Root::Param(i, _) = &r.root else { return None };
+                        let rt = roots.get(*i).copied().flatten()?;
                         let fi = r.field.as_ref().and_then(|fname| match self.f.locals[rt].ty.elem() {
                             Some(Ty::Struct(sid)) => self.an.m.structs[*sid].fields.iter().position(|(n, _)| n == fname),
                             _ => None,
                         });
                         let slot = match (&r.field, &r.index) { (None, Some(ix)) => ix.as_const().filter(|c| c.is_int() && c.n >= 0).map(|c| IDX + c.n as usize), _ => None };
-                        let stale = self.loop_writes.iter().any(|lw| lw.get(&rt).is_some_and(|fw| fw.all || match (fi, slot) {
+                        self.loop_writes.iter().any(|lw| lw.get(&rt).is_some_and(|fw| fw.all || match (fi, slot) {
                             (Some(f), _) | (None, Some(f)) => fw.fields.contains(&f),
                             (None, None) => !fw.fields.is_empty(),
-                        }));
-                        if stale {
-                            return Err(Fail::Unknown(format!("calls `{}` in a loop that writes `{}`, which its cost reads as a size", callee.name, self.f.locals[rt].name), e.line));
-                        }
+                        })).then_some(rt)
+                    };
+                    // only an unknown callee's argument, it is `_` there, as an argument the call
+                    // cannot name is; anywhere else the call is unknown
+                    let hide = |p: &Poly| { let mut rs = Vec::new(); p.reads(&mut rs); rs.iter().any(|r| stale(r).is_some()) };
+                    w = w.hide_args(&hide);
+                    mv = mv.hide_args(&hide);
+                    sp = sp.hide_args(&hide);
+                    let mut rs = Vec::new();
+                    for c in [&w, &mv, &sp] { for pc in &c.pieces { pc.poly.reads(&mut rs); } }
+                    if let Some(rt) = rs.iter().find_map(|r| stale(r)) {
+                        return Err(Fail::Unknown(format!("calls `{}` in a loop that writes `{}`, which its cost reads as a size", callee.name, self.f.locals[rt].name), e.line));
                     }
                 }
                 w = w.rename_roots(&rename).subst_many(&map);
@@ -3454,7 +3462,8 @@ impl<'a, 'b, 'c> Fa<'a, 'b, 'c> {
                 }
                 // everything the callee touches is resident here, and it has no array of its own:
                 // the call moves nothing where those residues hold (a loop of calls on a small array)
-                if !declared_only && !opaque && !callee.internal && !feet.is_empty() {
+                // — unless it calls an unknown callee, which may have arrays of its own
+                if !declared_only && !opaque && !callee.internal && !feet.is_empty() && !mv.has_opaque() {
                     let mut conds: Vec<Cond> = Vec::new();
                     let all = feet.iter().all(|(root, lo, hi, exact)| *exact && self.resident.iter().any(|r| {
                         let ok = r.root == *root && super::piece::dominates(lo, &r.lo) && super::piece::dominates(&r.hi, hi);

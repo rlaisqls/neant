@@ -148,7 +148,8 @@ const DECLINED_FOOT: &[(&str, &str)] = &[("arena_tree.nt", "sum"), ("arena_tree.
                                          ("forest.nt", "deep"), ("forest.nt", "deep_list"), ("sentinel.nt", "find"),
                                          ("sentinel.nt", "skip"), ("sentinel.nt", "stuck"),
                                          ("cursor.nt", "skip_sp"), ("cursor.nt", "via_call"),
-                                         ("cursor.nt", "moving_end"), ("cursor.nt", "upto")];
+                                         ("cursor.nt", "moving_end"), ("cursor.nt", "upto"),
+                                         ("cursor.nt", "pass"), ("cursor.nt", "repeat")];
 
 /// The same for the **footprint lower bound**: stated where `neant cost` states one and this pass
 /// states none. A `while` loop is given no loop atom by this pass — only a `for` mints one — so a
@@ -189,13 +190,13 @@ const EXACT_MOVES: usize = 92;
 /// whole of it is resident on return, whitespace-normalised so the report's column padding is not
 /// part of the comparison. Counted over every function, so one that should state no footprint and
 /// states none counts too.
-const EXACT_FOOT: usize = 148;
+const EXACT_FOOT: usize = 149;
 
 /// The same for the **footprint lower bound** — `moves` cannot be less than the distinct bytes a
 /// function's parameter arrays reach. Counted over every function, so a `main` that should have no
 /// bound and gets none counts too: a bound invented where `neant cost` states none is as wrong as
 /// a missing one, and only one of those two shows up as a difference.
-const EXACT_BOUNDS: usize = 189;
+const EXACT_BOUNDS: usize = 192;
 
 
 
