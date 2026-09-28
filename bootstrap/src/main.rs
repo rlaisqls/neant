@@ -47,6 +47,7 @@ fn main() {
     let mut lines = false;
     let mut show_laps = false;
     let mut show_m7 = false;
+    let mut core = m7::X925;
     let mut passthrough: Vec<String> = Vec::new();
     let default_p = std::thread::available_parallelism().map(|n| n.get() as i128).unwrap_or(4);
     let mut machine = cost::Machine { m_bytes: 2 << 20, b_bytes: 64, p_cores: default_p, ns_per_work: 0.0176, bytes_per_ns: 20.8, ns_per_miss: 112.3, ns_per_page: 0.0, ns_per_serial: 0.1554, ns_per_div: 0.1484 };
@@ -97,6 +98,7 @@ fn main() {
             "--eval" => { i += 1; eval = args.get(i).cloned(); }
             "--laps" => show_laps = true,
             "--m7" => { show_m7 = true; }
+            "--core" => { i += 1; core = match args.get(i).map(|s| s.as_str()) { Some("a725") => m7::A725, _ => m7::X925 }; }
             "--apply" => { i += 1; applies.extend(args.get(i).map(|s| s.split(',').map(String::from).collect::<Vec<_>>()).unwrap_or_default()); }
             "--fn" => { i += 1; m_fn = args.get(i).cloned(); }
             "--sizes" => { i += 1; m_sizes = args.get(i).map(|s| s.split(',').filter_map(|x| x.trim().parse().ok()).collect()).unwrap_or_default(); }
@@ -281,7 +283,7 @@ fn main() {
                             if c.laps_dropped {
                                 println!("                     m7 does not apply: a callee's loops have laps this call cannot name (an amortised scan's)");
                             } else {
-                                let (ns, in_bounds) = m7::compute_ns(asm, &laps);
+                                let (ns, in_bounds) = m7::compute_ns(asm, &laps, &core);
                                 // a bound only where the loops it holds for are more than a trace of the time
                                 let bound = in_bounds > 0.01 * ns;
                                 println!("                     m7 {}{:.3e} s (compute {:.3e} s on this core's model, memory {:.3e} s)", if bound { "≤ " } else { "" }, ns.max(tm) / 1e9, ns / 1e9, tm / 1e9);

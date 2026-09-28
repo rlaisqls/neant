@@ -7,13 +7,25 @@
 
 use std::collections::HashMap;
 
-/// One cycle of this core (a Cortex-X925 at 3.9 GHz), in nanoseconds.
-pub const CYCLE_NS: f64 = 0.257;
-/// Instructions in flight: an instruction is not dispatched before the one this many earlier has
-/// finished (the reorder buffer, about).
-const WINDOW: usize = 600;
-/// What a mispredicted loop exit costs, where the trip varies from one entry to the next.
-pub const MISS: f64 = 13.5;
+/// A core: its cycle, its window, what a missed loop exit costs, and its pipes a cycle. The
+/// latencies are the same on both of this machine's kinds (tests/kernels/*.c on CPU 5 and CPU 0).
+#[derive(Clone, Copy)]
+pub struct Core {
+    /// one cycle, in nanoseconds
+    pub cycle_ns: f64,
+    /// instructions in flight: none is dispatched before the one this many earlier has finished
+    window: usize,
+    /// cycles a mispredicted loop exit costs, where the trip varies from one entry to the next
+    miss: f64,
+    dispatch: f64,
+    fp: f64, div: f64, load: f64, store: f64, alu: f64, branch: f64,
+}
+
+/// The Cortex-X925 at 3.9 GHz (CPU 5): measured, the window about.
+pub const X925: Core = Core { cycle_ns: 0.257, window: 600, miss: 13.5, dispatch: 8.0, fp: 4.0, div: 1.0, load: 3.0, store: 2.0, alu: 6.0, branch: 2.0 };
+/// The Cortex-A725 at 2.8 GHz (CPU 0): the floating-point pipes, the divider and the missed exit
+/// measured; the dispatch width, the integer, load and store pipes and the window as Arm publishes them.
+pub const A725: Core = Core { cycle_ns: 0.357, window: 160, miss: 12.7, dispatch: 5.0, fp: 2.0, div: 1.0, load: 2.0, store: 1.0, alu: 4.0, branch: 1.0 };
 
 /// Latency in cycles. A multiply-add's addend joins late: two cycles, where a multiplicand waits four.
 fn latency(op: &str) -> f64 {
@@ -42,12 +54,11 @@ fn addend(op: &str) -> Option<usize> {
 enum Pipe { Fp, Div, Load, Store, Alu, Branch }
 
 impl Pipe {
-    /// How many a cycle.
-    fn width(self) -> f64 {
-        match self { Pipe::Fp => 4.0, Pipe::Div => 1.0, Pipe::Load => 3.0, Pipe::Store => 2.0, Pipe::Alu => 6.0, Pipe::Branch => 2.0 }
+    /// How many a cycle, on `core`.
+    fn width(self, core: &Core) -> f64 {
+        match self { Pipe::Fp => core.fp, Pipe::Div => core.div, Pipe::Load => core.load, Pipe::Store => core.store, Pipe::Alu => core.alu, Pipe::Branch => core.branch }
     }
 }
-const DISPATCH: f64 = 8.0;
 
 struct Ins { op: String, dests: Vec<String>, srcs: Vec<(usize, String)>, pipe: Pipe }
 
@@ -113,11 +124,11 @@ fn parse(line: &str) -> Ins {
 
 /// The steady state of a lap run over and over (the chain it waits on, dependences only, and its
 /// pipes' share, the longer), and one lap's critical path from a cold start.
-pub fn lap_cycles(body: &[String]) -> (f64, f64) {
+pub fn lap_cycles(body: &[String], core: &Core) -> (f64, f64) {
     let ins: Vec<Ins> = body.iter().map(|l| parse(l)).collect();
     let mut counts: HashMap<Pipe, f64> = HashMap::new();
     for i in &ins { *counts.entry(i.pipe).or_default() += 1.0; }
-    let res = counts.iter().map(|(p, n)| n / p.width()).fold(ins.len() as f64 / DISPATCH, f64::max);
+    let res = counts.iter().map(|(p, n)| n / p.width(core)).fold(ins.len() as f64 / core.dispatch, f64::max);
     let mut ready: HashMap<String, f64> = HashMap::new();
     let k = 60;
     let mut finish = Vec::new();
@@ -141,7 +152,7 @@ pub fn lap_cycles(body: &[String]) -> (f64, f64) {
 
 /// Cycles one pass of `trace` takes in the steady state, with the window: eight dispatched a cycle,
 /// none before the one `WINDOW` earlier has finished, each on its pipe when it has a slot.
-pub fn window_cycles(trace: &[String]) -> f64 {
+pub fn window_cycles(trace: &[String], core: &Core) -> f64 {
     let ins: Vec<Ins> = trace.iter().map(|l| parse(l)).collect();
     if ins.is_empty() { return 0.0; }
     let iters = 40;
@@ -154,15 +165,15 @@ pub fn window_cycles(trace: &[String]) -> f64 {
         let from = fin.len();
         for i in &ins {
             let n = fin.len();
-            let gate = if n >= WINDOW { fin[n - WINDOW] } else { 0.0 };
-            disp = (disp + 1.0 / DISPATCH).max(gate);
+            let gate = if n >= core.window { fin[n - core.window] } else { 0.0 };
+            disp = (disp + 1.0 / core.dispatch).max(gate);
             let (mut start, mut done) = (disp, 0.0f64);
             for (at, r) in &i.srcs {
                 let t = *ready.get(r).unwrap_or(&0.0);
                 if addend(&i.op) == Some(*at) { done = done.max(t + 2.0); } else { start = start.max(t); }
             }
             let mut c = start.floor() as i64;
-            while *used.get(&(i.pipe, c)).unwrap_or(&0.0) >= i.pipe.width() { c += 1; }
+            while *used.get(&(i.pipe, c)).unwrap_or(&0.0) >= i.pipe.width(core) { c += 1; }
             *used.entry((i.pipe, c)).or_default() += 1.0;
             let end = (start.max(c as f64) + latency(&i.op)).max(done);
             for r in &i.dests { ready.insert(r.clone(), end); }
@@ -235,7 +246,7 @@ pub fn loops(asm: &str) -> Vec<Loop> {
 /// entry whose trip varies pays a missed exit. Of the assembly loops one source loop became — a
 /// vector loop and its scalar remainder — the widest does the laps.
 /// Also returned: the part of it in loops whose laps are only a bound.
-pub fn compute_ns(asm: &str, laps: &HashMap<(String, u32), (f64, f64, bool, bool)>) -> (f64, f64) {
+pub fn compute_ns(asm: &str, laps: &HashMap<(String, u32), (f64, f64, bool, bool)>, core: &Core) -> (f64, f64) {
     let mut best: HashMap<(String, u32), Loop> = HashMap::new();
     for l in loops(asm) {
         let wider = best.get(&l.at).is_none_or(|b| l.lanes > b.lanes);
@@ -245,17 +256,17 @@ pub fn compute_ns(asm: &str, laps: &HashMap<(String, u32), (f64, f64, bool, bool
     for (at, l) in &best {
         let Some(&(n, entries, varies, bound)) = laps.get(at) else { continue };
         let trip = if entries > 0.0 { n / entries } else { 0.0 };
-        let miss = if varies { entries * MISS } else { 0.0 };
+        let miss = if varies { entries * core.miss } else { 0.0 };
         let cycles = match &l.nest {
             Some((pre, post)) if trip > 0.0 && trip <= 16.0 => {
                 let mut trace = pre.clone();
                 for _ in 0..(trip.round().max(1.0) as usize) { trace.extend(l.body.iter().cloned()); }
                 trace.extend(post.iter().cloned());
-                entries * window_cycles(&trace)
+                entries * window_cycles(&trace, core)
             }
-            _ => n * lap_cycles(&l.body).0 / l.lanes,
+            _ => n * lap_cycles(&l.body, core).0 / l.lanes,
         };
-        let ns = (cycles + miss) * CYCLE_NS;
+        let ns = (cycles + miss) * core.cycle_ns;
         total += ns;
         if bound { bounded += ns; }
     }
@@ -266,31 +277,32 @@ pub fn compute_ns(asm: &str, laps: &HashMap<(String, u32), (f64, f64, bool, bool
 mod tests {
     use super::*;
     fn body(s: &str) -> Vec<String> { s.lines().map(|l| l.to_string()).collect() }
+    fn lap_cycles_x(b: &[String]) -> (f64, f64) { lap_cycles(b, &X925) }
 
     #[test]
     fn an_add_chain_waits_two_cycles() {
-        let (c, _) = lap_cycles(&body("\tfadd\td0, d0, d1\n\tadd\tx0, x0, 1\n\tcmp\tx0, x2\n\tbne\t.L3"));
+        let (c, _) = lap_cycles_x(&body("\tfadd\td0, d0, d1\n\tadd\tx0, x0, 1\n\tcmp\tx0, x2\n\tbne\t.L3"));
         assert!((c - 2.0).abs() < 0.05, "{c}");
     }
 
     #[test]
     fn a_multiply_add_through_its_addend_waits_two() {
-        let (c, _) = lap_cycles(&body("\tldr\td2, [x6, x1, lsl 3]\n\tadd\tx1, x1, 1\n\tfmadd\td1, d2, d0, d1\n\tcmp\tx5, x1\n\tbne\t.L41"));
+        let (c, _) = lap_cycles_x(&body("\tldr\td2, [x6, x1, lsl 3]\n\tadd\tx1, x1, 1\n\tfmadd\td1, d2, d0, d1\n\tcmp\tx5, x1\n\tbne\t.L41"));
         assert!((c - 2.0).abs() < 0.05, "{c}");
-        let (m, _) = lap_cycles(&body("\tfmadd\td1, d1, d0, d2\n\tadd\tx1, x1, 1\n\tcmp\tx5, x1\n\tbne\t.L41"));
+        let (m, _) = lap_cycles_x(&body("\tfmadd\td1, d1, d0, d2\n\tadd\tx1, x1, 1\n\tcmp\tx5, x1\n\tbne\t.L41"));
         assert!((m - 4.0).abs() < 0.05, "{m}");
     }
 
     #[test]
     fn a_vector_accumulator_is_its_addend() {
-        let (c, _) = lap_cycles(&body("\tldr\tq1, [x1]\n\tadd\tx1, x1, 3584\n\tld1r\t{v2.2d}, [x2], 8\n\tfmla\tv0.2d, v2.2d, v1.2d\n\tcmp\tx1, x4\n\tbne\t.L32"));
+        let (c, _) = lap_cycles_x(&body("\tldr\tq1, [x1]\n\tadd\tx1, x1, 3584\n\tld1r\t{v2.2d}, [x2], 8\n\tfmla\tv0.2d, v2.2d, v1.2d\n\tcmp\tx1, x4\n\tbne\t.L32"));
         assert!((c - 2.0).abs() < 0.05, "{c}");
     }
 
     #[test]
     fn independent_adds_are_the_pipes() {
         let lines: String = (0..8).map(|k| format!("\tfadd\td{k}, d{k}, d9\n")).collect::<String>() + "\tsubs\tx0, x0, 1\n\tbne\t.L2";
-        let (c, _) = lap_cycles(&body(&lines));
+        let (c, _) = lap_cycles_x(&body(&lines));
         assert!((c - 2.0).abs() < 0.05, "{c}");
     }
 }

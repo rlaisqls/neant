@@ -195,7 +195,12 @@ where they are a bound (mandelbrot) or amortised away (`fir`), it cannot be appl
 
 ## Threats to validity
 
-- **One machine, one core.** `τ` and `BW` are this core's; nothing here is checked on a second
+- **One machine, two cores.** The same programs on the machine's other core, a Cortex-A725
+  (experiments.md, a second core): the calculus with the X925's constants is 2–4.5× off, refitted on
+  the A725 a log error of 0.34; M7 with the A725's measured table 0.19, the X925's 0.10 — the method
+  carries to a second microarchitecture with its microbenchmarks rerun. Not a second machine: the
+  memory, the compiler and the operating system are the same.
+- **One machine, one core** (as first written). `τ` and `BW` are this core's; nothing here is checked on a second
   machine or with more than one core, where the M5 measurement already showed the roofline is needed
   and did not fit `BW` for it.
 - **The corpus is the project's own.** It was written the way someone would write those programs,

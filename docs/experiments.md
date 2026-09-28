@@ -1016,6 +1016,35 @@ M7 would be per nest, not per innermost block: the inner loop's latency against 
 iterations' independence, which is what the calculus's affine forms already know — and it
 would need the compiler's own vector width and repeat pairing, which only the emitted assembly shows.
 
+## A second core: the Cortex-A725 (2026-09-29)
+
+The machine has ten Cortex-X925 cores and ten Cortex-A725 (CPUs 0–4 and 10–14, 2.8 GHz), a smaller
+design on the same memory. `chains.c`, `tp.c`, `dv.c`, `br.c` and `l2.c` on CPU 0 give the A725 the
+X925's latencies — an add two cycles, a multiply three, a multiply-add four through a multiplicand
+and two through its addend, a division thirteen, a square root fourteen, an L1 hit four — at a
+0.357 ns cycle, with half the floating-point pipes (two a cycle), the divider one a cycle, and a
+missed exit 12.7 cycles. The dispatch width, the integer, load and store pipes and the window are
+Arm's published figures (`m7::A725`; `neant cost --m7 --core a725`). The calculus refitted there
+(`roofline.py fit --cpu 0`): `τ` 0.0604 ns, `BW` 17.0 GB/s, `L` 136 ns, `τ_s` 0.213, `τ_div` 0.062.
+Five programs on CPU 0 (`tests/kernels/a725.py`):
+
+| program | calculus, the X925's constants | calculus, refitted | M7, the X925's model | M7, the A725's |
+|---|---|---|---|---|
+| spectral-norm, n = 2000 | 2.15 | 0.90 | 1.80 | **1.12** |
+| n-body, 10⁶ steps | 4.49 | 1.86 | 2.37 | **1.05** |
+| `matmul`, n = 300 / 600 | 4.42 / 2.17 | 1.29 / 1.39 | 1.52 / 1.64 | **1.09 / 1.18** |
+| `heat`, n = 300 | 2.15 | 0.95 | 1.93 | 0.70 |
+
+`ld.c` then checked the figures taken from Arm: a lap of 27 instructions with eight independent L1
+loads runs at eight instructions a cycle on the X925 and five on the A725 — the dispatch widths the
+model has — and twelve independent integer pairs at four a cycle on the A725, its integer pipes. So
+`heat`'s 0.70 there is not those numbers.
+
+Root-mean-square log error: 1.12, 0.34, 0.62, **0.19**. On a second core the calculus has to be
+refitted (its five constants on five kernels) and then errs about as it did on the first; M7 needs
+the core's table, which the same microbenchmarks give, and errs as little as it did there. `heat`,
+memory-bound, is M7's worst on both: its memory term is still the X925's bandwidth.
+
 ## Programs the project did not write: the Benchmarks Game (2026-09-28)
 
 **Why.** The corpus is the project's own (evaluation.md, threats). Five programs of the Computer
