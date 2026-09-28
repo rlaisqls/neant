@@ -984,6 +984,15 @@ and have no laps the calculus can give — a scan's bound is the text's length, 
 The map works, the core model is fifteen numbers, and the calculus supplies what llvm-mca cannot:
 how many times each loop runs, how often it is entered, and whether its trip varies.
 
+**In the harnesses.** `tests/bench/timing.py` and `tests/corpus/timing.py` print `neant cost --m7`'s
+time beside the calculus's. The Benchmarks Game: n-body 0.93–0.94, spectral-norm 1.01–1.06 (the
+calculus 1.75–1.78 and 1.21–1.26); mandelbrot 0.33–0.39 against 0.42–0.50, its laps the bound. The
+corpus: `matmul` 0.90–1.30 (the calculus 1.34–3.74), `heat` 0.64–0.82 (0.73–0.84); and the parsers
+fall apart — `fir` 2.0–4.1, `pid` 2.2–3.5, `csv` 7.7–22 — because the laps of an amortised parse are
+not the calculus's to give, so M7 counts the loops it can and misses the one that does the work.
+Where every loop's laps are exact, M7 is the better time; where one's are a bound or amortised
+away, the calculus is, and M7 should say it does not apply rather than print a number.
+
 On the kernels (`m7.py` on each at one check size, pinned to CPU 9): where compute binds it agrees
 with the calculus or does better — `divide` 1.04 (0.68), `logistic` 1.04 (1.04), `horner` 1.14 (1.04);
 where memory binds it is the calculus's memory term and says the same (`sum` 0.94, `dot` 1.30,

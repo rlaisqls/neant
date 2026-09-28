@@ -30,8 +30,8 @@ def main():
     corpus.run([str(corpus.NEANT), "build", str(empty), "--unchecked", "-o", str(work / "empty")])
     base = corpus.wall([str(work / "empty")], a.cpu, a.runs)
     print(f"baseline {base*1e3:.2f} ms, cpu {a.cpu}")
-    print(f"  {'program':<14} {'size':>9} {'bound':>6} {'pred ms':>10} {'meas ms':>10} {'meas/pred':>9}")
-    ratios = []
+    print(f"  {'program':<14} {'size':>9} {'bound':>6} {'pred ms':>10} {'meas ms':>10} {'meas/pred':>9} {'m7 ms':>9} {'meas/m7':>8}")
+    ratios, ratios_m7 = [], []
     for name, (sizes, make) in PROGRAMS.items():
         nt = HERE / name / "main.nt"
         binary = work / name
@@ -44,9 +44,15 @@ def main():
                 print(f"  {name:<14} {s:>9}   no prediction"); continue
             w, mv, pt, bound = p
             ratios.append(t / pt)
-            print(f"  {name:<14} {s:>9} {bound:>6} {pt*1e3:>10.3f} {t*1e3:>10.2f} {t/pt:>9.2f}")
+            m7 = corpus.predict_m7(nt, env)
+            if m7: ratios_m7.append(t / m7)
+            m7s = f"{m7*1e3:>9.3f} {t/m7:>8.2f}" if m7 else f"{'—':>9} {'—':>8}"
+            print(f"  {name:<14} {s:>9} {bound:>6} {pt*1e3:>10.3f} {t*1e3:>10.2f} {t/pt:>9.2f} {m7s}")
     g = math.exp(sum(math.log(x) for x in ratios) / len(ratios))
     print(f"\ngeometric mean measured/predicted over {len(ratios)} runs: {g:.2f}  (range {min(ratios):.3g} … {max(ratios):.3g})")
+    if ratios_m7:
+        g7 = math.exp(sum(math.log(x) for x in ratios_m7) / len(ratios_m7))
+        print(f"geometric mean measured/m7 over {len(ratios_m7)} runs: {g7:.2f}  (range {min(ratios_m7):.3g} … {max(ratios_m7):.3g})")
 
 if __name__ == "__main__":
     main()

@@ -50,6 +50,16 @@ PROGRAMS = {
     "csv":    ([1_000, 10_000, 100_000], csv),
 }
 
+def predict_m7(nt, env):
+    """M7's time for `main` (`neant cost --eval … --m7`, cost-model § M7's line), or None."""
+    ev = ",".join(f"{k}={v}" for k, v in env.items()) + ",B=64"
+    out = run([str(NEANT), "cost", nt.name, "--eval", ev, "--m7"], cwd=nt.parent).stdout
+    sec = out.split("\nmain", 1)
+    if len(sec) < 2: return None
+    main = re.split(r"\n(?=\S)", sec[1], maxsplit=1)[0]
+    m = re.search(r" m7 (\S+) s", main)
+    return float(m.group(1)) if m else None
+
 def predict(nt, env):
     ev = ",".join(f"{k}={v}" for k, v in env.items()) + ",B=64"
     out = run([str(NEANT), "cost", str(nt), "--eval", ev]).stdout
@@ -80,8 +90,8 @@ def main():
     run([str(NEANT), "build", str(empty), "--unchecked", "-o", str(work / "empty")])
     base = wall([str(work / "empty")], a.cpu, a.runs)
     print(f"baseline {base*1e3:.2f} ms, cpu {a.cpu}")
-    print(f"  {'program':<8} {'size':>9} {'pred work':>11} {'pred bytes':>11} {'bound':>6} {'pred ms':>10} {'meas ms':>10} {'meas/pred':>9}")
-    ratios = []
+    print(f"  {'program':<8} {'size':>9} {'pred work':>11} {'pred bytes':>11} {'bound':>6} {'pred ms':>10} {'meas ms':>10} {'meas/pred':>9} {'m7 ms':>9} {'meas/m7':>8}")
+    ratios, ratios_m7 = [], []
     for name in a.programs or list(PROGRAMS):
         sizes, make = PROGRAMS[name]
         nt = HERE / name / "main.nt"
@@ -97,11 +107,18 @@ def main():
                 continue
             w, mv, pt, bound = p
             # a run shorter than the baseline's noise has no ratio worth averaging
-            if t > 0.5e-3: ratios.append(t / pt)
-            print(f"  {name:<8} {s:>9} {w:>11.3e} {mv:>11.3e} {bound:>6} {pt*1e3:>10.3f} {t*1e3:>10.2f} {t/pt:>9.2f}")
+            m7 = predict_m7(nt, env)
+            if t > 0.5e-3:
+                ratios.append(t / pt)
+                if m7: ratios_m7.append(t / m7)
+            m7s = f"{m7*1e3:>9.3f} {t/m7:>8.2f}" if m7 else f"{'—':>9} {'—':>8}"
+            print(f"  {name:<8} {s:>9} {w:>11.3e} {mv:>11.3e} {bound:>6} {pt*1e3:>10.3f} {t*1e3:>10.2f} {t/pt:>9.2f} {m7s}")
     if ratios:
         g = math.exp(sum(math.log(x) for x in ratios) / len(ratios))
         print(f"\ngeometric mean measured/predicted over {len(ratios)} runs: {g:.2f}  (range {min(ratios):.3g} … {max(ratios):.3g})")
+    if ratios_m7:
+        g7 = math.exp(sum(math.log(x) for x in ratios_m7) / len(ratios_m7))
+        print(f"geometric mean measured/m7 over {len(ratios_m7)} runs: {g7:.2f}  (range {min(ratios_m7):.3g} … {max(ratios_m7):.3g})")
     print(f"inputs and binaries in {work}")
 
 if __name__ == "__main__":
