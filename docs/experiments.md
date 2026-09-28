@@ -911,6 +911,13 @@ loop's throughput at once; which calibration is right depends on which the code 
 the per-nest cost line M7 is for. The defaults stay as fitted; the unpaired set is
 `--tau 0.0291 --taus 0.3102 --tdiv 0.3447`.
 
+**Step 1 of the slice, and one loop of a program.** `neant emit --lines` puts `#line L "file"`
+before each loop, and `mca.py` names the loop each innermost assembly loop is (the `.loc` of its
+branch back). On spectral-norm, `main.nt:24` — `for j in 0..v.len() { s += eval_a(j, i) * v[j] }` —
+is a two-lane loop (`.2d`), 4.03 llvm-mca cycles an iteration, two laps an iteration: 2.01 cycles,
+**0.518 ns a lap** at the 0.257 ns cycle. Measured, 87 ms over the 1.6·10⁸ laps of that loop at
+n = 2000: **0.54 ns**. Within 4% on the program the calculus has at 1.26, where no fit was made.
+
 It does not survive a loop nest. The tiled `matmul`'s inner loop, a 64-long `acc += a·b` chain,
 is 6 cycles an iteration to llvm-mca and measures 0.165 ns (0.027 an mca cycle); the naive one 4.0
 and 0.276 (0.069). llvm-mca runs one loop in its steady state, and the core overlaps a short chain

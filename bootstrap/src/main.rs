@@ -2,7 +2,8 @@
 //!
 //!   neant build f.nt [-o out] [--unchecked]   compile to a binary via the C compiler
 //!   neant run   f.nt [--unchecked] [-- args]  build to a temp file and run it
-//!   neant emit  f.nt [--unchecked]            print the generated C
+//!   neant emit  f.nt [--unchecked] [--lines]  print the generated C; `--lines` puts a `#line` before
+//!                                             each loop, the `.nt` line it came from (plan § M7)
 //!   neant check f.nt                          parse and type-check only
 //!   neant cost  f.nt [-M bytes] [-B bytes] [-P cores] [--tau ns] [--bw GB/s] [--lat ns] [--tlb ns] [--taus ns] [--tdiv ns] [--bwmax GB/s] [--M3 bytes] [--bw2 GB/s] [--lat3 ns] [--eval n=..,..]
 //!                                             infer work, moves and span for every function
@@ -42,6 +43,7 @@ fn main() {
     let mut file: Option<PathBuf> = None;
     let mut out: Option<PathBuf> = None;
     let mut checked = true;
+    let mut lines = false;
     let mut passthrough: Vec<String> = Vec::new();
     let default_p = std::thread::available_parallelism().map(|n| n.get() as i128).unwrap_or(4);
     let mut machine = cost::Machine { m_bytes: 2 << 20, b_bytes: 64, p_cores: default_p, ns_per_work: 0.0176, bytes_per_ns: 20.8, ns_per_miss: 112.3, ns_per_page: 0.0, ns_per_serial: 0.1554, ns_per_div: 0.1484 };
@@ -74,6 +76,7 @@ fn main() {
         match args[i].as_str() {
             "-o" => { i += 1; out = args.get(i).map(PathBuf::from); }
             "--unchecked" => checked = false,
+            "--lines" => lines = true,
             "--check" => lock_check = true,
             "-M" => { i += 1; machine.m_bytes = parse_bytes(args.get(i)); }
             "-B" => { i += 1; machine.b_bytes = parse_bytes(args.get(i)); }
@@ -153,7 +156,7 @@ fn main() {
     }
     // the layout of every struct array, chosen before anything is costed or emitted
     let layouts = cost::analyze::choose_layouts(&mut module, &machine);
-    let opts = emit_c::Options { checked };
+    let opts = emit_c::Options { checked, lines };
     // `#[cost]` is checked on every command: a broken bound is a build error
     if cmd != "cost" {
         let costs = cost::analyze(&module, &machine);
@@ -283,7 +286,10 @@ fn main() {
                     Err(e) => { eprintln!("{}: `{name}` is not a SCoP: {}", file.display(), sources.relabel(&e.to_string())); process::exit(1); }
                 }
             }
-            None => print!("{}", sources.patch_c(&emit_c::emit(&module, &opts))),
+            None => {
+                let c = sources.patch_c(&emit_c::emit(&module, &opts));
+                print!("{}", if lines { sources.place_lines(&c) } else { c });
+            }
         },
         "build" => {
             let out = out.unwrap_or_else(|| file.with_extension(""));
@@ -354,8 +360,8 @@ fn main() {
                 };
                 let run_args: Vec<String> = probed.as_ref().map_or(vec![], |(p, _)| p.args.clone());
                 let bin = dir.join(format!("m{n}")); let bbin = dir.join(format!("b{n}"));
-                if let Err(e) = cc(&emit_c::emit(&drv, &emit_c::Options { checked: false }), &bin, &file) { eprintln!("{e}"); process::exit(1); }
-                if let Err(e) = cc(&emit_c::emit(&base, &emit_c::Options { checked: false }), &bbin, &file) { eprintln!("{e}"); process::exit(1); }
+                if let Err(e) = cc(&emit_c::emit(&drv, &emit_c::Options { checked: false, lines: false }), &bin, &file) { eprintln!("{e}"); process::exit(1); }
+                if let Err(e) = cc(&emit_c::emit(&base, &emit_c::Options { checked: false, lines: false }), &bbin, &file) { eprintln!("{e}"); process::exit(1); }
                 let (ins, ref_) = run_perf(&bin, &run_args);
                 let (bins, bref) = run_perf(&bbin, &run_args);
                 let ins = ins.saturating_sub(bins); let ref_ = ref_.saturating_sub(bref);

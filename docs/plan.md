@@ -1059,7 +1059,7 @@ on a loop nest, whose short chains the core overlaps across outer iterations: th
 be per nest, and read off the emitted assembly's vector width.
 
 *The first slice, as the probes leave it (2026-09-28):*
-1. **A map from assembly to the calculus's loops.** The emitter writes `#line` directives into
+1. **A map from assembly to the calculus's loops** *(done: `neant emit --lines`, `mca.py`)*. The emitter writes `#line` directives into
    the C it emits, so that `gcc -O2 -g -S` puts each instruction's `.loc` on the `.nt` line it came
    from; an innermost loop of the assembly (`tests/kernels/mca.py` finds them) is then the loop of
    the calculus at those lines, whose trip count and nest the calculus has. Inline markers

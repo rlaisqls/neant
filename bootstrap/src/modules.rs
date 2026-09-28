@@ -29,6 +29,21 @@ impl Sources {
         self.files.iter().find(|(_, base, n)| line > *base && line <= base + n).map(|(p, base, _)| (p.as_str(), line - base))
     }
 
+    /// `neant emit --lines`: each `#line N` the emitter wrote with a line of the joined source becomes
+    /// `#line L "file"`, the file and line it came from, so the assembly's `.loc`s name them.
+    pub fn place_lines(&self, c: &str) -> String {
+        c.lines().map(|l| {
+            let t = l.trim_start();
+            match t.strip_prefix("#line ").and_then(|n| n.trim().parse::<u32>().ok()) {
+                Some(n) => {
+                    let (p, line) = self.place(n).map_or((self.root.as_str(), n), |(p, l)| (p, l));
+                    format!("{}#line {line} \"{p}\"", &l[..l.len() - t.len()])
+                }
+                None => l.to_string(),
+            }
+        }).collect::<Vec<_>>().join("\n") + "\n"
+    }
+
     fn at(&self, line: u32, col: u32) -> String {
         match self.place(line) { Some((p, l)) => format!("{p}:{l}:{col}"), None => format!("{}:{line}:{col}", self.root) }
     }

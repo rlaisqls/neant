@@ -11,6 +11,9 @@ use crate::ir::*;
 pub struct Options {
     /// Emit a bounds check on every index. Off for measurement.
     pub checked: bool,
+    /// Put a `#line` directive before every loop, the `.nt` line it came from, so that the
+    /// assembly's `.loc`s name the source loop (plan § M7, a map from assembly to the calculus's loops).
+    pub lines: bool,
 }
 
 enum CVal {
@@ -454,6 +457,7 @@ static void nt_println_f64(double v) {
                 let s = self.expr(start).scalar();
                 let e = self.expr(end).scalar();
                 let hi = self.fresh("end");
+                if self.opts.lines { self.line(&format!("#line {}", start.line.max(end.line))); }
                 self.line(&format!("for (int64_t {i} = {s}, {hi} = {e}; {i} < {hi}; {i}++) {{"));
                 self.indent += 1;
                 self.block_body(body, Target::Discard);
@@ -463,6 +467,7 @@ static void nt_println_f64(double v) {
             Stmt::ParFor { var, end, body, acc, op } => {
                 let i = self.local_name(*var);
                 let e = self.expr(end).scalar();
+                if self.opts.lines { self.line(&format!("#line {}", end.line)); }
                 let hi = self.fresh("end");
                 let accnm = self.local_name(*acc);
                 let opstr = match op { ParOp::Add => "+", ParOp::Or => "||", ParOp::And => "&&" };
@@ -476,8 +481,9 @@ static void nt_println_f64(double v) {
                 self.indent -= 1;
                 self.line("}");
             }
-            Stmt::While { cond, body, .. } => {
+            Stmt::While { cond, body, line, .. } => {
                 let c = self.expr(cond).scalar();
+                if self.opts.lines { self.line(&format!("#line {line}")); }
                 self.line(&format!("while ({c}) {{"));
                 self.indent += 1;
                 self.block_body(body, Target::Discard);
