@@ -941,6 +941,24 @@ the gap is the core against the model it is not (`cortex-x4`), on work that is n
 on a model that is not this core's is not yet better than the calculus's four constants on programs,
 and M7 waits on a core model, not on the map, which works.
 
+**A model of this core.** `tp.c`'s eight independent chains of each operation measure what the
+`cortex-x4` model does not have: `f64` adds four a cycle (the model allows two), a multiply-add
+through its addend two cycles, a division thirteen. `m7.py --own` replaces llvm-mca with that
+table and a lap that is the longer of its carried chain (dependences only, sixty laps simulated)
+and its pipes' share (four floating-point, three loads, two stores, six integer, eight in all):
+
+| program | llvm-mca | this core's model | + an entry's critical path | the calculus |
+|---|---|---|---|---|
+| spectral-norm | 0.53 | **1.06** | 1.06 | 1.28 |
+| n-body | 0.65 | 2.34 | 0.45 | 1.81 |
+
+Spectral-norm's loop is long, its laps overlap, and the model has it. N-body's inner loop is
+entered 5·10⁶ times for 10⁷ laps, two a time: a lap's own critical path, a square root and a
+division, is fifty cycles from a cold start and 4.5 in the steady state, and the core runs it in
+12.8 — part of each entry overlapped with the last, by as much as its window and the memory chain
+through the bodies' velocities allow. Neither bound is the time; the overlap between entries is the
+next term, and it is the one the out-of-order window sets.
+
 It does not survive a loop nest. The tiled `matmul`'s inner loop, a 64-long `acc += a·b` chain,
 is 6 cycles an iteration to llvm-mca and measures 0.165 ns (0.027 an mca cycle); the naive one 4.0
 and 0.276 (0.069). llvm-mca runs one loop in its steady state, and the core overlaps a short chain

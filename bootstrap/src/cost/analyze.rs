@@ -88,10 +88,10 @@ pub struct FuncCost {
     /// core runs two streams at twice one stream's rate, near what the memory gives (cost-model
     /// § Time, streams). Read only by a time.
     pub conc: Cost,
-    /// How many times each loop's body runs in one call, by the loop's line (the line
+    /// How many times each loop is entered and its body runs in one call, by the loop's line (the line
     /// `neant emit --lines` puts before it): the laps a per-loop cycle count is multiplied by
     /// (plan § M7). Composed through calls; read only by `--eval`.
-    pub laps: Vec<(u32, Poly)>,
+    pub laps: Vec<(u32, Poly, Poly)>,
     /// Bytes a store's lines take back to memory, a write-back `moves` does not count, in one
     /// stream's bytes: in a loop of two streams or more, half (cost-model § Time, streams).
     pub wback: Cost,
@@ -881,7 +881,7 @@ struct Fa<'a, 'b, 'c> {
     /// an access being walked is a store
     storing: bool,
     /// each loop's laps, by line, and the line of the loop about to be entered
-    laps: Vec<(u32, Poly)>,
+    laps: Vec<(u32, Poly, Poly)>,
     pending_line: u32,
     /// the divisions, framed the same way
     divs: Cost,
@@ -1358,10 +1358,11 @@ impl<'a, 'b, 'c> Fa<'a, 'b, 'c> {
     }
     /// Open a loop: push it and start a fresh accumulator frame for its body.
     fn enter_loop(&mut self, lp: Loop) {
+        let entries = self.times_here();
         self.loop_recs.push(LoopRec { var: lp.var, atom: lp.atom, trip: lp.trip.clone(), lo: lp.lo.clone(), step: lp.step, monotone: lp.monotone });
         let lp = Loop { id: self.loop_recs.len() - 1, ..lp };
         self.loops.push(lp);
-        if !self.replay && self.pending_line > 0 { let t = self.times_here(); self.laps.push((self.pending_line, t)); }
+        if !self.replay && self.pending_line > 0 { let t = self.times_here(); self.laps.push((self.pending_line, entries, t)); }
         self.push_frame();
     }
     fn push_frame(&mut self) {
@@ -3682,9 +3683,10 @@ impl<'a, 'b, 'c> Fa<'a, 'b, 'c> {
                     if !declared_only && !opaque {
                         let here = self.times_here();
                         let hide = |p: &Poly| unnamed.iter().any(|(i, _)| p.mentions(*i));
-                        for (line, c) in &callee.laps {
-                            if hide(c) { continue; }
-                            self.laps.push((*line, c.rename_roots(&rename).subst_many(&map).mul(&here)));
+                        for (line, e, c) in &callee.laps {
+                            if hide(c) || hide(e) { continue; }
+                            let sub = |p: &Poly| p.rename_roots(&rename).subst_many(&map).mul(&here);
+                            self.laps.push((*line, sub(e), sub(c)));
                         }
                     }
                     // a square root runs on the divider: counted as a division (cost-model § Time, divisions)
