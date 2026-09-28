@@ -172,7 +172,8 @@ constant to tune:
   real (small sizes, up to 6×), and a chase inside L3 waits for L3 rather than memory (`arena`,
   0.28–0.58 there). The latency term closed the chase's gap past the last cache (5–31× → 1.00).
 - **Strides and the TLB** (`transpose`, 2–3×), and **bandwidth that grows with the number of
-  streams** (`dot`, 0.6×).
+  streams** (`dot`, 0.6×): one core reads 30 GB/s from one stream and about 60 from two or more
+  (experiments.md, bandwidth by the number of streams), and a write-back is not counted.
 - **Reuse between neighbouring sites, in part.** A stencil's five reads are three streams now, not
   five (cost-model § Neighbouring sites); the centre row is still counted apart from the rows it
   shares with its neighbours (`heat`, 2× high, from 8×).

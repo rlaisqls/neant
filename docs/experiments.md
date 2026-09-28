@@ -799,6 +799,26 @@ spectral-norm back at 1.26), the corpus's 1.25. The check's sizes are all past L
 barely move; the kernel it fixes is the one the fit's sizes skip. `roofline.py` now reads a
 prediction line whatever time terms it carries.
 
+## Bandwidth by the number of streams (2026-09-28, measured, not yet in the model)
+
+`BW` is one constant, fitted on `sum`'s one stream (20.8 GB/s with the setup's first touch of the
+pages charged). `dot` (two read streams) runs at 0.60–0.71 of the prediction and `saxpy` at 0.57–0.98,
+so a loop of `k` i64 read streams over 6.4·10⁶ elements was timed on CPU 5, 40 repeats, its setup's
+time subtracted:
+
+| streams | 1 | 2 | 3 | 4 | 6 |
+|---|---|---|---|---|---|
+| GB/s | 30.1 | 55.8 | 60.1 | 62.8 | 59.1 |
+
+One core's bandwidth is `min(k·30, ≈60)` GB/s: a second stream doubles it, and two streams nearly
+saturate the memory — the ten cores' aggregate is 65.6 (§ Cores). An `f64` sum and an `i64` sum
+stream at the same 27 GB/s, so the one-stream limit is the memory's and not the add's. A copy (one
+read, one write stream) moves 70 GB/s counting its write-back, 47 without. So the model's `moves/BW`
+is right for one stream and a factor of about two too slow for two or more — `dot`'s 0.7 — and it
+does not count a written line's write-back, which `saxpy`'s 0.98 at size hides by the two errors
+cancelling. The fix is per loop, `moves/min(k·BW₁, BW_core)` with write-backs counted, which moves
+`BW` itself and every prediction; it is left for a pass of its own.
+
 ## Programs the project did not write: the Benchmarks Game (2026-09-28)
 
 **Why.** The corpus is the project's own (evaluation.md, threats). Five programs of the Computer
