@@ -1032,15 +1032,11 @@ where it says `exact`, on programs generated to find the case where it is.
 
 **Do.**
 
-1. **Thresholds before numbers.** A section of evaluation.md is written, and committed, before any
-   held-out program is costed or timed: for each question the number that counts as holding, the
-   number that counts as failing, and what is reported in between. Proposed, to be fixed there:
-   time within 2× geometric mean and 4× every run; ranking a Kendall τ of 0.8 or better and above
-   the work-only baseline's; reach, the stated share (exact, modulo and bound) at least the
-   compiler's own and exact no lower than the C baseline's; trust, no wrong `exact` in the
-   generated suite. The roofline's constants and the calculus are frozen at a commit named in the same
-   section; a rule added afterwards is measured on the held-out set as a separate row, never
-   folded into the first.
+1. **Thresholds before numbers.** docs/heldout.md is written, and committed, before any held-out
+   program is costed or timed: for each question the number that counts as holding, the number
+   that counts as failing, and what is reported in between. The roofline's constants and the
+   calculus are frozen at a commit named there; a rule added afterwards is measured on the
+   held-out set as a separate row, never folded into the first.
 2. **A held-out corpus.** Ported with its published structure, the port committed before it is
    costed, its text never edited to suit the rules, every refusal kept as a rejected case with its
    cause, as `tests/corpus` does:
@@ -1069,10 +1065,11 @@ where it says `exact`, on programs generated to find the case where it is.
    that turns it off, and the held-out reach and time re-measured with each off. A rule that
    moves nothing on the held-out set is reported as fitted to the corpus it was found on.
 5. **A second and a third machine.** One x86 server core and one other ARM core (an Apple M-series
-   or a Neoverse). The constants refitted there by the kernels each was fitted on here and nothing else,
-   then every table re-taken: the claim is "two constants per machine", and a second machine is
-   where it is tested. The byte counter differs per machine (`l2d_cache_refill` here, LLC or
-   L2 misses on x86); which one is used, and why, is written down before the sweep. Past one
+   or a Neoverse). The constants refitted there by the kernels each was fitted on here and
+   nothing else, then every table re-taken: the claim is "two constants per machine", and a
+   second machine is where it is tested. The byte counter differs per machine
+   (`l2d_cache_refill` here, LLC or L2 misses on x86); which one is used, and why, is written
+   down before the sweep. Past one
    core: the M5 kernels and the `.par()` programs at P = 1…cores on both.
 6. **Ranking, the claim a user acts on.** For each corpus and held-out program, two to four
    versions a person would plausibly write (AoS and SoA, tiled and not, a copy and in place, a
