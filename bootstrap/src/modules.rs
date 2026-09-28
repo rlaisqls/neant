@@ -25,6 +25,9 @@ impl Sources {
     pub fn multi(&self) -> bool { self.multi }
 
     /// A global line as `(path, the file's own line)`.
+    /// The root file's path, for a line of a program of one file.
+    pub fn root_name(&self) -> String { self.root.clone() }
+
     pub fn place(&self, line: u32) -> Option<(&str, u32)> {
         self.files.iter().find(|(_, base, n)| line > *base && line <= base + n).map(|(p, base, _)| (p.as_str(), line - base))
     }

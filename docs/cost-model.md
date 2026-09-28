@@ -1019,6 +1019,14 @@ program is `(moves − chase − conc)/BW + conc/min(2·BW, BW_max) + wback/BW` 
 waits on its multiply-add's latency as much as on the memory, and `saxpy`'s write-backs had covered
 for its missing stream (experiments.md).
 
+**M7's line (2026-09-29).** `neant cost --eval … --m7` adds `m7 T s`: the C the compiler emits is
+compiled to assembly (`cc -O2 -g -S`, unchecked, a `#line` before each loop), each innermost loop
+of it is the calculus's loop at its line, and its cycles on a model of this core (`src/m7.rs`:
+latencies and pipes measured by `tests/kernels/*.c`, a short loop's entries simulated inside the
+loop around it with an instruction window, a missed exit an entry where the trip varies) times its
+laps and entries make the compute; `T` is the longer of that and the memory term above. It is an
+estimate of the constant, next to the cost and never in it; experiments.md, M7.
+
 **Divisions (2026-09-28).** An `f64` division is one unit of work to the calculus and several to
 the machine: its throughput is a fraction of an add's. Divisions are counted apart as `divs`,
 composed as work is, and charged `τ_div = 0.148 ns` each beyond their unit, fitted on a sum of

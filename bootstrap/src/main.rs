@@ -26,6 +26,7 @@ mod input;
 mod ir;
 mod lex;
 mod lsp;
+mod m7;
 mod modules;
 mod parse;
 mod types;
@@ -45,6 +46,7 @@ fn main() {
     let mut checked = true;
     let mut lines = false;
     let mut show_laps = false;
+    let mut show_m7 = false;
     let mut passthrough: Vec<String> = Vec::new();
     let default_p = std::thread::available_parallelism().map(|n| n.get() as i128).unwrap_or(4);
     let mut machine = cost::Machine { m_bytes: 2 << 20, b_bytes: 64, p_cores: default_p, ns_per_work: 0.0176, bytes_per_ns: 20.8, ns_per_miss: 112.3, ns_per_page: 0.0, ns_per_serial: 0.1554, ns_per_div: 0.1484 };
@@ -94,6 +96,7 @@ fn main() {
             "--lat3" => { i += 1; outer.ns_per_miss = args.get(i).and_then(|s| s.parse().ok()).unwrap_or(outer.ns_per_miss); }
             "--eval" => { i += 1; eval = args.get(i).cloned(); }
             "--laps" => show_laps = true,
+            "--m7" => { show_m7 = true; }
             "--apply" => { i += 1; applies.extend(args.get(i).map(|s| s.split(',').map(String::from).collect::<Vec<_>>()).unwrap_or_default()); }
             "--fn" => { i += 1; m_fn = args.get(i).cloned(); }
             "--sizes" => { i += 1; m_sizes = args.get(i).map(|s| s.split(',').filter_map(|x| x.trim().parse().ok()).collect()).unwrap_or_default(); }
@@ -177,6 +180,12 @@ fn main() {
             // for a time's second level, the whole analysis again with `M` the outer cache's size:
             // a size known here decides which regime holds at analysis time, so the cost at one
             // `M` cannot be re-read at another (docs/cost-model.md § Time, a second level)
+            // M7's cost line (plan § M7): the assembly the C compiler makes of the program, unchecked
+            // as a measured build is, each loop at the `.nt` line `#line` gives it
+            let asm = if show_m7 && eval.is_some() {
+                let c = sources.place_lines(&sources.patch_c(&emit_c::emit(&module, &emit_c::Options { checked: false, lines: true })));
+                match m7_asm(&c) { Ok(a) => Some(a), Err(e) => { eprintln!("--m7: {e}"); None } }
+            } else { None };
             let outer_costs = if eval.is_some() && outer.on {
                 let m3c = cost::Machine { m_bytes: outer.bytes, ..machine };
                 Some(cost::analyze(&module, &m3c))
@@ -255,6 +264,21 @@ fn main() {
                             }
                         }
                         println!();
+                        // M7's time: the loops' cycles on this core's model, times their laps, beside the
+                        // calculus's memory term — the longer
+                        if let Some(asm) = &asm {
+                            let mut laps: std::collections::HashMap<(String, u32), (f64, f64, bool)> = std::collections::HashMap::new();
+                            for (line, e, p, vary) in &c.laps {
+                                let Some(v) = eval_one(c, &cost::Cost::poly(p.clone()), ev, &machine) else { continue };
+                                let n = eval_one(c, &cost::Cost::poly(e.clone()), ev, &machine).unwrap_or(0.0);
+                                let Some((file, l)) = sources.place(*line).map(|(f, l)| (f.to_string(), l)).or(Some((sources.root_name(), *line))) else { continue };
+                                let key = (std::path::Path::new(&file).file_name().map_or(file.clone(), |n| n.to_string_lossy().to_string()), l);
+                                let x = laps.entry(key).or_insert((0.0, 0.0, false));
+                                x.0 += v; x.1 += n; x.2 |= *vary;
+                            }
+                            let ns = m7::compute_ns(asm, &laps);
+                            println!("                     m7 {:.3e} s (compute {:.3e} s on this core's model, memory {:.3e} s)", ns.max(tm) / 1e9, ns / 1e9, tm / 1e9);
+                        }
                         // each loop's laps at these sizes, by the file and line `emit --lines` gives it
                         if show_laps {
                             println!("                     memory {:.3e} s", tm / 1e9);
@@ -615,6 +639,20 @@ fn lex_kind_number(t: &lex::Tok) -> i32 {
         Amp => 51, AmpAmp => 52, Pipe => 53, PipePipe => 54, Bang => 55, Hash => 56,
         Eof => 57,
     }
+}
+
+/// The assembly `cc -O2 -g -S` makes of `c`, for M7's cost line.
+fn m7_asm(c: &str) -> Result<String, String> {
+    let dir = std::env::temp_dir().join(format!("neant-m7-{}", process::id()));
+    std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+    let (cf, sf) = (dir.join("p.c"), dir.join("p.s"));
+    std::fs::write(&cf, c).map_err(|e| e.to_string())?;
+    let cc = std::env::var("CC").unwrap_or_else(|_| "cc".to_string());
+    let st = Command::new(&cc).args(["-O2", "-g", "-std=gnu11", "-w", "-S", "-o"]).arg(&sf).arg(&cf).status().map_err(|e| format!("could not run `{cc}`: {e}"))?;
+    if !st.success() { return Err("the C compiler failed".into()); }
+    let asm = std::fs::read_to_string(&sf).map_err(|e| e.to_string())?;
+    let _ = std::fs::remove_dir_all(&dir);
+    Ok(asm)
 }
 
 fn cc(c: &str, out: &Path, src: &Path) -> Result<(), String> {

@@ -1080,7 +1080,10 @@ be per nest, and read off the emitted assembly's vector width.
    programs as they are, with no repeat unpaired to suit the model: the test is whether the
    programs' 0.27 and the kernels' 0.53 are both reached with the one constant.
 4. **Where it goes.** A report column beside `time`, not the cost: a cost is the calculus's and
-   proved; the cycle count is the compiler's and measured once per build. A micro-architectural cost line (what llvm-mca and uiCA
+   proved; the cycle count is the compiler's and measured once per build. *(Done: `neant cost --eval
+   … --m7` prints `m7 T s`, the longer of the loops' compute on this core's model (`src/m7.rs`,
+   the model `m7.py --own --window` is) and the calculus's memory term, and matches `m7.py` on the
+   five programs.)* A micro-architectural cost line (what llvm-mca and uiCA
 compute for a block, as default output, applicable because the type system knows what may be
 reassociated); schedules separate from algorithms; search over schedules pruned by the cost model
 and decided by measurement, persisted in `costs.lock`. An own backend is justified here and only
