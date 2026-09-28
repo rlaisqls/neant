@@ -819,6 +819,14 @@ does not count a written line's write-back, which `saxpy`'s 0.98 at size hides b
 cancelling. The fix is per loop, `moves/min(k·BW₁, BW_core)` with write-backs counted, which moves
 `BW` itself and every prediction; it is left for a pass of its own.
 
+Tried the same day, alone: the bytes of loops with two streams or more charged at `min(2·BW,
+BW_max)`. `dot` went from 0.60–0.71 to 1.16–1.46 and `saxpy` from 0.57–0.98 to 0.87–1.79, the
+kernels' mean from 1.09 to 1.24 — `dot`'s lap carries `s += a·b`, a multiply-add whose latency, not
+the memory, sets its pace (0.54 ns a lap, where two independent `i64` streams run 0.29), and
+`saxpy`'s write-backs are still not counted. Each of the three terms — streams, a carried
+multiply-add's latency, write-backs — was covering for the others, and one of them alone makes the
+model worse; they go in together or not at all. Reverted.
+
 ## Programs the project did not write: the Benchmarks Game (2026-09-28)
 
 **Why.** The corpus is the project's own (evaluation.md, threats). Five programs of the Computer
