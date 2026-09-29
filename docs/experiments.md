@@ -1288,20 +1288,20 @@ are all `i64` fields, most of them an index into an arena or a kind, whose width
 that owns the layout can choose.
 
 **Against the clock** (`tests/ablate/measure.nt`, CPU 5, an X925 with 2 MiB of L2; each figure
-the minimum of 5 runs, bytes `l2d_cache_refill × 64` in separate runs; one sitting, not repeated):
+the minimum of 5 runs, bytes `l2d_cache_refill × 64` in separate runs; two sittings, the second's ratios after the slash):
 
 | program | built (SoA) | ablated (AoS) | time AoS/SoA | bytes AoS/SoA | predicted |
 |---|---|---|---|---|---|
-| `particles.nt`, n = 4 000 000 × 20 (128 MB, past L3) | 0.212 s, 4.54e9 B | 0.303 s, 7.83e9 B | ×1.43 | ×1.72 | 4.48e9 against 7.68e9 B, ×1.71 |
-| `particles.nt`, n = 20 000 × 5 000 (640 KB, inside L2) | 0.157 s, 5.2e5 B | 0.141 s, 1.7e8 B | ×0.90 | — | nothing moves |
-| the compiler compiling itself, `Fac` SoA against AoS | 0.344 s, 2.41e8 B | 0.346 s, 2.48e8 B | ×1.00 | ×1.03 | — |
+| `particles.nt`, n = 4 000 000 × 20 (128 MB, past L3) | 0.212 s, 4.54e9 B | 0.303 s, 7.83e9 B | ×1.43 / 1.41 | ×1.72 / 1.73 | 4.48e9 against 7.68e9 B, ×1.71 |
+| `particles.nt`, n = 20 000 × 5 000 (640 KB, inside L2) | 0.157 s, 5.2e5 B | 0.141 s, 1.7e8 B | ×0.90 / 0.90 | ×325 / 1.03, both counts noise | nothing moves |
+| the compiler compiling itself, `Fac` SoA against AoS | 0.344 s, 2.41e8 B | 0.346 s, 2.48e8 B | ×1.00 / 1.01 | ×1.03 / 0.97 | — |
 
 Past the cache the model's bytes are the counter's within 2% in both layouts, and their ratio is
 the counter's; the time follows at ×1.43, less than the bytes (the time model, not the byte count, is what
 would have to say by how much). Inside L2 both layouts move under 2% of a streaming pass and AoS is if
 anything faster — where the model says nothing moves, the choice buys nothing. The compiler's one
-SoA struct buys nothing on the clock: turning it off adds 3% to the compiler's bytes and nothing
-to its time. So layout, the one representation choice the compiler makes, is right where it
+SoA struct buys nothing on the clock: turning it off leaves the compiler's bytes unchanged
+within ±3% across two runs, and its time too. So layout, the one representation choice the compiler makes, is right where it
 applies and measured where it matters, and on the one ordinary program it is not visible.
 
 ## Held-out, row one: PolyBench with the frozen compiler (2026-09-29)
