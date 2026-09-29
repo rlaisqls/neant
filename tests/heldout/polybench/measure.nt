@@ -4,6 +4,8 @@
 // EXTRALARGE sizes, pinned to one big core.
 //
 //     neant run measure.nt -- --cost [name ...]            write <name>/main.cost and tiers.txt
+//     neant run measure.nt -- --predict ROW.json --json OUT.json [--neant PATH]
+//                                a later row: ROW's measurements, the predictions of PATH
 //     neant run measure.nt -- [--cpu 5] [--runs 3] [--datasets MEDIUM,LARGE,EXTRALARGE]
 //                                [--json FILE] [--neant PATH] [name ...]
 //
@@ -496,13 +498,19 @@ fn main() {
     let mut cpu = 5;
     let mut runs = 3;
     let mut only_cost = false;
+    let mut pb = [b' '; 4096];
+    let mut pn = 0;
     let mut sel = [b' '; 4096];
     let mut sel_n = 0;
     let mut k = 0;
     while k < arg_count() {
         let a = arg(k);
         let more = k + 1 < arg_count();
-        if same(&a, "--cost") {
+        if more && same(&a, "--predict") {
+            let v = arg(k + 1);
+            pn = put(&mut pb, 0, &v);
+            k += 2;
+        } else if same(&a, "--cost") {
             only_cost = true;
             k += 1;
         } else if more && same(&a, "--cpu") {
@@ -555,7 +563,10 @@ fn main() {
             at = find_byte(&ks, at, b';') + 1;
         }
     }
-    if only_cost {
+    if pn > 0 {
+        let rows = cut(&pb, 0, pn);
+        predict_rows(&neant, &here, &rows, &json);
+    } else if only_cost {
         write_costs(&neant, &here, &sel, sel_n);
     } else {
         measure(&neant, &here, &ks, &sel, sel_n, &dsb, ds_n, cpu, runs, &json);
@@ -820,4 +831,138 @@ fn measure(neant: &[u8], here: &[u8], ks: &[u8], sel: &[u8], sel_n: i64, dsb: &[
     e = put(&mut o, e, &work);
     e = put_byte(&mut o, e, b'\n');
     print_bytes(&o, e);
+}
+
+// The text after `"key": ` in `s[from..to]`, or `to` when the key is not there.
+fn jfield(s: &[u8], from: i64, to: i64, key: &[u8]) -> i64 {
+    let mut k = [b' '; 64];
+    let mut e = put_byte(&mut k, 0, b'"');
+    e = put(&mut k, e, key);
+    e = put_byte(&mut k, e, b'"');
+    e = put(&mut k, e, ": ");
+    let pat = cut(&k, 0, e);
+    let at = find(s, from, &pat);
+    if at < to { at + pat.len() } else { to }
+}
+
+// --predict: a later row (heldout.md, what is frozen) whose binaries are the earlier row's —
+// the emitted C is the same, only the cost pass changed — so each run keeps its measurements and
+// is costed again by `neant`. Each line of `rows` becomes one line of `json`: the measurements as
+// they were, `measured_with` the compiler that built the binaries, `neant` this one, and its
+// prediction or why there is none.
+fn predict_rows(neant: &[u8], here: &[u8], rows: &[u8], json: &[u8]) {
+    if json.len() == 0 { fail("--predict needs --json"); }
+    let all = read_file(rows);
+    let mut refused_kernel = [b' '; 64];
+    let mut rk = 0;
+    let mut o = [b' '; 4096];
+    let mut at = 0;
+    while at < all.len() {
+        let le = line_end(&all, at);
+        let kf = jfield(&all, at, le, "kernel");
+        if kf < le {
+            let ke = find_byte(&all, kf + 1, b'"');
+            let name = cut(&all, kf + 1, ke);
+            let df = jfield(&all, at, le, "dataset");
+            let de = find_byte(&all, df + 1, b'"');
+            let mut db = [b' '; 4096];
+            let mut dn = put(&mut db, 0, here);
+            dn = put_byte(&mut db, dn, b'/');
+            dn = put(&mut db, dn, &name);
+            let dir = cut(&db, 0, dn);
+            let mn = "/main";
+            let dnt = ".nt";
+            let ntp = in_dir(&dir, &mn, &dnt);
+            let nt = read_file(&ntp);
+            let mp = b"\nfn main()";
+            let body = find(&nt, 0, &mp);
+            let mut xf = [0; 16];
+            let mut xt = [0; 16];
+            let mut ak = [0; 16];
+            let lets = size_lets(&nt, body, &mut xf, &mut xt, &mut ak);
+            // the sizes as the run was given them
+            let mut vals = [0; 16];
+            let mut i = jfield(&all, at, le, "sizes") + 1;
+            let mut nv = 0;
+            while i < le && all[i] != b']' && nv < 16 {
+                let v = parse_int(&all, skip_space(&all, i));
+                vals[nv] = v.v;
+                nv += 1;
+                i = find_byte(&all, v.end, b',');
+                if i > le { i = le; }
+                if i < le && all[i] == b',' { i += 1; } else { i = find_byte(&all, v.end, b']'); }
+            }
+            let mut ev = [b' '; 4096];
+            let mut evn = put(&mut ev, 0, " --eval '");
+            for q in 0..16 {
+                if q < lets {
+                    evn = put_span(&mut ev, evn, &nt, xf[q], xt[q]);
+                    evn = put_byte(&mut ev, evn, b'=');
+                    evn = format_int(vals[ak[q]], &mut ev, evn);
+                    evn = put(&mut ev, evn, ",a");
+                    evn = format_int(ak[q], &mut ev, evn);
+                    evn = put(&mut ev, evn, ".len()=");
+                    let mut digits = [b' '; 24];
+                    evn = format_int(format_int(vals[ak[q]], &mut digits, 0), &mut ev, evn);
+                    evn = put_byte(&mut ev, evn, b',');
+                }
+            }
+            evn = put(&mut ev, evn, "B=64'");
+            let skip = rk > 0 && same_span(&refused_kernel, 0, rk, &name);
+            let r = cost(neant, &dir, &ev, evn, skip);
+            let refused = skip || os_status() == 124;
+            if refused && !skip { rk = put(&mut refused_kernel, 0, &name); }
+            let mut p = predict(&r);
+            if refused { p.ok = false; }
+            // the measurements as they were, up to the compiler that built the binaries
+            let nf = jfield(&all, at, le, "neant");
+            let mut j = [b' '; 65536];
+            let mut jn = put_span(&mut j, 0, &all, at, nf - 11);
+            jn = put(&mut j, jn, ", ");
+            let mw = "measured_with";
+            jn = put_json(&mut j, jn, &mw, 0, mw.len());
+            jn = put(&mut j, jn, ": ");
+            jn = put_span(&mut j, jn, &all, nf, find_byte(&all, nf + 1, b'"') + 1);
+            jn = key(&mut j, jn, "neant");
+            jn = put_json(&mut j, jn, neant, 0, neant.len());
+            if p.ok {
+                jn = key(&mut j, jn, "pred_work");
+                jn = format_g(p.work, 17, &mut j, jn);
+                jn = key(&mut j, jn, "pred_bytes");
+                jn = format_g(p.moves, 17, &mut j, jn);
+                jn = key(&mut j, jn, "pred_s");
+                jn = format_g(p.time, 17, &mut j, jn);
+                jn = key(&mut j, jn, "bound");
+                jn = put_json(&mut j, jn, &r, p.bound, p.bound_end);
+            } else {
+                jn = key(&mut j, jn, "no_prediction");
+                if refused {
+                    let why = "refused, `neant cost` did not finish in 900 s";
+                    jn = put_json(&mut j, jn, &why, 0, why.len());
+                } else {
+                    jn = put_json(&mut j, jn, &r, p.block, p.block_end);
+                }
+            }
+            jn = put_byte(&mut j, jn, b'}');
+            jn = put_byte(&mut j, jn, b'\n');
+            if os_append(json, &j, jn) != jn { fail("cannot append to the JSON file"); }
+            let mut e = put_left(&mut o, 0, &name, 0, name.len(), 15);
+            e = put_byte(&mut o, e, b' ');
+            e = put_left(&mut o, e, &all, df + 1, de, 11);
+            if p.ok {
+                e = put(&mut o, e, "pred ");
+                e = format_e(p.time * 1e3, 3, &mut o, e);
+                e = put(&mut o, e, " ms ");
+                e = format_e(p.moves, 3, &mut o, e);
+                e = put(&mut o, e, " bytes");
+            } else if refused {
+                e = put(&mut o, e, "refused");
+            } else {
+                e = put(&mut o, e, "no prediction");
+            }
+            e = put_byte(&mut o, e, b'\n');
+            print_bytes(&o, e);
+        }
+        at = le + 1;
+    }
 }
