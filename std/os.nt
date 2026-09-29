@@ -1,0 +1,36 @@
+// std/os.nt — the program and the machine around it: a command run through the shell, a file
+// written, the clock, the environment, stderr and the exit code (docs/decisions.md §14). What a
+// harness needs that a kernel does not, so that one can be written in the language it measures.
+// Each is a C function in bootstrap/rt.c under the name it has here.
+//
+// A command is text, and text is a `[u8]` built into a buffer sized in advance (std/bytes.nt's
+// `put`): `os_run(&cmd, n)` runs its first `n` bytes, as `print_bytes` prints them. What a command
+// costs is the command's, so every one here that reaches outside is `unbounded`; the program that
+// calls them is a driver, whose own cost is not the question. `os_status` and `os_now` are a load
+// and a vDSO call, declared at a bound and not yet measured.
+
+// The command's standard output, whole, once it has exited; its stderr is the program's own. It is
+// run by `/bin/sh -c`, so a pipe, a redirection and `$HOME` mean what they do in a shell.
+extern fn os_run(cmd: &[u8], n: i64) -> [u8] uses io, unbounded;
+
+// How the last `os_run` ended: its exit code, 128 + the signal that stopped it, or −1 before any.
+#[cost(work_at_most = "10", moves_at_most = "0")]
+extern fn os_status() -> i64 uses io;
+
+// The first `n` bytes of `s` as the whole of the file at `path`, or after what it holds; the count
+// written, or −1 when the file cannot be opened.
+extern fn os_write(path: &[u8], s: &[u8], n: i64) -> i64 uses io, unbounded;
+extern fn os_append(path: &[u8], s: &[u8], n: i64) -> i64 uses io, unbounded;
+
+// Nanoseconds on the monotonic clock, from an origin of its own: only a difference means anything.
+#[cost(work_at_most = "100", moves_at_most = "0")]
+extern fn os_now() -> i64 uses io;
+
+// The variable's value, empty when it is not set.
+extern fn os_env(name: &[u8]) -> [u8] uses io, unbounded;
+
+// The first `n` bytes of `s` to stderr.
+extern fn os_eprint(s: &[u8], n: i64) uses io, unbounded;
+
+// The end of the program, with stdout flushed first.
+extern fn os_exit(code: i64) uses io, unbounded;

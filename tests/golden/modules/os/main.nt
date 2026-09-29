@@ -1,0 +1,58 @@
+// std/os.nt and std/bytes.nt from a directory that has neither: a command built into a buffer and
+// run, its output and status read back, a file written, appended to and read, and numbers in the
+// forms `printf` writes them read and written again.
+use "std/bytes.nt";
+use "std/os.nt";
+
+fn main() {
+    let mut c = [b' '; 256];
+    let mut n = put(&mut c, 0, "printf '%s %.17g %d' begin 0.1 42; exit 3");
+    let o = os_run(&c, n);
+    print_bytes(&o, o.len());
+    println("");
+    println(os_status());
+    let words = count_words(&o, 0, o.len());
+    println(words);
+    let at = skip_space(&o, word_end(&o, 0));
+    let f = parse_real(&o, at);
+    println(f.v);
+    println(same_span(&o, 0, word_end(&o, 0), "begin"));
+    println(find(&o, 0, "42"));
+
+    let p = "os-golden.tmp";
+    println(os_write(&p, &o, 5));
+    println(os_append(&p, &o, 5));
+    let back = read_file(&p);
+    print_bytes(&back, back.len());
+    println("");
+    n = put(&mut c, 0, "rm ");
+    n = put(&mut c, n, &p);
+    let r = os_run(&c, n);
+    println(os_status());
+    println(file_size(&p));
+
+    let t = "1.5e3 -2.25E-2 nan -inf 123456789012345678";
+    let mut out = [b' '; 256];
+    let mut e = 0;
+    let mut i = 0;
+    for k in 0..5 {
+        let x = parse_real(&t, i);
+        e = format_g(x.v, 10, &mut out, e);
+        e = put_byte(&mut out, e, b' ');
+        e = format_e(x.v, 3, &mut out, e);
+        e = put_byte(&mut out, e, b'\n');
+        i = skip_space(&t, x.end);
+    }
+    e = put_left(&mut out, e, "ab", 0, 2, 4);
+    e = put_right(&mut out, e, "cd", 0, 2, 4);
+    print_bytes(&out, e);
+    println("");
+    let before = os_now();
+    println(os_now() >= before);
+    let h = "NEANT_GOLDEN_UNSET_VARIABLE";
+    let v = os_env(&h);
+    println(v.len());
+    let msg = "to stderr";
+    os_eprint(&msg, msg.len());
+    os_exit(4);
+}

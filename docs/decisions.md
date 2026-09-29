@@ -4,6 +4,42 @@ Design decisions with the reasoning that produced them, so the reasoning is not 
 code is. Newest first. A decision is recorded when it was argued over, when it rejected
 alternatives worth remembering, or when a future reader would otherwise ask "why on earth".
 
+## 14 — A driver is written in the language: `std/os.nt` and `std/bytes.nt`
+
+**Decided and implemented 2026-09-29.** The held-out harness (docs/heldout.md) was Python —
+`check.py` against the original C and `measure.py` against the clock — like every harness in
+`tests/`. It is now `check.nt` and `measure.nt`, run by `neant run`, over two new std files. A
+harness has to start a compiler, a C compiler, `taskset` and `perf`, read what they print, and
+write a report; the language could read a file and its arguments (§9) and nothing else.
+
+- **`std/os.nt`** is eight externs over C functions in `bootstrap/rt.c`, under their C names
+  (`os_`-prefixed, so none meets a program's own extern or libc): `os_run(cmd, n)` runs the
+  first `n` bytes of a view through `/bin/sh -c` and returns its stdout as an owned `[u8]`,
+  `os_status()` how that run ended (its code, or 128 + a signal), `os_write`/`os_append` a file,
+  `os_now()` the monotonic clock in ns, `os_env(name)`, `os_eprint(s, n)` and `os_exit(code)`.
+  `rt.c` is linked when the emitted C calls one, as it already was for the other I/O. A command is
+  one text for the shell, not an argument list, because an array's elements are scalars or
+  structs (§9): the shell's own quoting is the list.
+- **`std/bytes.nt`** is neant: `put`, `put_span`, `put_byte`, `put_left`/`put_right`/`pad_to` build
+  text into a buffer from an offset, as `format_int` does; `same`, `same_span`, `has_at`, `find`,
+  `find_byte`, `line_end`, `word_end`, `count_words` read it; `cut` copies a span into an array of
+  its own for a callee that takes a whole view (a path); `parse_real` reads any number `printf`
+  writes (exponents, any number of digits, `nan`, `inf`), which `std/text.nt`'s constant-cost
+  `parse_float` does not; `format_g` and `format_e` write `%.<p>g` and `%.<p>e`.
+
+**What it is charged.** Everything in `os.nt` that reaches outside the process is `unbounded`:
+what a command costs is the command's, and a driver's own cost is not the question. `os_status`
+and `os_now` are declared at a bound (10 and 100), not yet measured. `bytes.nt`'s scans stop at
+what they read, the parser shape.
+
+Rejected: an `args: [[u8]]` form of `os_run` (no array of arrays); a growable text (§12 — every
+buffer here is sized where it is born, the harness's at a few KiB); and keeping Python, which is
+what a reader outside the project would have to trust to believe a held-out number, beside the
+compiler it measures. `check.nt` agrees with `check.py` port for port (27 of 27 at MINI, 26 of 26
+at SMALL with gramschmidt not comparable) before `check.py` was deleted; heldout.md's step 2 names
+`check.py`, and is left as it was written, since that file is not edited but for its *recorded*
+lines.
+
 ## 13 — A `[u8]` is printed by `print_bytes(&s, n)`, charged by the view
 
 **Decided and implemented 2026-09-26.** §12 left a formatted buffer unprintable: `print` takes a

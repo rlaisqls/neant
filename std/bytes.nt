@@ -1,0 +1,342 @@
+// std/bytes.nt — text as a driver handles it: built into a buffer, compared, searched, split into
+// lines and words, and read as a number whatever form a C `printf` gave it. A text is a `[u8]`, and
+// there is no concatenation (docs/decisions.md §12), so a text is built the way `format_int`
+// builds one: into a buffer sized in advance, from an offset, each call returning where it stopped.
+// A span of a text is the text and two offsets, `from` and `to`, since a view is of a whole array.
+//
+// The scans stop at what they read, so a loop over a line or a word is the parser shape
+// docs/corpus.md names: data-dependent, charged at the rest of the text.
+
+use "std/text.nt";
+
+// `s` copied into `out` at `at`; the offset after it. `out` must have room, or the store is out of
+// bounds and the program exits.
+fn put(out: &mut [u8], at: i64, s: &[u8]) -> i64 {
+    for k in 0..s.len() {
+        out[at + k] = s[k];
+    }
+    at + s.len()
+}
+
+// `s[from..to]` copied into `out` at `at`; the offset after it.
+fn put_span(out: &mut [u8], at: i64, s: &[u8], from: i64, to: i64) -> i64 {
+    for k in from..to {
+        out[at + k - from] = s[k];
+    }
+    at + to - from
+}
+
+// One byte at `at`; the offset after it.
+fn put_byte(out: &mut [u8], at: i64, c: u8) -> i64 {
+    out[at] = c;
+    at + 1
+}
+
+// Spaces from `at` to column `col`, at least one: a column in a table.
+fn pad_to(out: &mut [u8], at: i64, col: i64) -> i64 {
+    let mut i = at;
+    out[i] = b' ';
+    i += 1;
+    while i < col {
+        out[i] = b' ';
+        i += 1;
+    }
+    i
+}
+
+// Whether `a` and `b` hold the same bytes.
+fn same(a: &[u8], b: &[u8]) -> bool {
+    let mut eq = a.len() == b.len();
+    if eq {
+        for k in 0..a.len() {
+            if a[k] != b[k] { eq = false; }
+        }
+    }
+    eq
+}
+
+// Whether `xs[from..to]` holds the same bytes as `s`.
+fn same_span(xs: &[u8], from: i64, to: i64, s: &[u8]) -> bool {
+    let mut eq = to - from == s.len();
+    if eq {
+        for k in 0..s.len() {
+            if xs[from + k] != s[k] { eq = false; }
+        }
+    }
+    eq
+}
+
+// Whether `s` is in `xs` at `at`.
+fn has_at(xs: &[u8], at: i64, s: &[u8]) -> bool {
+    let mut eq = at >= 0 && at + s.len() <= xs.len();
+    let mut k = 0;
+    while eq && k < s.len() {
+        if xs[at + k] != s[k] { eq = false; }
+        k += 1;
+    }
+    eq
+}
+
+// The first offset at or after `at` that holds `c`, or `xs.len()` when none does.
+fn find_byte(xs: &[u8], at: i64, c: u8) -> i64 {
+    let mut i = at;
+    while i < xs.len() && xs[i] != c {
+        i += 1;
+    }
+    i
+}
+
+// The first offset at or after `at` where `s` begins, or `xs.len()` when it is nowhere after it.
+fn find(xs: &[u8], at: i64, s: &[u8]) -> i64 {
+    let mut i = at;
+    while i + s.len() <= xs.len() && !has_at(xs, i, s) {
+        i += 1;
+    }
+    if i + s.len() > xs.len() { xs.len() } else { i }
+}
+
+// The end of the line that `at` is in: the offset of its `\n`, or `xs.len()`.
+fn line_end(xs: &[u8], at: i64) -> i64 {
+    find_byte(xs, at, b'\n')
+}
+
+// The end of the word at `at`: the first space at or after it, or `xs.len()`.
+fn word_end(xs: &[u8], at: i64) -> i64 {
+    let mut i = at;
+    while i < xs.len() && !is_space(xs[i]) {
+        i += 1;
+    }
+    i
+}
+
+// How many words `xs[from..to]` holds, split at spaces.
+fn count_words(xs: &[u8], from: i64, to: i64) -> i64 {
+    let mut n = 0;
+    let mut i = from;
+    while i < to {
+        while i < to && is_space(xs[i]) { i += 1; }
+        if i < to {
+            n += 1;
+            while i < to && !is_space(xs[i]) { i += 1; }
+        }
+    }
+    n
+}
+
+// The number at `at` in any form `printf` writes one: `[-]digits[.digits][e[±]digits]`, any number
+// of digits, and `nan`, `inf` and `-inf`. Nothing is skipped first. The digits are summed into an
+// `f64` as they come, so a long mantissa is within a few ulps of the nearest double, not on it.
+fn parse_real(xs: &[u8], at: i64) -> Float {
+    let mut i = at;
+    let mut neg = false;
+    if i < xs.len() && (xs[i] == b'-' || xs[i] == b'+') {
+        neg = xs[i] == b'-';
+        i += 1;
+    }
+    let mut v = 0.0;
+    let mut ok = false;
+    if has_at(xs, i, "inf") {
+        v = 1.0 / 0.0;
+        i += 3;
+        ok = true;
+    } else if has_at(xs, i, "nan") || has_at(xs, i, "NaN") {
+        v = 0.0 / 0.0;
+        i += 3;
+        ok = true;
+    } else {
+        while i < xs.len() && is_digit(xs[i]) {
+            v = v * 10.0 + (xs[i] - b'0') as f64;
+            i += 1;
+            ok = true;
+        }
+        let mut places = 0;
+        if i < xs.len() && xs[i] == b'.' {
+            i += 1;
+            while i < xs.len() && is_digit(xs[i]) {
+                v = v * 10.0 + (xs[i] - b'0') as f64;
+                places += 1;
+                i += 1;
+                ok = true;
+            }
+        }
+        let mut e = 0;
+        if ok && i < xs.len() && (xs[i] == b'e' || xs[i] == b'E') {
+            let mut j = i + 1;
+            let mut eneg = false;
+            if j < xs.len() && (xs[j] == b'-' || xs[j] == b'+') {
+                eneg = xs[j] == b'-';
+                j += 1;
+            }
+            if j < xs.len() && is_digit(xs[j]) {
+                while j < xs.len() && is_digit(xs[j]) {
+                    e = e * 10 + (xs[j] - b'0') as i64;
+                    j += 1;
+                }
+                if eneg { e = 0 - e; }
+                i = j;
+            }
+        }
+        v = scale10(v, e - places);
+    }
+    if neg { v = 0.0 - v; }
+    Float { v: v, end: i, ok: ok }
+}
+
+// `v · 10^e`, by squaring: one rounding per bit of `e`, and a division for a negative `e`, so that
+// `0.1` is `1 / 10` and not `1 · 0.1`.
+fn scale10(v: f64, e: i64) -> f64 {
+    let mut p = 1.0;
+    let mut b = 10.0;
+    let mut k = e;
+    if k < 0 { k = 0 - k; }
+    while k > 0 {
+        if k % 2 == 1 { p = p * b; }
+        b = b * b;
+        k = k / 2;
+    }
+    if e < 0 { v / p } else { v * p }
+}
+
+// `x` with `sig` significant digits (1 to 17) the way C's `%.<sig>g` writes it: fixed where the
+// exponent is at least −4 and below `sig`, `d.ddde±XX` otherwise, trailing zeros dropped either way;
+// the offset after it. The digits are `x` scaled to an integer of `sig` places and rounded once, so
+// the last one can differ from glibc's by one where the scaling is inexact.
+fn format_g(x: f64, sig: i64, out: &mut [u8], at: i64) -> i64 {
+    let mut i = at;
+    if x != x {
+        i = put(out, i, "nan");
+    } else if x == 1.0 / 0.0 || x == -1.0 / 0.0 {
+        if x < 0.0 { i = put_byte(out, i, b'-'); }
+        i = put(out, i, "inf");
+    } else if x == 0.0 {
+        i = put_byte(out, i, b'0');
+    } else {
+        let mut ax = x;
+        if ax < 0.0 {
+            ax = 0.0 - ax;
+            i = put_byte(out, i, b'-');
+        }
+        // the exponent: 10^e ≤ ax < 10^(e+1)
+        let mut e = 0;
+        let mut t = ax;
+        while t >= 10.0 { t = t / 10.0; e += 1; }
+        while t < 1.0 { t = t * 10.0; e -= 1; }
+        let mut m = (scale10(scale10(ax, 0 - e), sig - 1) + 0.5) as i64;
+        let top = scale10(1.0, sig) as i64;
+        if m >= top {
+            m = m / 10;
+            e += 1;
+        }
+        let mut digits = [b'0'; 17];
+        let mut u = m;
+        for k in 0..17 {
+            if k < sig {
+                digits[sig - 1 - k] = b'0' + (u % 10) as u8;
+                u = u / 10;
+            }
+        }
+        // the last significant digit that is not a trailing zero
+        let mut last = 0;
+        for k in 0..17 {
+            if k < sig && digits[k] != b'0' { last = k; }
+        }
+        if e < -4 || e >= sig {
+            i = put_byte(out, i, digits[0]);
+            if last > 0 {
+                i = put_byte(out, i, b'.');
+                i = put_span(out, i, &digits, 1, last + 1);
+            }
+            i = put_byte(out, i, b'e');
+            let mut ae = e;
+            if e < 0 { i = put_byte(out, i, b'-'); ae = 0 - e; } else { i = put_byte(out, i, b'+'); }
+            if ae < 10 { i = put_byte(out, i, b'0'); }
+            i = format_int(ae, out, i);
+        } else if e < 0 {
+            i = put(out, i, "0.");
+            for k in 0..4 {
+                if k < 0 - e - 1 { i = put_byte(out, i, b'0'); }
+            }
+            i = put_span(out, i, &digits, 0, last + 1);
+        } else {
+            i = put_span(out, i, &digits, 0, e + 1);
+            if last > e {
+                i = put_byte(out, i, b'.');
+                i = put_span(out, i, &digits, e + 1, last + 1);
+            }
+        }
+    }
+    i
+}
+
+// `s[from..to]` as an array of its own, for a callee that takes a whole view (a path, a command).
+fn cut(s: &[u8], from: i64, to: i64) -> [u8] {
+    let mut o = [b'\0'; to - from];
+    for k in from..to {
+        o[k - from] = s[k];
+    }
+    o
+}
+
+// `x` as C's `%.<places>e` writes it, `d.ddde±XX` (places at most 16); the offset after it.
+fn format_e(x: f64, places: i64, out: &mut [u8], at: i64) -> i64 {
+    let mut i = at;
+    if x != x || x == 1.0 / 0.0 || x == -1.0 / 0.0 {
+        i = format_g(x, 1, out, i);
+    } else {
+        let mut ax = x;
+        if ax < 0.0 {
+            ax = 0.0 - ax;
+            i = put_byte(out, i, b'-');
+        }
+        let mut e = 0;
+        if ax > 0.0 {
+            let mut t = ax;
+            while t >= 10.0 { t = t / 10.0; e += 1; }
+            while t < 1.0 { t = t * 10.0; e -= 1; }
+        }
+        let mut m = (scale10(scale10(ax, 0 - e), places) + 0.5) as i64;
+        if ax > 0.0 && m >= scale10(1.0, places + 1) as i64 {
+            m = m / 10;
+            e += 1;
+        }
+        let mut digits = [b'0'; 17];
+        let mut u = m;
+        for k in 0..17 {
+            if k <= places {
+                digits[places - k] = b'0' + (u % 10) as u8;
+                u = u / 10;
+            }
+        }
+        i = put_byte(out, i, digits[0]);
+        if places > 0 {
+            i = put_byte(out, i, b'.');
+            i = put_span(out, i, &digits, 1, places + 1);
+        }
+        i = put_byte(out, i, b'e');
+        let mut ae = e;
+        if e < 0 { i = put_byte(out, i, b'-'); ae = 0 - e; } else { i = put_byte(out, i, b'+'); }
+        if ae < 10 { i = put_byte(out, i, b'0'); }
+        i = format_int(ae, out, i);
+    }
+    i
+}
+
+// `s[from..to]` right-aligned in a field of `width`: spaces first, then the text; the offset after.
+fn put_right(out: &mut [u8], at: i64, s: &[u8], from: i64, to: i64, width: i64) -> i64 {
+    let mut i = at;
+    while i - at < width - (to - from) {
+        out[i] = b' ';
+        i += 1;
+    }
+    put_span(out, i, s, from, to)
+}
+
+// `s[from..to]` left-aligned in a field of `width`: the text, then spaces; the offset after.
+fn put_left(out: &mut [u8], at: i64, s: &[u8], from: i64, to: i64, width: i64) -> i64 {
+    let mut i = put_span(out, at, s, from, to);
+    while i - at < width {
+        out[i] = b' ';
+        i += 1;
+    }
+    i
+}

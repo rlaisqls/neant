@@ -168,3 +168,85 @@ void nt_print_bytes(const uint8_t *s_p, int64_t s_n, int64_t n) {
     if (n < 0 || n > s_n) { fprintf(stderr, "print_bytes of %lld bytes from a view of %lld\n", (long long)n, (long long)s_n); exit(101); }
     fwrite(s_p, 1, (size_t)n, stdout);
 }
+
+// std/os.nt (docs/decisions.md §14): what a harness needs beyond a file and its arguments — a
+// command run through the shell with its output back, a file written or appended to, the clock, the
+// environment, and stderr. Each is an `extern` in std/os.nt under its C name here, `os_`-prefixed so
+// that none can meet a program's own extern or a libc symbol. A command is the first `n` bytes of a
+// view, as `print_bytes` takes a text, because a text is built into a buffer sized in advance.
+#include <sys/wait.h>
+#include <time.h>
+
+static int64_t os_last_status = -1;
+
+// the command's stdout, whole; its stderr is the program's. The status is kept for `os_status`.
+struct nt_arr_uint8_t os_run(const uint8_t *cmd_p, int64_t cmd_n, int64_t n) {
+    if (n < 0 || n > cmd_n) { fprintf(stderr, "os_run of %lld bytes from a view of %lld\n", (long long)n, (long long)cmd_n); exit(101); }
+    char *cmd = malloc((size_t)n + 1);
+    if (!cmd) { fprintf(stderr, "out of memory\n"); exit(101); }
+    memcpy(cmd, cmd_p, (size_t)n);
+    cmd[n] = '\0';
+    fflush(stdout);
+    FILE *p = popen(cmd, "r");
+    if (!p) { fprintf(stderr, "cannot run %s: %s\n", cmd, strerror(errno)); exit(101); }
+    size_t cap = 4096, got = 0;
+    uint8_t *buf = malloc(cap);
+    if (!buf) { fprintf(stderr, "out of memory\n"); exit(101); }
+    for (;;) {
+        if (got == cap) {
+            cap *= 2;
+            uint8_t *b = realloc(buf, cap);
+            if (!b) { fprintf(stderr, "out of memory\n"); exit(101); }
+            buf = b;
+        }
+        size_t k = fread(buf + got, 1, cap - got, p);
+        got += k;
+        if (k == 0) break;
+    }
+    int st = pclose(p);
+    os_last_status = st == -1 ? -1 : WIFEXITED(st) ? WEXITSTATUS(st) : WIFSIGNALED(st) ? 128 + WTERMSIG(st) : -1;
+    free(cmd);
+    struct nt_arr_uint8_t a = { buf, (int64_t)got };
+    return a;
+}
+
+// the exit status of the last `os_run`: its code, 128 + the signal that ended it, or −1 before any
+int64_t os_status(void) { return os_last_status; }
+
+static int64_t os_put(const uint8_t *path_p, int64_t path_n, const uint8_t *s_p, int64_t s_n, int64_t n, const char *mode) {
+    char path[4096];
+    if (n < 0 || n > s_n || nt_path(path, sizeof path, path_p, path_n) != 0) return -1;
+    FILE *f = fopen(path, mode);
+    if (!f) return -1;
+    size_t put = fwrite(s_p, 1, (size_t)n, f);
+    if (fclose(f) != 0) return -1;
+    return (int64_t)put;
+}
+
+// the first `n` bytes of `s` as the whole file, or after what it holds; the count written, or −1
+int64_t os_write(const uint8_t *path_p, int64_t path_n, const uint8_t *s_p, int64_t s_n, int64_t n) { return os_put(path_p, path_n, s_p, s_n, n, "wb"); }
+int64_t os_append(const uint8_t *path_p, int64_t path_n, const uint8_t *s_p, int64_t s_n, int64_t n) { return os_put(path_p, path_n, s_p, s_n, n, "ab"); }
+
+// the monotonic clock in nanoseconds, from an origin of its own: only a difference means anything
+int64_t os_now(void) {
+    struct timespec t;
+    clock_gettime(CLOCK_MONOTONIC, &t);
+    return (int64_t)t.tv_sec * 1000000000 + t.tv_nsec;
+}
+
+// an environment variable's value, empty when it is not set
+struct nt_arr_uint8_t os_env(const uint8_t *name_p, int64_t name_n) {
+    char name[4096];
+    const char *v = nt_path(name, sizeof name, name_p, name_n) == 0 ? getenv(name) : NULL;
+    return nt_bytes(v ? v : "", v ? (int64_t)strlen(v) : 0);
+}
+
+// the first `n` bytes of `s` to stderr, as `print_bytes` writes them to stdout
+void os_eprint(const uint8_t *s_p, int64_t s_n, int64_t n) {
+    if (n < 0 || n > s_n) { fprintf(stderr, "os_eprint of %lld bytes from a view of %lld\n", (long long)n, (long long)s_n); exit(101); }
+    fflush(stdout);
+    fwrite(s_p, 1, (size_t)n, stderr);
+}
+
+// the program's end with `code`, stdout flushed first
+void os_exit(int64_t code) { fflush(stdout); exit((int)code); }
