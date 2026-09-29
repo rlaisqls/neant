@@ -49,7 +49,11 @@ const NEIGHBOURS_INSTEAD: &[(&str, &str)] = &[("stencil.nt", "stencil"), ("stenc
 /// `(file, function)` where the self-hosted `moves` are higher because it sums a triangular loop's
 /// laps: `tri`'s `pairs` runs `j in i..a.len()`, which the Rust charges the hull of its laps once
 /// while they fit (cost-model § Moves, a triangle, 2026-09-28) and this pass charges lap by lap.
-const TRIANGLES_INSTEAD: &[(&str, &str)] = &[("tri.nt", "pairs"), ("tri.nt", "main")];
+/// `triangle_regime`'s `tri` too: its inner `j in 0..i + 1` makes a fit test in `i`, which the Rust
+/// decides at the largest `i` once `i` is summed (cost-model § A triangle's fit test, 2026-09-29)
+/// and this pass, lap by lap, never sees as one.
+const TRIANGLES_INSTEAD: &[(&str, &str)] = &[("tri.nt", "pairs"), ("tri.nt", "main"),
+    ("triangle_regime.nt", "tri"), ("triangle_regime.nt", "main")];
 
 /// `(file, function)` where the self-hosted `moves` are higher because a call whose every
 /// footprint range is resident still pays what the credit leaves above zero there; the Rust moves
@@ -131,6 +135,13 @@ const FOOTPRINT_NARROWER: &[(&str, &str)] = &[("parse.nt", "number"), ("bfs.nt",
                                               ("slots.nt", "count"), ("slots.nt", "fields"), ("slots.nt", "rewrite"),
                                               ("arena_tree.nt", "chase")];
 
+/// Functions whose footprint this pass states **wrongly**, not narrowly: a triangle's inner range
+/// `j in 0..i + 1` takes its hull at the outer loop's last lap, and this pass loses that
+/// variable's name there — `a: [0, 8·n² + 8· − 8·n + 8)`, an atom printed as nothing. Found
+/// 2026-09-29 by `triangle_regime`; not this pass's triangle rule (`TRIANGLES_INSTEAD`), which only
+/// charges more. A bug to fix in `compiler/cost.nt`, listed so that it is seen, not absorbed.
+const FOOTPRINT_UNNAMED: &[(&str, &str)] = &[("triangle_regime.nt", "tri")];
+
 /// Functions whose **cost this pass declines**, where the two footprints differ: a footprint
 /// without a cost is used by no caller, which is then without a cost too. `neant cost` states the
 /// whole arena for a recursion over a tree it costs, which visits every node it reaches
@@ -167,7 +178,7 @@ const BOUND_NARROWER: &[(&str, &str)] = &[("while.nt", "count_lt"), ("while.nt",
 
 /// The number of functions whose `work` the self-hosted pass reproduces exactly. In the test so
 /// that widening the slice means changing a number someone has to look at.
-const EXACT: usize = 106;
+const EXACT: usize = 108;
 
 /// The same for `moves`, whose slice is narrower: a function that calls anything is unknown,
 /// because a callee's traffic depends on what is already resident — which it now computes, so a
@@ -190,13 +201,13 @@ const EXACT_MOVES: usize = 92;
 /// whole of it is resident on return, whitespace-normalised so the report's column padding is not
 /// part of the comparison. Counted over every function, so one that should state no footprint and
 /// states none counts too.
-const EXACT_FOOT: usize = 149;
+const EXACT_FOOT: usize = 150;
 
 /// The same for the **footprint lower bound** — `moves` cannot be less than the distinct bytes a
 /// function's parameter arrays reach. Counted over every function, so a `main` that should have no
 /// bound and gets none counts too: a bound invented where `neant cost` states none is as wrong as
 /// a missing one, and only one of those two shows up as a difference.
-const EXACT_BOUNDS: usize = 192;
+const EXACT_BOUNDS: usize = 194;
 
 
 
@@ -437,6 +448,11 @@ fn self_hosted_work_agrees_with_bootstrap() {
             .filter(|r| r.len() >= 5).map(|r| (r[0], r[4])).collect();
         for (fname, g) in &got_foot {
             let listed = FOOTPRINT_NARROWER.contains(&(name.as_str(), fname));
+            if FOOTPRINT_UNNAMED.contains(&(name.as_str(), fname)) {
+                assert!(want_foot.get(*fname).is_some_and(|w| w != g),
+                    "{name} {fname} is listed as a footprint this pass states wrongly, but the two agree — delete it from FOOTPRINT_UNNAMED");
+                continue;
+            }
             match (want_foot.get(*fname), *g) {
                 (None, "none") => exact_foot += 1,
                 (None, other) => failures.push(format!("{name} {fname}: `neant cost` states no \

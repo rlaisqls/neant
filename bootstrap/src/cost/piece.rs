@@ -278,11 +278,26 @@ impl Cost {
     /// A condition that reads an element at the atom is decided at the most that element holds:
     /// the atom is gone once summed, and a regime cannot be chosen per iteration.
     pub fn sum_over(&self, atom: usize, lo: &Poly, step: i128, trip: &Poly) -> Cost {
+        self.sum_split(atom, lo, step, trip, &mut false)
+    }
+    /// `sum_over`, and a fit test in the atom itself — a working set that grows or shrinks with
+    /// the loop's variable, the inner loop of a triangle (`B·i < M`) — decided over every lap,
+    /// since after the sum there is no lap left to decide it in (`split_conds`): at the largest the
+    /// working set is, exact where that fits and a bound where it does not. `straddled` is set
+    /// when a bound is made.
+    pub fn sum_split(&self, atom: usize, lo: &Poly, step: i128, trip: &Poly, straddled: &mut bool) -> Cost {
         let hide = |p: &Poly| p.mentions(atom);
-        Cost::from_pieces(self.pieces.iter().map(|p| Piece {
-            conds: p.conds.iter().map(|c| Cond { ws: c.ws.hide_args(&hide), fits: c.fits }).collect(),
-            poly: p.poly.sum_over(atom, lo, step, trip),
-        }).collect())
+        let last = lo.add(&trip.sub(&Poly::constant(1)).scale(Rat::int(step)));
+        let mut out = Vec::new();
+        for p in &self.pieces {
+            let poly = p.poly.sum_over(atom, lo, step, trip);
+            let hidden: Vec<Cond> = p.conds.iter().map(|c| Cond { ws: c.ws.hide_args(&hide), fits: c.fits }).collect();
+            for (conds, s) in split_conds(&hidden, atom, lo, &last, step) {
+                if s { *straddled = true; }
+                out.push(Piece { conds, poly: poly.clone() });
+            }
+        }
+        Cost::from_pieces(out)
     }
     /// Substitution reaches into the conditions too.
     pub fn subst_many(&self, map: &[(usize, Poly)]) -> Cost {
@@ -445,4 +460,49 @@ impl<'a> fmt::Display for CostDisplay<'a> {
         }
         write!(f, "{}", parts.join(" | "))
     }
+}
+
+/// Which way `ws` moves as `atom` grows: `Some(true)` when it is linear in the atom with every
+/// coefficient positive (the rest of each term a product of sizes and `B`, never negative),
+/// `Some(false)` when every one is negative, `None` when it does not mention the atom directly,
+/// is not linear in it, mixes signs, or mentions it inside another atom (a read at it, a log).
+fn direction(ws: &Poly, atom: usize) -> Option<bool> {
+    let v = Atom::Var(atom);
+    let mut sign: Option<bool> = None;
+    for (m, c) in &ws.terms {
+        let direct = m.factors.get(&v).copied();
+        let inside = m.factors.iter().any(|(a, _)| *a != v && a.inner().iter().any(|q| q.mentions(atom)));
+        if inside { return None; }
+        let Some(e) = direct else { continue };
+        if e != Rat::one() { return None; }
+        let up = c.n > 0;
+        if sign.is_some_and(|s| s != up) { return None; }
+        sign = Some(up);
+    }
+    sign
+}
+
+/// Conditions in a loop's variable `atom`, running `lo` to `last` by `step`, decided over all its
+/// laps (`Cost::sum_split`). A working set that moves one way with the atom is largest at one end:
+/// a test that fits there fits in every lap, and the piece summed over them is exact; a test that
+/// does not fit there fails in some laps and maybe not in the first ones, and the piece that
+/// charges no reuse, summed over every lap, is at least what those laps cost — a bound, flagged
+/// in the second of the pair. One condition becomes one, so the regimes are as many as before.
+/// A condition not in the atom, or not moving one way with it, is kept as it is. The result is
+/// empty when the conditions cannot hold together.
+pub fn split_conds(conds: &[Cond], atom: usize, lo: &Poly, last: &Poly, step: i128) -> Vec<(Vec<Cond>, bool)> {
+    let mut out: Vec<Cond> = Vec::new();
+    let mut bound = false;
+    for c in conds {
+        let d = match direction(&c.ws, atom).map(|up| up == (step > 0)) {
+            None => c.clone(),
+            Some(grows) => {
+                let most = c.ws.subst(atom, if grows { last } else { lo });
+                if !c.fits { bound = true; }
+                Cond { ws: most, fits: c.fits }
+            }
+        };
+        if !out.contains(&d) { out.push(d); }
+    }
+    if feasible(&out) { vec![(out, bound)] } else { vec![] }
 }

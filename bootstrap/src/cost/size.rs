@@ -120,7 +120,7 @@ impl Atom {
     /// A size: what a cost is a polynomial in, and what degree counts.
     pub fn is_size(&self) -> bool { matches!(self, Atom::Var(_) | Atom::Read(_)) }
     /// The polynomials inside an atom, which substitution and `mentions` reach into.
-    fn inner(&self) -> Vec<&Poly> {
+    pub fn inner(&self) -> Vec<&Poly> {
         match self {
             Atom::Log(p) => vec![&**p],
             Atom::Opaque(o) => o.args.iter().flatten().collect(),

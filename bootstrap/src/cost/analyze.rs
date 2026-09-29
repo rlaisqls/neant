@@ -56,6 +56,8 @@ pub enum CostResult {
 
 /// How a line that rests on a callee bounded by a scan names it (docs/cost-model.md § A scan).
 const SCAN_TAG: &str = "(bound, a scan)";
+/// the same for a loop charged a bound where a fit test in its variable changes inside it
+const REGIME_TAG: &str = "(bound, a regime)";
 
 /// Whether `c` only falls as the atom `k` grows: every term in it is `−c·k·(sizes)` with `k` to
 /// the first power, `k` in no condition and inside no read or unknown callee's argument.
@@ -764,6 +766,9 @@ struct LoopRec {
     lo: Poly,
     step: i128,
     monotone: bool,
+    /// set when a sum over this loop decided a fit test in its variable at both ends and found
+    /// them on two sides (`Cost::sum_split`): the loop is then charged a bound
+    straddled: std::cell::Cell<bool>,
 }
 
 impl LoopRec {
@@ -773,7 +778,15 @@ impl LoopRec {
         match self.atom { Some(a) => p.sum_over(a, &self.lo, self.step, &self.trip), None => p.mul(&self.trip) }
     }
     fn sum_cost(&self, c: &Cost) -> Cost {
-        match self.atom { Some(a) => c.sum_over(a, &self.lo, self.step, &self.trip), None => c.mul_poly(&self.trip) }
+        match self.atom {
+            Some(a) => {
+                let mut s = false;
+                let r = c.sum_split(a, &self.lo, self.step, &self.trip, &mut s);
+                if s { self.straddled.set(true); }
+                r
+            }
+            None => c.mul_poly(&self.trip),
+        }
     }
     /// The loop variable's last value.
     fn last(&self) -> Poly { self.lo.add(&self.trip.sub(&Poly::constant(1)).scale(Rat::int(self.step))) }
@@ -1036,7 +1049,7 @@ impl<'a, 'b, 'c> Fa<'a, 'b, 'c> {
         // so does a loop bounded by a scan, here or in a callee (§ A scan)
         let scans = self.scans.take();
         if matches!(result, CostResult::Exact { .. }) {
-            if tier == "exact" && (!scans.is_empty() || self.rests_on.iter().any(|r| r.ends_with(SCAN_TAG))) { tier = "bound"; }
+            if tier == "exact" && (!scans.is_empty() || self.rests_on.iter().any(|r| r.ends_with(SCAN_TAG) || r.ends_with(REGIME_TAG))) { tier = "bound"; }
             for n in scans { if !self.notes.contains(&n) { self.notes.push(n); } }
         }
         // `#[cost(...)]`: the inferred cost must stay within the declaration. Without `sizes`,
@@ -1370,6 +1383,15 @@ impl<'a, 'b, 'c> Fa<'a, 'b, 'c> {
         self.names.push(name.to_string());
         self.names.len() - 1
     }
+    /// A loop whose sum decided a fit test in its own variable at two ends on two sides of `M`
+    /// (`Cost::sum_split`) is charged a bound there, and says so as a scan does.
+    fn note_straddle(&self, rec: &LoopRec) {
+        if !rec.straddled.get() { return; }
+        let v = rec.var.map_or("its variable".to_string(), |v| format!("`{}`", self.f.locals[v].name));
+        let n = format!("regime: a fit test inside the loop over {v} depends on {v}; where it changes inside the loop, each side is charged every lap, a bound");
+        let mut s = self.scans.borrow_mut();
+        if !s.contains(&n) { s.push(n); }
+    }
     /// Open a loop: push it and start a fresh accumulator frame for its body.
     fn enter_loop(&mut self, lp: Loop) {
         let entries = self.times_here();
@@ -1378,7 +1400,7 @@ impl<'a, 'b, 'c> Fa<'a, 'b, 'c> {
         // exit branch is not the same each entry
         let varies = lp.monotone || self.loops.iter().any(|l| l.atom.is_some_and(|a| lp.trip.mentions(a)))
             || { let mut rs = Vec::new(); lp.trip.reads(&mut rs); !rs.is_empty() };
-        self.loop_recs.push(LoopRec { var: lp.var, atom: lp.atom, trip: lp.trip.clone(), lo: lp.lo.clone(), step: lp.step, monotone: lp.monotone });
+        self.loop_recs.push(LoopRec { var: lp.var, atom: lp.atom, trip: lp.trip.clone(), lo: lp.lo.clone(), step: lp.step, monotone: lp.monotone, straddled: Default::default() });
         let lp = Loop { id: self.loop_recs.len() - 1, ..lp };
         self.loops.push(lp);
         if !self.replay && self.pending_line > 0 { let t = self.times_here(); self.laps.push((self.pending_line, entries, t, varies, bounded)); }
@@ -1460,6 +1482,7 @@ impl<'a, 'b, 'c> Fa<'a, 'b, 'c> {
         self.serial = self.serial.add(&rec.sum_cost(&if carried_chain(body) { w.clone() } else { body_serial.add_poly(&Poly::constant(chained as i128)) }));
         // an ordinary loop is sequential: its span sums the same way work does
         self.span = self.span.add(&rec.sum_cost(&sp));
+        self.note_straddle(&rec);
         if had_call {
             let first = match rec.atom { Some(a) => cold_calls.subst(a, &rec.lo), None => cold_calls.clone() };
             let warm = if self.numeric(&rec.trip).is_some_and(|t| t <= 1.0) { Cost::zero() } else {
@@ -1543,6 +1566,7 @@ impl<'a, 'b, 'c> Fa<'a, 'b, 'c> {
         self.wback = self.wback.add(&rec.sum_cost(&body_wback));
         self.divs = self.divs.add(&rec.sum_cost(&body_divs));
         self.serial = self.serial.add(&rec.sum_cost(&body_serial));
+        self.note_straddle(&rec);
         let depth = Cost::poly(Poly::atom(Atom::Log(Box::new(trip.clone()))));
         self.span = self.span.add(&w.add(&depth));
         if had_call {
@@ -1905,6 +1929,8 @@ impl<'a, 'b, 'c> Fa<'a, 'b, 'c> {
         ids.sort_unstable_by(|a, b| b.cmp(a));
         // a site already charged less by a group further in is not a member of another
         let mut grouped = vec![false; nsites];
+        // the loops whose sum decided an inner test at two ends on two sides of `M`
+        let mut straddle_at: Vec<usize> = Vec::new();
         for lid in ids {
             let members: Vec<(usize, usize)> = (0..nsites)
                 .filter_map(|s| self.sites[s].path.iter().position(|&l| l == lid).map(|pos| (s, pos)))
@@ -1924,7 +1950,17 @@ impl<'a, 'b, 'c> Fa<'a, 'b, 'c> {
                 let picks: Vec<&LP> = (0..members.len()).map(|i| &inners[i][choice[i]]).collect();
                 let mut conds: Vec<Cond> = Vec::new();
                 for lp in &picks { for c in &lp.conds { if !conds.contains(c) { conds.push(c.clone()); } } }
-                if super::piece::feasible(&conds) {
+                // a test an inner loop made in this loop's variable (a triangle's inner range, `B·i
+                // < M`) is decided at this loop's two ends now that its laps are summed away
+                // (`split_conds`); where the ends are on two sides it changes inside the loop, and
+                // each side is charged every lap, a bound
+                let variants = match rec.atom {
+                    Some(a) if conds.iter().any(|c| c.ws.mentions(a)) => super::piece::split_conds(&conds, a, &rec.lo, &rec.last(), rec.step),
+                    _ if super::piece::feasible(&conds) => vec![(conds.clone(), false)],
+                    _ => vec![],
+                };
+                for (conds, s) in variants {
+                    if s && !straddle_at.contains(&lid) { straddle_at.push(lid); }
                     let ws = picks.iter().fold(Poly::zero(), |acc, lp| acc.add(&lp.lines));
                     // a working set that varies with this loop's variable is tested at its largest
                     let test: Option<Poly> = match rec.atom {
@@ -2079,6 +2115,11 @@ impl<'a, 'b, 'c> Fa<'a, 'b, 'c> {
             for (i, &(s, _)) in members.iter().enumerate() {
                 table.insert((s, lid), std::mem::take(&mut out[i]));
             }
+        }
+        for lid in straddle_at {
+            let rec = self.loop_recs[lid].clone();
+            rec.straddled.set(true);
+            self.note_straddle(&rec);
         }
         // the total: sites add up, except that sites on the two sides of an `if` are alternatives
         let top = |s: usize| -> Cost {
@@ -3400,6 +3441,11 @@ impl<'a, 'b, 'c> Fa<'a, 'b, 'c> {
                     // a callee bounded by a scan of its own (§ A scan)
                     if callee.notes.iter().any(|n| n.starts_with("scan: ") || n.starts_with("worklist: ") || n.starts_with("tree: ")) {
                         let tag = format!("{} {SCAN_TAG}", callee.name);
+                        if !self.rests_on.contains(&tag) { self.rests_on.push(tag); }
+                    }
+                    // a callee charged a bound where a fit test in a loop's variable changes
+                    if callee.notes.iter().any(|n| n.starts_with("regime: ")) {
+                        let tag = format!("{} {REGIME_TAG}", callee.name);
                         if !self.rests_on.contains(&tag) { self.rests_on.push(tag); }
                     }
                 }

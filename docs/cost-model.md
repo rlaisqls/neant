@@ -468,6 +468,21 @@ end; where it does not, or neither end dominates, lap by lap as before. `pairs` 
 from `4·n²` to `32·n + 2·B − 8` in cache, against the lower bound's `8·n`; the self-hosted pass
 still sums (`TRIANGLES_INSTEAD`).
 
+**A triangle's fit test (2026-09-29).** The inner loop of a triangle, `for j in 0..i + 1`, has a
+working set in `i` — a row of `i + 1` elements, `B·i + 8·i < M` — and its fit test was made there
+and carried outward as it was: once `i` was summed away its regimes still named it, so a caller
+had an atom `kernel_syrk.i` in its conditions that no `--eval` could give. Eight of PolyBench's 30
+kernels were exact in form and had no prediction for it (evaluation § 5). The test is now decided
+over the laps when the loop of `i` is summed (`piece::split_conds`, in `Cost::sum_split` and in
+`settle_moves`' combination of an inner loop's alternatives): a working set linear in `i` is
+largest at one end, so a test that fits there fits in every lap and that piece's sum is exact;
+one that does not fit there fails in the last laps and perhaps not in the first, and the piece
+that charges no reuse, summed over every lap, is at least what they cost, a bound. The function
+says `regime: …` and is `bound`, and a caller rests on it `(bound, a regime)`. One condition
+becomes one, so the regimes are as many as before; a first attempt that kept both ends as
+conditions and a third piece for the switch multiplied them (cholesky 4 → 566, symm past 300 s).
+Golden `triangle_regime`.
+
 **Footprints of several ranges, and a resident call (2026-09-28).** A parameter's footprint was one
 range, so two SoA fields of one element — ranges `8·n` apart — fell back to the whole array, inexact,
 and no caller was credited for either. A parameter now keeps its disjoint exact ranges apart; a range

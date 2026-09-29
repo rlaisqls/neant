@@ -1,0 +1,25 @@
+// A triangle whose inner range grows with the outer variable: row `i` of `a` read up to its
+// diagonal, `m` times over. The inner loop's working set is `i + 1` elements, so its fit test is in
+// `i`, and once `i` is summed away it is decided at the largest `i` — exact where the widest row
+// fits, a bound where it does not (cost-model § A triangle's fit test). Before, `i` was left in the
+// regimes, and a caller could not evaluate them.
+fn tri(n: i64, m: i64, c: &mut [f64], a: &[f64]) {
+    for i in 0..n {
+        let mut s = 0.0;
+        for k in 0..m {
+            for j in 0..i + 1 {
+                s += a[i * n + j];
+            }
+        }
+        c[i] = s;
+    }
+}
+
+fn main() {
+    let n = 300;
+    let m = 20;
+    let mut c = [0.0; n];
+    let a = [1.0; n * n];
+    tri(n, m, &mut c, &a);
+    println(c[n - 1]);
+}

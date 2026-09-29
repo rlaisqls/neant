@@ -1,0 +1,10 @@
+tri              work 3·n²·m + 6·n·m + 3·n         moves                              bound  (3 regimes)
+                                               moves ≈ 4·n²                       if ≈ 8·n < M
+                                               moves ≈ 4·n²·m                     if ≈ 8·n ≥ M
+                                               moves 4·n² + 2·B·n + 4·n           if ≈ 8·n < M and ≈ 8·n ≥ M
+                 lower bound      moves 8·n                          (footprint, every distinct element crosses once)
+                 footprint        c: [0, 8·n)  a: [0, 8·n²)   resident after if ≈ 8·n² < M
+                 regime: a fit test inside the loop over `i` depends on `i`; where it changes inside the loop, each side is charged every lap, a bound
+main             work 5527206                      moves 302·B + 1086000              bound, io
+                 in `tri`: regime: a fit test inside the loop over `i` depends on `i`; where it changes inside the loop, each side is charged every lap, a bound
+                 rests on         tri (bound, a regime)
