@@ -1,0 +1,4 @@
+init_array       unknown: refused, `neant cost` did not finish in 900 s
+print_array      unknown: refused, `neant cost` did not finish in 900 s
+kernel_heat_3d   unknown: refused, `neant cost` did not finish in 900 s
+main             unknown: refused, `neant cost` did not finish in 900 s

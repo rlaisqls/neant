@@ -1,0 +1,56 @@
+struct Int       layout AoS  the model does not decide: no function's moves differ
+struct Float     layout AoS  the model does not decide: no function's moves differ
+is_digit         work 3                            moves 0                            exact
+is_space         work 7                            moves 0                            exact
+skip_space       work 2·xs.len() − 2·at + 12       moves xs.len() − at + 2·B          exact
+                 footprint        xs: [0, xs.len()) (whole array)   no residue claimed
+parse_int        work 333                          moves 37·B                         exact
+                 footprint        xs: [0, xs.len()) (whole array)   no residue claimed
+parse_float      work 681                          moves 73·B                         exact
+                 footprint        xs: [0, xs.len()) (whole array)   no residue claimed
+format_int       work 406                          moves 24·B + 19                    exact
+                 footprint        out: [0, out.len()) (whole array)   no residue claimed
+format_float     work 716                          moves 44·B + 19                    exact
+                 footprint        out: [0, out.len()) (whole array)   no residue claimed
+init_array       work 11·n² + 20·n·m + 4·n         moves                              exact  (4 regimes)
+                                               moves 8·n² + 16·n·m + 3·B·n        if ≈ 8·n < M and ≈ 16·m < M
+                                               moves 8·n² + 16·n·m + 3·B·n        if ≈ 8·n ≥ M and ≈ 16·m < M
+                                               moves 8·n² + 16·n·m + 3·B·n        if ≈ 8·n < M and ≈ 16·m ≥ M
+                                               moves 8·n² + 16·n·m + 3·B·n        if ≈ 8·n ≥ M and ≈ 16·m ≥ M
+                 lower bound      moves 8·n² + 16·n·m                (footprint, every distinct element crosses once)   gap 1× if ≈ 8·n < M and ≈ 16·m < M; 1× if ≈ 8·n ≥ M and ≈ 16·m < M; 1× if ≈ 8·n < M and ≈ 16·m ≥ M; 1× if ≈ 8·n ≥ M and ≈ 16·m ≥ M at M = 2 MiB, B = 64
+                 footprint        c: [0, 8·n²)  a: [0, 8·n·m)  b: [0, 8·n·m)   resident after if ≈ 8·n² + 16·n·m < M
+print_array      work 4·c.len() + 1                moves 8·c.len() + B                exact, io
+                 lower bound      moves 8·c.len()                    (footprint, every distinct element crosses once)   gap 1× at M = 2 MiB, B = 64
+                 footprint        c: [0, 8·c.len())   resident after if 8·c.len() < M
+kernel_syr2k     work ≈ 12·n²·m                    moves                              exact  (4 regimes)
+                                               moves ≈ B·n²·m + 4·n²·m            if ≈ 2·B·n·m + 8·n·m ≥ M and ≈ 2·B·i + 8·i ≥ M
+                                               moves ≈ 4·n²·m                     if ≈ 2·B·n·m + 8·n·m < M and ≈ 2·B·i + 8·i ≥ M
+                                               moves ≈ 8·n²·m                     if ≈ 16·n·m ≥ M and ≈ 2·B·i + 8·i < M
+                                               moves ≈ 8·n² + 32·n·m              if ≈ 16·n·m < M and ≈ 2·B·i + 8·i < M
+                 lower bound      moves 16·n·m                       (footprint, every distinct element crosses once)
+                 footprint        c: [0, 8·n²)  a: [0, 8·n·m)  b: [0, 8·n·m)   resident after if ≈ 8·n² + 16·n·m < M
+main             work ≈ 12·m·n²                    moves                              exact, io  (22 regimes)
+                                               moves ≈ 16·n² + 32·m·n             if ≈ 16·m·n < M and ≈ 2·B·kernel_syr2k.i + 8·kernel_syr2k.i < M and ≈ 8·n² + 16·m·n < M
+                                               moves ≈ 32·n² + 64·m·n             if ≈ 16·m·n < M and ≈ 2·B·kernel_syr2k.i + 8·kernel_syr2k.i < M and ≈ 8·n² + 16·m·n ≥ M
+                                               moves ≈ 16·n² + 32·m·n             if ≈ 2·B·m·n + 8·m·n < M and ≈ 16·m < M and ≈ 2·B·kernel_syr2k.i + 8·kernel_syr2k.i ≥ M and ≈ 8·n² + 16·m·n < M
+                                               moves ≈ 16·n² + 32·m·n             if ≈ 8·n ≥ M and ≈ 16·m < M and ≈ 2·B·kernel_syr2k.i + 8·kernel_syr2k.i ≥ M and ≈ 8·n² + 16·m·n < M
+                                               moves ≈ 16·n² + 32·m·n             if ≈ 8·n ≥ M and ≈ 16·m < M and ≈ 2·B·kernel_syr2k.i + 8·kernel_syr2k.i < M and ≈ 8·n² + 16·m·n < M
+                                               moves ≈ 16·n² + 32·m·n             if ≈ 2·B·m·n + 8·m·n < M and ≈ 16·m ≥ M and ≈ 2·B·kernel_syr2k.i + 8·kernel_syr2k.i ≥ M and ≈ 8·n² + 16·m·n < M
+                                               moves ≈ 16·n² + 32·m·n             if ≈ 8·n < M and ≈ 16·m ≥ M and ≈ 2·B·kernel_syr2k.i + 8·kernel_syr2k.i < M and ≈ 8·n² + 16·m·n < M
+                                               moves ≈ 16·n² + 32·m·n             if ≈ 8·n ≥ M and ≈ 16·m ≥ M and ≈ 2·B·kernel_syr2k.i + 8·kernel_syr2k.i ≥ M and ≈ 8·n² + 16·m·n < M
+                                               moves ≈ 16·n² + 32·m·n             if ≈ 8·n ≥ M and ≈ 16·m ≥ M and ≈ 2·B·kernel_syr2k.i + 8·kernel_syr2k.i < M and ≈ 8·n² + 16·m·n < M
+                                               moves ≈ B·m·n² + 4·m·n²            if ≈ 8·n ≥ M and ≈ 16·m < M and ≈ 2·B·kernel_syr2k.i + 8·kernel_syr2k.i ≥ M and ≈ 8·n² + 16·m·n ≥ M
+                                               moves ≈ B·m·n² + 4·m·n²            if ≈ 8·n ≥ M and ≈ 16·m ≥ M and ≈ 2·B·kernel_syr2k.i + 8·kernel_syr2k.i ≥ M and ≈ 8·n² + 16·m·n ≥ M
+                                               moves ≈ 4·m·n²                     if ≈ 2·B·m·n + 8·m·n < M and ≈ 16·m < M and ≈ 2·B·kernel_syr2k.i + 8·kernel_syr2k.i ≥ M and ≈ 8·n² + 16·m·n ≥ M
+                                               moves ≈ 4·m·n²                     if ≈ 2·B·m·n + 8·m·n < M and ≈ 16·m ≥ M and ≈ 2·B·kernel_syr2k.i + 8·kernel_syr2k.i ≥ M and ≈ 8·n² + 16·m·n ≥ M
+                                               moves ≈ 8·m·n²                     if ≈ 8·n ≥ M and ≈ 16·m < M and ≈ 2·B·kernel_syr2k.i + 8·kernel_syr2k.i < M and ≈ 8·n² + 16·m·n ≥ M
+                                               moves ≈ 8·m·n²                     if ≈ 8·n < M and ≈ 16·m ≥ M and ≈ 2·B·kernel_syr2k.i + 8·kernel_syr2k.i < M and ≈ 8·n² + 16·m·n ≥ M
+                                               moves ≈ 8·m·n²                     if ≈ 8·n ≥ M and ≈ 16·m ≥ M and ≈ 2·B·kernel_syr2k.i + 8·kernel_syr2k.i < M and ≈ 8·n² + 16·m·n ≥ M
+                                               moves ≈ 16·n² + 32·m·n             if ≈ 2·B·m·n + 8·m·n ≥ M and ≈ 8·n < M and ≈ 16·m < M and ≈ 2·B·kernel_syr2k.i + 8·kernel_syr2k.i ≥ M and ≈ 8·n² + 16·m·n < M
+                                               moves ≈ 16·n² + 32·m·n             if ≈ 8·n < M and ≈ 16·m < M and ≈ 16·m·n ≥ M and ≈ 2·B·kernel_syr2k.i + 8·kernel_syr2k.i < M and ≈ 8·n² + 16·m·n < M
+                                               moves ≈ 16·n² + 32·m·n             if ≈ 2·B·m·n + 8·m·n ≥ M and ≈ 8·n < M and ≈ 16·m ≥ M and ≈ 2·B·kernel_syr2k.i + 8·kernel_syr2k.i ≥ M and ≈ 8·n² + 16·m·n < M
+                                               moves ≈ B·m·n² + 4·m·n²            if ≈ 2·B·m·n + 8·m·n ≥ M and ≈ 8·n < M and ≈ 16·m < M and ≈ 2·B·kernel_syr2k.i + 8·kernel_syr2k.i ≥ M and ≈ 8·n² + 16·m·n ≥ M
+                                               moves ≈ B·m·n² + 4·m·n²            if ≈ 2·B·m·n + 8·m·n ≥ M and ≈ 8·n < M and ≈ 16·m ≥ M and ≈ 2·B·kernel_syr2k.i + 8·kernel_syr2k.i ≥ M and ≈ 8·n² + 16·m·n ≥ M
+                                               moves ≈ 8·m·n²                     if ≈ 8·n < M and ≈ 16·m < M and ≈ 16·m·n ≥ M and ≈ 2·B·kernel_syr2k.i + 8·kernel_syr2k.i < M and ≈ 8·n² + 16·m·n ≥ M
+                 rests on         arg (declared, extern)
+arg              work ≤ result.len()               moves ≤ result.len()               declared, io

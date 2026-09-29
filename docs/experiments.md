@@ -1291,3 +1291,31 @@ that owns the layout can choose.
 particles.nt` past the cache in both layouts (predicted moves 96·n against 56·n a repetition,
 ×1.71), and the self-hosted compiler compiling itself, `Fac` SoA against AoS, with
 `tests/ablate/measure.nt`.
+
+## Held-out, row one: PolyBench with the frozen compiler (2026-09-29)
+
+Stage E step 3 (heldout.md). The 30 PolyBench/C 4.2.1 ports, committed and checked against the
+original C at a962c26, costed with the compiler of `42f76be` (`measure.nt --cost`: 122 port-defined
+functions, 114 exact, 8 unknown — the refusals adi and heat-3d, whose cost pass did not finish in
+900 s; 21 std functions, 12 exact and 9 declared) and timed at MEDIUM, LARGE and EXTRALARGE:
+wall-clock minimum of three pinned runs and `l2d_cache_refill × 64` minimum of three, an empty
+program's subtracted, load 1.0–2.1. Runs: 23 kernels on CPU 5, 7 on CPU 15 (the other cluster's X925,
+separate L2 and L3), the two at once; gemm rerun on CPU 15 during a CPU 5 run matched CPU 5 within
+3% in time (376.6 against 389.1 ms, 3660 against 3740 ms) and 0.2% in bytes. The data is
+`tests/heldout/polybench/row1.json`; `summary.nt` judges it.
+
+- **Bytes** (EXTRALARGE, past L3): 18 kernels, geometric mean 0.64, 15 in [1/3, 3] — holds.
+  Outside: atax 0.25, bicg 0.32, trisolv 0.33.
+- **Time** (51 runs ≥ 1 ms): geometric mean 1.69, 11 outside [0.25, 4] — fails, against a
+  threshold of 10.2: seidel-2d 5.3–5.8 at all three sizes, correlation and covariance 9.0 and
+  gramschmidt 8.7 at EXTRALARGE, bicg 4.15, trisolv 4.11, mvt 4.08 (CPU 15), correlation at MEDIUM
+  0.04, durbin at EXTRALARGE 0.2495.
+- **No prediction**: 30 of 90 runs. Two refusals, and eight kernels whose `main` is exact but whose
+  regimes are conditions on a triangular loop's outer variable (`kernel_symm.i`), which `--eval`
+  cannot be given.
+
+What it points at, in the order it would move the numbers: the fit test of a triangular loop split
+over its outer index (eight kernels' predictions), a carried dependence in a sweep (seidel-2d), a
+strided walk's time at the bytes the model already gets right (correlation, covariance), a dot
+product's serial chain (the matrix–vector kernels), and `settle_moves`' exponential search (the two
+refusals). Each is a later row, labelled with its commit; this one is not replaced.

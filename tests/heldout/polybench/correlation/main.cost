@@ -1,0 +1,85 @@
+struct Int       layout AoS  the model does not decide: no function's moves differ
+struct Float     layout AoS  the model does not decide: no function's moves differ
+abs_f64          work 3                            moves 0                            exact
+abs_i64          work 3                            moves 0                            exact
+clamp_f64        work 4                            moves 0                            exact
+clamp_i64        work 4                            moves 0                            exact
+sign_f64         work 5                            moves 0                            exact
+sqrt             work ≤ 5                          moves ≤ 0                          declared
+floor            work ≤ 2                          moves ≤ 0                          declared
+ceil             work ≤ 2                          moves ≤ 0                          declared
+exp              work ≤ 50                         moves ≤ 0                          declared
+log              work ≤ 65                         moves ≤ 0                          declared
+sin              work ≤ 140                        moves ≤ 0                          declared
+cos              work ≤ 140                        moves ≤ 0                          declared
+pow              work ≤ 130                        moves ≤ 0                          declared
+is_digit         work 3                            moves 0                            exact
+is_space         work 7                            moves 0                            exact
+skip_space       work 2·xs.len() − 2·at + 12       moves xs.len() − at + 2·B          exact
+                 footprint        xs: [0, xs.len()) (whole array)   no residue claimed
+parse_int        work 333                          moves 37·B                         exact
+                 footprint        xs: [0, xs.len()) (whole array)   no residue claimed
+parse_float      work 681                          moves 73·B                         exact
+                 footprint        xs: [0, xs.len()) (whole array)   no residue claimed
+format_int       work 406                          moves 24·B + 19                    exact
+                 footprint        out: [0, out.len()) (whole array)   no residue claimed
+format_float     work 716                          moves 44·B + 19                    exact
+                 footprint        out: [0, out.len()) (whole array)   no residue claimed
+init_array       work 11·m·n + 2·n                 moves                              exact  (2 regimes)
+                                               moves 8·m·n + B·n                  if ≈ 8·m < M
+                                               moves 8·m·n + B·n                  if ≈ 8·m ≥ M
+                 lower bound      moves 8·m·n                        (footprint, every distinct element crosses once)   gap 1× if ≈ 8·m < M; 1× if ≈ 8·m ≥ M at M = 2 MiB, B = 64
+                 footprint        data: [0, 8·m·n)   resident after if 8·m·n < M
+print_array      work 4·corr.len() + 1             moves 8·corr.len() + B             exact, io
+                 lower bound      moves 8·corr.len()                 (footprint, every distinct element crosses once)   gap 1× at M = 2 MiB, B = 64
+                 footprint        corr: [0, 8·corr.len())   resident after if 8·corr.len() < M
+kernel_correlation work ≈ 7·m²·n                     moves                              exact  (16 regimes)
+                                               moves ≈ 4·m³·n                     if ≈ 2·B·m·n < M and ≈ B·n ≥ M and ≈ 24·m ≥ M
+                                               moves ≈ 4·m³·n                     if ≈ 2·B·m·n < M and ≈ B·n ≥ M and ≈ 24·m < M
+                                               moves ≈ B·m²·n                     if ≈ 2·B·m·n ≥ M and ≈ B·n ≥ M and ≈ 24·m < M
+                                               moves ≈ 4·m²·n                     if ≈ 8·m·n ≥ M and ≈ 24·m ≥ M and ≈ 2·B·n < M
+                                               moves ≈ 32·m³·n/B                  if ≈ 8·m·n < M and ≈ 24·m ≥ M and ≈ 2·B·n < M
+                                               moves ≈ 4·m²·n                     if ≈ 8·m·n ≥ M and ≈ 24·m < M and ≈ 2·B·n < M
+                                               moves ≈ 32·m³·n/B                  if ≈ 8·m·n < M and ≈ 24·m < M and ≈ 2·B·n < M
+                                               moves ≈ B·m²·n                     if ≈ 2·B·m·n ≥ M and ≈ B·n ≥ M and ≈ 24·m ≥ M
+                                               moves ≈ 4·m³·n                     if ≈ 2·B·m·n < M and ≈ B·n < M and ≈ 24·m ≥ M and ≈ B·n ≥ M
+                                               moves ≈ 4·m³·n                     if ≈ 2·B·m·n < M and ≈ B·n < M and ≈ 24·m < M and ≈ B·n ≥ M
+                                               moves ≈ 4·m³·n                     if ≈ 2·B·m·n < M and ≈ 24·m ≥ M and ≈ 2·B·n ≥ M and ≈ B·n < M
+                                               moves ≈ 4·m³·n                     if ≈ 2·B·m·n < M and ≈ 24·m < M and ≈ 2·B·n ≥ M and ≈ B·n < M
+                                               moves ≈ B·m²·n                     if ≈ 2·B·m·n ≥ M and ≈ B·n < M and ≈ 24·m ≥ M and ≈ B·n ≥ M
+                                               moves ≈ B·m²·n                     if ≈ 2·B·m·n ≥ M and ≈ B·n < M and ≈ 24·m < M and ≈ B·n ≥ M
+                                               moves ≈ B·m²·n                     if ≈ 2·B·m·n ≥ M and ≈ 24·m ≥ M and ≈ 2·B·n ≥ M and ≈ B·n < M
+                                               moves ≈ B·m²·n                     if ≈ 2·B·m·n ≥ M and ≈ 24·m < M and ≈ 2·B·n ≥ M and ≈ B·n < M
+                 lower bound      moves 4·m² + 8·m·n + 12·m          (footprint, every distinct element crosses once)
+                 footprint        data: [0, 8·data.len()) (whole array)  corr: [0, 8·corr.len()) (whole array)  mean: [0, 8·m)  stddev: [0, 8·m)   no residue claimed
+                 `data` moves by 8·m bytes per iteration of the innermost loop: a new line every time (main.nt:49)
+                 `data` moves by 8·m bytes per iteration of the innermost loop: a new line every time (main.nt:49)
+                 rests on         sqrt (declared, extern)
+main             work ≈ 7·m²·n                     moves                              exact, io  (24 regimes)
+                                               moves ≈ 4·m³·n                     if ≈ 2·B·m·n < M and ≈ 8·m ≥ M and ≈ B·n ≥ M
+                                               moves ≈ 4·m³·n                     if ≈ 2·B·m·n < M and ≈ B·n ≥ M and ≈ 24·m < M
+                                               moves ≈ B·m²·n                     if ≈ 2·B·m·n ≥ M and ≈ 8·m ≥ M and ≈ B·n ≥ M
+                                               moves ≈ B·m²·n                     if ≈ 2·B·m·n ≥ M and ≈ B·n ≥ M and ≈ 24·m < M
+                                               moves ≈ 4·m²·n                     if ≈ 8·m ≥ M and ≈ 8·m·n ≥ M and ≈ 2·B·n < M
+                                               moves ≈ 32·m³·n/B                  if ≈ 8·m ≥ M and ≈ 8·m·n < M and ≈ 2·B·n < M
+                                               moves ≈ 4·m²·n                     if ≈ 8·m·n ≥ M and ≈ 24·m < M and ≈ 2·B·n < M
+                                               moves ≈ 32·m³·n/B                  if ≈ 8·m·n < M and ≈ 24·m < M and ≈ 2·B·n < M
+                                               moves ≈ 4·m³·n                     if ≈ 2·B·m·n < M and ≈ 8·m < M and ≈ B·n ≥ M and ≈ 24·m ≥ M
+                                               moves ≈ 4·m³·n                     if ≈ 2·B·m·n < M and ≈ 8·m ≥ M and ≈ B·n < M and ≈ B·n ≥ M
+                                               moves ≈ 4·m³·n                     if ≈ 2·B·m·n < M and ≈ B·n < M and ≈ 24·m < M and ≈ B·n ≥ M
+                                               moves ≈ 4·m³·n                     if ≈ 2·B·m·n < M and ≈ 8·m ≥ M and ≈ 2·B·n ≥ M and ≈ B·n < M
+                                               moves ≈ 4·m³·n                     if ≈ 2·B·m·n < M and ≈ 24·m < M and ≈ 2·B·n ≥ M and ≈ B·n < M
+                                               moves ≈ B·m²·n                     if ≈ 2·B·m·n ≥ M and ≈ 8·m < M and ≈ B·n ≥ M and ≈ 24·m ≥ M
+                                               moves ≈ B·m²·n                     if ≈ 2·B·m·n ≥ M and ≈ 8·m ≥ M and ≈ B·n < M and ≈ B·n ≥ M
+                                               moves ≈ B·m²·n                     if ≈ 2·B·m·n ≥ M and ≈ B·n < M and ≈ 24·m < M and ≈ B·n ≥ M
+                                               moves ≈ 4·m²·n                     if ≈ 8·m < M and ≈ 8·m·n ≥ M and ≈ 24·m ≥ M and ≈ 2·B·n < M
+                                               moves ≈ 32·m³·n/B                  if ≈ 8·m < M and ≈ 8·m·n < M and ≈ 24·m ≥ M and ≈ 2·B·n < M
+                                               moves ≈ B·m²·n                     if ≈ 2·B·m·n ≥ M and ≈ 8·m ≥ M and ≈ 2·B·n ≥ M and ≈ B·n < M
+                                               moves ≈ B·m²·n                     if ≈ 2·B·m·n ≥ M and ≈ 24·m < M and ≈ 2·B·n ≥ M and ≈ B·n < M
+                                               moves ≈ 4·m³·n                     if ≈ 2·B·m·n < M and ≈ 8·m < M and ≈ B·n < M and ≈ 24·m ≥ M and ≈ B·n ≥ M
+                                               moves ≈ 4·m³·n                     if ≈ 2·B·m·n < M and ≈ 8·m < M and ≈ 24·m ≥ M and ≈ 2·B·n ≥ M and ≈ B·n < M
+                                               moves ≈ B·m²·n                     if ≈ 2·B·m·n ≥ M and ≈ 8·m < M and ≈ B·n < M and ≈ 24·m ≥ M and ≈ B·n ≥ M
+                                               moves ≈ B·m²·n                     if ≈ 2·B·m·n ≥ M and ≈ 8·m < M and ≈ 24·m ≥ M and ≈ 2·B·n ≥ M and ≈ B·n < M
+                 in `kernel_correlation`: `data` moves by 8·m bytes per iteration of the innermost loop: a new line every time (main.nt:49)
+                 rests on         arg (declared, extern); sqrt (declared, extern)
+arg              work ≤ result.len()               moves ≤ result.len()               declared, io

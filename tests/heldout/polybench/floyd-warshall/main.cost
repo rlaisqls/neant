@@ -1,0 +1,39 @@
+struct Int       layout AoS  the model does not decide: no function's moves differ
+struct Float     layout AoS  the model does not decide: no function's moves differ
+is_digit         work 3                            moves 0                            exact
+is_space         work 7                            moves 0                            exact
+skip_space       work 2·xs.len() − 2·at + 12       moves xs.len() − at + 2·B          exact
+                 footprint        xs: [0, xs.len()) (whole array)   no residue claimed
+parse_int        work 333                          moves 37·B                         exact
+                 footprint        xs: [0, xs.len()) (whole array)   no residue claimed
+parse_float      work 681                          moves 73·B                         exact
+                 footprint        xs: [0, xs.len()) (whole array)   no residue claimed
+format_int       work 406                          moves 24·B + 19                    exact
+                 footprint        out: [0, out.len()) (whole array)   no residue claimed
+format_float     work 716                          moves 44·B + 19                    exact
+                 footprint        out: [0, out.len()) (whole array)   no residue claimed
+init_array       work 23·n² + 2·n                  moves                              exact  (2 regimes)
+                                               moves 16·n² + 2·B·n                if ≈ 16·n < M
+                                               moves 16·n² + 2·B·n                if ≈ 16·n ≥ M
+                 lower bound      moves 8·n²                         (footprint, every distinct element crosses once)   gap 2× if ≈ 16·n < M; 2× if ≈ 16·n ≥ M at M = 2 MiB, B = 64
+                 footprint        path: [0, 8·n²)   resident after if 8·n² < M
+print_array      work 4·path.len() + 1             moves 8·path.len() + B             exact, io
+                 lower bound      moves 8·path.len()                 (footprint, every distinct element crosses once)   gap 1× at M = 2 MiB, B = 64
+                 footprint        path: [0, 8·path.len())   resident after if 8·path.len() < M
+kernel_floyd_warshall work 24·n³ + 2·n² + 2·n           moves                              exact  (4 regimes)
+                                               moves 40·n² + 3·B·n                if ≈ 16·n² < M
+                                               moves 24·n³ + 5·B·n²               if ≈ 32·n ≥ M
+                                               moves ≈ 16·n³                      if ≈ 16·n² ≥ M and ≈ 32·n < M
+                                               moves ≈ 8·n³                       if ≈ 16·n² ≥ M and ≈ 32·n < M
+                 lower bound      moves 8·n³/√M − M                  (HBL, σ = 3/2, CDKSY 2013)   gap 4344× if ≈ 32·n ≥ M; 2896× if ≈ 16·n² ≥ M and ≈ 32·n < M; 1448× if ≈ 16·n² ≥ M and ≈ 32·n < M at M = 2 MiB, B = 64
+                 lower bound      moves 8·n²                         (footprint, every distinct element crosses once)   gap 5× if ≈ 16·n² < M at M = 2 MiB, B = 64
+                 footprint        path: [0, 8·n²)   resident after if 8·n² < M
+main             work ≈ 24·n³                      moves                              exact, io  (6 regimes)
+                                               moves ≈ 24·n²                      if ≈ 16·n² < M
+                                               moves ≈ 24·n³                      if ≈ 16·n ≥ M
+                                               moves ≈ 24·n²                      if ≈ 16·n² ≥ M and 8·n² < M
+                                               moves ≈ 24·n³                      if ≈ 16·n < M and ≈ 32·n ≥ M
+                                               moves ≈ 16·n³                      if ≈ 32·n < M and 8·n² ≥ M
+                                               moves ≈ 8·n³                       if ≈ 32·n < M and 8·n² ≥ M
+                 rests on         arg (declared, extern)
+arg              work ≤ result.len()               moves ≤ result.len()               declared, io

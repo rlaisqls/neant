@@ -164,6 +164,68 @@ So the tiers are checked, repeatedly, and each fix came with a golden that repro
 not proved: there is no mechanised soundness argument, and the rate at which wrong `exact` lines
 were found through stage D says the next one is likely.
 
+## 5. Held-out: PolyBench, row one (2026-09-29)
+
+The first numbers on code the project did not write and fitted nothing on: the 30 PolyBench/C
+4.2.1 kernels (heldout.md), ported by its rules, each checked against the original C before it was
+costed (`check.nt`: 30 of 30 at MINI, 29 of 29 at SMALL, gramschmidt not comparable there), costed
+and timed with the compiler of the frozen commit `42f76be`. The data is
+`tests/heldout/polybench/row1.json` (90 runs, 30 kernels × MEDIUM, LARGE, EXTRALARGE), each port's
+report its `main.cost`, the tiers `tiers.txt`; `summary.nt` reads the JSON and applies
+heldout.md's thresholds, and prints what is below.
+
+| question | row one | heldout.md | verdict |
+|---|---|---|---|
+| **Bytes** (EXTRALARGE, footprint past L3) | 18 kernels, geometric mean 0.64, 15 within [1/3, 3] (83%) | holds: mean in [0.5, 2] and 80% in [1/3, 3] | **holds** |
+| **Time** (every run with predicted and measured ≥ 1 ms) | 51 runs, geometric mean 1.69, 11 outside [0.25, 4] (21.6%) | fails: more than 20% outside [0.25, 4] | **fails** |
+| **Reach** (port-defined functions) | 114 of 122 stated, all exact; 8 unknown, the two refusals | holds: stated ≥ 2/3 and exact ≥ the C analyser's | first half met; judged with the C analyser's row |
+| **Ranking**, **Trust** | — | steps 6 and 7 | later rows |
+
+**Bytes hold.** Where a kernel's arrays pass the last cache, the moves model is as good on code it
+never saw as on its own: 2mm, 3mm, gemm, fdtd-2d, correlation and covariance within 0.97–1.24, the
+geometric mean 0.64 pulled low by the matrix–vector kernels. The three outside are atax (0.25),
+bicg (0.32) and trisolv (0.33), each a single pass over a matrix that the model charges three to four
+times over. deriche at a gigabyte is 2.55.
+
+**Time fails, by one run.** The threshold is 20% of 51, 10.2 runs; 11 are outside, and one of them
+is durbin at EXTRALARGE, 0.2495. Without it the row would be *between*; this file reports what the
+threshold says. The misses are three shapes, each a term the time model lacks rather than a constant:
+
+- **Gauss–Seidel's carried dependence** (seidel-2d, 5.3–5.8 at every size): each point waits for the
+  one just written; the calculus charges the sweep at the rate of independent points.
+- **A column walk that the bytes model gets right and the time model does not** (correlation and
+  covariance 9.0, gramschmidt 8.7, at EXTRALARGE only; correlation's and covariance's bytes are
+  1.17–1.24, and at LARGE their time is 3.7): the bytes arrive at a column's stride, and a strided line costs more time than `BW` gives it
+  — evaluation's "strides and the TLB", at a hundred megabytes.
+- **Matrix–vector kernels at 3–4.1** past the noise (atax, bicg, gemver, gesummv, mvt, trisolv): the
+  one-pass matrix read whose bytes are overcharged is undercharged in time — most likely a dot
+  product's serial add chain, which the short-lap rule prices as independent adds (the `dot` of
+  § What fails); not yet measured apart.
+
+And the opposite side, predicted slower than they run: the stencils jacobi-2d (0.41–0.42) and
+fdtd-2d (0.39–0.65), whose bytes are overcharged 3× (0.33–0.34 at jacobi-2d) — the neighbouring-site
+reuse of § What fails, still counted apart.
+
+**No prediction for a third of the kernels, one cause for most.** Ten kernels have no time or bytes
+line: adi and heat-3d are refusals (the frozen compiler's cost pass did not finish in 900 s; its
+`settle_moves` tries every combination of sites), and in the other eight — cholesky, lu, ludcmp,
+symm, syrk, syr2k, trmm, nussinov — `main` is *exact* but its regimes are conditions on the outer
+variable of a triangular loop (`16·kernel_cholesky.i < M`), which `--eval` cannot be given and no
+caller can decide. The fit test of a loop whose inner extent depends on the outer index is left in
+that index instead of being split over it. It is the largest single gap row one found: 8 of 30
+kernels, exact in form and unusable as a prediction.
+
+**How it was measured, and what differs from heldout.md.** Wall-clock is the minimum of three runs
+pinned with `taskset`, an empty program's time subtracted; bytes are `l2d_cache_refill × 64`, the
+minimum of three runs under `perf stat`, the empty program's subtracted. Load was 1.0–2.1. Seven
+kernels' runs (21 of 90) were taken on CPU 15, the other L3 cluster's X925, alongside CPU 5, which heldout.md
+does not name: gemm rerun on CPU 15 while CPU 5 was busy agreed with its CPU 5 run within 3% in time
+and 0.2% in bytes (`row1-cpu15-check.json`), and of the seven kernels counted from CPU 15 only mvt
+has a prediction. So the verdict rests on two runs at the edge: durbin's EXTRALARGE at 0.2495 on CPU 5, and mvt's
+EXTRALARGE at 4.08 on CPU 15 — were either inside [0.25, 4], 10 of 51 would be outside, 19.6%, and
+the row *between*. The harness is neant
+(`measure.nt` over `std/os.nt`, decisions §14), not the Python heldout.md's step 2 names.
+
 ## What fails, and why
 
 Each of these is a term the model lacks or a shape the calculus does not reach, measured, not a

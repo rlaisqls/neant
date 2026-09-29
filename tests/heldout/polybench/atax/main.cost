@@ -1,0 +1,39 @@
+struct Int       layout AoS  the model does not decide: no function's moves differ
+struct Float     layout AoS  the model does not decide: no function's moves differ
+is_digit         work 3                            moves 0                            exact
+is_space         work 7                            moves 0                            exact
+skip_space       work 2·xs.len() − 2·at + 12       moves xs.len() − at + 2·B          exact
+                 footprint        xs: [0, xs.len()) (whole array)   no residue claimed
+parse_int        work 333                          moves 37·B                         exact
+                 footprint        xs: [0, xs.len()) (whole array)   no residue claimed
+parse_float      work 681                          moves 73·B                         exact
+                 footprint        xs: [0, xs.len()) (whole array)   no residue claimed
+format_int       work 406                          moves 24·B + 19                    exact
+                 footprint        out: [0, out.len()) (whole array)   no residue claimed
+format_float     work 716                          moves 44·B + 19                    exact
+                 footprint        out: [0, out.len()) (whole array)   no residue claimed
+init_array       work ≈ 11·m·n                     moves                              exact  (2 regimes)
+                                               moves ≈ 8·m·n                      if ≈ 8·n < M
+                                               moves ≈ 8·m·n                      if ≈ 8·n ≥ M
+                 lower bound      moves 8·m·n + 8·n                  (footprint, every distinct element crosses once)   gap 1× if ≈ 8·n < M; 1× if ≈ 8·n ≥ M at M = 2 MiB, B = 64
+                 footprint        a: [0, 8·m·n)  x: [0, 8·n)   resident after if ≈ 8·m·n < M
+print_array      work 4·y.len() + 1                moves 8·y.len() + B                exact, io
+                 lower bound      moves 8·y.len()                    (footprint, every distinct element crosses once)   gap 1× at M = 2 MiB, B = 64
+                 footprint        y: [0, 8·y.len())   resident after if 8·y.len() < M
+kernel_atax      work 20·m·n + 3·n + 3·m           moves                              exact  (2 regimes)
+                                               moves ≈ 16·m·n                     if ≈ 32·n < M
+                                               moves ≈ 32·m·n                     if ≈ 32·n ≥ M
+                 lower bound      moves 8·m·n + 16·n + 8·m           (footprint, every distinct element crosses once)   gap 2× if ≈ 32·n < M; 4× if ≈ 32·n ≥ M at M = 2 MiB, B = 64
+                 footprint        a: [0, 8·m·n)  x: [0, 8·n)  y: [0, 8·n)  tmp: [0, 8·m)   resident after if ≈ 8·m·n < M
+main             work ≈ 32·m·n                     moves                              exact, io  (9 regimes)
+                                               moves ≈ 40·m·n                     if ≈ 8·n ≥ M and ≈ 8·m·n < M
+                                               moves ≈ 48·m·n                     if ≈ 8·n ≥ M and ≈ 8·m·n ≥ M
+                                               moves ≈ 24·m·n                     if ≈ 32·n < M and ≈ 8·m·n < M
+                                               moves ≈ 32·m·n                     if ≈ 32·n < M and ≈ 8·m·n ≥ M
+                                               moves ≈ 40·m·n                     if ≈ 8·n < M and ≈ 32·n ≥ M and ≈ 8·m·n < M
+                                               moves ≈ 40·m·n                     if ≈ 8·n ≥ M and ≈ 8·m·n ≥ M and ≈ 8·m·n < M
+                                               moves ≈ 48·m·n                     if ≈ 8·n < M and ≈ 32·n ≥ M and ≈ 8·m·n ≥ M
+                                               moves ≈ 24·m·n                     if ≈ 32·n < M and ≈ 8·m·n ≥ M and ≈ 8·m·n < M
+                                               moves ≈ 40·m·n                     if ≈ 8·n < M and ≈ 32·n ≥ M and ≈ 8·m·n ≥ M and ≈ 8·m·n < M
+                 rests on         arg (declared, extern)
+arg              work ≤ result.len()               moves ≤ result.len()               declared, io

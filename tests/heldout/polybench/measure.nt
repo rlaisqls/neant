@@ -644,8 +644,15 @@ fn measure(neant: &[u8], here: &[u8], ks: &[u8], sel: &[u8], sel_n: i64, dsb: &[
         let mut xt = [0; 16];
         let mut ak = [0; 16];
         let lets = size_lets(&nt, body, &mut xf, &mut xt, &mut ak);
-        // a port the compiler refused once is not costed again at the next size
+        // a port the compiler refused once is not costed again at the next size, nor one --cost
+        // already found it refused (its main.cost says so)
         let mut refused = false;
+        let mc = ".cost";
+        let mcp = in_dir(&dir, &mn, &mc);
+        if file_size(&mcp) > 0 {
+            let prior = read_file(&mcp);
+            if find(&prior, 0, "unknown: refused, `neant cost` did not finish") < prior.len() { refused = true; }
+        }
 
         let mut d = 0;
         while d < ds_n {

@@ -1,0 +1,83 @@
+struct Int       layout AoS  the model does not decide: no function's moves differ
+struct Float     layout AoS  the model does not decide: no function's moves differ
+is_digit         work 3                            moves 0                            exact
+is_space         work 7                            moves 0                            exact
+skip_space       work 2·xs.len() − 2·at + 12       moves xs.len() − at + 2·B          exact
+                 footprint        xs: [0, xs.len()) (whole array)   no residue claimed
+parse_int        work 333                          moves 37·B                         exact
+                 footprint        xs: [0, xs.len()) (whole array)   no residue claimed
+parse_float      work 681                          moves 73·B                         exact
+                 footprint        xs: [0, xs.len()) (whole array)   no residue claimed
+format_int       work 406                          moves 24·B + 19                    exact
+                 footprint        out: [0, out.len()) (whole array)   no residue claimed
+format_float     work 716                          moves 44·B + 19                    exact
+                 footprint        out: [0, out.len()) (whole array)   no residue claimed
+init_array       work 29·nx·ny + 2·nx + 4·tmax     moves                              exact  (2 regimes)
+                                               moves ≈ 24·nx·ny                   if ≈ 24·ny < M
+                                               moves ≈ 24·nx·ny                   if ≈ 24·ny ≥ M
+                 lower bound      moves 24·nx·ny + 8·tmax            (footprint, every distinct element crosses once)   gap 1× if ≈ 24·ny < M; 1× if ≈ 24·ny ≥ M at M = 2 MiB, B = 64
+                 footprint        ex: [0, 8·nx·ny)  ey: [0, 8·nx·ny)  hz: [0, 8·nx·ny)  fict: [0, 8·tmax)   resident after if ≈ 24·nx·ny < M
+print_array      work ≈ 4·hz.len() + 4·ey.len() + 4·ex.len() moves ≈ 8·hz.len() + 8·ey.len() + 8·ex.len() exact, io
+                 lower bound      moves 8·hz.len() + 8·ey.len() + 8·ex.len() (footprint, every distinct element crosses once)   gap 1× at M = 2 MiB, B = 64
+                 footprint        ex: [0, 8·ex.len())  ey: [0, 8·ey.len())  hz: [0, 8·hz.len())   resident after if ≈ 8·hz.len() + 8·ey.len() + 8·ex.len() < M
+kernel_fdtd_2d   work ≈ 63·tmax·nx·ny              moves                              exact  (18 regimes)
+                                               moves ≈ 72·nx·ny                   if ≈ 72·nx·ny < M and ≈ 16·ny ≥ M
+                                               moves ≈ 72·tmax·nx·ny              if ≈ 72·nx·ny ≥ M and ≈ 16·ny ≥ M
+                                               moves ≈ 56·nx·ny                   if ≈ 56·nx·ny < M and ≈ 48·ny < M and ≈ 64·ny < M
+                                               moves ≈ 64·nx·ny                   if ≈ 64·nx·ny < M and ≈ 24·ny ≥ M and ≈ 64·ny < M
+                                               moves ≈ 64·nx·ny                   if ≈ 64·nx·ny < M and ≈ 48·ny < M and ≈ 64·ny ≥ M
+                                               moves ≈ 72·nx·ny                   if ≈ 72·nx·ny < M and ≈ 24·ny < M and ≈ 32·ny ≥ M
+                                               moves ≈ 56·tmax·nx·ny              if ≈ 56·nx·ny ≥ M and ≈ 48·ny < M and ≈ 64·ny < M
+                                               moves ≈ 64·tmax·nx·ny              if ≈ 64·nx·ny ≥ M and ≈ 24·ny ≥ M and ≈ 64·ny < M
+                                               moves ≈ 64·tmax·nx·ny              if ≈ 64·nx·ny ≥ M and ≈ 48·ny < M and ≈ 64·ny ≥ M
+                                               moves ≈ 72·tmax·nx·ny              if ≈ 72·nx·ny ≥ M and ≈ 24·ny < M and ≈ 32·ny ≥ M
+                                               moves ≈ 64·nx·ny                   if ≈ 64·nx·ny < M and ≈ 24·ny < M and ≈ 48·ny ≥ M and ≈ 64·ny < M
+                                               moves ≈ 72·nx·ny                   if ≈ 72·nx·ny < M and ≈ 24·ny ≥ M and ≈ 32·ny < M and ≈ 64·ny ≥ M
+                                               moves ≈ 72·nx·ny                   if ≈ 72·nx·ny < M and ≈ 16·ny < M and ≈ 24·ny ≥ M and ≈ 32·ny ≥ M
+                                               moves ≈ 64·tmax·nx·ny              if ≈ 64·nx·ny ≥ M and ≈ 24·ny < M and ≈ 48·ny ≥ M and ≈ 64·ny < M
+                                               moves ≈ 72·tmax·nx·ny              if ≈ 72·nx·ny ≥ M and ≈ 24·ny ≥ M and ≈ 32·ny < M and ≈ 64·ny ≥ M
+                                               moves ≈ 72·tmax·nx·ny              if ≈ 72·nx·ny ≥ M and ≈ 16·ny < M and ≈ 24·ny ≥ M and ≈ 32·ny ≥ M
+                                               moves ≈ 72·nx·ny                   if ≈ 72·nx·ny < M and ≈ 24·ny < M and ≈ 32·ny < M and ≈ 48·ny ≥ M and ≈ 64·ny ≥ M
+                                               moves ≈ 72·tmax·nx·ny              if ≈ 72·nx·ny ≥ M and ≈ 24·ny < M and ≈ 32·ny < M and ≈ 48·ny ≥ M and ≈ 64·ny ≥ M
+                 lower bound      moves 16·nx·ny + 8·tmax − 8·nx     (footprint, every distinct element crosses once)   gap 4× if ≈ 72·nx·ny < M and ≈ 16·ny ≥ M; 4× if ≈ 56·nx·ny < M and ≈ 48·ny < M and ≈ 64·ny < M; 4× if ≈ 64·nx·ny < M and ≈ 24·ny ≥ M and ≈ 64·ny < M; 4× if ≈ 64·nx·ny < M and ≈ 48·ny < M and ≈ 64·ny ≥ M; 4× if ≈ 72·nx·ny < M and ≈ 24·ny < M and ≈ 32·ny ≥ M; 4× if ≈ 64·nx·ny < M and ≈ 24·ny < M and ≈ 48·ny ≥ M and ≈ 64·ny < M; 4× if ≈ 72·nx·ny < M and ≈ 24·ny ≥ M and ≈ 32·ny < M and ≈ 64·ny ≥ M; 4× if ≈ 72·nx·ny < M and ≈ 16·ny < M and ≈ 24·ny ≥ M and ≈ 32·ny ≥ M; 4× if ≈ 72·nx·ny < M and ≈ 24·ny < M and ≈ 32·ny < M and ≈ 48·ny ≥ M and ≈ 64·ny ≥ M at M = 2 MiB, B = 64
+                 lower bound      moves 16·tmax·ny/M − M             (HBL, σ = 2, CDKSY 2013)
+                 footprint        ex: [0, 8·ex.len()) (whole array)  ey: [0, 8·ey.len()) (whole array)  hz: [0, 8·hz.len()) (whole array)  fict: [0, 8·tmax)   no residue claimed
+main             work ≈ 63·tmax·nx·ny              moves                              exact, io  (36 regimes)
+                                               moves ≈ 144·nx·ny                  if ≈ 72·nx·ny < M and ≈ 16·ny ≥ M and ≈ 24·nx·ny < M
+                                               moves ≈ 144·nx·ny                  if ≈ 72·nx·ny < M and ≈ 16·ny ≥ M and ≈ 24·nx·ny ≥ M
+                                               moves ≈ 72·tmax·nx·ny              if ≈ 72·nx·ny ≥ M and ≈ 16·ny ≥ M and ≈ 24·nx·ny < M
+                                               moves ≈ 72·tmax·nx·ny              if ≈ 72·nx·ny ≥ M and ≈ 16·ny ≥ M and ≈ 24·nx·ny ≥ M
+                                               moves ≈ 128·nx·ny                  if ≈ 56·nx·ny < M and ≈ 48·ny < M and ≈ 64·ny < M and ≈ 24·nx·ny < M
+                                               moves ≈ 136·nx·ny                  if ≈ 64·nx·ny < M and ≈ 24·ny ≥ M and ≈ 64·ny < M and ≈ 24·nx·ny < M
+                                               moves ≈ 128·nx·ny                  if ≈ 56·nx·ny < M and ≈ 48·ny < M and ≈ 64·ny < M and ≈ 24·nx·ny ≥ M
+                                               moves ≈ 136·nx·ny                  if ≈ 64·nx·ny < M and ≈ 24·ny ≥ M and ≈ 64·ny < M and ≈ 24·nx·ny ≥ M
+                                               moves ≈ 136·nx·ny                  if ≈ 64·nx·ny < M and ≈ 48·ny < M and ≈ 64·ny ≥ M and ≈ 24·nx·ny < M
+                                               moves ≈ 144·nx·ny                  if ≈ 72·nx·ny < M and ≈ 24·ny < M and ≈ 32·ny ≥ M and ≈ 24·nx·ny < M
+                                               moves ≈ 136·nx·ny                  if ≈ 64·nx·ny < M and ≈ 48·ny < M and ≈ 64·ny ≥ M and ≈ 24·nx·ny ≥ M
+                                               moves ≈ 144·nx·ny                  if ≈ 72·nx·ny < M and ≈ 24·ny < M and ≈ 32·ny ≥ M and ≈ 24·nx·ny ≥ M
+                                               moves ≈ 56·tmax·nx·ny              if ≈ 56·nx·ny ≥ M and ≈ 48·ny < M and ≈ 64·ny < M and ≈ 24·nx·ny < M
+                                               moves ≈ 64·tmax·nx·ny              if ≈ 64·nx·ny ≥ M and ≈ 24·ny ≥ M and ≈ 64·ny < M and ≈ 24·nx·ny < M
+                                               moves ≈ 56·tmax·nx·ny              if ≈ 56·nx·ny ≥ M and ≈ 48·ny < M and ≈ 64·ny < M and ≈ 24·nx·ny ≥ M
+                                               moves ≈ 64·tmax·nx·ny              if ≈ 64·nx·ny ≥ M and ≈ 24·ny ≥ M and ≈ 64·ny < M and ≈ 24·nx·ny ≥ M
+                                               moves ≈ 64·tmax·nx·ny              if ≈ 64·nx·ny ≥ M and ≈ 48·ny < M and ≈ 64·ny ≥ M and ≈ 24·nx·ny < M
+                                               moves ≈ 72·tmax·nx·ny              if ≈ 72·nx·ny ≥ M and ≈ 24·ny < M and ≈ 32·ny ≥ M and ≈ 24·nx·ny < M
+                                               moves ≈ 64·tmax·nx·ny              if ≈ 64·nx·ny ≥ M and ≈ 48·ny < M and ≈ 64·ny ≥ M and ≈ 24·nx·ny ≥ M
+                                               moves ≈ 72·tmax·nx·ny              if ≈ 72·nx·ny ≥ M and ≈ 24·ny < M and ≈ 32·ny ≥ M and ≈ 24·nx·ny ≥ M
+                                               moves ≈ 136·nx·ny                  if ≈ 64·nx·ny < M and ≈ 24·ny < M and ≈ 48·ny ≥ M and ≈ 64·ny < M and ≈ 24·nx·ny < M
+                                               moves ≈ 136·nx·ny                  if ≈ 64·nx·ny < M and ≈ 24·ny < M and ≈ 48·ny ≥ M and ≈ 64·ny < M and ≈ 24·nx·ny ≥ M
+                                               moves ≈ 144·nx·ny                  if ≈ 72·nx·ny < M and ≈ 24·ny ≥ M and ≈ 32·ny < M and ≈ 64·ny ≥ M and ≈ 24·nx·ny < M
+                                               moves ≈ 144·nx·ny                  if ≈ 72·nx·ny < M and ≈ 16·ny < M and ≈ 24·ny ≥ M and ≈ 32·ny ≥ M and ≈ 24·nx·ny < M
+                                               moves ≈ 144·nx·ny                  if ≈ 72·nx·ny < M and ≈ 24·ny ≥ M and ≈ 32·ny < M and ≈ 64·ny ≥ M and ≈ 24·nx·ny ≥ M
+                                               moves ≈ 144·nx·ny                  if ≈ 72·nx·ny < M and ≈ 16·ny < M and ≈ 24·ny ≥ M and ≈ 32·ny ≥ M and ≈ 24·nx·ny ≥ M
+                                               moves ≈ 64·tmax·nx·ny              if ≈ 64·nx·ny ≥ M and ≈ 24·ny < M and ≈ 48·ny ≥ M and ≈ 64·ny < M and ≈ 24·nx·ny < M
+                                               moves ≈ 64·tmax·nx·ny              if ≈ 64·nx·ny ≥ M and ≈ 24·ny < M and ≈ 48·ny ≥ M and ≈ 64·ny < M and ≈ 24·nx·ny ≥ M
+                                               moves ≈ 72·tmax·nx·ny              if ≈ 72·nx·ny ≥ M and ≈ 24·ny ≥ M and ≈ 32·ny < M and ≈ 64·ny ≥ M and ≈ 24·nx·ny < M
+                                               moves ≈ 72·tmax·nx·ny              if ≈ 72·nx·ny ≥ M and ≈ 16·ny < M and ≈ 24·ny ≥ M and ≈ 32·ny ≥ M and ≈ 24·nx·ny < M
+                                               moves ≈ 72·tmax·nx·ny              if ≈ 72·nx·ny ≥ M and ≈ 24·ny ≥ M and ≈ 32·ny < M and ≈ 64·ny ≥ M and ≈ 24·nx·ny ≥ M
+                                               moves ≈ 72·tmax·nx·ny              if ≈ 72·nx·ny ≥ M and ≈ 16·ny < M and ≈ 24·ny ≥ M and ≈ 32·ny ≥ M and ≈ 24·nx·ny ≥ M
+                                               moves ≈ 144·nx·ny                  if ≈ 72·nx·ny < M and ≈ 24·ny < M and ≈ 32·ny < M and ≈ 48·ny ≥ M and ≈ 64·ny ≥ M and ≈ 24·nx·ny < M
+                                               moves ≈ 144·nx·ny                  if ≈ 72·nx·ny < M and ≈ 24·ny < M and ≈ 32·ny < M and ≈ 48·ny ≥ M and ≈ 64·ny ≥ M and ≈ 24·nx·ny ≥ M
+                                               moves ≈ 72·tmax·nx·ny              if ≈ 72·nx·ny ≥ M and ≈ 24·ny < M and ≈ 32·ny < M and ≈ 48·ny ≥ M and ≈ 64·ny ≥ M and ≈ 24·nx·ny < M
+                                               moves ≈ 72·tmax·nx·ny              if ≈ 72·nx·ny ≥ M and ≈ 24·ny < M and ≈ 32·ny < M and ≈ 48·ny ≥ M and ≈ 64·ny ≥ M and ≈ 24·nx·ny ≥ M
+                 rests on         arg (declared, extern)
+arg              work ≤ result.len()               moves ≤ result.len()               declared, io

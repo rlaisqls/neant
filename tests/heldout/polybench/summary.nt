@@ -1,0 +1,175 @@
+// Row one's time and bytes questions judged by docs/heldout.md's thresholds, from the JSON lines
+// measure.nt appends (one object per kernel and dataset):
+//
+//     neant run summary.nt -- FILE.json [FILE.json ...]
+//
+// Time: every run past the noise — predicted and measured both at least 1 ms — in the geometric
+// mean of measured / predicted; holds when that mean is in [0.5, 2] and every run in [0.25, 4],
+// fails when it is outside [1/3, 3] or more than 20% of runs are outside [0.25, 4]. Bytes: the
+// largest size (EXTRALARGE), every kernel whose footprint exceeds L3 (16 MiB); holds when the mean
+// is in [0.5, 2] and 80% of kernels are in [1/3, 3], fails when the mean is outside [1/3, 3]. A run
+// with no prediction is listed and in neither mean. A kernel measured twice at a size (a check
+// rerun) is counted once, its first line.
+
+use "std/bytes.nt";
+use "std/math.nt";
+use "std/os.nt";
+
+// The text after `"key": ` in the line `s[from..to]`, or `to` when the key is not there.
+fn field(s: &[u8], from: i64, to: i64, key: &[u8]) -> i64 {
+    let mut k = [b' '; 64];
+    let mut e = put_byte(&mut k, 0, b'"');
+    e = put(&mut k, e, key);
+    e = put_byte(&mut k, e, b'"');
+    e = put(&mut k, e, ": ");
+    let pat = cut(&k, 0, e);
+    let at = find(s, from, &pat);
+    if at < to { at + pat.len() } else { to }
+}
+
+// The string value at `at` (just after its opening quote is `at + 1`): its end, the closing quote.
+fn str_end(s: &[u8], at: i64) -> i64 {
+    find_byte(s, at + 1, b'"')
+}
+
+fn put_ratio(out: &mut [u8], at: i64, x: f64) -> i64 {
+    format_float(x, 2, out, at)
+}
+
+fn main() {
+    // every line of every file, one after another
+    let mut all = [b' '; 4194304];
+    let mut an = 0;
+    for k in 0..arg_count() {
+        let p = arg(k);
+        let d = read_file(&p);
+        an = put(&mut all, an, &d);
+        if an > 0 && all[an - 1] != b'\n' { an = put_byte(&mut all, an, b'\n'); }
+    }
+    let mut seen = [b' '; 16384];
+    let mut sn = 0;
+    let mut t_n = 0;
+    let mut t_log = 0.0;
+    let mut t_out = 0;
+    let mut t_noise = 0;
+    let mut b_n = 0;
+    let mut b_log = 0.0;
+    let mut b_in = 0;
+    let mut out = [b' '; 262144];
+    let mut o = put(&mut out, 0, "runs outside [0.25, 4] or with no prediction:");
+    o = put_byte(&mut out, o, b'\n');
+    let mut none = [b' '; 65536];
+    let mut nn = 0;
+    let mut bout = [b' '; 65536];
+    let mut bo = 0;
+    let mut at = 0;
+    while at < an {
+        let le = line_end(&all, at);
+        let kf = field(&all, at, le, "kernel");
+        if kf < le {
+            let ke = str_end(&all, kf);
+            let df = field(&all, at, le, "dataset");
+            let de = str_end(&all, df);
+            // a kernel and dataset counted once
+            let mut key = [b' '; 128];
+            let mut kn = put_byte(&mut key, 0, b';');
+            kn = put_span(&mut key, kn, &all, kf + 1, ke);
+            kn = put_byte(&mut key, kn, b' ');
+            kn = put_span(&mut key, kn, &all, df + 1, de);
+            kn = put_byte(&mut key, kn, b';');
+            let kk = cut(&key, 0, kn);
+            if find(&seen, 0, &kk) >= sn {
+                sn = put_span(&mut seen, sn, &kk, 0, kk.len() - 1);
+                let ms = parse_real(&all, field(&all, at, le, "meas_s")).v;
+                let mb = parse_real(&all, field(&all, at, le, "meas_bytes")).v;
+                let fp = parse_real(&all, field(&all, at, le, "footprint")).v;
+                let pf = field(&all, at, le, "pred_s");
+                let xl = same_span(&all, df + 1, de, "EXTRALARGE");
+                if pf >= le {
+                    nn = put_span(&mut none, nn, &all, kf + 1, ke);
+                    nn = put_byte(&mut none, nn, b' ');
+                    nn = put_span(&mut none, nn, &all, df + 1, de);
+                    nn = put(&mut none, nn, ", ");
+                } else {
+                    let ps = parse_real(&all, pf).v;
+                    let pb = parse_real(&all, field(&all, at, le, "pred_bytes")).v;
+                    if ps < 0.001 || ms < 0.001 {
+                        t_noise += 1;
+                    } else {
+                        let r = ms / ps;
+                        t_n += 1;
+                        t_log += log(r);
+                        if r < 0.25 || r > 4.0 {
+                            t_out += 1;
+                            o = put(&mut out, o, "  ");
+                            o = put_left(&mut out, o, &all, kf + 1, ke, 15);
+                            o = put_byte(&mut out, o, b' ');
+                            o = put_left(&mut out, o, &all, df + 1, de, 11);
+                            o = put(&mut out, o, " time ");
+                            o = put_ratio(&mut out, o, r);
+                            o = put_byte(&mut out, o, b'\n');
+                        }
+                    }
+                    if xl && fp > 16777216.0 && pb > 0.0 {
+                        let r = mb / pb;
+                        b_n += 1;
+                        b_log += log(r);
+                        if r >= 1.0 / 3.0 && r <= 3.0 { b_in += 1; } else {
+                            bo = put(&mut bout, bo, "  ");
+                            bo = put_left(&mut bout, bo, &all, kf + 1, ke, 15);
+                            bo = put(&mut bout, bo, " bytes ");
+                            bo = put_ratio(&mut bout, bo, r);
+                            bo = put_byte(&mut bout, bo, b'\n');
+                        }
+                    }
+                }
+            }
+        }
+        at = le + 1;
+    }
+    o = put(&mut out, o, "  no prediction: ");
+    o = put_span(&mut out, o, &none, 0, max(nn - 2, 0));
+    o = put_byte(&mut out, o, b'\n');
+    o = put(&mut out, o, "bytes outside [1/3, 3]:");
+    o = put_byte(&mut out, o, b'\n');
+    o = put_span(&mut out, o, &bout, 0, bo);
+
+    let tg = exp(t_log / max(t_n, 1) as f64);
+    o = put_byte(&mut out, o, b'\n');
+    o = put(&mut out, o, "time: ");
+    o = format_int(t_n, &mut out, o);
+    o = put(&mut out, o, " runs past the noise (");
+    o = format_int(t_noise, &mut out, o);
+    o = put(&mut out, o, " under 1 ms), geometric mean ");
+    o = put_ratio(&mut out, o, tg);
+    o = put(&mut out, o, ", ");
+    o = format_int(t_out, &mut out, o);
+    o = put(&mut out, o, " outside [0.25, 4] — ");
+    let t_frac = t_out as f64 / max(t_n, 1) as f64;
+    if tg >= 0.5 && tg <= 2.0 && t_out == 0 {
+        o = put(&mut out, o, "holds");
+    } else if tg < 1.0 / 3.0 || tg > 3.0 || t_frac > 0.2 {
+        o = put(&mut out, o, "fails");
+    } else {
+        o = put(&mut out, o, "between");
+    }
+    let bg = exp(b_log / max(b_n, 1) as f64);
+    o = put_byte(&mut out, o, b'\n');
+    o = put(&mut out, o, "bytes: ");
+    o = format_int(b_n, &mut out, o);
+    o = put(&mut out, o, " kernels past L3 at EXTRALARGE, geometric mean ");
+    o = put_ratio(&mut out, o, bg);
+    o = put(&mut out, o, ", ");
+    o = format_int(b_in, &mut out, o);
+    o = put(&mut out, o, " within [1/3, 3] — ");
+    let b_frac = b_in as f64 / max(b_n, 1) as f64;
+    if bg >= 0.5 && bg <= 2.0 && b_frac >= 0.8 {
+        o = put(&mut out, o, "holds");
+    } else if bg < 1.0 / 3.0 || bg > 3.0 {
+        o = put(&mut out, o, "fails");
+    } else {
+        o = put(&mut out, o, "between");
+    }
+    o = put_byte(&mut out, o, b'\n');
+    print_bytes(&out, o);
+}

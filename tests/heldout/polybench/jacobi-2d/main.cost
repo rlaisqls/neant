@@ -1,0 +1,46 @@
+struct Int       layout AoS  the model does not decide: no function's moves differ
+struct Float     layout AoS  the model does not decide: no function's moves differ
+is_digit         work 3                            moves 0                            exact
+is_space         work 7                            moves 0                            exact
+skip_space       work 2·xs.len() − 2·at + 12       moves xs.len() − at + 2·B          exact
+                 footprint        xs: [0, xs.len()) (whole array)   no residue claimed
+parse_int        work 333                          moves 37·B                         exact
+                 footprint        xs: [0, xs.len()) (whole array)   no residue claimed
+parse_float      work 681                          moves 73·B                         exact
+                 footprint        xs: [0, xs.len()) (whole array)   no residue claimed
+format_int       work 406                          moves 24·B + 19                    exact
+                 footprint        out: [0, out.len()) (whole array)   no residue claimed
+format_float     work 716                          moves 44·B + 19                    exact
+                 footprint        out: [0, out.len()) (whole array)   no residue claimed
+init_array       work 22·n² + 2·n                  moves                              exact  (2 regimes)
+                                               moves 16·n² + 2·B·n                if ≈ 16·n < M
+                                               moves 16·n² + 2·B·n                if ≈ 16·n ≥ M
+                 lower bound      moves 16·n²                        (footprint, every distinct element crosses once)   gap 1× if ≈ 16·n < M; 1× if ≈ 16·n ≥ M at M = 2 MiB, B = 64
+                 footprint        a: [0, 8·n²)  b: [0, 8·n²)   resident after if 16·n² < M
+print_array      work 4·a.len() + 1                moves 8·a.len() + B                exact, io
+                 lower bound      moves 8·a.len()                    (footprint, every distinct element crosses once)   gap 1× at M = 2 MiB, B = 64
+                 footprint        a: [0, 8·a.len())   resident after if 8·a.len() < M
+kernel_jacobi_2d work 58·tsteps·n² − 226·tsteps·n + 224·tsteps moves                              exact  (6 regimes)
+                                               moves ≈ 64·n²                      if ≈ 64·n² < M and ≈ 32·n ≥ M
+                                               moves ≈ 64·tsteps·n²               if ≈ 64·n² ≥ M and ≈ 32·n ≥ M
+                                               moves ≈ 48·n²                      if ≈ 48·n² < M and ≈ 32·n < M and ≈ 96·n < M
+                                               moves ≈ 64·n²                      if ≈ 64·n² < M and ≈ 32·n < M and ≈ 96·n ≥ M
+                                               moves ≈ 48·tsteps·n²               if ≈ 48·n² ≥ M and ≈ 32·n < M and ≈ 96·n < M
+                                               moves ≈ 64·tsteps·n²               if ≈ 64·n² ≥ M and ≈ 32·n < M and ≈ 96·n ≥ M
+                 lower bound      moves 16·n² − 64·n + 64            (footprint, every distinct element crosses once)   gap 4× if ≈ 64·n² < M and ≈ 32·n ≥ M; 3× if ≈ 48·n² < M and ≈ 32·n < M and ≈ 96·n < M; 4× if ≈ 64·n² < M and ≈ 32·n < M and ≈ 96·n ≥ M at M = 2 MiB, B = 64
+                 footprint        a: [0, 8·a.len()) (whole array)  b: [0, 8·b.len()) (whole array)   no residue claimed
+main             work ≈ 58·tsteps·n²               moves                              exact, io  (12 regimes)
+                                               moves ≈ 104·n²                     if ≈ 64·n² < M and ≈ 16·n < M and ≈ 32·n ≥ M
+                                               moves ≈ 104·n²                     if ≈ 64·n² < M and ≈ 16·n ≥ M and ≈ 32·n ≥ M
+                                               moves ≈ 64·tsteps·n²               if ≈ 64·n² ≥ M and ≈ 16·n < M and ≈ 32·n ≥ M
+                                               moves ≈ 64·tsteps·n²               if ≈ 64·n² ≥ M and ≈ 16·n ≥ M and ≈ 32·n ≥ M
+                                               moves ≈ 88·n²                      if ≈ 48·n² < M and ≈ 16·n < M and ≈ 32·n < M and ≈ 96·n < M
+                                               moves ≈ 88·n²                      if ≈ 48·n² < M and ≈ 16·n ≥ M and ≈ 32·n < M and ≈ 96·n < M
+                                               moves ≈ 104·n²                     if ≈ 64·n² < M and ≈ 16·n < M and ≈ 32·n < M and ≈ 96·n ≥ M
+                                               moves ≈ 104·n²                     if ≈ 64·n² < M and ≈ 16·n ≥ M and ≈ 32·n < M and ≈ 96·n ≥ M
+                                               moves ≈ 48·tsteps·n²               if ≈ 48·n² ≥ M and ≈ 16·n < M and ≈ 32·n < M and ≈ 96·n < M
+                                               moves ≈ 48·tsteps·n²               if ≈ 48·n² ≥ M and ≈ 16·n ≥ M and ≈ 32·n < M and ≈ 96·n < M
+                                               moves ≈ 64·tsteps·n²               if ≈ 64·n² ≥ M and ≈ 16·n < M and ≈ 32·n < M and ≈ 96·n ≥ M
+                                               moves ≈ 64·tsteps·n²               if ≈ 64·n² ≥ M and ≈ 16·n ≥ M and ≈ 32·n < M and ≈ 96·n ≥ M
+                 rests on         arg (declared, extern)
+arg              work ≤ result.len()               moves ≤ result.len()               declared, io
