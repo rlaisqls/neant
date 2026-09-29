@@ -1,0 +1,10 @@
+smooth           work 8·n − 8                      moves 8·n + 2·B − 8                exact
+                 lower bound      moves 8·n − 8                      (footprint, every distinct element crosses once)   gap 1× at M = 2 MiB, B = 64
+                 footprint        a: [0, 8·a.len()) (whole array)   no residue claimed
+                   at n=1000,B=64: work 7992  moves 8120 bytes  write-back 64 bytes  serial 7992  divs 999  time 1.390e-6 s (work-bound)
+prefix           work 7·n − 7                      moves 8·n + 2·B − 8                exact
+                 lower bound      moves 8·n − 8                      (footprint, every distinct element crosses once)   gap 1× at M = 2 MiB, B = 64
+                 footprint        a: [0, 8·a.len()) (whole array)   no residue claimed
+                   at n=1000,B=64: work 6993  moves 8120 bytes  write-back 64 bytes  serial 999  time 3.935e-7 s (moves-bound)
+main             work 15992                        moves 5·B + 23984                  exact, io
+                   at n=1000,B=64: work 15992  moves 24304 bytes  write-back 128 bytes  serial 8991  divs 999  time 1.669e-6 s (work-bound)

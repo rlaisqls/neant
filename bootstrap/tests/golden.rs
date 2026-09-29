@@ -1,4 +1,4 @@
-//! Every `tests/golden/*.nt` with a `.cost` file must also reproduce it under `neant cost`, and one with a `.scop` file its SCoP export. It either runs — stdout must equal `.out`, exit code must equal `.exit`
+//! Every `tests/golden/*.nt` with a `.cost` file must also reproduce it under `neant cost`, one with a `.eval` file the report `neant cost --eval` prints at it (`.evalcost`), and one with a `.scop` file its SCoP export. It either runs — stdout must equal `.out`, exit code must equal `.exit`
 //! (default 0) — or, when a `.err` file exists, must be rejected with an error containing it.
 //! A `.args` file holds the program's arguments, one per line: it is run as `neant run f.nt --
 //! args…` from `tests/golden`, so a path among them names a file there, and once more as the
@@ -48,6 +48,18 @@ fn golden() {
             let got = String::from_utf8_lossy(&out.stdout).to_string();
             if got != want {
                 failures.push(format!("{name}: cost report differs\n--- got ---\n{got}--- want ---\n{want}"));
+            }
+        }
+        // `.eval`: its first line is `--eval`'s argument, and `.evalcost` what the report must be
+        // there — the time line and what it reads (`serial`, `divs`), which the plain report lacks
+        let eval_file = stem.with_extension("eval");
+        if eval_file.exists() {
+            let ev = std::fs::read_to_string(&eval_file).unwrap();
+            let want = std::fs::read_to_string(stem.with_extension("evalcost")).unwrap_or_default();
+            let out = Command::new(neant()).arg("cost").arg(nt).arg("--eval").arg(ev.lines().next().unwrap_or("").trim()).output().unwrap();
+            let got = String::from_utf8_lossy(&out.stdout).to_string();
+            if got != want {
+                failures.push(format!("{name}: evaluated cost report differs\n--- got ---\n{got}--- want ---\n{want}"));
             }
         }
         // `.scop`: the first line names the function, the rest is what `emit --scop` must print

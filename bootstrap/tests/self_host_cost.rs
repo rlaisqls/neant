@@ -44,7 +44,9 @@ const COPIES_INSTEAD: &[(&str, &str)] = &[];
 /// charges once (cost-model § Moves, neighbouring sites, 2026-09-27) and this pass, which has no
 /// such rule, charges as five. A deliberate divergence, argued here as the list above asks: the
 /// self-hosted pass states more, never less, and `main` inherits it through the call.
-const NEIGHBOURS_INSTEAD: &[(&str, &str)] = &[("stencil.nt", "stencil"), ("stencil.nt", "main")];
+/// `lap_chain`'s two loops read `a[j]` and `a[j − 1]`, one stream to the Rust and two here.
+const NEIGHBOURS_INSTEAD: &[(&str, &str)] = &[("stencil.nt", "stencil"), ("stencil.nt", "main"),
+    ("lap_chain.nt", "smooth"), ("lap_chain.nt", "prefix"), ("lap_chain.nt", "main")];
 
 /// `(file, function)` where the self-hosted `moves` are higher because it sums a triangular loop's
 /// laps: `tri`'s `pairs` runs `j in i..a.len()`, which the Rust charges the hull of its laps once
@@ -178,7 +180,7 @@ const BOUND_NARROWER: &[(&str, &str)] = &[("while.nt", "count_lt"), ("while.nt",
 
 /// The number of functions whose `work` the self-hosted pass reproduces exactly. In the test so
 /// that widening the slice means changing a number someone has to look at.
-const EXACT: usize = 108;
+const EXACT: usize = 111;
 
 /// The same for `moves`, whose slice is narrower: a function that calls anything is unknown,
 /// because a callee's traffic depends on what is already resident — which it now computes, so a
@@ -201,13 +203,13 @@ const EXACT_MOVES: usize = 92;
 /// whole of it is resident on return, whitespace-normalised so the report's column padding is not
 /// part of the comparison. Counted over every function, so one that should state no footprint and
 /// states none counts too.
-const EXACT_FOOT: usize = 150;
+const EXACT_FOOT: usize = 153;
 
 /// The same for the **footprint lower bound** — `moves` cannot be less than the distinct bytes a
 /// function's parameter arrays reach. Counted over every function, so a `main` that should have no
 /// bound and gets none counts too: a bound invented where `neant cost` states none is as wrong as
 /// a missing one, and only one of those two shows up as a difference.
-const EXACT_BOUNDS: usize = 194;
+const EXACT_BOUNDS: usize = 197;
 
 
 

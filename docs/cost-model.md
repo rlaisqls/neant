@@ -1022,6 +1022,17 @@ the chained operation waits; the rest of the lap overlaps), where a scalar multi
 whole loop serial. Charging the whole loop for a memory chain was tried first and took n-body from
 2.3× too fast to 2.7× too slow.
 
+*A store that reads the last lap's (2026-09-30).* A lap that reads the element the lap before it
+stored — Gauss–Seidel's `a[i·n + j] = (… + a[i·n + j − 1] + …) / 9` over `j`, a prefix sum's
+`a[j] = a[j] + a[j − 1]` — waits for that store: a recurrence through memory at a moving index,
+which neither rule above saw (the store to a fixed element needs an index the loop does not move).
+The read's index is the store's less the store's coefficient in the loop variable times the step,
+compared as polynomials in the locals (`lap_chain`). Charged as a carried scalar is: the whole lap
+serial when the value read reaches the store through a multiply or a divide, one unit a lap when
+only through adds. PolyBench's seidel-2d goes from 5.3–5.8 times slower than predicted to 0.78–0.81
+at all three sizes, with `τ_s` as it was (evaluation § 5). Golden `lap_chain`, whose `.eval` pins
+the `serial` column the plain report does not print.
+
 *Through an add (2026-09-28).* An `f64` a lap carries through an add or a subtract — `s += xs[i]`,
 `e = e − d` — waits for the add, whose latency a unit of work does not have: measured, the `sum`
 kernel in L1 takes 0.25 ns a lap against 0.07 predicted. The core runs a lap's other work while the

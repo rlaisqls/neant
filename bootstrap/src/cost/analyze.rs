@@ -1478,8 +1478,11 @@ impl<'a, 'b, 'c> Fa<'a, 'b, 'c> {
         // lap's other work while the add waits (`horner`'s eight multiplies; `matmul`'s next `j`)
         let mach = self.machine();
         let short = w.pieces.len() == 1 && w.pieces[0].poly.as_const().is_some_and(|c| c.to_f64() * mach.ns_per_work < mach.ns_per_serial);
-        let chained = memory_chain(body, rec.var) + if short { float_chain(body, self.f) } else { 0 };
-        self.serial = self.serial.add(&rec.sum_cost(&if carried_chain(body) { w.clone() } else { body_serial.add_poly(&Poly::constant(chained as i128)) }));
+        // a store that reads the element the last lap stored is a recurrence through memory: the
+        // whole lap when the value passes a multiply or divide on its way, one unit when only adds
+        let lap = lap_chain(body, rec.var, rec.step);
+        let chained = memory_chain(body, rec.var) + if short { float_chain(body, self.f) } else { 0 } + usize::from(lap == Some(false));
+        self.serial = self.serial.add(&rec.sum_cost(&if carried_chain(body) || lap == Some(true) { w.clone() } else { body_serial.add_poly(&Poly::constant(chained as i128)) }));
         // an ordinary loop is sequential: its span sums the same way work does
         self.span = self.span.add(&rec.sum_cost(&sp));
         self.note_straddle(&rec);
@@ -4431,4 +4434,75 @@ fn memory_chain(b: &Block, var: Option<LocalId>) -> usize {
         Stmt::Assign(LValue::IndexField(a, i, f, _), op, e) => fixed(i, &moving) && (op.is_some() || reads(e, *a, i, Some(*f))),
         _ => false,
     }).count()
+}
+
+/// A store that reads the element the last lap stored — `a[i·n + j] = (… + a[i·n + j − 1] + …) / 9`
+/// in a loop over `j` (Gauss–Seidel) — waits for that store every lap: a recurrence through memory,
+/// as a carried scalar is one through a register (cost-model § Time, serial work). `Some(true)` when
+/// the value read reaches the store through a multiply or a divide, which makes the whole lap
+/// serial as a scalar multiply chain does; `Some(false)` when only through adds, one unit a lap as a
+/// store to a fixed element is; `None` when no store reads its last lap's element. The last lap's
+/// element is the store's index less its coefficient in the loop variable times the step, the two
+/// indices compared as polynomials in the locals.
+fn lap_chain(b: &Block, var: Option<LocalId>, step: i128) -> Option<bool> {
+    type P = BTreeMap<Vec<LocalId>, i128>;
+    fn poly(e: &Expr) -> Option<P> {
+        let mut out = P::new();
+        match &e.kind {
+            ExprKind::Int(k) => { if *k != 0 { out.insert(vec![], *k as i128); } }
+            ExprKind::Local(l) => { out.insert(vec![*l], 1); }
+            ExprKind::Cast(x, _) => return poly(x),
+            ExprKind::Binary(op @ (BinOp::Add | BinOp::Sub), l, r) => {
+                out = poly(l)?;
+                let sign = if *op == BinOp::Sub { -1 } else { 1 };
+                for (m, c) in poly(r)? { *out.entry(m).or_insert(0) += sign * c; }
+            }
+            ExprKind::Binary(BinOp::Mul, l, r) => {
+                for (ma, ca) in poly(l)? {
+                    for (mb, cb) in poly(r)? {
+                        let mut m = ma.clone();
+                        m.extend(mb.iter().copied());
+                        m.sort();
+                        *out.entry(m).or_insert(0) += ca * cb;
+                    }
+                }
+            }
+            _ => return None,
+        }
+        out.retain(|_, c| *c != 0);
+        Some(out)
+    }
+    // does `e` read `arr` at an index whose polynomial is `want`, and is it under a multiply or divide
+    fn find(e: &Expr, arr: LocalId, want: &P, under: bool) -> Option<bool> {
+        match &e.kind {
+            ExprKind::Index(a, i) if *a == arr && poly(i).as_ref() == Some(want) => Some(under),
+            ExprKind::Binary(op, l, r) => {
+                let u = under || matches!(op, BinOp::Mul | BinOp::Div);
+                match (find(l, arr, want, u), find(r, arr, want, u)) {
+                    (Some(x), Some(y)) => Some(x || y),
+                    (x, y) => x.or(y),
+                }
+            }
+            ExprKind::Unary(_, x) | ExprKind::Cast(x, _) => find(x, arr, want, under),
+            _ => None,
+        }
+    }
+    let v = var?;
+    let mut found: Option<bool> = None;
+    for s in &b.stmts {
+        let Stmt::Assign(LValue::Index(a, i, _), op, e) = s else { continue };
+        let Some(pi) = poly(i) else { continue };
+        // the store's coefficient in the loop variable, a constant, and the index a lap earlier
+        let lin: Vec<(&Vec<LocalId>, &i128)> = pi.iter().filter(|(m, _)| m.contains(&v)).collect();
+        let [(m, c)] = lin.as_slice() else { continue };
+        if m.len() != 1 { continue; }
+        let mut prev = pi.clone();
+        *prev.entry(vec![]).or_insert(0) -= **c * step;
+        prev.retain(|_, c| *c != 0);
+        // a compound `*=` or `/=` puts the read under the multiply too
+        if let Some(u) = find(e, *a, &prev, matches!(op, Some(BinOp::Mul | BinOp::Div))) {
+            found = Some(found.unwrap_or(false) || u);
+        }
+    }
+    found
 }

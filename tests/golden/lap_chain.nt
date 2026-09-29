@@ -1,0 +1,22 @@
+// Two recurrences through memory (cost-model § Time, a store that reads the last lap's): a smoothing
+// that divides what the last lap stored, all its work serial, and a prefix sum that only adds it,
+// one unit a lap. `serial` is in the evaluated report only (`lap_chain.eval`).
+fn smooth(n: i64, a: &mut [f64]) {
+    for j in 1..n {
+        a[j] = (a[j - 1] + a[j]) / 2.0;
+    }
+}
+
+fn prefix(n: i64, a: &mut [f64]) {
+    for j in 1..n {
+        a[j] = a[j] + a[j - 1];
+    }
+}
+
+fn main() {
+    let n = 1000;
+    let mut a = [1.0; n];
+    smooth(n, &mut a);
+    prefix(n, &mut a);
+    println(a[n - 1]);
+}
