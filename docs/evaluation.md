@@ -226,6 +226,39 @@ EXTRALARGE at 4.08 on CPU 15 — were either inside [0.25, 4], 10 of 51 would be
 the row *between*. The harness is neant
 (`measure.nt` over `std/os.nt`, decisions §14), not the Python heldout.md's step 2 names.
 
+### Later rows (2026-09-29)
+
+Each a later compiler costing the same runs: the emitted C of the 27 ports that build under every
+compiler here is byte-identical to `42f76be`'s, so the binaries are row one's and only the
+predictions are new (`measure.nt --predict`). Row one is not replaced.
+
+| row | compiler | time | bytes | no prediction |
+|---|---|---|---|---|
+| 1 | `42f76be`, frozen | 51 runs, mean 1.69, 11 outside — **fails** | 18 kernels, mean 0.64, 15 in — **holds** | 10 kernels |
+| 2a | `cc66c66`: the time model's two changes since the freeze | 51 runs, mean 1.65, 8 outside — **between** | as row 1 | 10 kernels |
+| 2b | `5e997b9`: 2a and a triangle's fit test | 75 runs, mean 1.53, 10 outside — **between** | 26 kernels, mean 0.66, 22 in — **holds** | 2, the refusals |
+
+What moved each, so that neither is credited with the other's: **2a** is `17d7d75` (a carried
+`f64` add in a short lap is serial work) and `1be9f2a` (two streams share a bandwidth; a stored
+line is written back), both committed on 2026-09-28, before the first held-out number (09-29
+14:19); they raise the matrix–vector kernels' predicted time by a fifth to a third, which brings
+bicg at LARGE, trisolv and mvt at EXTRALARGE inside [0.25, 4], and that is the whole of the move
+from *fails* to *between*. **2b** is `f91bd83` and `5e997b9` (cost-model § A triangle's fit test):
+the eight kernels whose `main` was exact but named a loop variable get predictions, 24 runs more,
+of which syrk, syr2k, symm, cholesky, lu and ludcmp land inside and trmm at EXTRALARGE (5.58) and
+nussinov at MEDIUM and LARGE (0.17, 0.23) outside; nussinov's bytes are the one new kernel outside
+[1/3, 3] (0.17). The verdicts are the same as 2a's, on half again as many runs.
+
+`f91bd83` alone was a row too, and a bad one — time *fails* with 18 of 74 outside, bytes *between*
+at a mean of 0.38 (`row-f91bd83.json`): once its regimes could be evaluated, two older faults in a
+triangle's hull were chosen by them (lu and ludcmp predicted at `64·n⁴/(3·B)` bytes, nussinov at
+`n⁴`), which `5e997b9` fixed. It is kept, since a row is not dropped for being worse.
+
+What is left, in 2b: seidel-2d's carried dependence (5.3–5.8), correlation's and covariance's column
+walk at EXTRALARGE (9.0) and gramschmidt's (8.7), trmm at EXTRALARGE, nussinov overcharged about
+fivefold (its inner column walk charged lap by lap), the matrix–vector bytes (0.25–0.33), and the
+two refusals.
+
 ## What fails, and why
 
 Each of these is a term the model lacks or a shape the calculus does not reach, measured, not a

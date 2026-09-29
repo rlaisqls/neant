@@ -1331,3 +1331,33 @@ over its outer index (eight kernels' predictions), a carried dependence in a swe
 strided walk's time at the bytes the model already gets right (correlation, covariance), a dot
 product's serial chain (the matrix–vector kernels), and `settle_moves`' exponential search (the two
 refusals). Each is a later row, labelled with its commit; this one is not replaced.
+
+## Held-out, later rows: the time model's changes and a triangle's fit test (2026-09-29)
+
+Row one's 90 runs costed again by later compilers (`measure.nt --predict`): the 27 ports that
+build under all of them emit the same C as `42f76be`, byte for byte, so the binaries and their
+measurements are row one's. Judged by `summary.nt`; the data in `tests/heldout/polybench/`.
+
+| row | compiler | time | bytes | no prediction |
+|---|---|---|---|---|
+| 1 | `42f76be` | 51 runs, gm 1.69, 11 outside — fails | 18 kernels, gm 0.64, 15 in — holds | 10 kernels |
+| 2a | `cc66c66` | 51 runs, gm 1.65, 8 outside — between | as row 1 | 10 kernels |
+| — | `f91bd83` | 74 runs, gm 0.94, 18 outside — fails | 26 kernels, gm 0.38, 20 in — between | 2 kernels |
+| 2b | `5e997b9` | 75 runs, gm 1.53, 10 outside — between | 26 kernels, gm 0.66, 22 in — holds | 2 kernels |
+
+- `cc66c66` carries the freeze's calculus plus `17d7d75` and `1be9f2a` (the time model's serial add
+  and stream rules, committed 2026-09-28, before any held-out number): atax, bicg, gemver and
+  trisolv are predicted 20–33% slower, which brings bicg at LARGE, trisolv and mvt at EXTRALARGE
+  inside [0.25, 4].
+- `f91bd83` decides a triangle's fit test over its laps: eight kernels (cholesky, lu, ludcmp, symm,
+  syrk, syr2k, trmm, nussinov) whose regimes named `kernel_X.i` get a prediction. Two faults that
+  those regimes had hidden were then chosen: a triangle's hull slid a second time (lu and ludcmp
+  at `64·n⁴/(3·B)` bytes, 0.01 of the counter) and the sum it falls back to slid the same way
+  (nussinov `n⁴`, 0.00).
+- `5e997b9` stops both slides and takes a nested trip's variable at its extreme before the hull:
+  at EXTRALARGE, measured over predicted bytes are lu 0.60, ludcmp 0.59, cholesky 0.64, syrk 1.12,
+  syr2k 1.26, symm 1.16, trmm 1.05, and time 1.53, 1.53, 1.53, 2.08, 3.67, 3.20, 5.58; nussinov
+  stays overcharged, bytes 0.17 and time 0.44. `tri`'s `pairs` goes from 32 to 24·a.len() in cache and n-body's `advance`
+  from 272 to 216·bs.len(); neither changes a tier or n-body's layout.
+
+`~/work/.neant-loop/at-cc66c66` is the worktree `cc66c66` was built from, apart from the main tree.
