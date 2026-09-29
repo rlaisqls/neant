@@ -1,0 +1,42 @@
+// PolyBench/C 4.2.1 medley/floyd-warshall: all-pairs shortest paths. DATA_TYPE is int (i64).
+// Arguments: n. The ternary `a < b ? a : b` is an `if` expression.
+
+use "std/text.nt";
+
+fn init_array(n: i64, path: &mut [i64]) {
+    for i in 0..n {
+        for j in 0..n {
+            path[i * n + j] = i * j % 7 + 1;
+            if (i + j) % 13 == 0 || (i + j) % 7 == 0 || (i + j) % 11 == 0 {
+                path[i * n + j] = 999;
+            }
+        }
+    }
+}
+
+fn print_array(path: &[i64]) {
+    println(path.iter().sum());
+}
+
+fn kernel_floyd_warshall(n: i64, path: &mut [i64]) {
+    for k in 0..n {
+        for i in 0..n {
+            for j in 0..n {
+                path[i * n + j] = if path[i * n + j] < path[i * n + k] + path[k * n + j] {
+                    path[i * n + j]
+                } else {
+                    path[i * n + k] + path[k * n + j]
+                };
+            }
+        }
+    }
+}
+
+fn main() {
+    let a0 = arg(0);
+    let n = parse_int(&a0, 0).v;
+    let mut path = [0; n * n];
+    init_array(n, &mut path);
+    kernel_floyd_warshall(n, &mut path);
+    print_array(&path);
+}

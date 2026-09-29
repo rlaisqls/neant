@@ -1,0 +1,39 @@
+// PolyBench/C 4.2.1 linear-algebra/solvers/trisolv: solve L·x = b, L lower triangular.
+// Arguments: n. The init loop `j <= i` is written `0..i + 1`, the language having no inclusive range.
+
+use "std/text.nt";
+
+fn init_array(n: i64, l: &mut [f64], x: &mut [f64], b: &mut [f64]) {
+    for i in 0..n {
+        x[i] = -999.0;
+        b[i] = i as f64;
+        for j in 0..i + 1 {
+            l[i * n + j] = (i + n - j + 1) as f64 * 2.0 / n as f64;
+        }
+    }
+}
+
+fn print_array(x: &[f64]) {
+    println(x.iter().sum());
+}
+
+fn kernel_trisolv(n: i64, l: &[f64], x: &mut [f64], b: &[f64]) {
+    for i in 0..n {
+        x[i] = b[i];
+        for j in 0..i {
+            x[i] -= l[i * n + j] * x[j];
+        }
+        x[i] = x[i] / l[i * n + i];
+    }
+}
+
+fn main() {
+    let a0 = arg(0);
+    let n = parse_int(&a0, 0).v;
+    let mut l = [0.0; n * n];
+    let mut x = [0.0; n];
+    let mut b = [0.0; n];
+    init_array(n, &mut l, &mut x, &mut b);
+    kernel_trisolv(n, &l, &mut x, &b);
+    print_array(&x);
+}

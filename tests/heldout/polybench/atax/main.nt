@@ -1,0 +1,49 @@
+// PolyBench/C 4.2.1 linear-algebra/kernels/atax: y := Aᵀ·(A·x).
+// Arguments: m n. The local `fn` is named `fn_`, `fn` being a keyword.
+
+use "std/text.nt";
+
+fn init_array(m: i64, n: i64, a: &mut [f64], x: &mut [f64]) {
+    let fn_ = n as f64;
+    for i in 0..n {
+        x[i] = 1.0 + (i as f64 / fn_);
+    }
+    for i in 0..m {
+        for j in 0..n {
+            a[i * n + j] = ((i + j) % n) as f64 / (5 * m) as f64;
+        }
+    }
+}
+
+fn print_array(y: &[f64]) {
+    println(y.iter().sum());
+}
+
+fn kernel_atax(m: i64, n: i64, a: &[f64], x: &[f64], y: &mut [f64], tmp: &mut [f64]) {
+    for i in 0..n {
+        y[i] = 0.0;
+    }
+    for i in 0..m {
+        tmp[i] = 0.0;
+        for j in 0..n {
+            tmp[i] = tmp[i] + a[i * n + j] * x[j];
+        }
+        for j in 0..n {
+            y[j] = y[j] + a[i * n + j] * tmp[i];
+        }
+    }
+}
+
+fn main() {
+    let a0 = arg(0);
+    let m = parse_int(&a0, 0).v;
+    let a1 = arg(1);
+    let n = parse_int(&a1, 0).v;
+    let mut a = [0.0; m * n];
+    let mut x = [0.0; n];
+    let mut y = [0.0; n];
+    let mut tmp = [0.0; m];
+    init_array(m, n, &mut a, &mut x);
+    kernel_atax(m, n, &a, &x, &mut y, &mut tmp);
+    print_array(&y);
+}

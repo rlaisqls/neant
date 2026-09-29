@@ -1,0 +1,62 @@
+// PolyBench/C 4.2.1 stencils/fdtd-2d: 2-D finite-difference time-domain kernel.
+// Arguments: tmax nx ny. The array _fict_ is named fict.
+
+use "std/text.nt";
+
+fn init_array(tmax: i64, nx: i64, ny: i64, ex: &mut [f64], ey: &mut [f64], hz: &mut [f64], fict: &mut [f64]) {
+    for i in 0..tmax {
+        fict[i] = i as f64;
+    }
+    for i in 0..nx {
+        for j in 0..ny {
+            ex[i * ny + j] = (i as f64 * (j + 1) as f64) / nx as f64;
+            ey[i * ny + j] = (i as f64 * (j + 2) as f64) / ny as f64;
+            hz[i * ny + j] = (i as f64 * (j + 3) as f64) / nx as f64;
+        }
+    }
+}
+
+fn print_array(ex: &[f64], ey: &[f64], hz: &[f64]) {
+    println(ex.iter().sum());
+    println(ey.iter().sum());
+    println(hz.iter().sum());
+}
+
+fn kernel_fdtd_2d(tmax: i64, nx: i64, ny: i64, ex: &mut [f64], ey: &mut [f64], hz: &mut [f64], fict: &[f64]) {
+    for t in 0..tmax {
+        for j in 0..ny {
+            ey[0 * ny + j] = fict[t];
+        }
+        for i in 1..nx {
+            for j in 0..ny {
+                ey[i * ny + j] = ey[i * ny + j] - 0.5 * (hz[i * ny + j] - hz[(i - 1) * ny + j]);
+            }
+        }
+        for i in 0..nx {
+            for j in 1..ny {
+                ex[i * ny + j] = ex[i * ny + j] - 0.5 * (hz[i * ny + j] - hz[i * ny + j - 1]);
+            }
+        }
+        for i in 0..nx - 1 {
+            for j in 0..ny - 1 {
+                hz[i * ny + j] = hz[i * ny + j] - 0.7 * (ex[i * ny + j + 1] - ex[i * ny + j] + ey[(i + 1) * ny + j] - ey[i * ny + j]);
+            }
+        }
+    }
+}
+
+fn main() {
+    let a0 = arg(0);
+    let tmax = parse_int(&a0, 0).v;
+    let a1 = arg(1);
+    let nx = parse_int(&a1, 0).v;
+    let a2 = arg(2);
+    let ny = parse_int(&a2, 0).v;
+    let mut ex = [0.0; nx * ny];
+    let mut ey = [0.0; nx * ny];
+    let mut hz = [0.0; nx * ny];
+    let mut fict = [0.0; tmax];
+    init_array(tmax, nx, ny, &mut ex, &mut ey, &mut hz, &mut fict);
+    kernel_fdtd_2d(tmax, nx, ny, &mut ex, &mut ey, &mut hz, &fict);
+    print_array(&ex, &ey, &hz);
+}

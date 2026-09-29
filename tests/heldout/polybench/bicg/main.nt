@@ -1,0 +1,49 @@
+// PolyBench/C 4.2.1 linear-algebra/kernels/bicg: s := Aᵀ·r, q := A·p.
+// Arguments: m n.
+
+use "std/text.nt";
+
+fn init_array(m: i64, n: i64, a: &mut [f64], r: &mut [f64], p: &mut [f64]) {
+    for i in 0..m {
+        p[i] = (i % m) as f64 / m as f64;
+    }
+    for i in 0..n {
+        r[i] = (i % n) as f64 / n as f64;
+        for j in 0..m {
+            a[i * m + j] = (i * (j + 1) % n) as f64 / n as f64;
+        }
+    }
+}
+
+fn print_array(s: &[f64], q: &[f64]) {
+    println(s.iter().sum());
+    println(q.iter().sum());
+}
+
+fn kernel_bicg(m: i64, n: i64, a: &[f64], s: &mut [f64], q: &mut [f64], p: &[f64], r: &[f64]) {
+    for i in 0..m {
+        s[i] = 0.0;
+    }
+    for i in 0..n {
+        q[i] = 0.0;
+        for j in 0..m {
+            s[j] = s[j] + r[i] * a[i * m + j];
+            q[i] = q[i] + a[i * m + j] * p[j];
+        }
+    }
+}
+
+fn main() {
+    let a0 = arg(0);
+    let m = parse_int(&a0, 0).v;
+    let a1 = arg(1);
+    let n = parse_int(&a1, 0).v;
+    let mut a = [0.0; n * m];
+    let mut s = [0.0; m];
+    let mut q = [0.0; n];
+    let mut p = [0.0; m];
+    let mut r = [0.0; n];
+    init_array(m, n, &mut a, &mut r, &mut p);
+    kernel_bicg(m, n, &a, &mut s, &mut q, &p, &r);
+    print_array(&s, &q);
+}

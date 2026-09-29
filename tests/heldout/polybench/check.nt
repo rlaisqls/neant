@@ -1,0 +1,349 @@
+// The PolyBench ports against the original C (docs/heldout.md): each port is built and run at a
+// dataset's sizes, the original is compiled at the same sizes with its arrays dumped at full
+// precision, and each dumped array's sum is compared with the port's line for it. Nothing is costed.
+//
+//     neant run tests/heldout/polybench/check.nt -- [--dataset MINI] [--neant PATH] [name ...]
+//
+// The sizes are the dataset's `#define`s in the original header, in the order the header lists them,
+// which is the order a port reads its arguments in. The source is the release tarball, fetched once
+// into ~/.cache/neant and checked against the hash docs/heldout.md records (polybench.nt).
+
+use "polybench.nt";
+
+// A (port, dataset) pair whose original cannot be compared at all: the original disagrees with
+// itself under a change of floating-point contraction, so no port can be held to it there. The
+// reason is written into `out` at `at`, and the offset after it returned; `at` when it is comparable.
+fn incomparable(name: &[u8], dataset: &[u8], out: &mut [u8], at: i64) -> i64 {
+    let mut e = at;
+    if same(name, "gramschmidt") {
+        if same(dataset, "SMALL") {
+            e = put(out, e, "A is rank-deficient at m = 60 (R[k][k] ≈ 1e-13 from k = 37), and the original's own R and Q change with -ffp-contract=off (Q 2.93 against -0.52)");
+        } else if same(dataset, "LARGE") {
+            e = put(out, e, "A is rank-deficient (n = 1200 > m = 1000), and the original's own R and Q change with -ffp-contract=off (Q 5.66 against 9.33)");
+        } else if same(dataset, "EXTRALARGE") {
+            e = put(out, e, "A is rank-deficient (n = 2600 > m = 2000), and the original's own R and Q change with -ffp-contract=off (Q 26.9 against 17.7)");
+        }
+    }
+    e
+}
+
+// `h` with every `DATA_PRINTF_MODIFIER "%0.2f "` and `"%0.2lf "` made `"%.17g "`, into `out`; its length.
+fn full_precision(h: &[u8], out: &mut [u8]) -> i64 {
+    let pat = b"DATA_PRINTF_MODIFIER \"%0.2";
+    let f2 = b"\"%0.2f \"";
+    let lf2 = b"\"%0.2lf \"";
+    let g17 = b"\"%.17g \"";
+    let mut e = 0;
+    let mut at = 0;
+    let mut hit = find(h, 0, &pat);
+    while hit < h.len() {
+        let open = hit + 21;
+        let close = find_byte(h, open + 1, b'"');
+        let is_f = same_span(h, open, close + 1, &f2) || same_span(h, open, close + 1, &lf2);
+        e = put_span(out, e, h, at, open);
+        if is_f { e = put(out, e, &g17); } else { e = put_span(out, e, h, open, close + 1); }
+        at = close + 1;
+        hit = find(h, at, &pat);
+    }
+    put_span(out, e, h, at, h.len())
+}
+
+// The original built at the sizes and run: each dumped array's name into `names` (its span in
+// `nf`/`nt`) and the sum of its elements, in dump order, into `sums`; how many arrays.
+fn reference(odir: &[u8], dataset: &[u8], tmp: &[u8], util: &[u8],
+             names: &mut [u8], nf: &mut [i64], nt: &mut [i64], sums: &mut [f64]) -> i64 {
+    let base = base_name(odir);
+    let dc = ".c";
+    let dh = ".h";
+    let none = "";
+    let src_c = in_dir(odir, &base, &dc);
+    let src_h = in_dir(odir, &base, &dh);
+    let tmp_c = in_dir(tmp, &base, &dc);
+    let tmp_h = in_dir(tmp, &base, &dh);
+    let exe = in_dir(tmp, &base, &none);
+    let mut c = [b' '; 16384];
+    let mut n = put(&mut c, 0, "mkdir -p ");
+    n = put(&mut c, n, tmp);
+    n = put(&mut c, n, " && cp ");
+    n = put(&mut c, n, &src_c);
+    n = put_byte(&mut c, n, b' ');
+    n = put(&mut c, n, &tmp_c);
+    let r = os_run(&c, n);
+    if os_status() != 0 { fail("cannot copy the original"); }
+    let h = read_file(&src_h);
+    let mut hb = [b' '; h.len() + 4096];
+    let hn = full_precision(&h, &mut hb);
+    if os_write(&tmp_h, &hb, hn) != hn { fail("cannot write the header"); }
+    let mut from = [0; 16];
+    let mut to = [0; 16];
+    let mut vals = [0; 16];
+    let k = sizes(&h, dataset, &mut from, &mut to, &mut vals);
+    n = put(&mut c, 0, "cc -O2 -I ");
+    n = put(&mut c, n, util);
+    for i in 0..16 {
+        if i < k {
+            n = put(&mut c, n, " -D");
+            n = put_span(&mut c, n, &h, from[i], to[i]);
+            n = put_byte(&mut c, n, b'=');
+            n = format_int(vals[i], &mut c, n);
+        }
+    }
+    if find(&hb, 0, "DATA_TYPE_IS_FLOAT") < hn { n = put(&mut c, n, " -DDATA_TYPE_IS_DOUBLE"); }
+    n = put(&mut c, n, " -DPOLYBENCH_DUMP_ARRAYS ");
+    n = put(&mut c, n, &tmp_c);
+    n = put_byte(&mut c, n, b' ');
+    n = put(&mut c, n, util);
+    n = put(&mut c, n, "/polybench.c -lm -o ");
+    n = put(&mut c, n, &exe);
+    let built = os_run(&c, n);
+    if os_status() != 0 { fail("the original does not compile"); }
+    n = put(&mut c, 0, &exe);
+    n = put(&mut c, n, " 2>&1 >/dev/null");
+    let err = os_run(&c, n);
+    if os_status() != 0 { fail("the original failed"); }
+    let mut arrays = 0;
+    let mut ne = 0;
+    let mut at = find(&err, 0, "begin dump: ");
+    while at < err.len() {
+        let w = at + 12;
+        let we = word_end(&err, w);
+        nf[arrays] = ne;
+        ne = put_span(names, ne, &err, w, we);
+        nt[arrays] = ne;
+        let stop = find(&err, we, "end   dump");
+        let mut s = 0.0;
+        let mut i = skip_space(&err, we);
+        while i < stop {
+            let f = parse_real(&err, i);
+            s += f.v;
+            i = skip_space(&err, word_end(&err, i));
+        }
+        sums[arrays] = s;
+        arrays += 1;
+        at = find(&err, stop, "begin dump: ");
+    }
+    arrays
+}
+
+// Whether `a` and `b` agree: within 1e-9 of the larger, or of 1 when both are smaller.
+fn close(a: f64, b: f64) -> bool {
+    let mut ok = a == b;
+    let inf = 1.0 / 0.0;
+    if !ok && a == a && b == b && a != inf && a != 0.0 - inf && b != inf && b != 0.0 - inf {
+        let d = abs_f(a - b);
+        ok = d <= 1e-9 * max(1.0, max(abs_f(a), abs_f(b)));
+    }
+    ok
+}
+
+fn abs_f(x: f64) -> f64 {
+    if x < 0.0 { 0.0 - x } else { x }
+}
+
+fn main() {
+    let root = repo_root();
+    let mut ds = [b' '; 64];
+    let mut ds_n = put(&mut ds, 0, "MINI");
+    let mut nb = [b' '; 4096];
+    let mut nb_n = put(&mut nb, 0, &root);
+    nb_n = put(&mut nb, nb_n, "/bootstrap/target/release/neant");
+    let mut sel = [b' '; 4096];
+    let mut sel_n = 0;
+    let mut k = 0;
+    while k < arg_count() {
+        let a = arg(k);
+        if same(&a, "--dataset") && k + 1 < arg_count() {
+            let v = arg(k + 1);
+            ds_n = put(&mut ds, 0, &v);
+            k += 2;
+        } else if same(&a, "--neant") && k + 1 < arg_count() {
+            let v = arg(k + 1);
+            nb_n = put(&mut nb, 0, &v);
+            k += 2;
+        } else {
+            sel_n = put(&mut sel, sel_n, &a);
+            sel_n = put_byte(&mut sel, sel_n, b';');
+            k += 1;
+        }
+    }
+    let dataset = cut(&ds, 0, ds_n);
+    let neant = cut(&nb, 0, nb_n);
+    let ks = kernels();
+    let src = source();
+    let mut ub = [b' '; 4096];
+    let mut ue = put(&mut ub, 0, &src);
+    ue = put(&mut ub, ue, "/utilities");
+    let util = cut(&ub, 0, ue);
+    let mut hb = [b' '; 4096];
+    let mut he = put(&mut hb, 0, &root);
+    he = put(&mut hb, he, "/tests/heldout/polybench");
+    let here = cut(&hb, 0, he);
+    // every port that has a main.nt, in the table's order, when none is named
+    if sel_n == 0 {
+        let mut at = 0;
+        while at < ks.len() {
+            let w = word_end(&ks, at);
+            let mut pb = [b' '; 4096];
+            let mut pe = put(&mut pb, 0, &here);
+            pe = put_byte(&mut pb, pe, b'/');
+            pe = put_span(&mut pb, pe, &ks, at, w);
+            pe = put(&mut pb, pe, "/main.nt");
+            let p = cut(&pb, 0, pe);
+            if file_size(&p) >= 0 {
+                sel_n = put_span(&mut sel, sel_n, &ks, at, w);
+                sel_n = put_byte(&mut sel, sel_n, b';');
+            }
+            at = find_byte(&ks, at, b';') + 1;
+        }
+    }
+    let mk = "mktemp -d /tmp/neant-heldout-XXXXXX";
+    let wo = os_run(&mk, mk.len());
+    let work = cut(&wo, 0, line_end(&wo, 0));
+
+    let mut out = [b' '; 65536];
+    let mut total = 0;
+    let mut bad = 0;
+    let mut skipped = 0;
+    let mut at = 0;
+    while at < sel_n {
+        let se = find_byte(&sel, at, b';');
+        let name = cut(&sel, at, se);
+        at = se + 1;
+        total += 1;
+        let ki = kernel_at(&ks, &name);
+        if ki < 0 {
+            let mut m = [b' '; 256];
+            let mut me = put(&mut m, 0, "no port named ");
+            me = put(&mut m, me, &name);
+            let msg = cut(&m, 0, me);
+            fail(&msg);
+        }
+        let mut e = put(&mut out, 0, "skip ");
+        e = put(&mut out, e, &name);
+        e = pad_to(&mut out, e, 21);
+        let r = incomparable(&name, &dataset, &mut out, e);
+        if r > e {
+            e = put_byte(&mut out, r, b'\n');
+            print_bytes(&out, e);
+            skipped += 1;
+        } else {
+            let odir = original_dir(&src, &ks, ki);
+            let mut tb = [b' '; 4096];
+            let mut te = put(&mut tb, 0, &work);
+            te = put(&mut tb, te, "/ref-");
+            te = put(&mut tb, te, &name);
+            let tmp = cut(&tb, 0, te);
+            let mut names = [b' '; 1024];
+            let mut nf = [0; 16];
+            let mut nt = [0; 16];
+            let mut want = [0.0; 16];
+            let arrays = reference(&odir, &dataset, &tmp, &util, &mut names, &mut nf, &mut nt, &mut want);
+
+            // the port, built by `neant` and run at the same sizes
+            let mut c = [b' '; 16384];
+            let mut n = put(&mut c, 0, &neant);
+            n = put(&mut c, n, " build ");
+            n = put(&mut c, n, &here);
+            n = put_byte(&mut c, n, b'/');
+            n = put(&mut c, n, &name);
+            n = put(&mut c, n, "/main.nt -o ");
+            n = put(&mut c, n, &work);
+            n = put(&mut c, n, "/port-");
+            n = put(&mut c, n, &name);
+            n = put(&mut c, n, " 2>&1");
+            let bo = os_run(&c, n);
+            let mut ok = true;
+            let mut ne = 0;
+            let mut note = [b' '; 16384];
+            if os_status() != 0 {
+                ok = false;
+                ne = put_span(&mut note, 0, &bo, 0, line_end(&bo, 0));
+            } else {
+                let dh = ".h";
+                let base = base_name(&odir);
+                let hp = in_dir(&odir, &base, &dh);
+                let h = read_file(&hp);
+                let mut from = [0; 16];
+                let mut to = [0; 16];
+                let mut vals = [0; 16];
+                let sz = sizes(&h, &dataset, &mut from, &mut to, &mut vals);
+                n = put(&mut c, 0, &work);
+                n = put(&mut c, n, "/port-");
+                n = put(&mut c, n, &name);
+                for i in 0..16 {
+                    if i < sz {
+                        n = put_byte(&mut c, n, b' ');
+                        n = format_int(vals[i], &mut c, n);
+                    }
+                }
+                n = put(&mut c, n, " 2>");
+                n = put(&mut c, n, &work);
+                n = put(&mut c, n, "/err");
+                let po = os_run(&c, n);
+                let st = os_status();
+                if st != 0 {
+                    ok = false;
+                    ne = put(&mut note, 0, "exit ");
+                    ne = format_int(st, &mut note, ne);
+                    ne = put(&mut note, ne, ": ");
+                    let mut eb = [b' '; 4096];
+                    let mut ee = put(&mut eb, 0, &work);
+                    ee = put(&mut eb, ee, "/err");
+                    let errp = cut(&eb, 0, ee);
+                    let es = read_file(&errp);
+                    let s0 = skip_space(&es, 0);
+                    ne = put_span(&mut note, ne, &es, s0, line_end(&es, s0));
+                } else {
+                    let lines = count_words(&po, 0, po.len());
+                    if lines != arrays {
+                        ok = false;
+                        ne = format_int(lines, &mut note, 0);
+                        ne = put(&mut note, ne, " lines, the original dumps ");
+                        ne = format_int(arrays, &mut note, ne);
+                        ne = put(&mut note, ne, " arrays");
+                    } else {
+                        let mut i = skip_space(&po, 0);
+                        for j in 0..16 {
+                            if j < arrays {
+                                let g = parse_real(&po, i).v;
+                                i = skip_space(&po, word_end(&po, i));
+                                if j > 0 { ne = put_byte(&mut note, ne, b' '); }
+                                ne = put_span(&mut note, ne, &names, nf[j], nt[j]);
+                                ne = put_byte(&mut note, ne, b'=');
+                                ne = format_g(g, 10, &mut note, ne);
+                                if !close(g, want[j]) {
+                                    ok = false;
+                                    ne = put(&mut note, ne, " (want ");
+                                    ne = format_g(want[j], 10, &mut note, ne);
+                                    ne = put_byte(&mut note, ne, b')');
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            if !ok { bad += 1; }
+            if ok { e = put(&mut out, 0, "ok   "); } else { e = put(&mut out, 0, "FAIL "); }
+            e = put(&mut out, e, &name);
+            e = pad_to(&mut out, e, 21);
+            e = put_span(&mut out, e, &note, 0, ne);
+            e = put_byte(&mut out, e, b'\n');
+            print_bytes(&out, e);
+        }
+    }
+    let compared = total - skipped;
+    let mut e = put_byte(&mut out, 0, b'\n');
+    e = format_int(compared - bad, &mut out, e);
+    e = put(&mut out, e, " of ");
+    e = format_int(compared, &mut out, e);
+    e = put(&mut out, e, " agree with the original at ");
+    e = put(&mut out, e, &dataset);
+    if skipped > 0 {
+        e = put(&mut out, e, ", ");
+        e = format_int(skipped, &mut out, e);
+        e = put(&mut out, e, " not comparable there");
+    }
+    e = put_byte(&mut out, e, b'\n');
+    print_bytes(&out, e);
+    if bad > 0 { os_exit(1); }
+}

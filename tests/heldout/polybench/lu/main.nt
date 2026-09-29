@@ -1,0 +1,64 @@
+// PolyBench/C 4.2.1 linear-algebra/solvers/lu: A = L·U in place.
+// Arguments: n. init_array's temporary B is a local array there. A C loop `j <= i` is
+// `0..i + 1` (a range is half-open).
+
+use "std/text.nt";
+
+fn init_array(n: i64, a: &mut [f64]) {
+    for i in 0..n {
+        for j in 0..i + 1 {
+            a[i * n + j] = (-j % n) as f64 / n as f64 + 1.0;
+        }
+        for j in i + 1..n {
+            a[i * n + j] = 0.0;
+        }
+        a[i * n + i] = 1.0;
+    }
+    let mut b = [0.0; n * n];
+    for r in 0..n {
+        for s in 0..n {
+            b[r * n + s] = 0.0;
+        }
+    }
+    for t in 0..n {
+        for r in 0..n {
+            for s in 0..n {
+                b[r * n + s] += a[r * n + t] * a[s * n + t];
+            }
+        }
+    }
+    for r in 0..n {
+        for s in 0..n {
+            a[r * n + s] = b[r * n + s];
+        }
+    }
+}
+
+fn print_array(a: &[f64]) {
+    println(a.iter().sum());
+}
+
+fn kernel_lu(n: i64, a: &mut [f64]) {
+    for i in 0..n {
+        for j in 0..i {
+            for k in 0..j {
+                a[i * n + j] -= a[i * n + k] * a[k * n + j];
+            }
+            a[i * n + j] /= a[j * n + j];
+        }
+        for j in i..n {
+            for k in 0..i {
+                a[i * n + j] -= a[i * n + k] * a[k * n + j];
+            }
+        }
+    }
+}
+
+fn main() {
+    let a0 = arg(0);
+    let n = parse_int(&a0, 0).v;
+    let mut a = [0.0; n * n];
+    init_array(n, &mut a);
+    kernel_lu(n, &mut a);
+    print_array(&a);
+}

@@ -1,0 +1,55 @@
+// PolyBench/C 4.2.1 linear-algebra/blas/symm: C := alpha·A·B + beta·C, A symmetric, its lower
+// triangle stored. Arguments: m n. alpha and beta, which init_array sets through pointers, are set in main.
+// `j <= i` bounds are written `0..i + 1`; the -999 of A's unused upper triangle is `-999.0`;
+// temp2, declared at the top of kernel_symm, is a `let mut` at its `temp2 = 0` in the j loop.
+
+use "std/text.nt";
+
+fn init_array(m: i64, n: i64, c: &mut [f64], a: &mut [f64], b: &mut [f64]) {
+    for i in 0..m {
+        for j in 0..n {
+            c[i * n + j] = ((i + j) % 100) as f64 / m as f64;
+            b[i * n + j] = ((n + i - j) % 100) as f64 / m as f64;
+        }
+    }
+    for i in 0..m {
+        for j in 0..i + 1 {
+            a[i * m + j] = ((i + j) % 100) as f64 / m as f64;
+        }
+        for j in i + 1..m {
+            a[i * m + j] = -999.0;
+        }
+    }
+}
+
+fn print_array(c: &[f64]) {
+    println(c.iter().sum());
+}
+
+fn kernel_symm(m: i64, n: i64, alpha: f64, beta: f64, c: &mut [f64], a: &[f64], b: &[f64]) {
+    for i in 0..m {
+        for j in 0..n {
+            let mut temp2 = 0.0;
+            for k in 0..i {
+                c[k * n + j] += alpha * b[i * n + j] * a[i * m + k];
+                temp2 += b[k * n + j] * a[i * m + k];
+            }
+            c[i * n + j] = beta * c[i * n + j] + alpha * b[i * n + j] * a[i * m + i] + alpha * temp2;
+        }
+    }
+}
+
+fn main() {
+    let a0 = arg(0);
+    let m = parse_int(&a0, 0).v;
+    let a1 = arg(1);
+    let n = parse_int(&a1, 0).v;
+    let alpha = 1.5;
+    let beta = 1.2;
+    let mut c = [0.0; m * n];
+    let mut a = [0.0; m * m];
+    let mut b = [0.0; m * n];
+    init_array(m, n, &mut c, &mut a, &mut b);
+    kernel_symm(m, n, alpha, beta, &mut c, &a, &b);
+    print_array(&c);
+}

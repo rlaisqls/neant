@@ -1,0 +1,49 @@
+// PolyBench/C 4.2.1 linear-algebra/blas/syrk: the lower triangle of C := alpha·A·Aᵀ + beta·C.
+// Arguments: m n. alpha and beta, which init_array sets through pointers, are set in main.
+// `j <= i` bounds are written `0..i + 1`.
+
+use "std/text.nt";
+
+fn init_array(n: i64, m: i64, c: &mut [f64], a: &mut [f64]) {
+    for i in 0..n {
+        for j in 0..m {
+            a[i * m + j] = ((i * j + 1) % n) as f64 / n as f64;
+        }
+    }
+    for i in 0..n {
+        for j in 0..n {
+            c[i * n + j] = ((i * j + 2) % m) as f64 / m as f64;
+        }
+    }
+}
+
+fn print_array(c: &[f64]) {
+    println(c.iter().sum());
+}
+
+fn kernel_syrk(n: i64, m: i64, alpha: f64, beta: f64, c: &mut [f64], a: &[f64]) {
+    for i in 0..n {
+        for j in 0..i + 1 {
+            c[i * n + j] *= beta;
+        }
+        for k in 0..m {
+            for j in 0..i + 1 {
+                c[i * n + j] += alpha * a[i * m + k] * a[j * m + k];
+            }
+        }
+    }
+}
+
+fn main() {
+    let a0 = arg(0);
+    let m = parse_int(&a0, 0).v;
+    let a1 = arg(1);
+    let n = parse_int(&a1, 0).v;
+    let alpha = 1.5;
+    let beta = 1.2;
+    let mut c = [0.0; n * n];
+    let mut a = [0.0; n * m];
+    init_array(n, m, &mut c, &mut a);
+    kernel_syrk(n, m, alpha, beta, &mut c, &a);
+    print_array(&c);
+}

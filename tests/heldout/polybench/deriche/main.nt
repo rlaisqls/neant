@@ -1,0 +1,117 @@
+// PolyBench/C 4.2.1 medley/deriche: Deriche's recursive edge-detection filter.
+// Arguments: w h. DATA_TYPE is float in the original; it is f64 here and the reference is built
+// with DATA_TYPE_IS_DOUBLE, so EXP_FUN/POW_FUN are exp/pow and 65535.0f is 65535.0. alpha, which
+// init_array sets through a pointer, is set in main. The chained `a1 = a5 = k;` (and a2..a4,
+// c1 = c2) are two `let`s of the same value; the scalars are `let`s where each is first assigned
+// (the row or column start that resets it) rather than declared at the top. The downward loops
+// `for (j = h-1; j >= 0; j--)` and `for (i = w-1; i >= 0; i--)` are `while`s with the same bounds
+// (a range only counts up). c1 = c2 = 1 is 1.0 (an int stored to a float).
+
+use "std/math.nt";
+use "std/text.nt";
+
+fn init_array(w: i64, h: i64, img_in: &mut [f64], img_out: &mut [f64]) {
+    for i in 0..w {
+        for j in 0..h {
+            img_in[i * h + j] = ((313 * i + 991 * j) % 65536) as f64 / 65535.0;
+        }
+    }
+}
+
+fn print_array(img_out: &[f64]) {
+    println(img_out.iter().sum());
+}
+
+fn kernel_deriche(w: i64, h: i64, alpha: f64, img_in: &[f64], img_out: &mut [f64], y1: &mut [f64], y2: &mut [f64]) {
+    let k = (1.0 - exp(-alpha)) * (1.0 - exp(-alpha)) / (1.0 + 2.0 * alpha * exp(-alpha) - exp(2.0 * alpha));
+    let a1 = k;
+    let a5 = k;
+    let a2 = k * exp(-alpha) * (alpha - 1.0);
+    let a6 = a2;
+    let a3 = k * exp(-alpha) * (alpha + 1.0);
+    let a7 = a3;
+    let a4 = -k * exp(-2.0 * alpha);
+    let a8 = a4;
+    let b1 = pow(2.0, -alpha);
+    let b2 = -exp(-2.0 * alpha);
+    let c1 = 1.0;
+    let c2 = 1.0;
+
+    for i in 0..w {
+        let mut ym1 = 0.0;
+        let mut ym2 = 0.0;
+        let mut xm1 = 0.0;
+        for j in 0..h {
+            y1[i * h + j] = a1 * img_in[i * h + j] + a2 * xm1 + b1 * ym1 + b2 * ym2;
+            xm1 = img_in[i * h + j];
+            ym2 = ym1;
+            ym1 = y1[i * h + j];
+        }
+    }
+    for i in 0..w {
+        let mut yp1 = 0.0;
+        let mut yp2 = 0.0;
+        let mut xp1 = 0.0;
+        let mut xp2 = 0.0;
+        let mut j = h - 1;
+        while j >= 0 {
+            y2[i * h + j] = a3 * xp1 + a4 * xp2 + b1 * yp1 + b2 * yp2;
+            xp2 = xp1;
+            xp1 = img_in[i * h + j];
+            yp2 = yp1;
+            yp1 = y2[i * h + j];
+            j -= 1;
+        }
+    }
+    for i in 0..w {
+        for j in 0..h {
+            img_out[i * h + j] = c1 * (y1[i * h + j] + y2[i * h + j]);
+        }
+    }
+    for j in 0..h {
+        let mut tm1 = 0.0;
+        let mut ym1 = 0.0;
+        let mut ym2 = 0.0;
+        for i in 0..w {
+            y1[i * h + j] = a5 * img_out[i * h + j] + a6 * tm1 + b1 * ym1 + b2 * ym2;
+            tm1 = img_out[i * h + j];
+            ym2 = ym1;
+            ym1 = y1[i * h + j];
+        }
+    }
+    for j in 0..h {
+        let mut tp1 = 0.0;
+        let mut tp2 = 0.0;
+        let mut yp1 = 0.0;
+        let mut yp2 = 0.0;
+        let mut i = w - 1;
+        while i >= 0 {
+            y2[i * h + j] = a7 * tp1 + a8 * tp2 + b1 * yp1 + b2 * yp2;
+            tp2 = tp1;
+            tp1 = img_out[i * h + j];
+            yp2 = yp1;
+            yp1 = y2[i * h + j];
+            i -= 1;
+        }
+    }
+    for i in 0..w {
+        for j in 0..h {
+            img_out[i * h + j] = c2 * (y1[i * h + j] + y2[i * h + j]);
+        }
+    }
+}
+
+fn main() {
+    let a0 = arg(0);
+    let w = parse_int(&a0, 0).v;
+    let a1 = arg(1);
+    let h = parse_int(&a1, 0).v;
+    let alpha = 0.25;
+    let mut img_in = [0.0; w * h];
+    let mut img_out = [0.0; w * h];
+    let mut y1 = [0.0; w * h];
+    let mut y2 = [0.0; w * h];
+    init_array(w, h, &mut img_in, &mut img_out);
+    kernel_deriche(w, h, alpha, &img_in, &mut img_out, &mut y1, &mut y2);
+    print_array(&img_out);
+}

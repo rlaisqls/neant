@@ -1,0 +1,60 @@
+// PolyBench/C 4.2.1 linear-algebra/solvers/gramschmidt: QR by modified Gram-Schmidt.
+// Arguments: m n. print_array dumps R then Q (A is passed but not dumped). nrm is a `let` where
+// each k first assigns it rather than declared at the top.
+
+use "std/math.nt";
+use "std/text.nt";
+
+fn init_array(m: i64, n: i64, a: &mut [f64], r: &mut [f64], q: &mut [f64]) {
+    for i in 0..m {
+        for j in 0..n {
+            a[i * n + j] = (((i * j) % m) as f64 / m as f64) * 100.0 + 10.0;
+            q[i * n + j] = 0.0;
+        }
+    }
+    for i in 0..n {
+        for j in 0..n {
+            r[i * n + j] = 0.0;
+        }
+    }
+}
+
+fn print_array(a: &[f64], r: &[f64], q: &[f64]) {
+    println(r.iter().sum());
+    println(q.iter().sum());
+}
+
+fn kernel_gramschmidt(m: i64, n: i64, a: &mut [f64], r: &mut [f64], q: &mut [f64]) {
+    for k in 0..n {
+        let mut nrm = 0.0;
+        for i in 0..m {
+            nrm += a[i * n + k] * a[i * n + k];
+        }
+        r[k * n + k] = sqrt(nrm);
+        for i in 0..m {
+            q[i * n + k] = a[i * n + k] / r[k * n + k];
+        }
+        for j in k + 1..n {
+            r[k * n + j] = 0.0;
+            for i in 0..m {
+                r[k * n + j] += q[i * n + k] * a[i * n + j];
+            }
+            for i in 0..m {
+                a[i * n + j] = a[i * n + j] - q[i * n + k] * r[k * n + j];
+            }
+        }
+    }
+}
+
+fn main() {
+    let a0 = arg(0);
+    let m = parse_int(&a0, 0).v;
+    let a1 = arg(1);
+    let n = parse_int(&a1, 0).v;
+    let mut a = [0.0; m * n];
+    let mut r = [0.0; n * n];
+    let mut q = [0.0; m * n];
+    init_array(m, n, &mut a, &mut r, &mut q);
+    kernel_gramschmidt(m, n, &mut a, &mut r, &mut q);
+    print_array(&a, &r, &q);
+}

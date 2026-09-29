@@ -1,0 +1,38 @@
+// PolyBench/C 4.2.1 stencils/jacobi-1d: 1-D Jacobi stencil, 3 points.
+// Arguments: tsteps n.
+
+use "std/text.nt";
+
+fn init_array(n: i64, a: &mut [f64], b: &mut [f64]) {
+    for i in 0..n {
+        a[i] = (i as f64 + 2.0) / n as f64;
+        b[i] = (i as f64 + 3.0) / n as f64;
+    }
+}
+
+fn print_array(a: &[f64]) {
+    println(a.iter().sum());
+}
+
+fn kernel_jacobi_1d(tsteps: i64, n: i64, a: &mut [f64], b: &mut [f64]) {
+    for t in 0..tsteps {
+        for i in 1..n - 1 {
+            b[i] = 0.33333 * (a[i - 1] + a[i] + a[i + 1]);
+        }
+        for i in 1..n - 1 {
+            a[i] = 0.33333 * (b[i - 1] + b[i] + b[i + 1]);
+        }
+    }
+}
+
+fn main() {
+    let a0 = arg(0);
+    let tsteps = parse_int(&a0, 0).v;
+    let a1 = arg(1);
+    let n = parse_int(&a1, 0).v;
+    let mut a = [0.0; n];
+    let mut b = [0.0; n];
+    init_array(n, &mut a, &mut b);
+    kernel_jacobi_1d(tsteps, n, &mut a, &mut b);
+    print_array(&a);
+}

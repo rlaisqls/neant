@@ -1,0 +1,146 @@
+// What check.nt and measure.nt share (docs/heldout.md): the ports and the original's directory for
+// each, the release tarball fetched once and checked against its hash, a dataset's sizes read from
+// the original header, and the paths every driver builds. A path is built into a buffer and cut to
+// its length (std/bytes.nt), since a view is of a whole array.
+
+use "std/bytes.nt";
+use "std/os.nt";
+
+// Each port's directory and the original's under the tarball, one `name dir;` after another.
+fn kernels() -> [u8] {
+    let mut t = [b' '; 2048];
+    let mut e = put(&mut t, 0, "correlation datamining/correlation;covariance datamining/covariance;");
+    e = put(&mut t, e, "gemm linear-algebra/blas/gemm;gemver linear-algebra/blas/gemver;");
+    e = put(&mut t, e, "gesummv linear-algebra/blas/gesummv;symm linear-algebra/blas/symm;");
+    e = put(&mut t, e, "syr2k linear-algebra/blas/syr2k;syrk linear-algebra/blas/syrk;");
+    e = put(&mut t, e, "trmm linear-algebra/blas/trmm;");
+    e = put(&mut t, e, "2mm linear-algebra/kernels/2mm;3mm linear-algebra/kernels/3mm;");
+    e = put(&mut t, e, "atax linear-algebra/kernels/atax;bicg linear-algebra/kernels/bicg;");
+    e = put(&mut t, e, "doitgen linear-algebra/kernels/doitgen;mvt linear-algebra/kernels/mvt;");
+    e = put(&mut t, e, "cholesky linear-algebra/solvers/cholesky;durbin linear-algebra/solvers/durbin;");
+    e = put(&mut t, e, "gramschmidt linear-algebra/solvers/gramschmidt;lu linear-algebra/solvers/lu;");
+    e = put(&mut t, e, "ludcmp linear-algebra/solvers/ludcmp;trisolv linear-algebra/solvers/trisolv;");
+    e = put(&mut t, e, "deriche medley/deriche;floyd-warshall medley/floyd-warshall;");
+    e = put(&mut t, e, "nussinov medley/nussinov;");
+    e = put(&mut t, e, "adi stencils/adi;fdtd-2d stencils/fdtd-2d;heat-3d stencils/heat-3d;");
+    e = put(&mut t, e, "jacobi-1d stencils/jacobi-1d;jacobi-2d stencils/jacobi-2d;");
+    e = put(&mut t, e, "seidel-2d stencils/seidel-2d;");
+    cut(&t, 0, e)
+}
+
+// The offset in `kernels()` of the entry for `name`, or −1: its name is `at..word_end(at)`, its
+// directory from one past that to the next `;`.
+fn kernel_at(ks: &[u8], name: &[u8]) -> i64 {
+    let mut found = -1;
+    let mut at = 0;
+    while at < ks.len() {
+        let w = word_end(ks, at);
+        if found < 0 && same_span(ks, at, w, name) { found = at; }
+        at = find_byte(ks, at, b';') + 1;
+    }
+    found
+}
+
+// The repository's root, from git, so that a driver runs from anywhere.
+fn repo_root() -> [u8] {
+    let cmd = "git rev-parse --show-toplevel";
+    let o = os_run(&cmd, cmd.len());
+    if os_status() != 0 { fail("not in a git repository"); }
+    cut(&o, 0, line_end(&o, 0))
+}
+
+// The message to stderr and exit 2.
+fn fail(msg: &[u8]) {
+    os_eprint(msg, msg.len());
+    let nl = [b'\n'; 1];
+    os_eprint(&nl, 1);
+    os_exit(2);
+}
+
+// The unpacked release: `~/.cache/neant/polybench-c-4.2.1-beta`, fetched and checked first when it
+// is not there.
+fn source() -> [u8] {
+    let h = "HOME";
+    let home = os_env(&h);
+    let mut p = [b' '; 4096];
+    let mut e = put(&mut p, 0, &home);
+    e = put(&mut p, e, "/.cache/neant");
+    let cache = cut(&p, 0, e);
+    e = put(&mut p, e, "/polybench-c-4.2.1-beta");
+    let src = cut(&p, 0, e);
+    e = put(&mut p, e, "/utilities/polybench.c");
+    let probe = cut(&p, 0, e);
+    if file_size(&probe) < 0 {
+        let mut c = [b' '; 8192];
+        let mut n = put(&mut c, 0, "mkdir -p ");
+        n = put(&mut c, n, &cache);
+        n = put(&mut c, n, " && cd ");
+        n = put(&mut c, n, &cache);
+        n = put(&mut c, n, " && { test -f polybench-c-4.2.1-beta.tar.gz || curl -sSfL -o polybench-c-4.2.1-beta.tar.gz https://downloads.sourceforge.net/project/polybench/polybench-c-4.2.1-beta.tar.gz; }");
+        n = put(&mut c, n, " && sha256sum polybench-c-4.2.1-beta.tar.gz");
+        let sum = os_run(&c, n);
+        if os_status() != 0 || !has_at(&sum, 0, "426519ee8443a5f2175de6a3e9328cda8917a5e33053d0e8f59855ab56d689a4") {
+            fail("polybench-c-4.2.1-beta.tar.gz: sha256 is not 426519ee8443a5f2175de6a3e9328cda8917a5e33053d0e8f59855ab56d689a4");
+        }
+        n = put(&mut c, 0, "tar -xzf ");
+        n = put(&mut c, n, &cache);
+        n = put(&mut c, n, "/polybench-c-4.2.1-beta.tar.gz -C ");
+        n = put(&mut c, n, &cache);
+        let done = os_run(&c, n);
+        if os_status() != 0 { fail("cannot unpack the PolyBench tarball"); }
+    }
+    src
+}
+
+// The original's directory for the entry at `k` in `ks`: `src/dir`.
+fn original_dir(src: &[u8], ks: &[u8], k: i64) -> [u8] {
+    let mut p = [b' '; 4096];
+    let mut e = put(&mut p, 0, src);
+    e = put_byte(&mut p, e, b'/');
+    e = put_span(&mut p, e, ks, word_end(ks, k) + 1, find_byte(ks, k, b';'));
+    cut(&p, 0, e)
+}
+
+// The last part of a path.
+fn base_name(dir: &[u8]) -> [u8] {
+    let mut s = 0;
+    for k in 0..dir.len() {
+        if dir[k] == b'/' { s = k + 1; }
+    }
+    cut(dir, s, dir.len())
+}
+
+// `dir/base.ext`.
+fn in_dir(dir: &[u8], base: &[u8], ext: &[u8]) -> [u8] {
+    let mut p = [b' '; 4096];
+    let mut e = put(&mut p, 0, dir);
+    e = put_byte(&mut p, e, b'/');
+    e = put(&mut p, e, base);
+    e = put(&mut p, e, ext);
+    cut(&p, 0, e)
+}
+
+// The dataset's `#define`s in the header, in its order: each name's span in `h` into `from`/`to`
+// and its value into `vals`; how many. A header without the dataset's block is a failure.
+fn sizes(h: &[u8], dataset: &[u8], from: &mut [i64], to: &mut [i64], vals: &mut [i64]) -> i64 {
+    let mut key = [b' '; 64];
+    let mut e = put(&mut key, 0, "ifdef ");
+    e = put(&mut key, e, dataset);
+    e = put(&mut key, e, "_DATASET");
+    let k = cut(&key, 0, e);
+    let start = find(h, 0, &k);
+    if start == h.len() { fail("a header has no block for the dataset"); }
+    let stop = find(h, start, "endif");
+    let mut n = 0;
+    let mut at = find(h, start, "define");
+    while at < stop {
+        let nm = skip_space(h, at + 6);
+        let ne = word_end(h, nm);
+        from[n] = nm;
+        to[n] = ne;
+        vals[n] = parse_int(h, skip_space(h, ne)).v;
+        n += 1;
+        at = find(h, ne, "define");
+    }
+    n
+}

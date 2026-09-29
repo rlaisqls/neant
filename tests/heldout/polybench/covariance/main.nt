@@ -1,0 +1,55 @@
+// PolyBench/C 4.2.1 datamining/covariance: the covariance matrix of n samples of m variables.
+// Arguments: m n. float_n, which init_array sets through a pointer, is set in main.
+
+use "std/text.nt";
+
+fn init_array(m: i64, n: i64, data: &mut [f64]) {
+    for i in 0..n {
+        for j in 0..m {
+            data[i * m + j] = (i as f64 * j as f64) / m as f64;
+        }
+    }
+}
+
+fn print_array(cov: &[f64]) {
+    println(cov.iter().sum());
+}
+
+fn kernel_covariance(m: i64, n: i64, float_n: f64, data: &mut [f64], cov: &mut [f64], mean: &mut [f64]) {
+    for j in 0..m {
+        mean[j] = 0.0;
+        for i in 0..n {
+            mean[j] += data[i * m + j];
+        }
+        mean[j] /= float_n;
+    }
+    for i in 0..n {
+        for j in 0..m {
+            data[i * m + j] -= mean[j];
+        }
+    }
+    for i in 0..m {
+        for j in i..m {
+            cov[i * m + j] = 0.0;
+            for k in 0..n {
+                cov[i * m + j] += data[k * m + i] * data[k * m + j];
+            }
+            cov[i * m + j] /= (float_n - 1.0);
+            cov[j * m + i] = cov[i * m + j];
+        }
+    }
+}
+
+fn main() {
+    let a0 = arg(0);
+    let m = parse_int(&a0, 0).v;
+    let a1 = arg(1);
+    let n = parse_int(&a1, 0).v;
+    let float_n = n as f64;
+    let mut data = [0.0; n * m];
+    let mut cov = [0.0; m * m];
+    let mut mean = [0.0; m];
+    init_array(m, n, &mut data);
+    kernel_covariance(m, n, float_n, &mut data, &mut cov, &mut mean);
+    print_array(&cov);
+}

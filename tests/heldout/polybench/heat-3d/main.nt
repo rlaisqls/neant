@@ -1,0 +1,58 @@
+// PolyBench/C 4.2.1 stencils/heat-3d: heat equation over a 3-D grid, 7-point stencil.
+// Arguments: tsteps n. The chained `A[i][j][k] = B[i][j][k] = …` is two statements, B assigned
+// the value and A then assigned B's element. The kernel's time loop bound, the macro TSTEPS in
+// the original, is the argument tsteps (the same value); `t <= TSTEPS` is the range 1..tsteps + 1.
+
+use "std/text.nt";
+
+fn init_array(n: i64, a: &mut [f64], b: &mut [f64]) {
+    for i in 0..n {
+        for j in 0..n {
+            for k in 0..n {
+                b[(i * n + j) * n + k] = (i + j + (n - k)) as f64 * 10.0 / n as f64;
+                a[(i * n + j) * n + k] = b[(i * n + j) * n + k];
+            }
+        }
+    }
+}
+
+fn print_array(a: &[f64]) {
+    println(a.iter().sum());
+}
+
+fn kernel_heat_3d(tsteps: i64, n: i64, a: &mut [f64], b: &mut [f64]) {
+    for t in 1..tsteps + 1 {
+        for i in 1..n - 1 {
+            for j in 1..n - 1 {
+                for k in 1..n - 1 {
+                    b[(i * n + j) * n + k] = 0.125 * (a[((i + 1) * n + j) * n + k] - 2.0 * a[(i * n + j) * n + k] + a[((i - 1) * n + j) * n + k])
+                        + 0.125 * (a[(i * n + j + 1) * n + k] - 2.0 * a[(i * n + j) * n + k] + a[(i * n + j - 1) * n + k])
+                        + 0.125 * (a[(i * n + j) * n + k + 1] - 2.0 * a[(i * n + j) * n + k] + a[(i * n + j) * n + k - 1])
+                        + a[(i * n + j) * n + k];
+                }
+            }
+        }
+        for i in 1..n - 1 {
+            for j in 1..n - 1 {
+                for k in 1..n - 1 {
+                    a[(i * n + j) * n + k] = 0.125 * (b[((i + 1) * n + j) * n + k] - 2.0 * b[(i * n + j) * n + k] + b[((i - 1) * n + j) * n + k])
+                        + 0.125 * (b[(i * n + j + 1) * n + k] - 2.0 * b[(i * n + j) * n + k] + b[(i * n + j - 1) * n + k])
+                        + 0.125 * (b[(i * n + j) * n + k + 1] - 2.0 * b[(i * n + j) * n + k] + b[(i * n + j) * n + k - 1])
+                        + b[(i * n + j) * n + k];
+                }
+            }
+        }
+    }
+}
+
+fn main() {
+    let a0 = arg(0);
+    let tsteps = parse_int(&a0, 0).v;
+    let a1 = arg(1);
+    let n = parse_int(&a1, 0).v;
+    let mut a = [0.0; n * n * n];
+    let mut b = [0.0; n * n * n];
+    init_array(n, &mut a, &mut b);
+    kernel_heat_3d(tsteps, n, &mut a, &mut b);
+    print_array(&a);
+}

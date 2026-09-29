@@ -1,0 +1,71 @@
+// PolyBench/C 4.2.1 linear-algebra/kernels/2mm: D := alpha·A·B·C + beta·D.
+// Arguments: ni nj nk nl. alpha and beta, which init_array sets through pointers, are set in main.
+
+use "std/text.nt";
+
+fn init_array(ni: i64, nj: i64, nk: i64, nl: i64, a: &mut [f64], b: &mut [f64], c: &mut [f64], d: &mut [f64]) {
+    for i in 0..ni {
+        for j in 0..nk {
+            a[i * nk + j] = ((i * j + 1) % ni) as f64 / ni as f64;
+        }
+    }
+    for i in 0..nk {
+        for j in 0..nj {
+            b[i * nj + j] = (i * (j + 1) % nj) as f64 / nj as f64;
+        }
+    }
+    for i in 0..nj {
+        for j in 0..nl {
+            c[i * nl + j] = ((i * (j + 3) + 1) % nl) as f64 / nl as f64;
+        }
+    }
+    for i in 0..ni {
+        for j in 0..nl {
+            d[i * nl + j] = (i * (j + 2) % nk) as f64 / nk as f64;
+        }
+    }
+}
+
+fn print_array(d: &[f64]) {
+    println(d.iter().sum());
+}
+
+fn kernel_2mm(ni: i64, nj: i64, nk: i64, nl: i64, alpha: f64, beta: f64, tmp: &mut [f64], a: &[f64], b: &[f64], c: &[f64], d: &mut [f64]) {
+    for i in 0..ni {
+        for j in 0..nj {
+            tmp[i * nj + j] = 0.0;
+            for k in 0..nk {
+                tmp[i * nj + j] += alpha * a[i * nk + k] * b[k * nj + j];
+            }
+        }
+    }
+    for i in 0..ni {
+        for j in 0..nl {
+            d[i * nl + j] *= beta;
+            for k in 0..nj {
+                d[i * nl + j] += tmp[i * nj + k] * c[k * nl + j];
+            }
+        }
+    }
+}
+
+fn main() {
+    let a0 = arg(0);
+    let ni = parse_int(&a0, 0).v;
+    let a1 = arg(1);
+    let nj = parse_int(&a1, 0).v;
+    let a2 = arg(2);
+    let nk = parse_int(&a2, 0).v;
+    let a3 = arg(3);
+    let nl = parse_int(&a3, 0).v;
+    let alpha = 1.5;
+    let beta = 1.2;
+    let mut tmp = [0.0; ni * nj];
+    let mut a = [0.0; ni * nk];
+    let mut b = [0.0; nk * nj];
+    let mut c = [0.0; nj * nl];
+    let mut d = [0.0; ni * nl];
+    init_array(ni, nj, nk, nl, &mut a, &mut b, &mut c, &mut d);
+    kernel_2mm(ni, nj, nk, nl, alpha, beta, &mut tmp, &a, &b, &c, &mut d);
+    print_array(&d);
+}

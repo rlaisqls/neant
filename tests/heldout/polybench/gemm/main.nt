@@ -1,0 +1,56 @@
+// PolyBench/C 4.2.1 linear-algebra/blas/gemm: C := alpha·A·B + beta·C.
+// Arguments: ni nj nk. alpha and beta, which init_array sets through pointers, are set in main.
+
+use "std/text.nt";
+
+fn init_array(ni: i64, nj: i64, nk: i64, c: &mut [f64], a: &mut [f64], b: &mut [f64]) {
+    for i in 0..ni {
+        for j in 0..nj {
+            c[i * nj + j] = ((i * j + 1) % ni) as f64 / ni as f64;
+        }
+    }
+    for i in 0..ni {
+        for j in 0..nk {
+            a[i * nk + j] = (i * (j + 1) % nk) as f64 / nk as f64;
+        }
+    }
+    for i in 0..nk {
+        for j in 0..nj {
+            b[i * nj + j] = (i * (j + 2) % nj) as f64 / nj as f64;
+        }
+    }
+}
+
+fn print_array(c: &[f64]) {
+    println(c.iter().sum());
+}
+
+fn kernel_gemm(ni: i64, nj: i64, nk: i64, alpha: f64, beta: f64, c: &mut [f64], a: &[f64], b: &[f64]) {
+    for i in 0..ni {
+        for j in 0..nj {
+            c[i * nj + j] *= beta;
+        }
+        for k in 0..nk {
+            for j in 0..nj {
+                c[i * nj + j] += alpha * a[i * nk + k] * b[k * nj + j];
+            }
+        }
+    }
+}
+
+fn main() {
+    let a0 = arg(0);
+    let ni = parse_int(&a0, 0).v;
+    let a1 = arg(1);
+    let nj = parse_int(&a1, 0).v;
+    let a2 = arg(2);
+    let nk = parse_int(&a2, 0).v;
+    let alpha = 1.5;
+    let beta = 1.2;
+    let mut c = [0.0; ni * nj];
+    let mut a = [0.0; ni * nk];
+    let mut b = [0.0; nk * nj];
+    init_array(ni, nj, nk, &mut c, &mut a, &mut b);
+    kernel_gemm(ni, nj, nk, alpha, beta, &mut c, &a, &b);
+    print_array(&c);
+}

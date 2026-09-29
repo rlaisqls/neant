@@ -1,0 +1,816 @@
+// The PolyBench ports against the clock and the counter (docs/heldout.md, the order of the work,
+// step 3): each port's predicted time and moves, from `neant cost --eval` with the frozen compiler,
+// against its measured wall-clock and L2 refills × 64, at the original's MEDIUM, LARGE and
+// EXTRALARGE sizes, pinned to one big core.
+//
+//     neant run measure.nt -- --cost [name ...]            write <name>/main.cost and tiers.txt
+//     neant run measure.nt -- [--cpu 5] [--runs 3] [--datasets MEDIUM,LARGE,EXTRALARGE]
+//                                [--json FILE] [--neant PATH] [name ...]
+//
+// The harness is tests/corpus/timing.py's (wall-clock via taskset, the minimum of `runs`, an empty
+// program's run subtracted) and tests/kernels/sweep.py's (`perf stat -e l2d_cache_refill`, the pinned
+// cluster's PMU copy, the minimum of `runs`), in separate runs so that perf is not in the time. The
+// sizes are handed to the port in the header's order, as check.nt hands them; the `--eval` atoms are
+// main's lets that read them (`let n = parse_int(&a0, 0).v;` gives `n` and `a0.len()`). The
+// footprint is the arrays main allocates, evaluated at the sizes, × 8 bytes; heldout.md's bytes
+// question is over the kernels whose footprint exceeds L3 (16 MiB, plan § Validation harness notes)
+// at the largest size.
+
+use "polybench.nt";
+
+// main's size lets: the name's span in `nt` into `xf`/`xt` and the argument it reads into `ak`;
+// how many. A `let x = parse_int(&aK, 0).v;` is one.
+fn size_lets(nt: &[u8], body: i64, xf: &mut [i64], xt: &mut [i64], ak: &mut [i64]) -> i64 {
+    let mut n = 0;
+    let mut at = find(nt, body, "let ");
+    while at < nt.len() {
+        let nm = at + 4;
+        let ne = word_end(nt, nm);
+        if has_at(nt, ne, " = parse_int(&a") {
+            let k = parse_int(nt, ne + 15);
+            if k.ok && has_at(nt, k.end, ", 0).v;") && n < 16 {
+                xf[n] = nm;
+                xt[n] = ne;
+                ak[n] = k.v;
+                n += 1;
+            }
+        }
+        at = find(nt, nm, "let ");
+    }
+    n
+}
+
+// The value of the size let whose name is `nt[from..to]`, or −1 when there is none.
+fn let_value(nt: &[u8], from: i64, to: i64, xf: &[i64], xt: &[i64], ak: &[i64], lets: i64, vals: &[i64]) -> i64 {
+    let mut v = -1;
+    for k in 0..16 {
+        if k < lets && v < 0 && to - from == xt[k] - xf[k] {
+            let mut eq = true;
+            for j in 0..(to - from) {
+                if nt[from + j] != nt[xf[k] + j] { eq = false; }
+            }
+            if eq { v = vals[ak[k]]; }
+        }
+    }
+    v
+}
+
+// Bytes of the arrays main allocates (`[0.0; e]`, `[0; e]`, `e` a product of size lets and
+// literals), 8 each.
+fn footprint(nt: &[u8], body: i64, xf: &[i64], xt: &[i64], ak: &[i64], lets: i64, vals: &[i64]) -> i64 {
+    let mut total = 0;
+    let mut at = find(nt, body, "= [");
+    while at < nt.len() {
+        let mut i = at + 3;
+        let lit = i;
+        while i < nt.len() && (is_digit(nt[i]) || nt[i] == b'-' || nt[i] == b'.') { i += 1; }
+        if i > lit && has_at(nt, i, "; ") {
+            let stop = find(nt, i, "];");
+            if stop < line_end(nt, i) {
+                let mut p = 8;
+                let mut f = i + 2;
+                while f < stop {
+                    let fe = min(find_byte(nt, f, b'*'), stop);
+                    let mut a = f;
+                    let mut b = fe;
+                    while a < b && nt[a] == b' ' { a += 1; }
+                    while b > a && nt[b - 1] == b' ' { b -= 1; }
+                    let num = parse_int(nt, a);
+                    if num.ok && num.end == b {
+                        p = p * num.v;
+                    } else {
+                        let v = let_value(nt, a, b, xf, xt, ak, lets, vals);
+                        if v < 0 { fail("a footprint names something that is not a size let"); }
+                        p = p * v;
+                    }
+                    f = fe + 1;
+                }
+                total += p;
+            }
+        }
+        at = find(nt, at + 3, "= [");
+    }
+    total
+}
+
+// `neant cost main.nt` and more, run in the port's directory, for at most 900 s: the frozen
+// compiler does not finish on some ports (adi, heat-3d), and a report it does not give in that time
+// is a refusal — every function unknown, no prediction. `os_status()` is 124 after one.
+// With `skip`, nothing is run and the report is empty.
+fn cost(neant: &[u8], dir: &[u8], extra: &[u8], extra_n: i64, skip: bool) -> [u8] {
+    let mut c = [b' '; 16384];
+    let mut n = put(&mut c, 0, "true");
+    if !skip {
+        n = put(&mut c, 0, "cd ");
+        n = put(&mut c, n, dir);
+        n = put(&mut c, n, " && timeout 900 ");
+        n = put(&mut c, n, neant);
+        n = put(&mut c, n, " cost main.nt");
+        n = put_span(&mut c, n, extra, 0, extra_n);
+    }
+    let o = os_run(&c, n);
+    if os_status() != 0 && os_status() != 124 { fail("neant cost failed"); }
+    o
+}
+
+// A prediction: main's `at` line read, or not there.
+struct Pred { ok: bool, work: f64, moves: f64, time: f64, bound: i64, bound_end: i64, block: i64, block_end: i64 }
+
+// main's `at …: work W  moves M bytes  time T s (X-bound)` line in the report; the bound word and
+// main's block are spans of `r`.
+fn predict(r: &[u8]) -> Pred {
+    let mut start = 0;
+    if !has_at(r, 0, "main ") {
+        let pat = b"\nmain ";
+        start = find(r, 0, &pat);
+        if start < r.len() { start += 1; } else { start = 0; }
+    }
+    let mut p = Pred { ok: false, work: 0.0, moves: 0.0, time: 0.0, bound: 0, bound_end: 0, block: start, block_end: start };
+    let mut at = start;
+    let mut going = true;
+    while going && at < r.len() {
+        let le = line_end(r, at);
+        if at > start && le > at && r[at] != b' ' {
+            going = false;
+        } else {
+            p.block_end = le;
+            let a = find(r, at, " at ");
+            let w = find(r, at, ": work ");
+            if !p.ok && a < le && w < le {
+                let mv = find(r, w, "moves ");
+                let tm = find(r, w, "time ");
+                let bd = find(r, w, " s (");
+                let be = find(r, w, "-bound)");
+                if mv < le && tm < le && bd < le && be < le {
+                    p.ok = true;
+                    p.work = parse_real(r, w + 7).v;
+                    p.moves = parse_real(r, mv + 6).v;
+                    p.time = parse_real(r, tm + 5).v;
+                    p.bound = bd + 4;
+                    p.bound_end = be;
+                }
+            }
+            at = le + 1;
+        }
+    }
+    p
+}
+
+// The minimum over `runs` of the command's wall-clock in seconds, pinned; its stdout into `out`
+// (the last run's), with its length.
+struct Wall { s: f64, n: i64 }
+
+fn wall(cpu: i64, argv: &[u8], argv_n: i64, runs: i64, out: &mut [u8]) -> Wall {
+    let mut c = [b' '; 16384];
+    let mut n = put(&mut c, 0, "taskset -c ");
+    n = format_int(cpu, &mut c, n);
+    n = put_byte(&mut c, n, b' ');
+    n = put_span(&mut c, n, argv, 0, argv_n);
+    let mut best = 1.0 / 0.0;
+    let mut got = 0;
+    for r in 0..runs {
+        let t0 = os_now();
+        let o = os_run(&c, n);
+        let dt = (os_now() - t0) as f64 * 1e-9;
+        if os_status() != 0 { fail("a timed run failed"); }
+        best = min(best, dt);
+        got = put_span(out, 0, &o, 0, min(o.len(), out.len()));
+    }
+    Wall { s: best, n: got }
+}
+
+// The minimum over `runs` of the pinned cluster's l2d_cache_refill count. perf prints one copy of
+// the event per cluster (armv8_pmuv3_N/event/); the other cluster's is 0 or <not counted>, so the
+// sum is the pinned cluster's.
+fn refills(cpu: i64, argv: &[u8], argv_n: i64, runs: i64) -> i64 {
+    let mut c = [b' '; 16384];
+    let mut n = put(&mut c, 0, "taskset -c ");
+    n = format_int(cpu, &mut c, n);
+    n = put(&mut c, n, " perf stat -x, -e l2d_cache_refill ");
+    n = put_span(&mut c, n, argv, 0, argv_n);
+    n = put(&mut c, n, " 2>&1 >/dev/null");
+    let mut best = -1;
+    for r in 0..runs {
+        let o = os_run(&c, n);
+        if os_status() != 0 {
+            os_eprint(&o, o.len());
+            os_exit(1);
+        }
+        let mut sum = 0;
+        let mut at = 0;
+        while at < o.len() {
+            let le = line_end(&o, at);
+            let c1 = find_byte(&o, at, b',');
+            let c2 = find_byte(&o, c1 + 1, b',');
+            let c3 = find_byte(&o, c2 + 1, b',');
+            if c3 < le && find(&o, c2 + 1, "l2d_cache_refill") < c3 {
+                let v = parse_int(&o, at);
+                if v.ok && v.end == c1 { sum += v.v; }
+            }
+            at = le + 1;
+        }
+        if best < 0 || sum < best { best = sum; }
+    }
+    best
+}
+
+// The tier word's index: bound, declared, exact, modulo, unknown — the order they print in — or −1.
+fn tier_of(s: &[u8], from: i64, to: i64) -> i64 {
+    let mut e = to;
+    if e > from && s[e - 1] == b',' { e -= 1; }
+    let mut t = -1;
+    if same_span(s, from, e, "bound") { t = 0; }
+    if same_span(s, from, e, "declared") { t = 1; }
+    if same_span(s, from, e, "exact") { t = 2; }
+    if same_span(s, from, e, "modulo") { t = 3; }
+    if same_span(s, from, e, "unknown") { t = 4; }
+    t
+}
+
+fn put_tier(out: &mut [u8], at: i64, t: i64) -> i64 {
+    let mut e = at;
+    if t == 0 { e = put(out, e, "bound"); }
+    if t == 1 { e = put(out, e, "declared"); }
+    if t == 2 { e = put(out, e, "exact"); }
+    if t == 3 { e = put(out, e, "modulo"); }
+    if t == 4 { e = put(out, e, "unknown"); }
+    e
+}
+
+// Whether the port's source defines `fn r[from..to]` at the start of a line.
+fn defines(src: &[u8], r: &[u8], from: i64, to: i64) -> bool {
+    let mut yes = false;
+    let mut at = 0;
+    while at < src.len() {
+        if has_at(src, at, "fn ") {
+            let ne = at + 3 + (to - from);
+            let mut eq = ne <= src.len();
+            for k in 0..(to - from) {
+                if eq && src[at + 3 + k] != r[from + k] { eq = false; }
+            }
+            if eq && (ne == src.len() || src[ne] == b'(' || src[ne] == b'<') {
+                yes = true;
+            }
+        }
+        at = line_end(src, at) + 1;
+    }
+    yes
+}
+
+// The report, or for a refusal a line for each function the source defines, unknown, in the
+// report's own form so that it is read and counted as one.
+fn report_or_refusal(got: &[u8], refused: bool, src: &[u8]) -> [u8] {
+    let mut b = [b' '; got.len() + 2 * src.len() + 64];
+    let mut n = 0;
+    if refused {
+        let mut s = 0;
+        while s < src.len() {
+            if has_at(src, s, "fn ") {
+                let mut ne = s + 3;
+                while ne < src.len() && src[ne] != b'(' && src[ne] != b'<' && !is_space(src[ne]) { ne += 1; }
+                n = put_left(&mut b, n, src, s + 3, ne, 16);
+                n = put_byte(&mut b, n, b' ');
+                n = put(&mut b, n, "unknown: refused, `neant cost` did not finish in 900 s");
+                n = put_byte(&mut b, n, b'\n');
+            }
+            s = line_end(src, s) + 1;
+        }
+    } else {
+        n = put(&mut b, 0, got);
+    }
+    cut(&b, 0, n)
+}
+
+// --cost: each port's report into <name>/main.cost, each function's tier into tiers.txt, and the
+// count of port-defined functions and of std functions (counted once) by tier.
+fn write_costs(neant: &[u8], here: &[u8], sel: &[u8], sel_n: i64) {
+    let mut table = [b' '; 262144];
+    let mut tn = 0;
+    let mut own = [0; 5];
+    let mut lib = [b' '; 16384];
+    let mut ln = 0;
+    let mut lib_count = [0; 5];
+    let mut lib_n = 0;
+    let mut at = 0;
+    while at < sel_n {
+        let se = find_byte(sel, at, b';');
+        let name = cut(sel, at, se);
+        at = se + 1;
+        let mut db = [b' '; 4096];
+        let mut de = put(&mut db, 0, here);
+        de = put_byte(&mut db, de, b'/');
+        de = put(&mut db, de, &name);
+        let dir = cut(&db, 0, de);
+        let none = "";
+        let got = cost(neant, &dir, &none, 0, false);
+        let refused = os_status() == 124;
+        let mn = "/main";
+        let dc = ".cost";
+        let dn = ".nt";
+        let cp = in_dir(&dir, &mn, &dc);
+        let np = in_dir(&dir, &mn, &dn);
+        let src = read_file(&np);
+        let r = report_or_refusal(&got, refused, &src);
+        if os_write(&cp, &r, r.len()) != r.len() { fail("cannot write main.cost"); }
+        // each function line's own tier word, as bootstrap/tests/bench.rs reads it
+        let mut seen = [b' '; 4096];
+        let mut sn = 0;
+        let mut l = 0;
+        while l < r.len() {
+            let le = line_end(&r, l);
+            if le > l && r[l] != b' ' && !has_at(&r, l, "struct ") {
+                let fe = word_end(&r, l);
+                let w1 = skip_space(&r, fe);
+                let mut t = -1;
+                if has_at(&r, w1, "unknown:") {
+                    t = 4;
+                } else {
+                    let mut w = w1;
+                    while w < le {
+                        let we = min(word_end(&r, w), le);
+                        let tw = tier_of(&r, w, we);
+                        if tw >= 0 { t = tw; }
+                        w = skip_space(&r, we);
+                        if w > le { w = le; }
+                    }
+                }
+                if t >= 0 {
+                    tn = put_left(&mut table, tn, &name, 0, name.len(), 15);
+                    tn = put_byte(&mut table, tn, b' ');
+                    tn = put_left(&mut table, tn, &r, l, fe, 16);
+                    tn = put_byte(&mut table, tn, b' ');
+                    tn = put_tier(&mut table, tn, t);
+                    tn = put_byte(&mut table, tn, b'\n');
+                    sn = put_span(&mut seen, sn, &r, l, fe);
+                    sn = put_byte(&mut seen, sn, b';');
+                    if defines(&src, &r, l, fe) {
+                        own[t] += 1;
+                    } else {
+                        // a std function, counted the first time it is seen
+                        let mut key = [b' '; 256];
+                        let mut ke = put_byte(&mut key, 0, b';');
+                        ke = put_span(&mut key, ke, &r, l, fe);
+                        ke = put_byte(&mut key, ke, b';');
+                        let k = cut(&key, 0, ke);
+                        if find(&lib, 0, &k) >= ln {
+                            if ln == 0 { ln = put_byte(&mut lib, 0, b';'); }
+                            ln = put_span(&mut lib, ln, &k, 1, k.len());
+                            lib_count[t] += 1;
+                            lib_n += 1;
+                        }
+                    }
+                }
+            }
+            l = le + 1;
+        }
+        // a function the source defines with no tier line
+        let mut mb = [b' '; 4096];
+        let mut me = 0;
+        let mut s = 0;
+        while s < src.len() {
+            if has_at(&src, s, "fn ") {
+                let fe = s + 3;
+                let mut ne = fe;
+                while ne < src.len() && (is_digit(src[ne]) || src[ne] == b'_' || (src[ne] >= b'a' && src[ne] <= b'z') || (src[ne] >= b'A' && src[ne] <= b'Z')) { ne += 1; }
+                let mut key = [b' '; 256];
+                let mut ke = put_span(&mut key, 0, &src, fe, ne);
+                ke = put_byte(&mut key, ke, b';');
+                let k = cut(&key, 0, ke);
+                let mut hit = false;
+                let mut q = 0;
+                while q < sn {
+                    let qe = find_byte(&seen, q, b';');
+                    if same_span(&seen, q, qe + 1, &k) { hit = true; }
+                    q = qe + 1;
+                }
+                if !hit {
+                    if me > 0 { me = put(&mut mb, me, ", "); }
+                    me = put_span(&mut mb, me, &src, fe, ne);
+                }
+            }
+            s = line_end(&src, s) + 1;
+        }
+        if me > 0 {
+            let mut o = [b' '; 4400];
+            let mut oe = put(&mut o, 0, &name);
+            oe = put(&mut o, oe, ": no tier for ");
+            oe = put_span(&mut o, oe, &mb, 0, me);
+            oe = put_byte(&mut o, oe, b'\n');
+            print_bytes(&o, oe);
+        }
+    }
+    let tp = "/tiers.txt";
+    let none = "";
+    let tpath = in_dir(here, &tp, &none);
+    if os_write(&tpath, &table, tn) != tn { fail("cannot write tiers.txt"); }
+    let mut o = [b' '; 1024];
+    let mut oe = put(&mut o, 0, "port-defined functions: ");
+    oe = format_int(own[0] + own[1] + own[2] + own[3] + own[4], &mut o, oe);
+    oe = put(&mut o, oe, "  ");
+    let mut first = true;
+    for t in 0..5 {
+        if own[t] > 0 {
+            if !first { oe = put(&mut o, oe, "  "); }
+            first = false;
+            oe = put_tier(&mut o, oe, t);
+            oe = put_byte(&mut o, oe, b' ');
+            oe = format_int(own[t], &mut o, oe);
+        }
+    }
+    oe = put_byte(&mut o, oe, b'\n');
+    oe = put(&mut o, oe, "std functions, counted once: ");
+    oe = format_int(lib_n, &mut o, oe);
+    oe = put(&mut o, oe, "  ");
+    let mut first = true;
+    for t in 0..5 {
+        if lib_count[t] > 0 {
+            if !first { oe = put(&mut o, oe, "  "); }
+            first = false;
+            oe = put_tier(&mut o, oe, t);
+            oe = put_byte(&mut o, oe, b' ');
+            oe = format_int(lib_count[t], &mut o, oe);
+        }
+    }
+    oe = put_byte(&mut o, oe, b'\n');
+    print_bytes(&o, oe);
+}
+
+// `s[from..to]` as a JSON string.
+fn put_json(out: &mut [u8], at: i64, s: &[u8], from: i64, to: i64) -> i64 {
+    let mut i = put_byte(out, at, b'"');
+    for k in from..to {
+        let c = s[k];
+        if c == b'"' || c == b'\\' {
+            i = put_byte(out, i, b'\\');
+            i = put_byte(out, i, c);
+        } else if c == b'\n' {
+            i = put_byte(out, i, b'\\');
+            i = put_byte(out, i, b'n');
+        } else if c == b'\t' {
+            i = put_byte(out, i, b'\\');
+            i = put_byte(out, i, b't');
+        } else {
+            i = put_byte(out, i, c);
+        }
+    }
+    put_byte(out, i, b'"')
+}
+
+// A field's key and the `, ` before it.
+fn key(out: &mut [u8], at: i64, k: &[u8]) -> i64 {
+    let mut i = at;
+    if out[i - 1] != b'{' { i = put(out, i, ", "); }
+    i = put_json(out, i, k, 0, k.len());
+    put(out, i, ": ")
+}
+
+// A number in a table column: `x` formatted by `fmt` (0 fixed with `p` places, 1 `%.<p>e`), right
+// in a field of `width`.
+fn col(out: &mut [u8], at: i64, x: f64, fmt: i64, p: i64, width: i64) -> i64 {
+    let mut t = [b' '; 64];
+    let mut n = 0;
+    if fmt == 0 {
+        if x != x || x == 1.0 / 0.0 || x == -1.0 / 0.0 { n = format_g(x, 1, &mut t, 0); } else { n = format_float(x, p, &mut t, 0); }
+    } else {
+        n = format_e(x, p, &mut t, 0);
+    }
+    put_right(out, at, &t, 0, n, width)
+}
+
+fn dash(out: &mut [u8], at: i64, width: i64) -> i64 {
+    let d = "—";
+    put_right(out, at, &d, 0, d.len(), width + d.len() - 1)
+}
+
+fn main() {
+    let root = repo_root();
+    let h = "HOME";
+    let home = os_env(&h);
+    let mut nb = [b' '; 4096];
+    let mut nb_n = put(&mut nb, 0, &home);
+    nb_n = put(&mut nb, nb_n, "/work/.neant-loop/frozen-target/release/neant");
+    let mut dsb = [b' '; 256];
+    let mut ds_n = put(&mut dsb, 0, "MEDIUM,LARGE,EXTRALARGE");
+    let mut jb = [b' '; 4096];
+    let mut jn = 0;
+    let mut cpu = 5;
+    let mut runs = 3;
+    let mut only_cost = false;
+    let mut sel = [b' '; 4096];
+    let mut sel_n = 0;
+    let mut k = 0;
+    while k < arg_count() {
+        let a = arg(k);
+        let more = k + 1 < arg_count();
+        if same(&a, "--cost") {
+            only_cost = true;
+            k += 1;
+        } else if more && same(&a, "--cpu") {
+            let v = arg(k + 1);
+            cpu = parse_int(&v, 0).v;
+            k += 2;
+        } else if more && same(&a, "--runs") {
+            let v = arg(k + 1);
+            runs = parse_int(&v, 0).v;
+            k += 2;
+        } else if more && same(&a, "--datasets") {
+            let v = arg(k + 1);
+            ds_n = put(&mut dsb, 0, &v);
+            k += 2;
+        } else if more && same(&a, "--neant") {
+            let v = arg(k + 1);
+            nb_n = put(&mut nb, 0, &v);
+            k += 2;
+        } else if more && same(&a, "--json") {
+            let v = arg(k + 1);
+            jn = put(&mut jb, 0, &v);
+            k += 2;
+        } else {
+            sel_n = put(&mut sel, sel_n, &a);
+            sel_n = put_byte(&mut sel, sel_n, b';');
+            k += 1;
+        }
+    }
+    let neant = cut(&nb, 0, nb_n);
+    let json = cut(&jb, 0, jn);
+    let ks = kernels();
+    let mut hb = [b' '; 4096];
+    let mut he = put(&mut hb, 0, &root);
+    he = put(&mut hb, he, "/tests/heldout/polybench");
+    let here = cut(&hb, 0, he);
+    if sel_n == 0 {
+        let mut at = 0;
+        while at < ks.len() {
+            let w = word_end(&ks, at);
+            let mut pb = [b' '; 4096];
+            let mut pe = put(&mut pb, 0, &here);
+            pe = put_byte(&mut pb, pe, b'/');
+            pe = put_span(&mut pb, pe, &ks, at, w);
+            pe = put(&mut pb, pe, "/main.nt");
+            let p = cut(&pb, 0, pe);
+            if file_size(&p) >= 0 {
+                sel_n = put_span(&mut sel, sel_n, &ks, at, w);
+                sel_n = put_byte(&mut sel, sel_n, b';');
+            }
+            at = find_byte(&ks, at, b';') + 1;
+        }
+    }
+    if only_cost {
+        write_costs(&neant, &here, &sel, sel_n);
+    } else {
+        measure(&neant, &here, &ks, &sel, sel_n, &dsb, ds_n, cpu, runs, &json);
+    }
+}
+
+fn measure(neant: &[u8], here: &[u8], ks: &[u8], sel: &[u8], sel_n: i64, dsb: &[u8], ds_n: i64,
+           cpu: i64, runs: i64, json: &[u8]) {
+    let src = source();
+    let mk = "mktemp -d /tmp/neant-heldout-measure-XXXXXX";
+    let wo = os_run(&mk, mk.len());
+    let work = cut(&wo, 0, line_end(&wo, 0));
+    let en = "/empty";
+    let ent = ".nt";
+    let none = "";
+    let empty_nt = in_dir(&work, &en, &ent);
+    let empty = in_dir(&work, &en, &none);
+    let pb = b"fn main() {\n    println(0);\n}\n";
+    if os_write(&empty_nt, &pb, pb.len()) != pb.len() { fail("cannot write the empty program"); }
+    let mut c = [b' '; 16384];
+    let mut n = put(&mut c, 0, neant);
+    n = put(&mut c, n, " build ");
+    n = put(&mut c, n, &empty_nt);
+    n = put(&mut c, n, " --unchecked -o ");
+    n = put(&mut c, n, &empty);
+    let bo = os_run(&c, n);
+    if os_status() != 0 { fail("cannot build the empty program"); }
+    let mut stdout = [b' '; 65536];
+    let base = wall(cpu, &empty, empty.len(), runs, &mut stdout);
+    let base_refills = refills(cpu, &empty, empty.len(), runs);
+    let lp = "/proc/loadavg";
+    let la = read_file(&lp);
+    let load1 = parse_real(&la, 0).v;
+    let mut o = [b' '; 65536];
+    let mut e = put(&mut o, 0, "neant ");
+    e = put(&mut o, e, neant);
+    e = put_byte(&mut o, e, b'\n');
+    e = put(&mut o, e, "baseline ");
+    e = format_float(base.s * 1e3, 2, &mut o, e);
+    e = put(&mut o, e, " ms, ");
+    e = format_int(base_refills, &mut o, e);
+    e = put(&mut o, e, " refills, cpu ");
+    e = format_int(cpu, &mut o, e);
+    e = put(&mut o, e, ", runs ");
+    e = format_int(runs, &mut o, e);
+    e = put(&mut o, e, ", load ");
+    e = put_span(&mut o, e, &la, 0, word_end(&la, word_end(&la, word_end(&la, 0) + 1) + 1));
+    e = put_byte(&mut o, e, b'\n');
+    e = put(&mut o, e, "  kernel          dataset     footprint  bound     pred ms     meas ms  t m/p  pred bytes  meas bytes  b m/p  output");
+    e = put_byte(&mut o, e, b'\n');
+    print_bytes(&o, e);
+
+    let mut at = 0;
+    while at < sel_n {
+        let se = find_byte(sel, at, b';');
+        let name = cut(sel, at, se);
+        at = se + 1;
+        let ki = kernel_at(ks, &name);
+        if ki < 0 { fail("no port by that name"); }
+        let odir = original_dir(&src, ks, ki);
+        let obase = base_name(&odir);
+        let dh = ".h";
+        let hp = in_dir(&odir, &obase, &dh);
+        let h = read_file(&hp);
+        let mut db = [b' '; 4096];
+        let mut de = put(&mut db, 0, here);
+        de = put_byte(&mut db, de, b'/');
+        de = put(&mut db, de, &name);
+        let dir = cut(&db, 0, de);
+        let mn = "/main";
+        let dn = ".nt";
+        let ntp = in_dir(&dir, &mn, &dn);
+        let nt = read_file(&ntp);
+        let mp = b"\nfn main()";
+        let body = find(&nt, 0, &mp);
+        let slash = "/";
+        let binary = in_dir(&work, &slash, &name);
+        n = put(&mut c, 0, neant);
+        n = put(&mut c, n, " build ");
+        n = put(&mut c, n, &ntp);
+        n = put(&mut c, n, " --unchecked -o ");
+        n = put(&mut c, n, &binary);
+        let built = os_run(&c, n);
+        if os_status() != 0 { fail("a port does not build"); }
+        let mut xf = [0; 16];
+        let mut xt = [0; 16];
+        let mut ak = [0; 16];
+        let lets = size_lets(&nt, body, &mut xf, &mut xt, &mut ak);
+        // a port the compiler refused once is not costed again at the next size
+        let mut refused = false;
+
+        let mut d = 0;
+        while d < ds_n {
+            let dend = min(find_byte(dsb, d, b','), ds_n);
+            let ds = cut(dsb, d, dend);
+            d = dend + 1;
+            let mut from = [0; 16];
+            let mut to = [0; 16];
+            let mut vals = [0; 16];
+            let sz = sizes(&h, &ds, &mut from, &mut to, &mut vals);
+            let fp = footprint(&nt, body, &xf, &xt, &ak, lets, &vals);
+            // the --eval atoms, and the binary with its sizes
+            let mut ev = [b' '; 4096];
+            let mut evn = put(&mut ev, 0, " --eval '");
+            for i in 0..16 {
+                if i < lets {
+                    evn = put_span(&mut ev, evn, &nt, xf[i], xt[i]);
+                    evn = put_byte(&mut ev, evn, b'=');
+                    evn = format_int(vals[ak[i]], &mut ev, evn);
+                    evn = put(&mut ev, evn, ",a");
+                    evn = format_int(ak[i], &mut ev, evn);
+                    evn = put(&mut ev, evn, ".len()=");
+                    let mut digits = [b' '; 24];
+                    evn = format_int(format_int(vals[ak[i]], &mut digits, 0), &mut ev, evn);
+                    evn = put_byte(&mut ev, evn, b',');
+                }
+            }
+            evn = put(&mut ev, evn, "B=64'");
+            let mut argv = [b' '; 4096];
+            let mut an = put(&mut argv, 0, &binary);
+            for i in 0..16 {
+                if i < sz {
+                    an = put_byte(&mut argv, an, b' ');
+                    an = format_int(vals[i], &mut argv, an);
+                }
+            }
+            let r = cost(neant, &dir, &ev, evn, refused);
+            if os_status() == 124 { refused = true; }
+            let mut p = predict(&r);
+            if refused { p.ok = false; }
+            let w = wall(cpu, &argv, an, runs, &mut stdout);
+            let t = w.s - base.s;
+            let mb = ((refills(cpu, &argv, an, runs) - base_refills) * 64) as f64;
+
+            e = put(&mut o, 0, "  ");
+            e = put_left(&mut o, e, &name, 0, name.len(), 15);
+            e = put_byte(&mut o, e, b' ');
+            e = put_left(&mut o, e, &ds, 0, ds.len(), 10);
+            e = put_byte(&mut o, e, b' ');
+            e = col(&mut o, e, fp as f64 / 1048576.0, 0, 1, 9);
+            e = put_byte(&mut o, e, b'M');
+            if p.ok {
+                e = put_byte(&mut o, e, b' ');
+                e = put_right(&mut o, e, &r, p.bound, p.bound_end, 6);
+                e = put_byte(&mut o, e, b' ');
+                e = col(&mut o, e, p.time * 1e3, 0, 3, 11);
+                e = put_byte(&mut o, e, b' ');
+                e = col(&mut o, e, t * 1e3, 0, 2, 11);
+                e = put_byte(&mut o, e, b' ');
+                e = col(&mut o, e, t / p.time, 0, 2, 6);
+                e = put_byte(&mut o, e, b' ');
+                e = col(&mut o, e, p.moves, 1, 3, 11);
+                e = put_byte(&mut o, e, b' ');
+                e = col(&mut o, e, mb, 1, 3, 11);
+                e = put_byte(&mut o, e, b' ');
+                if p.moves > 0.0 { e = col(&mut o, e, mb / p.moves, 0, 2, 6); } else { e = col(&mut o, e, 1.0 / 0.0, 0, 2, 6); }
+                e = put(&mut o, e, "  ");
+                // the port's output, its words joined by one space
+                let mut i = skip_space(&stdout, 0);
+                let mut first = true;
+                while i < w.n {
+                    let we = min(word_end(&stdout, i), w.n);
+                    if !first { e = put_byte(&mut o, e, b' '); }
+                    e = put_span(&mut o, e, &stdout, i, we);
+                    first = false;
+                    i = skip_space(&stdout, we);
+                }
+            } else {
+                e = put_byte(&mut o, e, b' ');
+                e = dash(&mut o, e, 6);
+                e = put_byte(&mut o, e, b' ');
+                e = dash(&mut o, e, 11);
+                e = put_byte(&mut o, e, b' ');
+                e = col(&mut o, e, t * 1e3, 0, 2, 11);
+                e = put_byte(&mut o, e, b' ');
+                e = dash(&mut o, e, 6);
+                e = put_byte(&mut o, e, b' ');
+                e = dash(&mut o, e, 11);
+                e = put_byte(&mut o, e, b' ');
+                e = col(&mut o, e, mb, 1, 3, 11);
+                e = put_byte(&mut o, e, b' ');
+                e = dash(&mut o, e, 6);
+                e = put(&mut o, e, "  no prediction");
+            }
+            e = put_byte(&mut o, e, b'\n');
+            print_bytes(&o, e);
+
+            if json.len() > 0 {
+                let mut j = [b' '; 65536];
+                let mut jn = put_byte(&mut j, 0, b'{');
+                jn = key(&mut j, jn, "kernel");
+                jn = put_json(&mut j, jn, &name, 0, name.len());
+                jn = key(&mut j, jn, "dataset");
+                jn = put_json(&mut j, jn, &ds, 0, ds.len());
+                jn = key(&mut j, jn, "sizes");
+                jn = put_byte(&mut j, jn, b'[');
+                for i in 0..16 {
+                    if i < sz {
+                        if i > 0 { jn = put(&mut j, jn, ", "); }
+                        jn = format_int(vals[i], &mut j, jn);
+                    }
+                }
+                jn = put_byte(&mut j, jn, b']');
+                jn = key(&mut j, jn, "footprint");
+                jn = format_int(fp, &mut j, jn);
+                jn = key(&mut j, jn, "meas_s");
+                jn = format_g(t, 17, &mut j, jn);
+                jn = key(&mut j, jn, "meas_bytes");
+                jn = format_int(mb as i64, &mut j, jn);
+                jn = key(&mut j, jn, "output");
+                jn = put_byte(&mut j, jn, b'[');
+                let mut i = skip_space(&stdout, 0);
+                let mut first = true;
+                while i < w.n {
+                    let we = min(word_end(&stdout, i), w.n);
+                    if !first { jn = put(&mut j, jn, ", "); }
+                    jn = put_json(&mut j, jn, &stdout, i, we);
+                    first = false;
+                    i = skip_space(&stdout, we);
+                }
+                jn = put_byte(&mut j, jn, b']');
+                jn = key(&mut j, jn, "cpu");
+                jn = format_int(cpu, &mut j, jn);
+                jn = key(&mut j, jn, "runs");
+                jn = format_int(runs, &mut j, jn);
+                jn = key(&mut j, jn, "load");
+                jn = format_g(load1, 17, &mut j, jn);
+                jn = key(&mut j, jn, "neant");
+                jn = put_json(&mut j, jn, neant, 0, neant.len());
+                if p.ok {
+                    jn = key(&mut j, jn, "pred_work");
+                    jn = format_g(p.work, 17, &mut j, jn);
+                    jn = key(&mut j, jn, "pred_bytes");
+                    jn = format_g(p.moves, 17, &mut j, jn);
+                    jn = key(&mut j, jn, "pred_s");
+                    jn = format_g(p.time, 17, &mut j, jn);
+                    jn = key(&mut j, jn, "bound");
+                    jn = put_json(&mut j, jn, &r, p.bound, p.bound_end);
+                } else {
+                    jn = key(&mut j, jn, "no_prediction");
+                    if refused {
+                        let why = "refused, `neant cost` did not finish in 900 s";
+                        jn = put_json(&mut j, jn, &why, 0, why.len());
+                    } else {
+                        jn = put_json(&mut j, jn, &r, p.block, p.block_end);
+                    }
+                }
+                jn = put_byte(&mut j, jn, b'}');
+                jn = put_byte(&mut j, jn, b'\n');
+                if os_append(json, &j, jn) != jn { fail("cannot append to the JSON file"); }
+            }
+        }
+    }
+    e = put(&mut o, 0, "binaries in ");
+    e = put(&mut o, e, &work);
+    e = put_byte(&mut o, e, b'\n');
+    print_bytes(&o, e);
+}
