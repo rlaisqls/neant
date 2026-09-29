@@ -15,3 +15,9 @@ pub mod size;
 
 pub use analyze::{analyze, CostResult, FuncCost, Machine};
 pub use piece::Cost;
+
+/// An ablation: `NEANT_ABLATE=layout,region,reuse` turns off what one language decision buys, so
+/// that what it buys can be counted (the compiler without it, on the same programs).
+pub fn ablate(what: &str) -> bool {
+    std::env::var("NEANT_ABLATE").is_ok_and(|v| v.split(',').any(|w| w == what))
+}

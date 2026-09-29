@@ -1,0 +1,110 @@
+// The ablations against the clock and the counter: one program built twice — as the compiler
+// builds it, and with one language decision turned off (NEANT_ABLATE, bootstrap/src/cost/mod.rs) —
+// each run pinned, wall-clock the minimum of `runs`, bytes `l2d_cache_refill × 64` the minimum of
+// `runs` in separate runs so that perf is not in the time (tests/heldout/polybench/measure.nt's
+// harness, copied since that file has a `main`).
+//
+//     neant run measure.nt -- CPU RUNS NAME 'BUILT' 'ABLATED' [NAME 'BUILT' 'ABLATED' ...]
+//
+// BUILT and ABLATED are whole commands, arguments and redirections included. One line per NAME:
+// seconds and bytes of each, and ablated over built for both.
+
+use "std/os.nt";
+use "std/bytes.nt";
+
+fn fail(msg: &[u8]) {
+    os_eprint(&msg, msg.len());
+    os_exit(1);
+}
+
+fn wall(cpu: i64, argv: &[u8], runs: i64) -> f64 {
+    let mut c = [b' '; 16384];
+    let mut n = put(&mut c, 0, "taskset -c ");
+    n = format_int(cpu, &mut c, n);
+    n = put_byte(&mut c, n, b' ');
+    n = put(&mut c, n, argv);
+    n = put(&mut c, n, " > /dev/null");
+    let mut best = 1.0 / 0.0;
+    for r in 0..runs {
+        let t0 = os_now();
+        let o = os_run(&c, n);
+        let dt = (os_now() - t0) as f64 * 1e-9;
+        if os_status() != 0 { fail("a timed run failed\n"); }
+        best = min(best, dt);
+    }
+    best
+}
+
+// perf prints one copy of the event per cluster; the other cluster's is 0 or <not counted>, so
+// the sum is the pinned cluster's.
+fn refills(cpu: i64, argv: &[u8], runs: i64) -> i64 {
+    let mut c = [b' '; 16384];
+    let mut n = put(&mut c, 0, "taskset -c ");
+    n = format_int(cpu, &mut c, n);
+    n = put(&mut c, n, " perf stat -x, -e l2d_cache_refill sh -c '");
+    n = put(&mut c, n, argv);
+    n = put(&mut c, n, " > /dev/null' 2>&1 >/dev/null");
+    let mut best = -1;
+    for r in 0..runs {
+        let o = os_run(&c, n);
+        if os_status() != 0 {
+            os_eprint(&o, o.len());
+            os_exit(1);
+        }
+        let mut sum = 0;
+        let mut at = 0;
+        while at < o.len() {
+            let le = line_end(&o, at);
+            let c1 = find_byte(&o, at, b',');
+            let c2 = find_byte(&o, c1 + 1, b',');
+            let c3 = find_byte(&o, c2 + 1, b',');
+            if c3 < le && find(&o, c2 + 1, "l2d_cache_refill") < c3 {
+                let v = parse_int(&o, at);
+                if v.ok && v.end == c1 { sum += v.v; }
+            }
+            at = le + 1;
+        }
+        if best < 0 || sum < best { best = sum; }
+    }
+    best
+}
+
+fn main() {
+    let a0 = arg(0);
+    let cpu = parse_int(&a0, 0).v;
+    let a1 = arg(1);
+    let runs = parse_int(&a1, 0).v;
+    let mut out = [b' '; 4096];
+    let mut k = 2;
+    let mut more = true;
+    while more {
+        if k + 2 >= arg_count() {
+            more = false;
+        } else {
+            let name = arg(k);
+            let built = arg(k + 1);
+            let ablated = arg(k + 2);
+            let tb = wall(cpu, &built, runs);
+            let ta = wall(cpu, &ablated, runs);
+            let bb = refills(cpu, &built, runs) * 64;
+            let ba = refills(cpu, &ablated, runs) * 64;
+            let mut n = put(&mut out, 0, &name);
+            n = pad_to(&mut out, n, 16);
+            n = put(&mut out, n, "built ");
+            n = format_g(tb, 4, &mut out, n);
+            n = put(&mut out, n, " s ");
+            n = format_g(bb as f64, 4, &mut out, n);
+            n = put(&mut out, n, " B   ablated ");
+            n = format_g(ta, 4, &mut out, n);
+            n = put(&mut out, n, " s ");
+            n = format_g(ba as f64, 4, &mut out, n);
+            n = put(&mut out, n, " B   ablated/built time ");
+            n = format_g(ta / tb, 3, &mut out, n);
+            n = put(&mut out, n, " bytes ");
+            n = format_g(ba as f64 / max(bb, 1) as f64, 3, &mut out, n);
+            print_bytes(&out, n);
+            println("");
+            k += 3;
+        }
+    }
+}

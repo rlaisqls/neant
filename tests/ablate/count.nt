@@ -1,0 +1,159 @@
+// What each language decision buys, counted: every program costed by the compiler as it is and
+// with one decision turned off (NEANT_ABLATE, bootstrap/src/cost/mod.rs), and the report lines
+// compared. Run from the repo root:
+//
+//     neant run tests/ablate/count.nt -- NEANT ABLATION [ABLATION ...]
+//
+// NEANT is the compiler; each ABLATION is `layout`, `region` or `reuse`. One line per program where
+// some ablation changes a function's line or the model chose SoA for a struct: its report lines, how
+// many differ under each ablation, and the tiers before and after. The programs are the goldens,
+// the corpus, the Benchmarks Game, PolyBench (adi and heat-3d, which the calculus does not finish,
+// left out) and the compiler as build.sh concatenates it. A program that does not check (the
+// `err_` goldens) is skipped.
+
+use "std/os.nt";
+use "std/bytes.nt";
+
+fn fail(msg: &[u8]) {
+    os_eprint(&msg, msg.len());
+    os_exit(1);
+}
+
+// `neant cost` on `path` (run in its directory) with NEANT_ABLATE set to `abl`, which may be empty.
+fn cost(neant: &[u8], path: &[u8], from: i64, to: i64, abl: &[u8]) -> [u8] {
+    let mut c = [b' '; 4096];
+    let mut n = put(&mut c, 0, "f=");
+    n = put_span(&mut c, n, path, from, to);
+    n = put(&mut c, n, "; cd $(dirname $f) && NEANT_ABLATE=");
+    n = put(&mut c, n, abl);
+    n = put(&mut c, n, " ");
+    n = put(&mut c, n, neant);
+    n = put(&mut c, n, " cost $(basename $f) 2>/dev/null");
+    os_run(&c, n)
+}
+
+// A report's head lines are the ones that start in column one and are not a struct's.
+fn is_head(r: &[u8], at: i64) -> bool {
+    at < r.len() && r[at] != b' ' && r[at] != b'\n' && !has_at(r, at, "struct ")
+}
+
+// The tier of the line at `at`: 0 exact, 1 modulo, 2 bound, 3 unknown, 4 none of them (a
+// declaration, a struct-returning helper).
+fn tier(r: &[u8], at: i64) -> i64 {
+    let le = line_end(r, at);
+    let u = find(r, at, "unknown");
+    let m = find(r, at, "modulo");
+    let b = find(r, at, "bound");
+    let e = find(r, at, "exact");
+    if u < le { 3 } else if m < le { 1 } else if b < le { 2 } else if e < le { 0 } else { 4 }
+}
+
+fn put_tiers(out: &mut [u8], at: i64, ts: &[i64]) -> i64 {
+    let mut n = at;
+    n = format_int(ts[0], out, n);
+    n = put(out, n, "/");
+    n = format_int(ts[1], out, n);
+    n = put(out, n, "/");
+    n = format_int(ts[2], out, n);
+    n = put(out, n, "/");
+    n = format_int(ts[3], out, n);
+    n
+}
+
+fn main() {
+    let neant = arg(0);
+    if arg_count() < 2 { fail("usage: count.nt NEANT ABLATION [ABLATION ...]\n"); }
+    let mut c = [b' '; 1024];
+    let mut cn = put(&mut c, 0, "t=$(mktemp --suffix=.nt); cat compiler/lex.nt compiler/parse.nt compiler/check.nt compiler/emit.nt compiler/poly.nt compiler/cost.nt compiler/main.nt > $t; ");
+    cn = put(&mut c, cn, "ls tests/golden/*.nt tests/corpus/*/main.nt tests/bench/*/main.nt tests/heldout/polybench/*/main.nt | grep -v -E 'adi|heat-3d'; echo $t");
+    let list = os_run(&c, cn);
+    let mut out = [b' '; 65536];
+    let mut total = [0; 16];
+    let mut at = 0;
+    while at < list.len() {
+        let le = line_end(&list, at);
+        let none = "";
+        let base = cost(&neant, &list, at, le, &none);
+        let mut heads = 0;
+        let mut soa = 0;
+        let mut tb = [0; 5];
+        let mut p = 0;
+        while p < base.len() {
+            if is_head(&base, p) { heads += 1; tb[tier(&base, p)] += 1; }
+            if has_at(&base, p, "struct ") && find(&base, p, "layout SoA  decided") < line_end(&base, p) { soa += 1; }
+            p = line_end(&base, p) + 1;
+        }
+        let mut n = put_span(&mut out, 0, &list, at, le);
+        n = pad_to(&mut out, n, 44);
+        n = put(&mut out, n, "lines ");
+        n = format_int(heads, &mut out, n);
+        n = put(&mut out, n, "  soa ");
+        n = format_int(soa, &mut out, n);
+        n = put(&mut out, n, "  tiers ");
+        n = put_tiers(&mut out, n, &tb);
+        let mut any = soa > 0;
+        for k in 1..arg_count() {
+            let abl = arg(k);
+            let x = cost(&neant, &list, at, le, &abl);
+            let mut ta = [0; 5];
+            let mut differ = 0;
+            let mut i = 0;
+            let mut j = 0;
+            while i < base.len() || j < x.len() {
+                while i < base.len() && !is_head(&base, i) { i = line_end(&base, i) + 1; }
+                while j < x.len() && !is_head(&x, j) { j = line_end(&x, j) + 1; }
+                if i < base.len() && j < x.len() {
+                    ta[tier(&x, j)] += 1;
+                    let li = line_end(&base, i);
+                    let lj = line_end(&x, j);
+                    let mut eq = li - i == lj - j;
+                    let mut q = 0;
+                    while eq && q < li - i {
+                        if base[i + q] != x[j + q] { eq = false; }
+                        q += 1;
+                    }
+                    if !eq { differ += 1; }
+                    i = li + 1;
+                    j = lj + 1;
+                } else {
+                    i = base.len();
+                    j = x.len();
+                }
+            }
+            if differ > 0 { any = true; }
+            if heads > 0 { total[k] += differ; }
+            n = put(&mut out, n, "   ");
+            n = put(&mut out, n, &abl);
+            n = put(&mut out, n, " differ ");
+            n = format_int(differ, &mut out, n);
+            n = put(&mut out, n, " tiers ");
+            n = put_tiers(&mut out, n, &ta);
+        }
+        if heads > 0 {
+            total[0] += heads;
+            if any {
+                print_bytes(&out, n);
+                println("");
+            }
+        }
+        at = le + 1;
+    }
+    // the concatenated compiler is the list's last line
+    let mut last = list.len() - 1;
+    while last > 0 && list[last - 1] != b'\n' { last -= 1; }
+    let mut rm = [b' '; 1024];
+    let mut rn = put(&mut rm, 0, "rm -f ");
+    rn = put_span(&mut rm, rn, &list, last, list.len() - 1);
+    let gone = os_run(&rm, rn);
+    let mut n = put(&mut out, 0, "all programs: lines ");
+    n = format_int(total[0], &mut out, n);
+    for k in 1..arg_count() {
+        let abl = arg(k);
+        n = put(&mut out, n, "   ");
+        n = put(&mut out, n, &abl);
+        n = put(&mut out, n, " differ ");
+        n = format_int(total[k], &mut out, n);
+    }
+    print_bytes(&out, n);
+    println("");
+}

@@ -128,6 +128,14 @@ Each of these is what it is because a cost has to flow through it.
   `Result`; unwinding has no bound. Null is `Option`. Sizes are named by the compiler and appear in
   reports as `xs.len()`, not as a bare `n` you had to declare.
 
+What three of these buy was counted by turning each off in the compiler and costing every program
+in the repository again (docs/experiments.md § What each language decision buys). None changes a
+tier on any program: they buy precision in a line and the code emitted, not reach. The layout choice
+changes 20 of the compiler's 278 lines (one struct of nineteen goes SoA, its loops' moves halved);
+the arena rule tightens a bound in four lines outside the tests; in-place reuse is used by nothing
+but its own tests; PolyBench is untouched by all three. The case for a language over an analyser
+rests, on these programs, on representation, and on the part of it not yet built.
+
 The array-language lineage of the previous project survives in one place: the semantics of the
 collection tier. Every operation there has a known cost, programs are compositions, and fusion is
 guaranteed — a pipeline that would allocate an intermediate is a type error, not a missed
@@ -170,9 +178,10 @@ A correction to the analogy this document opens with. Correctness composes like 
 and `g: B→C` give `A→C` with no further information. Cost does not, because the cache is a shared
 resource: what `g` costs after `f` depends on what `f` left in the cache. So a cost signature is
 not a type but an **effect**: it must say what a function touches (its footprint) and what it
-leaves resident (its residue), and composition subtracts the overlap. The calculus is being
-rebuilt in that shape (plan, stage A); until it is, the compiler re-analyses a callee at each call
-site, which is not composition but whole-program analysis, and is said so.
+leaves resident (its residue), and composition subtracts the overlap. The calculus has
+that shape (plan, stage A): a signature carries work, footprint, moves and residue, the call-site
+re-analysis is deleted, and a caller checks against a callee whose body is gone and whose
+declaration is kept (stage B).
 
 ## Where the pieces already exist
 

@@ -1231,3 +1231,63 @@ formulas that each matched the source and none of the output. It was found by *p
 double count would print for `2..len` and `3..len` before running them, and then running them. The
 second implementation is only a check on the first when the two are derived independently and
 compared on numbers neither was tuned to.
+
+## What each language decision buys: ablations (2026-09-29, static; the clock is to come)
+
+README § The decisions underneath says what each decision buys and measured none of it apart from
+the M4 gate. So each one that the compiler can turn off is turned off, `NEANT_ABLATE=layout`,
+`region` or `reuse` (`bootstrap/src/cost/mod.rs`), and every program the repository has is costed
+both ways, `tests/ablate/count.nt`:
+
+- **layout**: every struct stays as declared, AoS, as Rust's `Vec<T>` must — what the compiler
+  may do because a projection is not an address;
+- **region**: a walk over an arena costs a line per step even where the arena fits, as a walk
+  through pointers must when nothing says where they point — what the index-into-a-named-array
+  link buys;
+- **reuse**: `ys = xs` always copies — what uniqueness and in-place update buy.
+
+The programs: 82 goldens that check, the corpus's 8, the Benchmarks Game's 5, PolyBench's 28 (adi
+and heat-3d do not finish being costed, either way) and the compiler: 1080 report lines, 278 of
+them the compiler's. A line counts as changed if any column of it does. In all, 31 lines change
+without the layout choice, 20 without the arena rule and 4 without reuse.
+
+| turned off | lines changed outside the goldens | by how much | tiers changed |
+|---|---|---|---|
+| layout | the compiler 20 (one struct of 19, `Fac`), n-body 1 | the changed lines' moves ×2; n-body's five bodies fit either way | **none** |
+| region | the compiler 2, corpus `bfs` and `csv` 1 each | `csv`'s `main` `4·len` → `(B + 4)·len`, ×17 at `B` = 64; in the goldens `arena`, `tree` up to ×8 | **none** |
+| reuse | **none** | only the three goldens written for it | **none** |
+| any | PolyBench: **none**, in 390 lines | — | — |
+
+**What that says.**
+
+1. **No decision changes a tier.** Exact, modulo, bound and unknown are the same counts under
+   every ablation, on every program. What the decisions buy is precision in a line the compiler
+   would state anyway, and the code it emits — not reach. Stage D's number does not rest on any
+   of them.
+2. **Reuse is never used outside its own tests.** No program in the corpus, the Benchmarks Game,
+   PolyBench or the compiler reassigns a whole array. M5's result stands (a forced copy moves what
+   the model says), but nothing written since needed it.
+3. **Layout is chosen once in the compiler's nineteen structs.** `Fac { atom, exp }` goes SoA
+   because the monomial loops (`mono_cmp`, `mono_degree`, `pol_eq`, `log_atom` …) read one field;
+   the other eighteen are read a whole element at a time and stay AoS. The two builds of the
+   compiler (`neant emit` with and without `NEANT_ABLATE=layout`) compile the compiler to the same
+   bytes, so the difference is time only; it is measured below when the machine is free.
+4. **The region rule changes most, and it is the least a language's.** That an index lands in the
+   array it indexes is the language's guarantee, but a C analyser told a pool's extent could apply
+   the same rule, and what it changes is a bound's tightness, not what the program does.
+5. **PolyBench is untouched.** Affine code with no structs is where the language neither costs
+   anything (the ports' changes are all syntax: a downward loop as a `while`, an out-parameter set
+   in `main`, `<=` as a half-open range) nor buys anything — the same result an analyser on the C
+   would give, which is what stage E's reach baseline will show.
+
+So on this repository's programs the argument that this is a language, and not an analyser over a
+Rust subset, rests on representation — and representation, as built, is the choice between AoS
+and SoA, taken once in nineteen structs of the one ordinary program. What the rest of the argument
+needs is a representation change the compiler does not make yet: the compiler's nineteen structs
+are all `i64` fields, most of them an index into an arena or a kind, whose width only a compiler
+that owns the layout can choose.
+
+**Still to measure** (held while the held-out row one runs on the machine): `tests/ablate/
+particles.nt` past the cache in both layouts (predicted moves 96·n against 56·n a repetition,
+×1.71), and the self-hosted compiler compiling itself, `Fac` SoA against AoS, with
+`tests/ablate/measure.nt`.

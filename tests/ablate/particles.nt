@@ -1,0 +1,47 @@
+// golden particles at a size past the cache, repeated: the layout ablation's timing program.
+// Arguments: n reps.
+use "std/text.nt";
+
+struct Particle { x: f64, y: f64, vx: f64, vy: f64 }
+
+fn step(ps: &mut [Particle], dt: f64) {
+    for i in 0..ps.len() {
+        ps[i].x += ps[i].vx * dt;
+        ps[i].y += ps[i].vy * dt;
+    }
+}
+
+fn kinetic(ps: &[Particle]) -> f64 {
+    let mut e = 0.0;
+    for i in 0..ps.len() {
+        e += ps[i].vx * ps[i].vx + ps[i].vy * ps[i].vy;
+    }
+    0.5 * e
+}
+
+fn centroid_x(ps: &[Particle]) -> f64 {
+    let mut s = 0.0;
+    for i in 0..ps.len() {
+        s += ps[i].x;
+    }
+    s / (ps.len() as f64)
+}
+
+fn main() {
+    let a0 = arg(0);
+    let n = parse_int(&a0, 0).v;
+    let a1 = arg(1);
+    let reps = parse_int(&a1, 0).v;
+    let mut ps = [Particle { x: 0.0, y: 0.0, vx: 1.0, vy: 2.0 }; n];
+    for i in 0..n {
+        ps[i].x = i as f64;
+        ps[i].vx = (i % 3) as f64;
+    }
+    let mut acc = 0.0;
+    for r in 0..reps {
+        step(&mut ps, 0.5);
+        acc += kinetic(&ps);
+        acc += centroid_x(&ps);
+    }
+    println(acc);
+}

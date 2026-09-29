@@ -581,7 +581,7 @@ impl<'a> Ctx<'a> {
                                     if src != id {
                                         // `self.expr(value)` above already rejected `xs` moved
                                         let forced_loop = self.loop_start.last().is_some_and(|&start| src < start || id < start);
-                                        let ri = Reassign { target: id, src, line: *line, in_place: !forced_loop, conflict_line: None };
+                                        let ri = Reassign { target: id, src, line: *line, in_place: !forced_loop && !crate::cost::ablate("reuse"), conflict_line: None };
                                         let idx = self.reassigns.len();
                                         self.reassigns.push(ri);
                                         if !forced_loop { self.reassign_pending.push(idx); }

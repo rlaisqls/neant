@@ -210,6 +210,11 @@ pub fn choose_layouts(m: &mut Module, machine: &Machine) -> Vec<LayoutChoice> {
             out.push(LayoutChoice { name: m.structs[sid].name.clone(), layout: m.structs[sid].layout, fixed: true, decided_by: vec![], why: None });
             continue;
         }
+        if super::ablate("layout") {
+            m.structs[sid].layout = Layout::Aos;
+            out.push(LayoutChoice { name: m.structs[sid].name.clone(), layout: Layout::Aos, fixed: false, decided_by: vec![], why: Some("ablated: the declared layout") });
+            continue;
+        }
         // an array of holders is AoS only (docs/arrays-by-value-design.md §9): SoA is not weighed
         if m.structs[sid].array_part().0 > 0 {
             let in_array = m.funcs.iter().any(|f| f.locals.iter().any(|l| matches!(l.ty.elem(), Some(Ty::Struct(s)) if *s == sid)));
@@ -1959,7 +1964,7 @@ impl<'a, 'b, 'c> Fa<'a, 'b, 'c> {
                             // is small enough to stay in cache: once every line of it has been
                             // touched, nothing more is fetched, whatever the order. So the site
                             // costs at most the array, under the condition that the array fits.
-                            if site.aff.is_none() && fits {
+                            if site.aff.is_none() && fits && !super::ablate("region") {
                                 let root = self.local_root.get(&site.arr).copied().unwrap_or(site.arr);
                                 let bytes = self.local_size.get(&root).cloned().unwrap_or_else(Poly::zero).scale(Rat::int(self.elem_bytes(root)));
                                 if !bytes.is_zero() {
