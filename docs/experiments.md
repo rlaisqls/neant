@@ -1232,7 +1232,7 @@ double count would print for `2..len` and `3..len` before running them, and then
 second implementation is only a check on the first when the two are derived independently and
 compared on numbers neither was tuned to.
 
-## What each language decision buys: ablations (2026-09-29, static; the clock is to come)
+## What each language decision buys: ablations (2026-09-29, static, then the clock)
 
 README § The decisions underneath says what each decision buys and measured none of it apart from
 the M4 gate. So each one that the compiler can turn off is turned off, `NEANT_ABLATE=layout`,
@@ -1271,7 +1271,7 @@ without the layout choice, 20 without the arena rule and 4 without reuse.
    because the monomial loops (`mono_cmp`, `mono_degree`, `pol_eq`, `log_atom` …) read one field;
    the other eighteen are read a whole element at a time and stay AoS. The two builds of the
    compiler (`neant emit` with and without `NEANT_ABLATE=layout`) compile the compiler to the same
-   bytes, so the difference is time only; it is measured below when the machine is free.
+   bytes, so the difference is time only; it is measured below.
 4. **The region rule changes most, and it is the least a language's.** That an index lands in the
    array it indexes is the language's guarantee, but a C analyser told a pool's extent could apply
    the same rule, and what it changes is a bound's tightness, not what the program does.
@@ -1287,10 +1287,22 @@ needs is a representation change the compiler does not make yet: the compiler's 
 are all `i64` fields, most of them an index into an arena or a kind, whose width only a compiler
 that owns the layout can choose.
 
-**Still to measure** (held while the held-out row one runs on the machine): `tests/ablate/
-particles.nt` past the cache in both layouts (predicted moves 96·n against 56·n a repetition,
-×1.71), and the self-hosted compiler compiling itself, `Fac` SoA against AoS, with
-`tests/ablate/measure.nt`.
+**Against the clock** (`tests/ablate/measure.nt`, CPU 5, an X925 with 2 MiB of L2; each figure
+the minimum of 5 runs, bytes `l2d_cache_refill × 64` in separate runs; one sitting, not repeated):
+
+| program | built (SoA) | ablated (AoS) | time AoS/SoA | bytes AoS/SoA | predicted |
+|---|---|---|---|---|---|
+| `particles.nt`, n = 4 000 000 × 20 (128 MB, past L3) | 0.212 s, 4.54e9 B | 0.303 s, 7.83e9 B | ×1.43 | ×1.72 | 4.48e9 against 7.68e9 B, ×1.71 |
+| `particles.nt`, n = 20 000 × 5 000 (640 KB, inside L2) | 0.157 s, 5.2e5 B | 0.141 s, 1.7e8 B | ×0.90 | — | nothing moves |
+| the compiler compiling itself, `Fac` SoA against AoS | 0.344 s, 2.41e8 B | 0.346 s, 2.48e8 B | ×1.00 | ×1.03 | — |
+
+Past the cache the model's bytes are the counter's within 2% in both layouts, and their ratio is
+the counter's; the time follows at ×1.43, less than the bytes (the time model, not the byte count, is what
+would have to say by how much). Inside L2 both layouts move under 2% of a streaming pass and AoS is if
+anything faster — where the model says nothing moves, the choice buys nothing. The compiler's one
+SoA struct buys nothing on the clock: turning it off adds 3% to the compiler's bytes and nothing
+to its time. So layout, the one representation choice the compiler makes, is right where it
+applies and measured where it matters, and on the one ordinary program it is not visible.
 
 ## Held-out, row one: PolyBench with the frozen compiler (2026-09-29)
 
