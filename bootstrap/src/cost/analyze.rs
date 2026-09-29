@@ -2040,6 +2040,21 @@ impl<'a, 'b, 'c> Fa<'a, 'b, 'c> {
                                 let a = rec.atom.unwrap();
                                 let hull = if fits { self.site_range(site) } else { None }.and_then(|(lo, hi)| {
                                     use super::piece::dominates;
+                                    // a loop inside this one whose trip is a loop variable (`k in 0..j`)
+                                    // leaves that variable in the range: each is taken at its own
+                                    // extreme first, innermost out, so what is left is in this loop's
+                                    // variable and the loops outside it
+                                    let pos = site.path.iter().position(|&l| l == lid)?;
+                                    let (mut lo, mut hi) = (lo, hi);
+                                    for &l in site.path[pos + 1..].iter().rev() {
+                                        let r = &self.loop_recs[l];
+                                        let Some(b) = r.atom else { continue };
+                                        if !lo.mentions(b) && !hi.mentions(b) { continue; }
+                                        let (l0, l1) = (lo.subst(b, &r.lo), lo.subst(b, &r.last()));
+                                        let (h0, h1) = (hi.subst(b, &r.lo), hi.subst(b, &r.last()));
+                                        lo = if dominates(&l1, &l0) { l0 } else if dominates(&l0, &l1) { l1 } else { return None };
+                                        hi = if dominates(&h1, &h0) { h1 } else if dominates(&h0, &h1) { h0 } else { return None };
+                                    }
                                     let (l0, l1) = (lo.subst(a, &rec.lo), lo.subst(a, &rec.last()));
                                     let (h0, h1) = (hi.subst(a, &rec.lo), hi.subst(a, &rec.last()));
                                     let lo = if dominates(&l1, &l0) { l0 } else if dominates(&l0, &l1) { l1 } else { return None };
@@ -2047,28 +2062,38 @@ impl<'a, 'b, 'c> Fa<'a, 'b, 'c> {
                                     Some(hi.sub(&lo))
                                 });
                                 match hull {
-                                    Some(bytes) => bytes.mul_atom_pow(Atom::B, Rat::int(-1)).add(&Poly::constant(1)),
-                                    None => summed.clone(),
+                                    Some(bytes) => (bytes.mul_atom_pow(Atom::B, Rat::int(-1)).add(&Poly::constant(1)), true),
+                                    None => (summed.clone(), true),
                                 }
-                            } else { lp.lines.clone() };
+                            } else { (lp.lines.clone(), false) };
                             let (total, contig) = if !fits {
                                 (summed.clone(), false)
                             } else {
                                 let stride = site.aff.as_ref().map(|a| rec.var.and_then(|v| a.coeffs.get(&v).cloned()).unwrap_or_else(Poly::zero).scale(Rat::int(site.stride)));
                                 match stride {
                                     None => (summed.clone(), false),
-                                    Some(st) if st.is_zero() => (same_set(), lp.contig),
+                                    Some(st) if st.is_zero() => (same_set().0, lp.contig),
                                     Some(st) => match self.numeric(&st) {
                                         Some(sb) if sb.abs() >= m.b_bytes as f64 => (summed.clone(), false),
                                         Some(sb) => {
                                             let slide = rec.sum(&Poly::constant(1)).scale(Rat::new(sb.abs() as i128, 1)).mul_atom_pow(Atom::B, Rat::int(-1));
                                             let slide = match self.numeric(&slide) { Some(v) if v < 1.0 => Poly::constant(1), _ => slide };
-                                            if lp.contig { (same_set().add(&slide), true) } else { (same_set().mul(&slide), false) }
+                                            // a hull, or the sum it falls back to, is the lines of every lap
+                                            // already, the slide's included: it is not slid again
+                                            match same_set() {
+                                                (h, true) => (h, false),
+                                                (s, false) => if lp.contig { (s.add(&slide), true) } else { (s.mul(&slide), false) },
+                                            }
                                         }
                                         None => (summed.clone(), false),
                                     },
                                 }
                             };
+                            // reuse only takes lines away: a charge for the fitting case that is not
+                            // below the one with no reuse at all (the hull of a triangle's laps times
+                            // a slide that already walks them, `n²·n²`) is wrong, and the plain sum
+                            // stands for it
+                            let (total, contig) = if fits && total != summed && super::piece::dominates(&total, &summed) { (summed.clone(), false) } else { (total, contig) };
                             let np = LP { conds: conds.clone(), lines: total, contig };
                             // a member of a group whose window fits: the first is charged in full,
                             // the one furthest ahead the lines of the laps between them, the rest

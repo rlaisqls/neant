@@ -483,6 +483,18 @@ becomes one, so the regimes are as many as before; a first attempt that kept bot
 conditions and a third piece for the switch multiplied them (cholesky 4 → 566, symm past 300 s).
 Golden `triangle_regime`.
 
+Two older faults that the conditions in `i` had hidden came out once those regimes could be
+evaluated, and are fixed with it. A triangle's hull (§ A triangle) is the lines of every lap of
+its loop, the slide included, and was slid again: a column read under `j in 0..i` was `n²·n²`,
+lu's and ludcmp's `64·n⁴/(3·B)` in the regime where the row fits, and the sum the hull falls back
+to when its ends cannot be ordered was slid the same way (nussinov's `n⁴`). Neither is slid now.
+And the hull was taken with the ranges of the loops inside it still in their own variables — `k in
+0..j` leaves `j` in the range at the loop of `i` — so a caller was handed `first.j`; each inner
+variable is now taken at its own extreme first, innermost out. `pairs` in golden `tri` goes from
+`32·a.len()` to `24·a.len()` in cache, against the lower bound's `8·a.len()`. n-body's `advance` goes from
+`272·bs.len()` to `216·bs.len()` and `energy` from `160·bs.len()` to `128·bs.len()` where the bodies fit,
+against `56·bs.len()`; the layout chosen is still SoA.
+
 **Footprints of several ranges, and a resident call (2026-09-28).** A parameter's footprint was one
 range, so two SoA fields of one element — ranges `8·n` apart — fell back to the whole array, inexact,
 and no caller was credited for either. A parameter now keeps its disjoint exact ranges apart; a range
