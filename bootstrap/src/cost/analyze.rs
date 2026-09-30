@@ -765,6 +765,9 @@ struct Site {
     /// the `if` branches this site sits in, outermost first: sites on different sides of one
     /// `if` are alternatives, and their moves combine by max, not sum
     branch: Vec<(usize, bool)>,
+    /// the index in the loops' own values (`(k + 1)·n + j`), where `aff` has each loop's from its
+    /// start: what a triangle's hull is taken over, one loop's extreme inside the next's
+    raw: Option<Poly>,
 }
 
 /// What is remembered of a loop after it is popped.
@@ -1863,7 +1866,8 @@ impl<'a, 'b, 'c> Fa<'a, 'b, 'c> {
             }),
             _ => false,
         };
-        self.sites.push(Site { dep, paged, store: self.storing, arr, aff, es, stride, field, base, key, path, branch: self.branch.clone() });
+        let raw = self.exact_size(idx);
+        self.sites.push(Site { dep, paged, store: self.storing, arr, aff, es, stride, field, base, key, path, branch: self.branch.clone(), raw });
     }
 
     /// The access sites of loop `lid` that read one array at offsets the loop carries into each
@@ -1996,8 +2000,12 @@ impl<'a, 'b, 'c> Fa<'a, 'b, 'c> {
                     let test: Option<Poly> = match rec.atom {
                         Some(a) if ws.mentions(a) => {
                             let signs: Vec<i128> = ws.terms.iter().filter(|(mo, _)| mo.has_atom(&Atom::Var(a))).map(|(_, c)| c.n.signum()).collect();
-                            if signs.iter().all(|&x| x >= 0) { Some(ws.subst(a, &rec.last())) }
-                            else if signs.iter().all(|&x| x <= 0) { Some(ws.subst(a, &rec.lo)) }
+                            // at the variable's largest value where the set grows with it, its least where
+                            // it shrinks: the last lap's and the first's when it counts up, the other
+                            // way round when it counts down (`while i >= 0 { … i -= 1 }`)
+                            let (least, most) = if rec.step > 0 { (rec.lo.clone(), rec.last()) } else { (rec.last(), rec.lo.clone()) };
+                            if signs.iter().all(|&x| x >= 0) { Some(ws.subst(a, &most)) }
+                            else if signs.iter().all(|&x| x <= 0) { Some(ws.subst(a, &least)) }
                             else { None }
                         }
                         _ => Some(ws.clone()),
@@ -2068,36 +2076,69 @@ impl<'a, 'b, 'c> Fa<'a, 'b, 'c> {
                             // subsets of the lines of its hull over every lap, each fetched once while they fit
                             let same_set = || if rec.atom.is_some_and(|a| lp.lines.mentions(a)) {
                                 let a = rec.atom.unwrap();
-                                let hull = if fits { self.site_range(site) } else { None }.and_then(|(lo, hi)| {
+                                // the index in the loops' own values, where there is one: `site_range`
+                                // adds each loop's span apart, which counts twice a variable that is
+                                // also an inner loop's trip (`k in i + 1..j` inside `j`)
+                                let range = site.raw.as_ref().map(|r| {
+                                    let st = Rat::int(site.stride);
+                                    (r.scale(st).add(&site.base), r.scale(st).add(&Poly::constant(site.es)).add(&site.base))
+                                }).or_else(|| self.site_range(site));
+                                let hull = if fits { range } else { None }.and_then(|(lo, hi)| {
                                     use super::piece::dominates;
                                     // a loop inside this one whose trip is a loop variable (`k in 0..j`)
                                     // leaves that variable in the range: each is taken at its own
                                     // extreme first, innermost out, so what is left is in this loop's
                                     // variable and the loops outside it
+                                    // an end at its least or its most over a loop's laps: where it is
+                                    // linear in the loop's variable the coefficient's sign says which
+                                    // lap (`n·j` is largest at the last `j`, whatever the loops outside
+                                    // it hold), and otherwise the two laps' values must be ordered
+                                    let extreme = |p: &Poly, b: usize, r: &LoopRec, most: bool| -> Option<Poly> {
+                                        if !p.mentions(b) { return Some(p.clone()); }
+                                        let (first, last) = (p.subst(b, &r.lo), p.subst(b, &r.last()));
+                                        match super::piece::direction(p, b) {
+                                            // the atom's larger value is the last lap's when it counts up
+                                            Some(up) => Some(if up == most && r.step > 0 || up != most && r.step < 0 { last } else { first }),
+                                            None if most => if dominates(&last, &first) { Some(last) } else if dominates(&first, &last) { Some(first) } else { None },
+                                            None => if dominates(&last, &first) { Some(first) } else if dominates(&first, &last) { Some(last) } else { None },
+                                        }
+                                    };
                                     let pos = site.path.iter().position(|&l| l == lid)?;
                                     let (mut lo, mut hi) = (lo, hi);
                                     for &l in site.path[pos + 1..].iter().rev() {
                                         let r = &self.loop_recs[l];
                                         let Some(b) = r.atom else { continue };
-                                        if !lo.mentions(b) && !hi.mentions(b) { continue; }
-                                        let (l0, l1) = (lo.subst(b, &r.lo), lo.subst(b, &r.last()));
-                                        let (h0, h1) = (hi.subst(b, &r.lo), hi.subst(b, &r.last()));
-                                        lo = if dominates(&l1, &l0) { l0 } else if dominates(&l0, &l1) { l1 } else { return None };
-                                        hi = if dominates(&h1, &h0) { h1 } else if dominates(&h0, &h1) { h0 } else { return None };
+                                        lo = extreme(&lo, b, r, false)?;
+                                        hi = extreme(&hi, b, r, true)?;
                                     }
-                                    let (l0, l1) = (lo.subst(a, &rec.lo), lo.subst(a, &rec.last()));
-                                    let (h0, h1) = (hi.subst(a, &rec.lo), hi.subst(a, &rec.last()));
-                                    let lo = if dominates(&l1, &l0) { l0 } else if dominates(&l0, &l1) { l1 } else { return None };
-                                    let hi = if dominates(&h1, &h0) { h1 } else if dominates(&h0, &h1) { h0 } else { return None };
+                                    let lo = extreme(&lo, a, rec, false)?;
+                                    let hi = extreme(&hi, a, rec, true)?;
+                                    // a hull whose ends are out of order, its leading term negative, is
+                                    // no hull (a trip that is empty at an end)
                                     Some(hi.sub(&lo))
                                 });
                                 match hull {
                                     Some(bytes) => (bytes.mul_atom_pow(Atom::B, Rat::int(-1)).add(&Poly::constant(1)), true),
+                                    // ends that cannot be ordered (a trip that falls as an offset rises,
+                                    // `j in i + 1..n` inside `i`): the laps' lines are at most the
+                                    // array's, all of them, while it fits — the region rule's bound
+                                    None if fits => {
+                                        let root = self.local_root.get(&site.arr).copied().unwrap_or(site.arr);
+                                        let bytes = self.local_size.get(&root).cloned().unwrap_or_else(Poly::zero).scale(Rat::int(self.elem_bytes(root)));
+                                        let whole = bytes.mul_atom_pow(Atom::B, Rat::int(-1));
+                                        let mm = self.machine();
+                                        if !bytes.is_zero() && super::piece::dominates_eventually(&summed.at_machine(mm.b_bytes, mm.m_bytes), &whole.at_machine(mm.b_bytes, mm.m_bytes)) { (whole, true) } else { (summed.clone(), true) }
+                                    }
                                     None => (summed.clone(), true),
                                 }
                             } else { (lp.lines.clone(), false) };
                             let (total, contig) = if !fits {
                                 (summed.clone(), false)
+                            } else if rec.atom.is_some_and(|a| lp.lines.mentions(a)) && !matches!(site.aff, None) {
+                                // a triangle's laps: the hull of every lap is the lines they share,
+                                // whatever the step between laps — a step of a size (`(n + 1)·8` a
+                                // lap of `i`, nussinov's column) as much as one under a line
+                                (same_set().0, false)
                             } else {
                                 let stride = site.aff.as_ref().map(|a| rec.var.and_then(|v| a.coeffs.get(&v).cloned()).unwrap_or_else(Poly::zero).scale(Rat::int(site.stride)));
                                 match stride {
@@ -2123,7 +2164,12 @@ impl<'a, 'b, 'c> Fa<'a, 'b, 'c> {
                             // below the one with no reuse at all (the hull of a triangle's laps times
                             // a slide that already walks them, `n²·n²`) is wrong, and the plain sum
                             // stands for it
-                            let (total, contig) = if fits && total != summed && super::piece::dominates(&total, &summed) { (summed.clone(), false) } else { (total, contig) };
+                            // — and so is a hull that is only more for small sizes, compared at this
+                            // machine's `B` the way the region rule compares (a triangle's bounding
+                            // rows, `8·n²`, against the rows it reads, `4·n²`)
+                            let mm = self.machine();
+                            let more = |p: &Poly, q: &Poly| super::piece::dominates(p, q) || super::piece::dominates_eventually(&p.at_machine(mm.b_bytes, mm.m_bytes), &q.at_machine(mm.b_bytes, mm.m_bytes));
+                            let (total, contig) = if fits && total != summed && more(&total, &summed) { (summed.clone(), false) } else { (total, contig) };
                             let np = LP { conds: conds.clone(), lines: total, contig };
                             // a member of a group whose window fits: the first is charged in full,
                             // the one furthest ahead the lines of the laps between them, the rest
@@ -2205,7 +2251,15 @@ impl<'a, 'b, 'c> Fa<'a, 'b, 'c> {
             let mut pages = self.loop_recs[lid].trip.scale(Rat::int(n));
             for &l in path.iter().rev() {
                 let r = &self.loop_recs[l];
-                if let Some(a) = r.atom { if pages.mentions(a) { pages = pages.subst(a, &r.last()); } }
+                let Some(a) = r.atom else { continue };
+                if !pages.mentions(a) { continue; }
+                // the variable's largest value where the pages grow with it, its least where they
+                // shrink, whichever way the loop counts
+                let (least, most) = if r.step > 0 { (r.lo.clone(), r.last()) } else { (r.last(), r.lo.clone()) };
+                pages = match super::piece::direction(&pages, a) {
+                    Some(false) => pages.subst(a, &least),
+                    _ => pages.subst(a, &most),
+                };
             }
             // every lap of it, over every lap of the loops around it, one access at a time
             let mut laps = Poly::constant(1);

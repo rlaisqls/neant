@@ -1,9 +1,9 @@
 pairs            work 3·a.len()² + 5·a.len()       moves                              exact  (2 regimes)
-                                               moves 24·a.len() + 2·B − 8         if ≈ 8·a.len() < M
                                                moves 4·a.len()² + 2·B·a.len() + 4·a.len() if ≈ 8·a.len() ≥ M
-                 lower bound      moves 8·a.len()                    (footprint, every distinct element crosses once)   gap 3× if ≈ 8·a.len() < M at M = 2 MiB, B = 64
+                                               moves 16·a.len() + 2·B             if ≈ 8·a.len() < M
+                 lower bound      moves 8·a.len()                    (footprint, every distinct element crosses once)   gap 2× if ≈ 8·a.len() < M at M = 2 MiB, B = 64
                  footprint        a: [0, 8·a.len())   resident after if 8·a.len() < M
 tiles            work 21·n/4 + 1                   moves 8·n + 2·B                    exact
                  lower bound      moves 8·n                          (footprint, every distinct element crosses once)   gap 1× at M = 2 MiB, B = 64
                  footprint        a: [0, 8·n)   resident after if 8·n < M
-main             work 102                          moves 4·B + 216                    exact, io
+main             work 102                          moves 4·B + 200                    exact, io

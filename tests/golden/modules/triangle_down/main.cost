@@ -1,0 +1,10 @@
+walk             work ≈ 13·n³/6                    moves                              bound  (3 regimes)
+                                               moves B·n³/6 − B·n/6               if ≈ B·n ≥ M
+                                               moves ≈ 12·n²                      if ≈ B·n < M and ≈ 8·n² < M
+                                               moves ≈ 4·n³                       if ≈ B·n < M and ≈ 8·n² ≥ M
+                 lower bound      moves 4·n² − 4·n                   (footprint, every distinct element crosses once)   gap 3× if ≈ B·n < M and ≈ 8·n² < M at M = 2 MiB, B = 64
+                 footprint        t: [0, 8·t.len()) (whole array)   no residue claimed
+                 regime: a fit test inside the loop over `i` depends on `i`; where it changes inside the loop, each side is charged every lap, a bound
+main             work 132508                       moves 42·B + 31192                 bound, io
+                 in `walk`: regime: a fit test inside the loop over `i` depends on `i`; where it changes inside the loop, each side is charged every lap, a bound
+                 rests on         walk (bound, a regime)

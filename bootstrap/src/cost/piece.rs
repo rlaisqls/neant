@@ -466,7 +466,7 @@ impl<'a> fmt::Display for CostDisplay<'a> {
 /// coefficient positive (the rest of each term a product of sizes and `B`, never negative),
 /// `Some(false)` when every one is negative, `None` when it does not mention the atom directly,
 /// is not linear in it, mixes signs, or mentions it inside another atom (a read at it, a log).
-fn direction(ws: &Poly, atom: usize) -> Option<bool> {
+pub fn direction(ws: &Poly, atom: usize) -> Option<bool> {
     let v = Atom::Var(atom);
     let mut sign: Option<bool> = None;
     for (m, c) in &ws.terms {

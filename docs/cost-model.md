@@ -495,6 +495,29 @@ variable is now taken at its own extreme first, innermost out. `pairs` in golden
 `272·bs.len()` to `216·bs.len()` and `energy` from `160·bs.len()` to `128·bs.len()` where the bodies fit,
 against `56·bs.len()`; the layout chosen is still SoA.
 
+**A triangle's hull, in the loops' own values (2026-09-30).** nussinov's inner walk,
+`t[(k + 1)·n + j]` for `k in i + 1..j` inside `j in i + 1..n` inside `i` counting down, was
+charged lap by lap wherever a column fit, `B·n³/6`, five times its counter. Four faults, each
+found by the one before it. The hull was taken from `site_range`, which adds each loop's span
+apart and so counts `j` twice when it is also the trip of the loop inside (a hull `8·n² + 8·n·j`
+for what is at most `8·n·j`); it is now the index in the loops' own values (`Site::raw`), each
+variable taken at its own extreme, innermost out. An end was put at its extreme only when the two
+laps' values could be ordered, which `8·n·j` against `8·n·i` cannot be without `j ≥ i`; an end
+linear in the variable now goes by its coefficient's sign (`piece::direction`). A step between laps
+that is a size (`(n + 1)·8`) sent the site to the lap-by-lap sum before any hull was tried; a
+triangle's laps now try the hull whatever the step. And the fit test of a loop counting down took
+its working set at the first lap as if it were the least, which for `i` from `n − 1` is the most:
+a set that shrinks with `i` was tested at its smallest, `−16·n/B + 13`, found to fit, and charged
+as if the table fit — 124 times under the counter for the moment it stood. The least and the most
+are now the step's. A hull is also no more than the laps' own sum where that is less at this
+machine's `B` (a triangle's bounding rows `8·n²` against the rows it reads, `4·n²`). nussinov goes
+to 1.63 / 0.41 / 0.78 of its predicted time and 0.50 of its bytes at EXTRALARGE; `tri`'s `pairs`
+from 24 to 16·a.len() in cache, n-body's `advance` from 216 to 160·bs.len(), `whileshapes`'
+insertion sort from quadratic in its range to linear, and the compiler's `mono_mul` and `mono_with`
+lose their quadratic moves (95 exact, 45 modulo, 44 bound, 94 unknown). Golden
+`modules/triangle_down`, among the modules because the self-hosted pass costs a loop counting down
+its own way.
+
 **Footprints of several ranges, and a resident call (2026-09-28).** A parameter's footprint was one
 range, so two SoA fields of one element — ranges `8·n` apart — fell back to the whole array, inexact,
 and no caller was credited for either. A parameter now keeps its disjoint exact ranges apart; a range

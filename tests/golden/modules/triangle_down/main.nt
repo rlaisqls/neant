@@ -1,0 +1,26 @@
+// nussinov's shape: an outer loop counting down, `i` from `n − 1` to 0, over a triangle whose
+// inner walk reads a column below the row (cost-model § A triangle's fit test). The fit test of
+// the loop of `i` is at the working set's largest, which a loop counting down reaches at its last
+// lap, not its first; and the column's hull is taken over the loops' own values, `(k + 1)·n + j`.
+//
+// Kept among the modules cases, which the self-hosted comparison does not read: that pass costs a
+// `while` counting down its own way (exact work, no regimes for the moves), a divergence older than
+// this program.
+fn walk(n: i64, t: &mut [f64]) {
+    let mut i = n - 1;
+    while i >= 0 {
+        for j in i + 1..n {
+            for k in i + 1..j {
+                t[i * n + j] = t[i * n + j] + t[(k + 1) * n + j];
+            }
+        }
+        i -= 1;
+    }
+}
+
+fn main() {
+    let n = 40;
+    let mut t = [1.0; n * n];
+    walk(n, &mut t);
+    println(t[n - 1]);
+}
