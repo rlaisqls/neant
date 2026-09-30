@@ -1344,6 +1344,7 @@ measurements are row one's. Judged by `summary.nt`; the data in `tests/heldout/p
 | 2a | `cc66c66` | 51 runs, gm 1.65, 8 outside — between | as row 1 | 10 kernels |
 | — | `f91bd83` | 74 runs, gm 0.94, 18 outside — fails | 26 kernels, gm 0.38, 20 in — between | 2 kernels |
 | 2b | `5e997b9` | 75 runs, gm 1.53, 10 outside — between | 26 kernels, gm 0.66, 22 in — holds | 2 kernels |
+| 2c | `97cb921` | 75 runs, gm 1.42, 7 outside — between | as 2b — holds | 2 kernels |
 
 - `cc66c66` carries the freeze's calculus plus `17d7d75` and `1be9f2a` (the time model's serial add
   and stream rules, committed 2026-09-28, before any held-out number): atax, bicg, gemver and
@@ -1361,3 +1362,9 @@ measurements are row one's. Judged by `summary.nt`; the data in `tests/heldout/p
   from 272 to 216·bs.len(); neither changes a tier or n-body's layout.
 
 `~/work/.neant-loop/at-cc66c66` is the worktree `cc66c66` was built from, apart from the main tree.
+
+`97cb921` (2026-09-30) adds a recurrence through memory at a moving index — a lap that reads the
+element the last one stored — charged as a carried scalar is: seidel-2d's value passes the `/ 9`, so
+its whole lap is serial, 53 units at `τ_s`. Predicted over measured time goes from 5.31, 5.75, 5.81
+to 0.78, 0.80, 0.81 at MEDIUM, LARGE and EXTRALARGE; no other kernel's prediction moves by more than
+1%. Golden `lap_chain` pins the rule's `serial` column through a new `.eval` file.

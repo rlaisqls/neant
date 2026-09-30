@@ -237,6 +237,7 @@ predictions are new (`measure.nt --predict`). Row one is not replaced.
 | 1 | `42f76be`, frozen | 51 runs, mean 1.69, 11 outside — **fails** | 18 kernels, mean 0.64, 15 in — **holds** | 10 kernels |
 | 2a | `cc66c66`: the time model's two changes since the freeze | 51 runs, mean 1.65, 8 outside — **between** | as row 1 | 10 kernels |
 | 2b | `5e997b9`: 2a and a triangle's fit test | 75 runs, mean 1.53, 10 outside — **between** | 26 kernels, mean 0.66, 22 in — **holds** | 2, the refusals |
+| 2c | `97cb921`: 2b and a store that reads the last lap's | 75 runs, mean 1.42, 7 outside — **between** | as 2b — **holds** | 2, the refusals |
 
 What moved each, so that neither is credited with the other's: **2a** is `17d7d75` (a carried
 `f64` add in a short lap is serial work) and `1be9f2a` (two streams share a bandwidth; a stored
@@ -254,10 +255,16 @@ at a mean of 0.38 (`row-f91bd83.json`): once its regimes could be evaluated, two
 triangle's hull were chosen by them (lu and ludcmp predicted at `64·n⁴/(3·B)` bytes, nussinov at
 `n⁴`), which `5e997b9` fixed. It is kept, since a row is not dropped for being worse.
 
-What is left, in 2b: seidel-2d's carried dependence (5.3–5.8), correlation's and covariance's column
-walk at EXTRALARGE (9.0) and gramschmidt's (8.7), trmm at EXTRALARGE, nussinov overcharged about
-fivefold (its inner column walk charged lap by lap), the matrix–vector bytes (0.25–0.33), and the
-two refusals.
+**2c** is `97cb921` (2026-09-30): a store that reads the element the last lap stored is a
+recurrence through memory (cost-model § Time, a store that reads the last lap's), and seidel-2d's
+passes a division, so its whole lap is serial. Only seidel-2d's three runs move, from 5.3–5.8 to
+0.78–0.81, with `τ_s` as it was; time is 75 runs, mean 1.42, 7 outside — **between** — and bytes
+as 2b (`row2c-97cb921.json`).
+
+What is left, in 2c: correlation's and covariance's column walk at EXTRALARGE (9.0) and
+gramschmidt's (8.7), trmm at EXTRALARGE (5.58), nussinov overcharged about fivefold (0.17, 0.23; its
+inner column walk charged lap by lap), durbin at EXTRALARGE (0.2495), the matrix–vector bytes
+(0.25–0.33), and the two refusals. *Holds* needs every run inside [0.25, 4]: seven to go.
 
 ## What fails, and why
 
