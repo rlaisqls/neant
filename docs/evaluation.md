@@ -238,6 +238,7 @@ predictions are new (`measure.nt --predict`). Row one is not replaced.
 | 2a | `cc66c66`: the time model's two changes since the freeze | 51 runs, mean 1.65, 8 outside — **between** | as row 1 | 10 kernels |
 | 2b | `5e997b9`: 2a and a triangle's fit test | 75 runs, mean 1.53, 10 outside — **between** | 26 kernels, mean 0.66, 22 in — **holds** | 2, the refusals |
 | 2c | `97cb921`: 2b and a store that reads the last lap's | 75 runs, mean 1.42, 7 outside — **between** | as 2b — **holds** | 2, the refusals |
+| 2d | `796deb5`: 2c and translations past the TLB | 75 runs, mean 1.06, 4 outside — **between** | as 2b — **holds** | 2, the refusals |
 
 What moved each, so that neither is credited with the other's: **2a** is `17d7d75` (a carried
 `f64` add in a short lap is serial work) and `1be9f2a` (two streams share a bandwidth; a stored
@@ -261,10 +262,19 @@ passes a division, so its whole lap is serial. Only seidel-2d's three runs move,
 0.78–0.81, with `τ_s` as it was; time is 75 runs, mean 1.42, 7 outside — **between** — and bytes
 as 2b (`row2c-97cb921.json`).
 
-What is left, in 2c: correlation's and covariance's column walk at EXTRALARGE (9.0) and
-gramschmidt's (8.7), trmm at EXTRALARGE (5.58), nussinov overcharged about fivefold (0.17, 0.23; its
+**2d** is `796deb5` (2026-09-30): translations (cost-model § Time, translations) — an access that
+moves a page or more a lap, in a loop whose run touches more pages than the TLB maps, waits for a
+page walk each lap, `τ_tlb` = 1.6 ns measured by `tests/kernels/pagewalk.nt` and fitted on no
+program. correlation, covariance and gramschmidt at EXTRALARGE go from 8.7–9.0 to 0.96–0.98, and
+the same term moves kernels no one aimed it at: 2mm and 3mm at EXTRALARGE from 2.81 and 3.00 to
+0.95 and 1.06, symm from 3.20 to 0.69, lu and cholesky from 1.53 to 0.86 and 0.98. At LARGE, where
+correlation's and covariance's pages are 1.4 times the reach and a walk is cheaper than at four,
+they are overcharged, 0.41–0.42. Time is 75 runs, mean 1.06, 4 outside — **between** — and bytes as
+2b (`row2d-796deb5.json`).
+
+What is left, in 2d: trmm at EXTRALARGE (5.58), nussinov overcharged about fivefold (0.17, 0.23; its
 inner column walk charged lap by lap), durbin at EXTRALARGE (0.2495), the matrix–vector bytes
-(0.25–0.33), and the two refusals. *Holds* needs every run inside [0.25, 4]: seven to go.
+(0.25–0.33), and the two refusals. *Holds* needs every run inside [0.25, 4]: four to go.
 
 ## What fails, and why
 

@@ -1345,6 +1345,7 @@ measurements are row one's. Judged by `summary.nt`; the data in `tests/heldout/p
 | — | `f91bd83` | 74 runs, gm 0.94, 18 outside — fails | 26 kernels, gm 0.38, 20 in — between | 2 kernels |
 | 2b | `5e997b9` | 75 runs, gm 1.53, 10 outside — between | 26 kernels, gm 0.66, 22 in — holds | 2 kernels |
 | 2c | `97cb921` | 75 runs, gm 1.42, 7 outside — between | as 2b — holds | 2 kernels |
+| 2d | `796deb5` | 75 runs, gm 1.06, 4 outside — between | as 2b — holds | 2 kernels |
 
 - `cc66c66` carries the freeze's calculus plus `17d7d75` and `1be9f2a` (the time model's serial add
   and stream rules, committed 2026-09-28, before any held-out number): atax, bicg, gemver and
@@ -1368,3 +1369,14 @@ element the last one stored — charged as a carried scalar is: seidel-2d's valu
 its whole lap is serial, 53 units at `τ_s`. Predicted over measured time goes from 5.31, 5.75, 5.81
 to 0.78, 0.80, 0.81 at MEDIUM, LARGE and EXTRALARGE; no other kernel's prediction moves by more than
 1%. Golden `lap_chain` pins the rule's `serial` column through a new `.eval` file.
+
+`796deb5` (2026-09-30) charges translations. `tests/kernels/pagewalk.nt` walks a column of lines in
+cache at a stride of 4160, 11 200 and 20 800 bytes, four sums so no add chain paces it: 0.13 ns an
+access while the pages fit the first-level TLB, 0.3–0.7 ns while they fit the second (to 2048 pages),
+1.3–2.1 ns past it; `τ_tlb` = 1.6 ns is the mean at 4096–8192 pages less the one at 1024. A first
+run at 4 KiB and 8 KiB strides read 1.0 ns already at 128 pages, which was the lines meeting in one
+set of the cache, not the TLB: at a stride of 832 elements (6.5 KiB) it is 0.48. `matmul_naive` at
+832, a new page every lap and 832 pages a column, measures 0.37 ns a lap and is charged nothing.
+Held-out, measured over predicted time at EXTRALARGE: correlation 9.16 → 0.98, covariance 9.19 →
+0.98, gramschmidt 9.01 → 0.96, 2mm 2.81 → 0.95, 3mm 3.00 → 1.06, symm 3.20 → 0.69, lu 1.53 → 0.86,
+cholesky 1.53 → 0.98; at LARGE correlation and covariance 3.62 → 0.41 and 3.78 → 0.42.
