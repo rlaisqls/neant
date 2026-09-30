@@ -239,6 +239,8 @@ predictions are new (`measure.nt --predict`). Row one is not replaced.
 | 2b | `5e997b9`: 2a and a triangle's fit test | 75 runs, mean 1.53, 10 outside — **between** | 26 kernels, mean 0.66, 22 in — **holds** | 2, the refusals |
 | 2c | `97cb921`: 2b and a store that reads the last lap's | 75 runs, mean 1.42, 7 outside — **between** | as 2b — **holds** | 2, the refusals |
 | 2d | `796deb5`: 2c and translations past the TLB | 75 runs, mean 1.06, 4 outside — **between** | as 2b — **holds** | 2, the refusals |
+| 2e | `e1dbf2b`: 2d and a triangle's hull in the loops' own values | 75 runs, mean 1.12, 1 outside — **between** | 26 kernels, mean 0.73, 23 in — **holds** | 2, the refusals |
+| 2f | `2958e91`: 2e and a chain around a loop inside | 75 runs, mean 1.18, 0 outside — **holds** | as 2e — **holds** | 2, the refusals |
 
 What moved each, so that neither is credited with the other's: **2a** is `17d7d75` (a carried
 `f64` add in a short lap is serial work) and `1be9f2a` (two streams share a bandwidth; a stored
@@ -272,9 +274,32 @@ correlation's and covariance's pages are 1.4 times the reach and a walk is cheap
 they are overcharged, 0.41–0.42. Time is 75 runs, mean 1.06, 4 outside — **between** — and bytes as
 2b (`row2d-796deb5.json`).
 
-What is left, in 2d: trmm at EXTRALARGE (5.58), nussinov overcharged about fivefold (0.17, 0.23; its
-inner column walk charged lap by lap), durbin at EXTRALARGE (0.2495), the matrix–vector bytes
-(0.25–0.33), and the two refusals. *Holds* needs every run inside [0.25, 4]: four to go.
+**2e** is `e1dbf2b` (2026-09-30): a triangle's hull in the loops' own values (cost-model § A
+triangle's hull, in the loops' own values) — four faults in the hull, the last a loop counting down
+tested at the wrong end. nussinov goes from 0.17 / 0.23 / 0.44 to 1.63 / 0.41 / 0.78 of its time
+and from 0.17 to 0.50 of its bytes, and trmm at EXTRALARGE from 5.58 to 0.61 with it. Time is 75
+runs, mean 1.12, 1 outside — **between** — bytes 26 kernels, mean 0.73, 23 in — **holds**
+(`row2e-e1dbf2b.json`).
+
+**2f** is `2958e91` (2026-09-30): a chain carried at a loop's own level is charged the lap's own
+work and its nested loops' serial, not their whole work (cost-model § Time, around a loop inside).
+durbin goes from 0.2495 to 1.60 at EXTRALARGE; no other prediction moves. Time is 75 runs, mean
+1.18, **none outside [0.25, 4] — holds**; bytes as 2e — **holds** (`row2f-2958e91.json`).
+
+**What 2f is and is not.** It is the first row in which both questions hold, and it is not
+held-out evidence the way row one is. From 2b on, each change was made after looking at where row
+one missed, kernel by kernel, and aimed at that miss: no constant was fitted on a held-out program
+(`τ_tlb` is `pagewalk.nt`'s, every other constant row one's), but the rules were chosen with these
+thirty kernels' failures in view, and a later row on the same kernels measures how well the
+calculus now explains them, not how well it predicts code it has not seen. What would test 2f is
+what heldout.md already names and row one did not reach: the rest of the Benchmarks Game and the
+four programs outside numerics, ported and committed before `2958e91` costs them. Row one stays
+what the calculus predicted blind: time *fails*, by one run.
+
+What is left, in 2f: no time run outside [0.25, 4]; the matrix–vector bytes (atax 0.25, bicg 0.32,
+trisolv 0.33, three of 26); correlation and covariance overcharged at LARGE (0.41–0.42), just past the
+TLB's reach; and adi and heat-3d refused, the frozen compiler's `settle_moves` exponential in their
+sites, which is Reach's question and not these two.
 
 ## What fails, and why
 

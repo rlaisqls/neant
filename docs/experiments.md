@@ -1346,6 +1346,8 @@ measurements are row one's. Judged by `summary.nt`; the data in `tests/heldout/p
 | 2b | `5e997b9` | 75 runs, gm 1.53, 10 outside — between | 26 kernels, gm 0.66, 22 in — holds | 2 kernels |
 | 2c | `97cb921` | 75 runs, gm 1.42, 7 outside — between | as 2b — holds | 2 kernels |
 | 2d | `796deb5` | 75 runs, gm 1.06, 4 outside — between | as 2b — holds | 2 kernels |
+| 2e | `e1dbf2b` | 75 runs, gm 1.12, 1 outside — between | 26 kernels, gm 0.73, 23 in — holds | 2 kernels |
+| 2f | `2958e91` | 75 runs, gm 1.18, 0 outside — holds | as 2e — holds | 2 kernels |
 
 - `cc66c66` carries the freeze's calculus plus `17d7d75` and `1be9f2a` (the time model's serial add
   and stream rules, committed 2026-09-28, before any held-out number): atax, bicg, gemver and
@@ -1380,3 +1382,12 @@ set of the cache, not the TLB: at a stride of 832 elements (6.5 KiB) it is 0.48.
 Held-out, measured over predicted time at EXTRALARGE: correlation 9.16 → 0.98, covariance 9.19 →
 0.98, gramschmidt 9.01 → 0.96, 2mm 2.81 → 0.95, 3mm 3.00 → 1.06, symm 3.20 → 0.69, lu 1.53 → 0.86,
 cholesky 1.53 → 0.98; at LARGE correlation and covariance 3.62 → 0.41 and 3.78 → 0.42.
+
+`e1dbf2b` and `2958e91` (2026-09-30). The first puts a triangle's hull in the loops' own values and
+fixes a loop counting down being tested at its first lap as its least: nussinov 0.17 / 0.23 / 0.44 →
+1.63 / 0.41 / 0.78 of its time, 0.17 → 0.50 of its bytes, trmm at EXTRALARGE 5.58 → 0.61. For one
+build between the two, nussinov's bytes were 124 times under the counter — the counting-down test
+calling a table of 242 MB resident — which is how the fourth fault was found. The second charges a
+chain carried at a loop's own level for that level's work only: durbin 0.2495 → 1.60, measured by
+another session first (`beta` removed: the same time; `sum` split four ways: 25% faster). Row 2f is
+the first with no time run outside [0.25, 4]; evaluation § 5 says what that does and does not show.
