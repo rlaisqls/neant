@@ -1074,6 +1074,27 @@ composed as work is, and charged `τ_div = 0.148 ns` each beyond their unit, fit
 reciprocals over an array in L1. Spectral-norm, whose inner loop divides, goes from 1.9 to 1.27.
 Only a time reads `divs`.
 
+**Translations (2026-09-30).** An access whose address moves a page or more a lap of its innermost
+loop — a column walk, `data[k·m + i]` over `k` with `8·m ≥ 4096` — needs a page of its own every
+lap, and when one run of that loop touches more pages than the second-level TLB maps (2048 of 4 KiB,
+`T` = 8 MiB) every lap waits for a page walk, whether or not its line is in cache. Measured by
+`tests/kernels/pagewalk.nt` on this core: an access to a line in cache costs 0.13 ns while its pages
+fit the first-level TLB, 0.3–0.7 ns while they fit the second, and 1.5–2.1 ns past it (at 3072 to
+8192 pages, a stride of 20.8 KB); `τ_tlb` = **1.6 ns** is the last less the second, fitted on the
+probe and on no program. Such an access is counted as `tlb`, per lap and not per line fetched —
+under the two conditions that its step is a page or more (when the step is a size) and that the
+loop's accesses that move so, times its trip at its largest, are more pages than `T` — composed
+through calls and loops as `divs` is, and charged `τ_tlb` each on the compute side of a time.
+Both conditions are written as fit tests on `M` at this machine's ratio of `T` (or a page) to `M`.
+Two things tell it apart from the per-line charge tried below: it counts accesses, so a column that
+stays in cache still pays, and it asks whether the pages fit, so `matmul_naive`'s column walk, 832
+pages at 832, pays nothing — measured 0.37 ns a lap there, where every lap is a new page. A stride
+of a power of two is slower again (1.0 ns a lap at 4 KiB and 8 KiB within the TLB's reach, the lines
+meeting in one set of the cache), which is not in the model. PolyBench's correlation, covariance and
+gramschmidt at EXTRALARGE go from 8.7–9.0 times slower than predicted to 0.96–0.98; at LARGE,
+where their pages are 1.4 times the reach and the walk costs less than at four, correlation and
+covariance are overcharged (0.41–0.42). Golden `tlb_column`.
+
 **Pages, tried (2026-09-27).** Lines fetched by an access that moves a page or more a lap of its
 innermost loop are counted as `paged`, and `--tlb ns` charges each of them a TLB walk. Fitted on a
 transpose it is 9 ns; held fixed, it over-charges naive matmul fourfold, whose column walk reuses

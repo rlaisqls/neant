@@ -1,0 +1,20 @@
+// A column walk against the TLB (cost-model § Time, translations): each column of an n × m array
+// summed down its rows, an access a row apart, so a page a lap once `8·m ≥ 4096`. Past the TLB's
+// reach, `n` pages a column, every lap waits for a page walk: `tlb` in the evaluated report
+// (`tlb_column.eval`), at a size where a column's pages are more than the TLB maps.
+fn colsum(n: i64, m: i64, a: &[f64]) -> f64 {
+    let mut t = 0.0;
+    for j in 0..m {
+        for i in 0..n {
+            t += a[i * m + j];
+        }
+    }
+    t
+}
+
+fn main() {
+    let n = 20;
+    let m = 600;
+    let a = [1.0; n * m];
+    println(colsum(n, m, &a));
+}

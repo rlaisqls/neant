@@ -50,7 +50,7 @@ fn main() {
     let mut core = m7::X925;
     let mut passthrough: Vec<String> = Vec::new();
     let default_p = std::thread::available_parallelism().map(|n| n.get() as i128).unwrap_or(4);
-    let mut machine = cost::Machine { m_bytes: 2 << 20, b_bytes: 64, p_cores: default_p, ns_per_work: 0.0176, bytes_per_ns: 20.8, ns_per_miss: 112.3, ns_per_page: 0.0, ns_per_serial: 0.1554, ns_per_div: 0.1484 };
+    let mut machine = cost::Machine { m_bytes: 2 << 20, b_bytes: 64, p_cores: default_p, ns_per_work: 0.0176, bytes_per_ns: 20.8, ns_per_miss: 112.3, ns_per_page: 0.0, ns_per_serial: 0.1554, ns_per_div: 0.1484, tlb_bytes: 2048 * 4096, page_bytes: 4096, ns_per_tlb: 1.6 };
     // `ns_per_page` is off (0) unless `--tlb` is given: a TLB walk per paged line fits transpose and
     // over-charges naive matmul fourfold (docs/experiments.md § The roofline, pages)
     // the cache outside `M`, for a time only (docs/cost-model.md § Time, a second level): its size,
@@ -220,7 +220,9 @@ fn main() {
                         // work on a chain each lap waits on runs at its own, slower rate
                         let ser = if c.serial.pieces.is_empty() { 0.0 } else { eval_one(c, &c.serial, ev, &machine).unwrap_or(0.0) }.min(w).max(0.0);
                         let dv = if c.divs.pieces.is_empty() { 0.0 } else { eval_one(c, &c.divs, ev, &machine).unwrap_or(0.0) }.max(0.0);
-                        let tw = if span != work { sv.max(w / p) * machine.ns_per_work } else { (w - ser) * machine.ns_per_work + ser * machine.ns_per_serial + dv * machine.ns_per_div };
+                        // an access past the TLB waits for its page walk (cost-model § Time, translations)
+                        let tl = if c.tlb.pieces.is_empty() { 0.0 } else { eval_one(c, &c.tlb, ev, &machine).unwrap_or(0.0) }.max(0.0);
+                        let tw = if span != work { sv.max(w / p) * machine.ns_per_work } else { (w - ser) * machine.ns_per_work + ser * machine.ns_per_serial + dv * machine.ns_per_div + tl * machine.ns_per_tlb };
                         // a chase's lines wait one on the last: latency, not bandwidth
                         let ch = if c.chase.pieces.is_empty() { 0.0 } else { eval_one(c, &c.chase, ev, &machine).unwrap_or(0.0) }.min(m);
                         // the same cost across the boundary of the cache outside `M`: what crosses
@@ -256,6 +258,7 @@ fn main() {
                         if wb > 0.0 { print!("  write-back {wb:.0} bytes"); }
                         if ser > 0.0 { print!("  serial {ser:.0}"); }
                         if dv > 0.0 { print!("  divs {dv:.0}"); }
+                        if tl > 0.0 { print!("  tlb {tl:.0}"); }
                         print!("  time {:.3e} s ({}-bound)", tw.max(tm) / 1e9, if tw >= tm { "work" } else { "moves" });
                         if span != work {
                             if let Some(s) = eval_one(c, span, ev, &machine) {

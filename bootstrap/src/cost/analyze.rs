@@ -46,6 +46,12 @@ pub struct Machine {
     /// Nanoseconds an f64 division takes beyond an ordinary unit of work, its lower throughput,
     /// fitted on a sum of reciprocals (cost-model § Time, divisions).
     pub ns_per_div: f64,
+    /// The bytes the second-level TLB maps, 2048 entries of a 4 KiB page, and the nanoseconds an
+    /// access past it waits for its page walk (cost-model § Time, translations), both from
+    /// `tests/kernels/pagewalk.nt`.
+    pub tlb_bytes: i128,
+    pub page_bytes: i128,
+    pub ns_per_tlb: f64,
 }
 
 #[derive(Debug, Clone)]
@@ -111,6 +117,10 @@ pub struct FuncCost {
     /// How many `f64` divisions `work` holds: a division's throughput is a fraction of an add's,
     /// so a time charges each more (cost-model § Time, divisions). Read only by a time.
     pub divs: Cost,
+    /// How many accesses translate a page the TLB no longer holds: each lap of an innermost loop
+    /// whose accesses move a page or more a lap, over more pages than the TLB maps (cost-model
+    /// § Time, translations). Read only by a time.
+    pub tlb: Cost,
     /// Whether the function touches an array of its own, which a caller's residue cannot cover.
     pub internal: bool,
     /// Lower bounds the catalogue recognised in this function's body.
@@ -501,12 +511,12 @@ impl<'a> Analyzer<'a> {
         let names = param_names(f);
         let unknown = |reason: String| FuncCost {
             name: f.name.clone(), names: names.clone(), result: CostResult::Unknown { reason, line: f.line },
-            chase: Cost::zero(), paged: Cost::zero(), laps: vec![], laps_dropped: false, conc: Cost::zero(), wback: Cost::zero(), serial: Cost::zero(), divs: Cost::zero(), internal: true,
+            chase: Cost::zero(), paged: Cost::zero(), laps: vec![], laps_dropped: false, conc: Cost::zero(), wback: Cost::zero(), serial: Cost::zero(), divs: Cost::zero(), tlb: Cost::zero(), internal: true,
             bounds: vec![], notes: vec![], suggestions: vec![], effects: vec![], violations: vec![], tier: "unknown", result_size: None,
             footprint: whole_arrays(self.m, f), resident: None, declared: Declared::default(), rests_on: vec![],
         };
         let unknown = |reason: String, rests: &[String]| FuncCost { rests_on: rests.to_vec(), ..unknown(reason) };
-        let mut cols = [Cost::zero(), Cost::zero(), Cost::zero(), Cost::zero(), Cost::zero(), Cost::zero(), Cost::zero(), Cost::zero()];
+        let mut cols = [Cost::zero(), Cost::zero(), Cost::zero(), Cost::zero(), Cost::zero(), Cost::zero(), Cost::zero(), Cost::zero(), Cost::zero()];
         let mut rests_on: Vec<String> = Vec::new();
         let mut io = false;
         for &g in &members {
@@ -542,7 +552,7 @@ impl<'a> Analyzer<'a> {
                 let c = Cost::poly(c.pieces.iter().fold(Poly::zero(), |a, p| a.add(&p.poly)));
                 c.hide_args(&moving).map(|q| q.widen_reads_where(&moving))
             };
-            let own = [settle(work), settle(moves), settle(&raw.chase), settle(&raw.paged), settle(&raw.serial), settle(&raw.divs), settle(&raw.conc), settle(&raw.wback)];
+            let own = [settle(work), settle(moves), settle(&raw.chase), settle(&raw.paged), settle(&raw.serial), settle(&raw.divs), settle(&raw.conc), settle(&raw.wback), settle(&raw.tlb)];
             // an invocation's own cost may not depend on which node it is on, nor on a parameter
             // that is not handed on unchanged from the start
             for c in &own {
@@ -601,7 +611,7 @@ impl<'a> Analyzer<'a> {
             if raw.effects.contains(&"io") { io = true; }
         }
         let groups = Poly::var(ai).scale(Rat::int(shape.links as i128)).add(&Poly::constant(1));
-        let [work, moves, chase, paged, serial, divs, conc, wback] = cols.map(|c| c.mul_poly(&groups));
+        let [work, moves, chase, paged, serial, divs, conc, wback, tlb] = cols.map(|c| c.mul_poly(&groups));
         let an = &f.locals[f.params[ai]].name;
         let others: Vec<String> = members.iter().filter(|&&g| g != fid).map(|&g| format!("`{}`", self.m.funcs[g].name)).collect();
         let with = if others.is_empty() { String::new() } else { format!("with {} ", others.join(", ")) };
@@ -611,7 +621,7 @@ impl<'a> Analyzer<'a> {
         let footprint = whole_arrays(self.m, f);
         Some(FuncCost {
             name: f.name.clone(), names, result: CostResult::Exact { span: work.clone(), work, moves },
-            chase, paged, laps: vec![], laps_dropped: true, conc, wback, serial, divs, internal: true, bounds: vec![], notes: vec![note], suggestions: vec![],
+            chase, paged, laps: vec![], laps_dropped: true, conc, wback, serial, divs, tlb, internal: true, bounds: vec![], notes: vec![note], suggestions: vec![],
             effects: if io { vec!["io"] } else { vec![] }, violations: vec![], tier, result_size: None,
             footprint, resident: None, declared: Declared::default(), rests_on,
         })
@@ -627,7 +637,7 @@ impl<'a> Analyzer<'a> {
                 self.done[fid] = Some(FuncCost {
                     name: f.name.clone(),
                     names: param_names(f),
-                    result: CostResult::Unknown { reason: "mutually recursive with another function; only self-recursion is solved".into(), line: f.line }, chase: Cost::zero(), paged: Cost::zero(), laps: vec![], laps_dropped: false, conc: Cost::zero(), wback: Cost::zero(), serial: Cost::zero(), divs: Cost::zero(), internal: true,
+                    result: CostResult::Unknown { reason: "mutually recursive with another function; only self-recursion is solved".into(), line: f.line }, chase: Cost::zero(), paged: Cost::zero(), laps: vec![], laps_dropped: false, conc: Cost::zero(), wback: Cost::zero(), serial: Cost::zero(), divs: Cost::zero(), tlb: Cost::zero(), internal: true,
                     bounds: vec![], notes: vec![], suggestions: vec![], effects: vec![], violations: vec![], tier: "unknown", result_size: None,
                     footprint: vec![], resident: None, declared: Declared::default(), rests_on: vec![],
                 });
@@ -913,6 +923,9 @@ struct Fa<'a, 'b, 'c> {
     /// the divisions, framed the same way
     divs: Cost,
     divs_saved: Vec<Cost>,
+    /// accesses past the TLB's reach (cost-model § Time, translations), saved and summed as `divs` are
+    tlb: Cost,
+    tlb_saved: Vec<Cost>,
     /// the serial work, framed the same way
     serial: Cost,
     serial_saved: Vec<Cost>,
@@ -927,7 +940,7 @@ impl<'a, 'b, 'c> Fa<'a, 'b, 'c> {
             local_size: HashMap::new(), local_affine: HashMap::new(), initial: HashMap::new(), at_entry: false,
             loops: vec![], work: Cost::zero(), moves: Cost::zero(), span: Cost::zero(), saved: vec![], branch: vec![], next_if: 0,
             local_root: HashMap::new(), resident: vec![], call_moves: Cost::zero(), saved_calls: vec![], replay: false, has_call: vec![], rests_on: vec![],
-            reads: Default::default(), loop_writes: vec![], entry_read: Default::default(), scans: Default::default(), amort: vec![], scan_ind: Default::default(), chase: Cost::zero(), chase_saved: vec![], chase_vars: vec![], paged: Cost::zero(), paged_saved: vec![], conc: Cost::zero(), conc_saved: vec![], wback: Cost::zero(), wback_saved: vec![], storing: false, laps: vec![], laps_dropped: false, pending_line: 0, pending_bounded: false, divs: Cost::zero(), divs_saved: vec![], serial: Cost::zero(), serial_saved: vec![],
+            reads: Default::default(), loop_writes: vec![], entry_read: Default::default(), scans: Default::default(), amort: vec![], scan_ind: Default::default(), chase: Cost::zero(), chase_saved: vec![], chase_vars: vec![], paged: Cost::zero(), paged_saved: vec![], conc: Cost::zero(), conc_saved: vec![], wback: Cost::zero(), wback_saved: vec![], storing: false, laps: vec![], laps_dropped: false, pending_line: 0, pending_bounded: false, divs: Cost::zero(), divs_saved: vec![], tlb: Cost::zero(), tlb_saved: vec![], serial: Cost::zero(), serial_saved: vec![],
         };
         for (i, &p) in f.params.iter().enumerate() {
             let l = &f.locals[p];
@@ -989,7 +1002,7 @@ impl<'a, 'b, 'c> Fa<'a, 'b, 'c> {
                 _ if effects.contains(&"unbounded") => CostResult::Unknown { reason: "declared unbounded".into(), line: self.f.line },
                 _ => CostResult::Unknown { reason: "an extern needs `#[cost(work_at_most = …, moves_at_most = …)]` or `uses unbounded`".into(), line: self.f.line },
             };
-            return FuncCost { name: self.f.name.clone(), names: self.names, result, chase: Cost::zero(), paged: Cost::zero(), laps: vec![], laps_dropped: false, conc: Cost::zero(), wback: Cost::zero(), serial: Cost::zero(), divs: Cost::zero(), internal: true, bounds: vec![], notes: vec![], suggestions: vec![], effects, violations, tier: "declared", footprint: vec![], resident: None, declared, rests_on: vec![], result_size: self.result_size.clone() };
+            return FuncCost { name: self.f.name.clone(), names: self.names, result, chase: Cost::zero(), paged: Cost::zero(), laps: vec![], laps_dropped: false, conc: Cost::zero(), wback: Cost::zero(), serial: Cost::zero(), divs: Cost::zero(), tlb: Cost::zero(), internal: true, bounds: vec![], notes: vec![], suggestions: vec![], effects, violations, tier: "declared", footprint: vec![], resident: None, declared, rests_on: vec![], result_size: self.result_size.clone() };
         };
         let mut tier = "exact";
         self.chase_vars = loaded_in_loops(body);
@@ -1114,8 +1127,9 @@ impl<'a, 'b, 'c> Fa<'a, 'b, 'c> {
         let wback = if matches!(result, CostResult::Exact { .. }) { self.wback.clone() } else { Cost::zero() };
         let serial = if matches!(result, CostResult::Exact { .. }) { self.serial.clone() } else { Cost::zero() };
         let divs = if matches!(result, CostResult::Exact { .. }) { self.divs.clone() } else { Cost::zero() };
+        let tlb = if matches!(result, CostResult::Exact { .. }) { self.tlb.clone() } else { Cost::zero() };
         let internal = self.sites.iter().any(|st| { let r = self.local_root.get(&st.arr).copied().unwrap_or(st.arr); !self.f.params.contains(&r) });
-        FuncCost { name: self.f.name.clone(), names: self.names, result, chase, paged, laps, laps_dropped: self.laps_dropped, conc, wback, serial, divs, internal, bounds: self.bounds, notes: self.notes, suggestions: vec![], effects, violations, tier, footprint, resident, declared, rests_on: self.rests_on, result_size: self.result_size.clone() }
+        FuncCost { name: self.f.name.clone(), names: self.names, result, chase, paged, laps, laps_dropped: self.laps_dropped, conc, wback, serial, divs, tlb, internal, bounds: self.bounds, notes: self.notes, suggestions: vec![], effects, violations, tier, footprint, resident, declared, rests_on: self.rests_on, result_size: self.result_size.clone() }
     }
 
     /// The byte range one access site covers over its loop nest, from its affine index and the
@@ -1414,6 +1428,7 @@ impl<'a, 'b, 'c> Fa<'a, 'b, 'c> {
         self.conc_saved.push(std::mem::replace(&mut self.conc, Cost::zero()));
         self.wback_saved.push(std::mem::replace(&mut self.wback, Cost::zero()));
         self.divs_saved.push(std::mem::replace(&mut self.divs, Cost::zero()));
+        self.tlb_saved.push(std::mem::replace(&mut self.tlb, Cost::zero()));
         self.serial_saved.push(std::mem::replace(&mut self.serial, Cost::zero()));
         self.has_call.push(false);
     }
@@ -1432,6 +1447,11 @@ impl<'a, 'b, 'c> Fa<'a, 'b, 'c> {
         let wb = std::mem::replace(&mut self.wback, pwb);
         let pdv = self.divs_saved.pop().unwrap();
         let dv = std::mem::replace(&mut self.divs, pdv);
+        // a branch's translations go back into the frame below, both branches' together: more
+        // than the one that runs, and only a time reads them
+        let ptl = self.tlb_saved.pop().unwrap();
+        let tl = std::mem::replace(&mut self.tlb, ptl);
+        self.tlb = self.tlb.add(&tl);
         let pse = self.serial_saved.pop().unwrap();
         let se = std::mem::replace(&mut self.serial, pse);
         let had = self.has_call.pop().unwrap_or(false);
@@ -1457,6 +1477,8 @@ impl<'a, 'b, 'c> Fa<'a, 'b, 'c> {
         let body_wback = std::mem::replace(&mut self.wback, pwb);
         let pdv = self.divs_saved.pop().unwrap();
         let body_divs = std::mem::replace(&mut self.divs, pdv);
+        let ptl = self.tlb_saved.pop().unwrap();
+        let body_tlb = std::mem::replace(&mut self.tlb, ptl);
         let pse = self.serial_saved.pop().unwrap();
         let body_serial = std::mem::replace(&mut self.serial, pse);
         let had_call = self.has_call.pop().unwrap_or(false);
@@ -1471,6 +1493,7 @@ impl<'a, 'b, 'c> Fa<'a, 'b, 'c> {
         self.conc = self.conc.add(&rec.sum_cost(&body_conc));
         self.wback = self.wback.add(&rec.sum_cost(&body_wback));
         self.divs = self.divs.add(&rec.sum_cost(&body_divs));
+        self.tlb = self.tlb.add(&rec.sum_cost(&body_tlb));
         // a loop whose lap waits on the last one: all its work is serial, nested loops' included
         // through memory only the chained stores wait, one unit each a lap, and an `f64` carried
         // through an add waits for the add, one unit a lap, in a short lap
@@ -1516,6 +1539,7 @@ impl<'a, 'b, 'c> Fa<'a, 'b, 'c> {
                 self.conc = self.conc_saved.pop().unwrap();
                 self.wback = self.wback_saved.pop().unwrap();
                 self.divs = self.divs_saved.pop().unwrap();
+                self.tlb = self.tlb_saved.pop().unwrap();
                 self.serial = self.serial_saved.pop().unwrap();
                 self.has_call.pop();
                 let warm_body = std::mem::replace(&mut self.call_moves, pc);
@@ -1554,6 +1578,8 @@ impl<'a, 'b, 'c> Fa<'a, 'b, 'c> {
         let body_wback = std::mem::replace(&mut self.wback, pwb);
         let pdv = self.divs_saved.pop().unwrap();
         let body_divs = std::mem::replace(&mut self.divs, pdv);
+        let ptl = self.tlb_saved.pop().unwrap();
+        let body_tlb = std::mem::replace(&mut self.tlb, ptl);
         let pse = self.serial_saved.pop().unwrap();
         let body_serial = std::mem::replace(&mut self.serial, pse);
         let had_call = self.has_call.pop().unwrap_or(false);
@@ -1568,6 +1594,7 @@ impl<'a, 'b, 'c> Fa<'a, 'b, 'c> {
         self.conc = self.conc.add(&rec.sum_cost(&body_conc));
         self.wback = self.wback.add(&rec.sum_cost(&body_wback));
         self.divs = self.divs.add(&rec.sum_cost(&body_divs));
+        self.tlb = self.tlb.add(&rec.sum_cost(&body_tlb));
         self.serial = self.serial.add(&rec.sum_cost(&body_serial));
         self.note_straddle(&rec);
         let depth = Cost::poly(Poly::atom(Atom::Log(Box::new(trip.clone()))));
@@ -2148,6 +2175,48 @@ impl<'a, 'b, 'c> Fa<'a, 'b, 'c> {
             let rec = self.loop_recs[lid].clone();
             rec.straddled.set(true);
             self.note_straddle(&rec);
+        }
+        // **Translations** (cost-model § Time, translations): an access whose address moves a page
+        // or more a lap of its innermost loop needs a page of its own every lap, and when that loop's
+        // run touches more pages than the TLB maps — the accesses that move so, times its laps, its
+        // trip taken at its largest — every such lap waits for a page walk. Counted per access,
+        // not per line fetched: a column that stays in cache still translates each lap.
+        // each such access, with the condition that its step is a page or more when the step is a
+        // size (`8·m ≥ 4096`, written as a fit test the way the pages are below)
+        let mut paged_at: Vec<(usize, Vec<Option<Cond>>)> = Vec::new();
+        for site in &self.sites {
+            let (Some(&lid), Some(aff)) = (site.path.last(), site.aff.as_ref()) else { continue };
+            let rec = &self.loop_recs[lid];
+            let Some(v) = rec.var else { continue };
+            let Some(c) = aff.coeffs.get(&v) else { continue };
+            let step = c.scale(Rat::int(site.stride * rec.step.abs()));
+            let cond = match self.numeric(&step) {
+                Some(bytes) if bytes.abs() < m.page_bytes as f64 => continue,
+                Some(_) => None,
+                None if step.terms.values().all(|k| k.n >= 0) => Some(Cond { ws: step.scale(Rat::new(m.m_bytes, m.page_bytes)).mul_atom_pow(Atom::B, Rat::int(-1)), fits: false }),
+                None => continue,
+            };
+            match paged_at.iter_mut().find(|(l, _)| *l == lid) { Some((_, cs)) => cs.push(cond), None => paged_at.push((lid, vec![cond])) }
+        }
+        for (lid, conds) in paged_at {
+            let n = conds.len() as i128;
+            let path: Vec<usize> = match self.sites.iter().find(|s| s.path.last() == Some(&lid)) { Some(s) => s.path.clone(), None => continue };
+            // the pages one run of the loop touches, at its largest over the loops outside it
+            let mut pages = self.loop_recs[lid].trip.scale(Rat::int(n));
+            for &l in path.iter().rev() {
+                let r = &self.loop_recs[l];
+                if let Some(a) = r.atom { if pages.mentions(a) { pages = pages.subst(a, &r.last()); } }
+            }
+            // every lap of it, over every lap of the loops around it, one access at a time
+            let mut laps = Poly::constant(1);
+            for &l in path.iter().rev() { laps = self.loop_recs[l].sum(&laps); }
+            // `pages · page ≥ T`, written as a fit test on `M` at this machine's ratio of the two
+            let ws = pages.scale(Rat::new(m.page_bytes * m.m_bytes, m.tlb_bytes)).mul_atom_pow(Atom::B, Rat::int(-1));
+            for c in conds {
+                let mut under = vec![Cond { ws: ws.clone(), fits: false }];
+                under.extend(c);
+                self.tlb = self.tlb.add_under(&under, &laps);
+            }
         }
         // the total: sites add up, except that sites on the two sides of an `if` are alternatives
         let top = |s: usize| -> Cost {
@@ -3792,6 +3861,12 @@ impl<'a, 'b, 'c> Fa<'a, 'b, 'c> {
                         let hide = |p: &Poly| unnamed.iter().any(|(i, _)| p.mentions(*i));
                         let c = c_divs.hide_args(&hide);
                         if !c.pieces.iter().any(|pc| hide(&pc.poly)) { self.divs = self.divs.add(&c.rename_roots(&rename).subst_many(&map)); }
+                    }
+                    // the callee's translations, as its divisions are
+                    if !declared_only && !opaque && !callee.tlb.pieces.is_empty() {
+                        let hide = |p: &Poly| unnamed.iter().any(|(i, _)| p.mentions(*i));
+                        let c = callee.tlb.hide_args(&hide);
+                        if !c.pieces.iter().any(|pc| hide(&pc.poly) || pc.conds.iter().any(|cd| hide(&cd.ws))) { self.tlb = self.tlb.add(&c.rename_roots(&rename).subst_many(&map)); }
                     }
                     if !declared_only && !opaque && !callee.paged.pieces.is_empty() {
                         let hide = |p: &Poly| unnamed.iter().any(|(i, _)| p.mentions(*i));

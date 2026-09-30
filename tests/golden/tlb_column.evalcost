@@ -1,0 +1,8 @@
+colsum           work 6·n·m + 2·m                  moves                              exact  (2 regimes)
+                                               moves 8·n·m                        if B·n < M
+                                               moves B·n·m                        if B·n ≥ M
+                 lower bound      moves 8·n·m                        (footprint, every distinct element crosses once)   gap 1× if B·n < M; 8× if B·n ≥ M at M = 2 MiB, B = 64
+                 footprint        a: [0, 8·n·m)   resident after if 8·n·m < M
+                   at n=3000,m=2600,B=64: work 46805200  moves 62400000 bytes  paged 62400000 bytes  serial 7800000  tlb 7800000  time 1.438e-2 s (work-bound)
+main             work 85204                        moves 192000                       exact, io
+                   at n=3000,m=2600,B=64: work 85204  moves 192000 bytes  paged 96000 bytes  serial 12000  time 9.231e-6 s (moves-bound)
