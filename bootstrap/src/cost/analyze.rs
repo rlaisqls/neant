@@ -929,6 +929,10 @@ struct Fa<'a, 'b, 'c> {
     /// accesses past the TLB's reach (cost-model § Time, translations), saved and summed as `divs` are
     tlb: Cost,
     tlb_saved: Vec<Cost>,
+    /// the part of a frame's work that nested loops added, so that a chain carried at a loop's own
+    /// level is not charged for the loops inside it (cost-model § Time, serial work)
+    inner_work: Cost,
+    inner_work_saved: Vec<Cost>,
     /// the serial work, framed the same way
     serial: Cost,
     serial_saved: Vec<Cost>,
@@ -943,7 +947,7 @@ impl<'a, 'b, 'c> Fa<'a, 'b, 'c> {
             local_size: HashMap::new(), local_affine: HashMap::new(), initial: HashMap::new(), at_entry: false,
             loops: vec![], work: Cost::zero(), moves: Cost::zero(), span: Cost::zero(), saved: vec![], branch: vec![], next_if: 0,
             local_root: HashMap::new(), resident: vec![], call_moves: Cost::zero(), saved_calls: vec![], replay: false, has_call: vec![], rests_on: vec![],
-            reads: Default::default(), loop_writes: vec![], entry_read: Default::default(), scans: Default::default(), amort: vec![], scan_ind: Default::default(), chase: Cost::zero(), chase_saved: vec![], chase_vars: vec![], paged: Cost::zero(), paged_saved: vec![], conc: Cost::zero(), conc_saved: vec![], wback: Cost::zero(), wback_saved: vec![], storing: false, laps: vec![], laps_dropped: false, pending_line: 0, pending_bounded: false, divs: Cost::zero(), divs_saved: vec![], tlb: Cost::zero(), tlb_saved: vec![], serial: Cost::zero(), serial_saved: vec![],
+            reads: Default::default(), loop_writes: vec![], entry_read: Default::default(), scans: Default::default(), amort: vec![], scan_ind: Default::default(), chase: Cost::zero(), chase_saved: vec![], chase_vars: vec![], paged: Cost::zero(), paged_saved: vec![], conc: Cost::zero(), conc_saved: vec![], wback: Cost::zero(), wback_saved: vec![], storing: false, laps: vec![], laps_dropped: false, pending_line: 0, pending_bounded: false, divs: Cost::zero(), divs_saved: vec![], tlb: Cost::zero(), tlb_saved: vec![], inner_work: Cost::zero(), inner_work_saved: vec![], serial: Cost::zero(), serial_saved: vec![],
         };
         for (i, &p) in f.params.iter().enumerate() {
             let l = &f.locals[p];
@@ -1432,6 +1436,7 @@ impl<'a, 'b, 'c> Fa<'a, 'b, 'c> {
         self.wback_saved.push(std::mem::replace(&mut self.wback, Cost::zero()));
         self.divs_saved.push(std::mem::replace(&mut self.divs, Cost::zero()));
         self.tlb_saved.push(std::mem::replace(&mut self.tlb, Cost::zero()));
+        self.inner_work_saved.push(std::mem::replace(&mut self.inner_work, Cost::zero()));
         self.serial_saved.push(std::mem::replace(&mut self.serial, Cost::zero()));
         self.has_call.push(false);
     }
@@ -1455,6 +1460,9 @@ impl<'a, 'b, 'c> Fa<'a, 'b, 'c> {
         let ptl = self.tlb_saved.pop().unwrap();
         let tl = std::mem::replace(&mut self.tlb, ptl);
         self.tlb = self.tlb.add(&tl);
+        let piw = self.inner_work_saved.pop().unwrap();
+        let iw = std::mem::replace(&mut self.inner_work, piw);
+        self.inner_work = self.inner_work.add(&iw);
         let pse = self.serial_saved.pop().unwrap();
         let se = std::mem::replace(&mut self.serial, pse);
         let had = self.has_call.pop().unwrap_or(false);
@@ -1482,6 +1490,8 @@ impl<'a, 'b, 'c> Fa<'a, 'b, 'c> {
         let body_divs = std::mem::replace(&mut self.divs, pdv);
         let ptl = self.tlb_saved.pop().unwrap();
         let body_tlb = std::mem::replace(&mut self.tlb, ptl);
+        let piw = self.inner_work_saved.pop().unwrap();
+        let body_inner = std::mem::replace(&mut self.inner_work, piw);
         let pse = self.serial_saved.pop().unwrap();
         let body_serial = std::mem::replace(&mut self.serial, pse);
         let had_call = self.has_call.pop().unwrap_or(false);
@@ -1490,6 +1500,7 @@ impl<'a, 'b, 'c> Fa<'a, 'b, 'c> {
         let sp = std::mem::replace(&mut self.span, psp);
         let rec = self.loop_recs[lp.id].clone();
         self.work = self.work.add(&rec.sum_cost(&w));
+        self.inner_work = self.inner_work.add(&rec.sum_cost(&w));
         self.moves = self.moves.add(&rec.sum_cost(&m));
         self.chase = self.chase.add(&rec.sum_cost(&body_chase));
         self.paged = self.paged.add(&rec.sum_cost(&body_paged));
@@ -1508,7 +1519,11 @@ impl<'a, 'b, 'c> Fa<'a, 'b, 'c> {
         // whole lap when the value passes a multiply or divide on its way, one unit when only adds
         let lap = lap_chain(body, rec.var, rec.step);
         let chained = memory_chain(body, rec.var) + if short { float_chain(body, self.f) } else { 0 } + usize::from(lap == Some(false));
-        self.serial = self.serial.add(&rec.sum_cost(&if carried_chain(body) || lap == Some(true) { w.clone() } else { body_serial.add_poly(&Poly::constant(chained as i128)) }));
+        // a chain the lap carries at its own level waits for the lap's own work, not for the loops
+        // inside it, which run between one link and the next at their own rate (durbin's `beta`
+        // around three loops over `i`): the lap's work less theirs, and whatever of theirs is serial
+        let own_chain = || w.add(&body_inner.scale(Rat::int(-1))).add(&body_serial);
+        self.serial = self.serial.add(&rec.sum_cost(&if carried_chain(body) || lap == Some(true) { own_chain() } else { body_serial.add_poly(&Poly::constant(chained as i128)) }));
         // an ordinary loop is sequential: its span sums the same way work does
         self.span = self.span.add(&rec.sum_cost(&sp));
         self.note_straddle(&rec);
@@ -1543,6 +1558,7 @@ impl<'a, 'b, 'c> Fa<'a, 'b, 'c> {
                 self.wback = self.wback_saved.pop().unwrap();
                 self.divs = self.divs_saved.pop().unwrap();
                 self.tlb = self.tlb_saved.pop().unwrap();
+                self.inner_work = self.inner_work_saved.pop().unwrap();
                 self.serial = self.serial_saved.pop().unwrap();
                 self.has_call.pop();
                 let warm_body = std::mem::replace(&mut self.call_moves, pc);
@@ -1583,6 +1599,8 @@ impl<'a, 'b, 'c> Fa<'a, 'b, 'c> {
         let body_divs = std::mem::replace(&mut self.divs, pdv);
         let ptl = self.tlb_saved.pop().unwrap();
         let body_tlb = std::mem::replace(&mut self.tlb, ptl);
+        let piw = self.inner_work_saved.pop().unwrap();
+        let body_inner = std::mem::replace(&mut self.inner_work, piw);
         let pse = self.serial_saved.pop().unwrap();
         let body_serial = std::mem::replace(&mut self.serial, pse);
         let had_call = self.has_call.pop().unwrap_or(false);
@@ -1591,6 +1609,7 @@ impl<'a, 'b, 'c> Fa<'a, 'b, 'c> {
         self.span = psp;
         let rec = self.loop_recs[lp.id].clone();
         self.work = self.work.add(&rec.sum_cost(&w));
+        self.inner_work = self.inner_work.add(&rec.sum_cost(&w));
         self.moves = self.moves.add(&rec.sum_cost(&m));
         self.chase = self.chase.add(&rec.sum_cost(&body_chase));
         self.paged = self.paged.add(&rec.sum_cost(&body_paged));

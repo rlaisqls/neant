@@ -1045,6 +1045,17 @@ the chained operation waits; the rest of the lap overlaps), where a scalar multi
 whole loop serial. Charging the whole loop for a memory chain was tried first and took n-body from
 2.3× too fast to 2.7× too slow.
 
+*Around a loop inside (2026-09-30).* "Its whole body's, nested loops' included" charged a chain
+carried at a loop's own level for the loops inside it too: durbin's `beta = (1 − α²)·β` each lap of
+`k`, around three loops over `i` that run between one link and the next, made all of durbin serial,
+predicted 3.8 times its time. The loops inside do not wait on that chain (removing it measures the
+same; splitting their `sum` four ways does not, which is their own add chain), so the lap is now
+charged its own work — the work the frame has less what its nested loops added (`inner_work`) —
+and the nested loops' own serial work, where it was the whole lap. An innermost loop has none
+inside, so mandelbrot, the logistic map and seidel-2d keep their charge. durbin goes from 0.2495 to
+1.60 of its predicted time at EXTRALARGE and from 0.26 to 1.68 at LARGE. Found by a read-only look
+from another session, which measured the two variants. Golden `outer_chain`.
+
 *A store that reads the last lap's (2026-09-30).* A lap that reads the element the lap before it
 stored — Gauss–Seidel's `a[i·n + j] = (… + a[i·n + j − 1] + …) / 9` over `j`, a prefix sum's
 `a[j] = a[j] + a[j − 1]` — waits for that store: a recurrence through memory at a moving index,

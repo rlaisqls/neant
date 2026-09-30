@@ -1,0 +1,5 @@
+outer            work 2·n² + 5·n − 7               moves                              exact  (2 regimes)
+                                               moves 8·n + B − 8                  if ≈ 8·n < M
+                                               moves ≈ 4·n²                       if ≈ 8·n ≥ M
+                 footprint        r: [0, 8·r.len()) (whole array)   no residue claimed
+main             work 20596                        moves B + 1592                     exact, io

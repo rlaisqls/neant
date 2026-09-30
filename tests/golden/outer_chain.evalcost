@@ -1,0 +1,7 @@
+outer            work 2·n² + 5·n − 7               moves                              exact  (2 regimes)
+                                               moves 8·n + B − 8                  if ≈ 8·n < M
+                                               moves ≈ 4·n²                       if ≈ 8·n ≥ M
+                 footprint        r: [0, 8·r.len()) (whole array)   no residue claimed
+                   at n=4000,B=64: work 32019993  moves 32056 bytes  serial 8025993  time 1.670e-3 s (work-bound)
+main             work 20596                        moves B + 1592                     exact, io
+                   at n=4000,B=64: work 20596  moves 1656 bytes  serial 5643  time 1.140e-6 s (work-bound)

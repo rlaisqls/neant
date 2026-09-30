@@ -1,0 +1,23 @@
+// A chain carried at a loop's own level around a loop inside it (cost-model § Time, serial work):
+// durbin's shape, `beta` multiplied each lap of `k` while a sum over `i` runs between one link and
+// the next. The lap's own work is serial and the inner loop's is not, but for its own add chain;
+// `serial` is in the evaluated report (`outer_chain.eval`).
+fn outer(n: i64, r: &[f64]) -> f64 {
+    let mut beta = 1.0;
+    let mut acc = 0.0;
+    for k in 1..n {
+        beta = (1.0 - 0.5 * beta) * beta;
+        let mut sum = 0.0;
+        for i in 0..k {
+            sum += r[i];
+        }
+        acc += sum * beta;
+    }
+    acc
+}
+
+fn main() {
+    let n = 100;
+    let r = [1.0; n];
+    println(outer(n, &r));
+}
